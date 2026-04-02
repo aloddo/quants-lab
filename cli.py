@@ -136,12 +136,12 @@ async def trigger_task(task_name: str, config_path: str, timeout: int):
     
     try:
         runner = TaskRunner(config_path=config_path)
-        
+
         # Setup storage and orchestrator
-        storage_config = runner._get_storage_config()
         from core.tasks.storage import MongoDBTaskStorage
-        storage = MongoDBTaskStorage(storage_config)
-        
+        storage = MongoDBTaskStorage()
+        await storage.initialize()
+
         from core.tasks.orchestrator import TaskOrchestrator
         max_concurrent = runner.config.get("max_concurrent_tasks", 10)
         runner.orchestrator = TaskOrchestrator(

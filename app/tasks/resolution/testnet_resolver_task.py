@@ -101,33 +101,40 @@ class TestnetResolverTask(BaseTask):
 
         amount = amount_usd / price
 
-        # Build executor config
-        side = "BUY" if direction == "LONG" else "SELL"
-        executor_config = {
-            "type": "position_executor",
-            "connector_name": self.connector,
-            "trading_pair": pair,
-            "side": side,
-            "amount": amount,
+        # Build executor config (HB API format: nested under executor_config with triple_barrier_config)
+        side = 1 if direction == "LONG" else 2  # 1=BUY, 2=SELL per HB TradeType enum
+
+        # Compute TP/SL as percentages for triple barrier
+        if engine == "E1":
+            tp_pct = params["tp_pct"]
+            sl_pct = params["sl_pct"]
+        elif engine == "E2":
+            tp_abs = candidate.get("tp_price")
+            sl_abs = candidate.get("sl_price")
+            tp_pct = abs(tp_abs - price) / price if tp_abs and price else 0.03
+            sl_pct = abs(sl_abs - price) / price if sl_abs and price else 0.015
+
+        time_limit = params.get("time_limit_hours", 24) * 3600
+
+        request_body = {
+            "account_name": self.account,
+            "executor_config": {
+                "type": "position_executor",
+                "connector_name": self.connector,
+                "trading_pair": pair,
+                "side": side,
+                "amount": str(amount),
+                "leverage": 1,
+                "triple_barrier_config": {
+                    "take_profit": str(tp_pct),
+                    "stop_loss": str(sl_pct),
+                    "time_limit": time_limit,
+                },
+            },
         }
 
-        # TP/SL
-        if engine == "E1":
-            if direction == "LONG":
-                executor_config["take_profit"] = price * (1 + params["tp_pct"])
-                executor_config["stop_loss"] = price * (1 - params["sl_pct"])
-            else:
-                executor_config["take_profit"] = price * (1 - params["tp_pct"])
-                executor_config["stop_loss"] = price * (1 + params["sl_pct"])
-        elif engine == "E2":
-            # E2 uses absolute prices from the candidate
-            executor_config["take_profit"] = candidate.get("tp_price")
-            executor_config["stop_loss"] = candidate.get("sl_price")
-
-        executor_config["time_limit"] = params.get("time_limit_hours", 24) * 3600
-
         try:
-            result = await self.hb_client.create_executor(executor_config)
+            result = await self.hb_client.create_executor(request_body)
             executor_id = result.get("executor_id") or result.get("id")
             logger.info(f"Placed testnet order for {engine}/{pair}: executor_id={executor_id}")
 
@@ -139,7 +146,7 @@ class TestnetResolverTask(BaseTask):
                     message=(
                         f"<b>Testnet Order Placed</b>\n"
                         f"Engine: {engine} | Pair: {pair}\n"
-                        f"Side: {side} | Amount: ${amount_usd:.0f}\n"
+                        f"Side: {'LONG' if side == 1 else 'SHORT'} | Amount: ${amount_usd:.0f}\n"
                         f"Executor: {executor_id}"
                     ),
                     level="info",

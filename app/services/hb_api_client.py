@@ -59,7 +59,7 @@ class HBApiClient:
         """Ping HB API. Returns True if reachable, False otherwise."""
         try:
             session = await self._get_session()
-            async with session.get(f"{self.base_url}/health", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with session.get(f"{self.base_url}/", timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -76,7 +76,7 @@ class HBApiClient:
 
     async def get_executor_status(self, executor_id: str) -> Dict[str, Any]:
         """Get executor status by ID."""
-        return await self._request("GET", f"/executors/{executor_id}/status")
+        return await self._request("GET", f"/executors/{executor_id}")
 
     async def stop_executor(self, executor_id: str) -> Dict[str, Any]:
         """Stop a running executor."""
