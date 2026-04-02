@@ -95,7 +95,7 @@ tasks:
     max_retries: 2
     timeout_seconds: 120
     config:
-      connector: "bybit_perpetual_testnet"
+      connector: "bybit_perpetual_demo"
       account: "master_account"
       position_size_pct: 0.003
       fallback_capital: 500

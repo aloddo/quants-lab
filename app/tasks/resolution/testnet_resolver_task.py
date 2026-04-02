@@ -1,9 +1,13 @@
 """
-Testnet resolver — places real orders on Bybit testnet via HB API.
+Paper trading resolver — places real orders on Bybit demo via HB API.
 
-On CANDIDATE_READY signal: creates PositionExecutor on bybit_perpetual_testnet.
+On CANDIDATE_READY signal: creates PositionExecutor on bybit_perpetual_demo.
 On subsequent runs: polls executor status, records fills and outcomes.
+
+Bybit demo uses real market data with virtual funds (closer to prod than testnet).
 """
+# Register the demo connector domain
+import app.connectors.bybit_perpetual_demo  # noqa: F401
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -36,7 +40,7 @@ class TestnetResolverTask(BaseTask):
     def __init__(self, config):
         super().__init__(config)
         task_config = self.config.config
-        self.connector = task_config.get("connector", "bybit_perpetual_testnet")
+        self.connector = task_config.get("connector", "bybit_perpetual_demo")
         self.account = task_config.get("account", "master_account")
         self.position_size_pct = task_config.get("position_size_pct", 0.003)
         self.fallback_capital = task_config.get("fallback_capital", 500.0)

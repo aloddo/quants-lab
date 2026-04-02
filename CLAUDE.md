@@ -2,7 +2,7 @@
 
 ## What is this repo
 
-Fork of `hummingbot/quants-lab` with a systematic crypto perpetual futures trading system built on QuantsLab primitives. Two engines: E1 (compression breakout) and E2 (range fade). Paper trading on Bybit testnet via Hummingbot API.
+Fork of `hummingbot/quants-lab` with a systematic crypto perpetual futures trading system built on QuantsLab primitives. Two engines: E1 (compression breakout) and E2 (range fade). Paper trading on Bybit demo (api-demo.bybit.com) via Hummingbot API.
 
 Owner: Alberto Loddo (GitHub: aloddo)
 
@@ -150,5 +150,5 @@ e2_bulk_backtest          (weekly Sunday 04:00 UTC)
 - **Feature TTL is 90 days** — if you need longer history for backtesting, query parquet directly, don't rely on MongoDB features.
 - **The `timestamp` field in derivatives collections uses milliseconds** (Bybit convention), but QL features use Python datetime objects. Watch for unit mismatches.
 - **`core/` FeatureStorage uses `insert_many`** which creates duplicates. Our FeatureComputationTask uses upsert instead — don't use FeatureStorage.save_features() directly.
-- **Bybit testnet connector** must be configured in Hummingbot separately — it's not the same as the live connector.
+- **Bybit demo connector** (`bybit_perpetual_demo`) is registered by `app/connectors/bybit_perpetual_demo.py`. Uses `api-demo.bybit.com` (real market data, virtual funds). Configure credentials via HB API or MCP.
 - **Git push requires token** — hermes user has no credential helper. Use the temporary URL method documented above.
