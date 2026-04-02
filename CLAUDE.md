@@ -150,5 +150,12 @@ e2_bulk_backtest          (weekly Sunday 04:00 UTC)
 - **Feature TTL is 90 days** — if you need longer history for backtesting, query parquet directly, don't rely on MongoDB features.
 - **The `timestamp` field in derivatives collections uses milliseconds** (Bybit convention), but QL features use Python datetime objects. Watch for unit mismatches.
 - **`core/` FeatureStorage uses `insert_many`** which creates duplicates. Our FeatureComputationTask uses upsert instead — don't use FeatureStorage.save_features() directly.
-- **Bybit demo connector** (`bybit_perpetual_demo`) is registered by `app/connectors/bybit_perpetual_demo.py`. Uses `api-demo.bybit.com` (real market data, virtual funds). Configure credentials via HB API or MCP.
+- **Bybit demo connector** (`bybit_perpetual_demo`) uses `api-demo.bybit.com` (real market data, virtual funds). Registered by patching the HB connector in both the conda env (`site-packages`) and the Docker container. **If the HB API Docker container is rebuilt**, re-apply the patch:
+  ```bash
+  HOST_PKG="/Users/hermes/miniforge3/envs/quants-lab/lib/python3.12/site-packages/hummingbot/connector/derivative/bybit_perpetual"
+  CONTAINER_PKG="/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/derivative/bybit_perpetual"
+  docker cp "$HOST_PKG/bybit_perpetual_constants.py" "hummingbot-api:$CONTAINER_PKG/bybit_perpetual_constants.py"
+  docker cp "$HOST_PKG/bybit_perpetual_utils.py" "hummingbot-api:$CONTAINER_PKG/bybit_perpetual_utils.py"
+  docker restart hummingbot-api
+  ```
 - **Git push requires token** — hermes user has no credential helper. Use the temporary URL method documented above.
