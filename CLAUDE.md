@@ -186,6 +186,53 @@ db.candidates.find({trigger_fired: true, disposition: {$ne: "CANDIDATE_READY"}})
 db.candidates.find({engine: "E1", pair: "XRP-USDT"}).sort({timestamp_utc: -1})
 ```
 
+## Remote Access (from MacBook Air via Tailscale)
+
+```bash
+# SSH in
+ssh hermes@<tailscale-ip>
+
+# Check system health
+bash /Users/hermes/quants-lab/scripts/status.sh
+
+# Watch pipeline logs live
+tmux attach -t ql-pipeline
+# Detach: Ctrl+B then D
+
+# Watch QL API logs
+tmux attach -t ql-api
+
+# Check QL API endpoints
+curl http://localhost:8001/health
+curl http://localhost:8001/tasks
+
+# Pull latest code
+cd /Users/hermes/quants-lab && git pull
+
+# Run Jupyter for backtesting
+cd /Users/hermes/quants-lab
+MONGO_URI=mongodb://localhost:27017/quants_lab MONGO_DATABASE=quants_lab \
+  /Users/hermes/miniforge3/envs/quants-lab/bin/jupyter lab --port 8888 --no-browser
+# Then tunnel: ssh -L 8888:localhost:8888 hermes@<tailscale-ip>
+# Or access directly if Tailscale exposes the port
+
+# Emergency stop
+bash /Users/hermes/quants-lab/scripts/kill_switch.sh
+bash /Users/hermes/quants-lab/scripts/kill_switch.sh --full  # also kills tmux
+
+# Restart pipeline after stop
+bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
+```
+
+### tmux sessions
+
+| Session | Purpose | Attach |
+|---------|---------|--------|
+| `ql-pipeline` | TaskOrchestrator DAG | `tmux attach -t ql-pipeline` |
+| `ql-api` | QL Task API on :8001 | `tmux attach -t ql-api` |
+| `hummingbot` | HB instance | `tmux attach -t hummingbot` |
+| `gateway` | HB gateway | `tmux attach -t gateway` |
+
 ## Gotchas
 
 - **CandlesDownloaderTask writes parquet only at the end** — if killed mid-run, all data is lost. The scheduled task uses 7-day retention (fast). Use separate backfill scripts for historical data.
