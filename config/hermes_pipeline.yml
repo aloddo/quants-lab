@@ -95,13 +95,10 @@ tasks:
     max_retries: 2
     timeout_seconds: 120
     config:
-      connector: "bybit_perpetual_demo"
-      account: "master_account"
       position_size_pct: 0.003
       fallback_capital: 100000
       engines: ["E1", "E2"]
       max_portfolio_positions: 3
-      max_portfolio_exposure_pct: 0.02
     tags: [resolution, testnet]
 
   # ═══════ Weekly: Re-optimization ════════════════════════
