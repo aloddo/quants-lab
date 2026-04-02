@@ -41,6 +41,8 @@ class TestnetResolverTask(BaseTask):
         self.position_size_pct = task_config.get("position_size_pct", 0.003)
         self.fallback_capital = task_config.get("fallback_capital", 500.0)
         self.engines = task_config.get("engines", ["E1", "E2"])
+        self.max_portfolio_positions = task_config.get("max_portfolio_positions", 3)
+        self.max_portfolio_exposure_pct = task_config.get("max_portfolio_exposure_pct", 0.02)  # 2% total
         self.hb_client = HBApiClient()
 
     async def setup(self, context: TaskContext) -> None:
@@ -233,25 +235,47 @@ class TestnetResolverTask(BaseTask):
         # Phase 1: Place orders for new CANDIDATE_READY signals
         capital = await self._get_capital()
 
-        for engine in self.engines:
-            params = ENGINE_PARAMS.get(engine, ENGINE_PARAMS["E1"])
-            max_concurrent = params.get("max_concurrent", 2)
-            active_count = await self._count_active_positions(engine)
+        # Portfolio-level check: total active across ALL engines
+        total_active = 0
+        for eng in self.engines:
+            total_active += await self._count_active_positions(eng)
 
-            if active_count >= max_concurrent:
-                logger.info(f"{engine}: {active_count}/{max_concurrent} active — skipping new orders")
-                continue
-
-            # Find unplaced CANDIDATE_READY signals
-            ready_docs = await self.mongodb_client.get_documents(
-                "candidates",
-                {"engine": engine, "disposition": "CANDIDATE_READY"},
+        if total_active >= self.max_portfolio_positions:
+            logger.info(
+                f"Portfolio limit reached: {total_active}/{self.max_portfolio_positions} "
+                f"active across all engines — skipping new orders"
             )
+        else:
+            # Check total exposure
+            total_exposure_pct = total_active * self.position_size_pct
+            remaining_exposure = self.max_portfolio_exposure_pct - total_exposure_pct
 
-            slots = max_concurrent - active_count
-            for doc in ready_docs[:slots]:
-                await self._place_order(doc, capital)
-                stats["new_orders"] += 1
+            for engine in self.engines:
+                params = ENGINE_PARAMS.get(engine, ENGINE_PARAMS["E1"])
+                max_concurrent = params.get("max_concurrent", 2)
+                active_count = await self._count_active_positions(engine)
+
+                if active_count >= max_concurrent:
+                    logger.info(f"{engine}: {active_count}/{max_concurrent} active — skipping")
+                    continue
+
+                if total_active >= self.max_portfolio_positions:
+                    break
+
+                # Find unplaced CANDIDATE_READY signals
+                ready_docs = await self.mongodb_client.get_documents(
+                    "candidates",
+                    {"engine": engine, "disposition": "CANDIDATE_READY"},
+                )
+
+                slots = min(
+                    max_concurrent - active_count,
+                    self.max_portfolio_positions - total_active,
+                )
+                for doc in ready_docs[:slots]:
+                    await self._place_order(doc, capital)
+                    stats["new_orders"] += 1
+                    total_active += 1
 
         # Phase 2: Poll active positions
         stats["poll_stats"] = await self._poll_active_positions()

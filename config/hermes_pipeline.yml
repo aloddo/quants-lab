@@ -100,4 +100,51 @@ tasks:
       position_size_pct: 0.003
       fallback_capital: 500
       engines: ["E1", "E2"]
+      max_portfolio_positions: 3
+      max_portfolio_exposure_pct: 0.02
     tags: [resolution, testnet]
+
+  # ═══════ Weekly: Re-optimization ════════════════════════
+  e1_bulk_backtest:
+    enabled: true
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 7200
+    config:
+      engine: "E1"
+      connector_name: "bybit_perpetual"
+      controller_name: "e1_compression_breakout"
+      controller_config:
+        total_amount_quote: 100
+        max_executors_per_side: 1
+        cooldown_time: 60
+      backtest_days: 180
+      resolution: "1h"
+      trade_cost: 0.000375
+    tags: [backtesting, e1, weekly]
+
+  e2_bulk_backtest:
+    enabled: true
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 4 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 7200
+    config:
+      engine: "E2"
+      connector_name: "bybit_perpetual"
+      controller_name: "e2_range_fade"
+      controller_config:
+        total_amount_quote: 100
+        max_executors_per_side: 1
+        cooldown_time: 60
+      backtest_days: 180
+      resolution: "1h"
+      trade_cost: 0.000375
+    tags: [backtesting, e2, weekly]
