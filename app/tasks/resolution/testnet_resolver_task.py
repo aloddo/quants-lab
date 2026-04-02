@@ -1,10 +1,9 @@
 """
-Paper trading resolver — places orders on Bybit demo via direct REST API.
+Paper trading resolver — places orders on Bybit demo via HB native executors.
 
-On CANDIDATE_READY signal: places market order with TP/SL on api-demo.bybit.com.
-On subsequent runs: polls positions, records fills and outcomes.
-
-Uses BybitDemoTrader (direct API) instead of HB executors to avoid connector bugs.
+Uses bybit_perpetual_testnet connector (patched to point at api-demo.bybit.com).
+On CANDIDATE_READY: creates PositionExecutor with TP/SL/time limit.
+On subsequent runs: polls executor status, records fills and outcomes.
 """
 import logging
 import os
@@ -12,11 +11,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from core.tasks import BaseTask, TaskContext
-from app.services.bybit_demo_trader import BybitDemoTrader
+from app.services.hb_api_client import HBApiClient
 
 logger = logging.getLogger(__name__)
 
-# Engine-specific exit parameters
 ENGINE_PARAMS = {
     "E1": {
         "tp_pct": 0.03,
@@ -31,44 +29,39 @@ ENGINE_PARAMS = {
 }
 
 
-def _bybit_symbol(pair: str) -> str:
-    """Convert BTC-USDT → BTCUSDT."""
-    return pair.replace("-", "")
-
-
 class TestnetResolverTask(BaseTask):
-    """Place and track orders on Bybit demo for paper trading."""
+    """Place and track orders on Bybit demo via HB executors."""
 
     def __init__(self, config):
         super().__init__(config)
         task_config = self.config.config
+        self.connector = task_config.get("connector", "bybit_perpetual_testnet")
+        self.account = task_config.get("account", "master_account")
         self.position_size_pct = task_config.get("position_size_pct", 0.003)
         self.fallback_capital = task_config.get("fallback_capital", 100000)
         self.engines = task_config.get("engines", ["E1", "E2"])
         self.max_portfolio_positions = task_config.get("max_portfolio_positions", 3)
-
-        api_key = task_config.get("api_key") or os.getenv("BYBIT_DEMO_API_KEY", "")
-        api_secret = task_config.get("api_secret") or os.getenv("BYBIT_DEMO_API_SECRET", "")
-        self.trader = BybitDemoTrader(api_key, api_secret)
+        self.hb_client = HBApiClient()
 
     async def setup(self, context: TaskContext) -> None:
         await super().setup(context)
         if not self.mongodb_client:
             raise RuntimeError("MongoDB required for TestnetResolverTask")
-        # Health check: verify Bybit demo API works
-        try:
-            balance = await self.trader.get_wallet_balance()
-            if balance["equity"] <= 0:
-                raise RuntimeError("Bybit demo account has zero equity")
-            logger.info(f"Bybit demo balance: ${balance['equity']:.0f}")
-        except Exception as e:
-            raise RuntimeError(f"Bybit demo API health check failed: {e}")
+        if not await self.hb_client.health_check():
+            raise RuntimeError(
+                f"Hummingbot API at {self.hb_client.base_url} is unreachable."
+            )
 
     async def _get_capital(self) -> float:
         try:
-            balance = await self.trader.get_wallet_balance()
-            return balance["equity"] if balance["equity"] > 0 else self.fallback_capital
-        except Exception:
+            portfolio = await self.hb_client.get_portfolio_state(self.account)
+            if isinstance(portfolio, dict):
+                for token_data in portfolio.get("tokens", []):
+                    if token_data.get("token") == "USDT":
+                        return float(token_data.get("balance", self.fallback_capital))
+            return self.fallback_capital
+        except Exception as e:
+            logger.warning(f"Could not fetch capital: {e}, using fallback {self.fallback_capital}")
             return self.fallback_capital
 
     async def _count_active_positions(self, engine: str) -> int:
@@ -83,85 +76,71 @@ class TestnetResolverTask(BaseTask):
         direction = candidate["direction"]
         params = ENGINE_PARAMS.get(engine, ENGINE_PARAMS["E1"])
 
-        # Position sizing
         amount_usd = capital * self.position_size_pct
         price = candidate.get("decision_price", 0)
         if price <= 0:
             logger.error(f"Invalid decision_price for {pair}: {price}")
             return
 
-        # Get trading rules for min order size
-        symbol = _bybit_symbol(pair)
-        side = "Buy" if direction == "LONG" else "Sell"
+        amount = round(amount_usd / price, 3)
+        side = 1 if direction == "LONG" else 2
 
-        # Calculate amount in base asset, rounded to Bybit's step size
-        # BTC: 0.001, most alts: 0.1 or 1.0. Use 3 decimals as safe default.
-        raw_amount = amount_usd / price
-        amount = round(raw_amount, 3)
-
-        # Calculate TP/SL prices
+        # TP/SL as percentages for triple barrier
         if engine == "E1":
-            if direction == "LONG":
-                tp_price = round(price * (1 + params["tp_pct"]), 2)
-                sl_price = round(price * (1 - params["sl_pct"]), 2)
-            else:
-                tp_price = round(price * (1 - params["tp_pct"]), 2)
-                sl_price = round(price * (1 + params["sl_pct"]), 2)
+            tp_pct = params["tp_pct"]
+            sl_pct = params["sl_pct"]
         elif engine == "E2":
-            tp_price = candidate.get("tp_price")
-            sl_price = candidate.get("sl_price")
-            if tp_price:
-                tp_price = round(float(tp_price), 2)
-            if sl_price:
-                sl_price = round(float(sl_price), 2)
-        else:
-            tp_price, sl_price = None, None
+            tp_abs = candidate.get("tp_price")
+            sl_abs = candidate.get("sl_price")
+            tp_pct = abs(float(tp_abs) - price) / price if tp_abs else 0.03
+            sl_pct = abs(float(sl_abs) - price) / price if sl_abs else 0.015
+
+        time_limit = params.get("time_limit_hours", 24) * 3600
+
+        request_body = {
+            "account_name": self.account,
+            "executor_config": {
+                "type": "position_executor",
+                "connector_name": self.connector,
+                "trading_pair": pair,
+                "side": side,
+                "amount": str(amount),
+                "leverage": 1,
+                "triple_barrier_config": {
+                    "take_profit": str(tp_pct),
+                    "stop_loss": str(sl_pct),
+                    "time_limit": time_limit,
+                },
+            },
+        }
 
         try:
-            result = await self.trader.place_market_order(
-                symbol=symbol,
-                side=side,
-                qty=str(amount),
-                take_profit=str(tp_price) if tp_price else None,
-                stop_loss=str(sl_price) if sl_price else None,
-            )
-            order_id = result["result"]["orderId"]
-            logger.info(f"Placed demo order for {engine}/{pair}: order_id={order_id}, amount={amount}, TP={tp_price}, SL={sl_price}")
+            result = await self.hb_client.create_executor(request_body)
+            executor_id = result.get("executor_id") or result.get("id")
+            logger.info(f"Placed demo order for {engine}/{pair}: executor_id={executor_id}")
 
-            # Wait briefly for fill
-            import asyncio
-            await asyncio.sleep(2)
-            order = await self.trader.get_order(order_id)
-            fill_price = float(order.get("avgPrice") or 0)
-
-            # Notify via Telegram
             if self.notification_manager:
                 from core.notifiers.base import NotificationMessage
                 await self.notification_manager.send_notification(NotificationMessage(
                     title=f"Demo Order — {engine}/{pair}",
                     message=(
-                        f"<b>Demo Order Filled</b>\n"
+                        f"<b>Demo Order Placed</b>\n"
                         f"Engine: {engine} | Pair: {pair}\n"
                         f"Side: {'LONG' if direction == 'LONG' else 'SHORT'} | Amount: ${amount_usd:.0f}\n"
-                        f"Entry: {fill_price} | TP: {tp_price} | SL: {sl_price}"
+                        f"Executor: {executor_id}"
                     ),
                     level="info",
                 ))
 
-            # Update candidate in MongoDB
             db = self.mongodb_client.get_database()
             await db["candidates"].update_one(
                 {"candidate_id": candidate["candidate_id"]},
                 {"$set": {
                     "disposition": "TESTNET_ACTIVE",
-                    "bybit_order_id": order_id,
+                    "executor_id": executor_id,
                     "testnet_placed_at": int(datetime.now(timezone.utc).timestamp() * 1000),
                     "testnet_amount": amount,
                     "testnet_amount_usd": amount_usd,
-                    "testnet_fill_price": fill_price,
-                    "testnet_tp_price": tp_price,
-                    "testnet_sl_price": sl_price,
-                    "testnet_side": side,
                 }},
             )
         except Exception as e:
@@ -173,78 +152,70 @@ class TestnetResolverTask(BaseTask):
             )
 
     async def _poll_active_positions(self) -> Dict[str, int]:
-        """Check Bybit demo positions and resolve closed ones."""
         stats = {"polled": 0, "resolved": 0, "errors": 0}
-
         docs = await self.mongodb_client.get_documents(
             "candidates", {"disposition": "TESTNET_ACTIVE"},
         )
-        if not docs:
-            return stats
-
         db = self.mongodb_client.get_database()
 
-        # Get all open positions from Bybit
-        try:
-            all_positions = await self.trader.get_positions()
-            open_symbols = {
-                p["symbol"]: p for p in all_positions if float(p.get("size", 0)) > 0
-            }
-        except Exception as e:
-            logger.warning(f"Failed to fetch positions: {e}")
-            return stats
-
         for doc in docs:
-            pair = doc.get("pair", "")
-            symbol = _bybit_symbol(pair)
-            stats["polled"] += 1
+            executor_id = doc.get("executor_id")
+            if not executor_id:
+                continue
+            try:
+                status = await self.hb_client.get_executor_status(executor_id)
+                stats["polled"] += 1
 
-            # If position no longer open on Bybit, it was closed (TP/SL/liquidation)
-            if symbol not in open_symbols:
-                # Position closed — try to get the close details
-                fill_price = doc.get("testnet_fill_price", 0)
-                side = doc.get("testnet_side", "Buy")
+                exec_status = status.get("status", "").lower()
+                if exec_status in ("completed", "failed", "stopped", "closed", "terminated"):
+                    fill_price = status.get("entry_price") or status.get("fill_price")
+                    exit_price = status.get("close_price") or status.get("exit_price")
+                    pnl = status.get("pnl") or status.get("net_pnl_quote")
+                    close_type = status.get("close_type")
+                    filled_amount = status.get("filled_amount_quote")
 
-                # Estimate exit: query recent closed PnL
-                # For now, mark as resolved with the info we have
-                await db["candidates"].update_one(
-                    {"candidate_id": doc["candidate_id"]},
-                    {"$set": {
-                        "disposition": "RESOLVED_TESTNET",
-                        "testnet_resolved_at": int(datetime.now(timezone.utc).timestamp() * 1000),
-                        "testnet_status": "closed",
-                    }},
-                )
-                stats["resolved"] += 1
-                logger.info(f"Resolved {doc.get('engine')}/{pair}: position closed on Bybit")
+                    await db["candidates"].update_one(
+                        {"candidate_id": doc["candidate_id"]},
+                        {"$set": {
+                            "disposition": "RESOLVED_TESTNET",
+                            "testnet_resolved_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+                            "testnet_fill_price": fill_price,
+                            "testnet_exit_price": exit_price,
+                            "testnet_pnl": pnl,
+                            "testnet_close_type": close_type,
+                            "testnet_filled_amount_quote": filled_amount,
+                            "testnet_status": exec_status,
+                            "testnet_raw_result": status,
+                        }},
+                    )
+                    stats["resolved"] += 1
+                    logger.info(f"Resolved {doc['engine']}/{doc['pair']}: {exec_status}, pnl={pnl}")
 
-                if self.notification_manager:
-                    from core.notifiers.base import NotificationMessage
-                    await self.notification_manager.send_notification(NotificationMessage(
-                        title=f"Position Closed — {doc.get('engine')}/{pair}",
-                        message=(
-                            f"<b>Position Closed</b>\n"
-                            f"Engine: {doc.get('engine')} | Pair: {pair}\n"
-                            f"Entry: {fill_price}\n"
-                            f"Closed by TP/SL or manually"
-                        ),
-                        level="success",
-                    ))
-            else:
-                # Still open — log unrealized PnL
-                pos = open_symbols[symbol]
-                upnl = pos.get("unrealisedPnl", 0)
-                logger.debug(f"{doc.get('engine')}/{pair}: still active, uPnL={upnl}")
+                    if self.notification_manager:
+                        from core.notifiers.base import NotificationMessage
+                        emoji = "+" if pnl and float(pnl) > 0 else "-"
+                        await self.notification_manager.send_notification(NotificationMessage(
+                            title=f"Position Closed — {doc['engine']}/{doc['pair']}",
+                            message=(
+                                f"<b>{emoji} Position Closed</b>\n"
+                                f"Engine: {doc['engine']} | Pair: {doc['pair']}\n"
+                                f"Close type: {close_type}\n"
+                                f"PnL: {pnl}"
+                            ),
+                            level="success" if pnl and float(pnl) > 0 else "error",
+                        ))
+
+            except Exception as e:
+                stats["errors"] += 1
+                logger.warning(f"Error polling executor {executor_id}: {e}")
 
         return stats
 
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
         stats = {"new_orders": 0, "poll_stats": {}, "errors": 0}
-
         capital = await self._get_capital()
 
-        # Portfolio-level check
         total_active = 0
         for eng in self.engines:
             total_active += await self._count_active_positions(eng)
@@ -257,10 +228,8 @@ class TestnetResolverTask(BaseTask):
                 max_concurrent = params.get("max_concurrent", 2)
                 active_count = await self._count_active_positions(engine)
 
-                if active_count >= max_concurrent:
+                if active_count >= max_concurrent or total_active >= self.max_portfolio_positions:
                     continue
-                if total_active >= self.max_portfolio_positions:
-                    break
 
                 ready_docs = await self.mongodb_client.get_documents(
                     "candidates", {"engine": engine, "disposition": "CANDIDATE_READY"},
@@ -272,7 +241,6 @@ class TestnetResolverTask(BaseTask):
                     stats["new_orders"] += 1
                     total_active += 1
 
-        # Poll active positions
         stats["poll_stats"] = await self._poll_active_positions()
 
         duration = (datetime.now(timezone.utc) - start).total_seconds()
@@ -285,7 +253,7 @@ class TestnetResolverTask(BaseTask):
         }
 
     async def cleanup(self, context: TaskContext, result) -> None:
-        await self.trader.close()
+        await self.hb_client.close()
         await super().cleanup(context, result)
 
     async def on_success(self, context: TaskContext, result) -> None:

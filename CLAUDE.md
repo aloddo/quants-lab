@@ -192,13 +192,29 @@ db.candidates.find({engine: "E1", pair: "XRP-USDT"}).sort({timestamp_utc: -1})
 - **Feature TTL is 90 days** — if you need longer history for backtesting, query parquet directly, don't rely on MongoDB features.
 - **The `timestamp` field in derivatives collections uses milliseconds** (Bybit convention), but QL features use Python datetime objects. Watch for unit mismatches.
 - **`core/` FeatureStorage uses `insert_many`** which creates duplicates. Our FeatureComputationTask uses upsert instead — don't use FeatureStorage.save_features() directly.
-- **Bybit demo connector** (`bybit_perpetual_demo`) uses `api-demo.bybit.com` (real market data, virtual funds). Registered by patching the HB connector in both the conda env (`site-packages`) and the Docker container. **If the HB API Docker container is rebuilt**, re-apply the patch:
+- **Bybit demo trading** uses `bybit_perpetual_testnet` connector patched to point at `api-demo.bybit.com`. Three patches required inside the Docker container. **IMPORTANT: use `sed` for patching** (Python file I/O doesn't persist reliably in Docker overlay FS). Re-apply after any container rebuild:
   ```bash
-  HOST_PKG="/Users/hermes/miniforge3/envs/quants-lab/lib/python3.12/site-packages/hummingbot/connector/derivative/bybit_perpetual"
-  CONTAINER_PKG="/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/derivative/bybit_perpetual"
-  docker cp "$HOST_PKG/bybit_perpetual_constants.py" "hummingbot-api:$CONTAINER_PKG/bybit_perpetual_constants.py"
-  docker cp "$HOST_PKG/bybit_perpetual_utils.py" "hummingbot-api:$CONTAINER_PKG/bybit_perpetual_utils.py"
+  PKG="/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/derivative/bybit_perpetual"
+
+  # 1. URL patches (REST + WebSocket) — public WS must point to mainnet (demo has no public WS)
+  docker exec hummingbot-api sed -i 's|api-testnet.bybit.com|api-demo.bybit.com|' "$PKG/bybit_perpetual_constants.py"
+  docker exec hummingbot-api sed -i 's|stream-testnet.bybit.com/v5/public|stream.bybit.com/v5/public|' "$PKG/bybit_perpetual_constants.py"
+  docker exec hummingbot-api sed -i 's|stream-testnet.bybit.com/v5/private|stream-demo.bybit.com/v5/private|' "$PKG/bybit_perpetual_constants.py"
+
+  # 2. Rate limit fix (connector initializes without pairs, needs defaults)
+  docker exec hummingbot-api sed -i 's|return web_utils.build_rate_limits(self.trading_pairs)|pairs = self.trading_pairs or ["BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","BCH-USDT","LTC-USDT"]; return web_utils.build_rate_limits(pairs)|' "$PKG/bybit_perpetual_derivative.py"
+
+  # 3. Position mode fix (demo set-position-mode returns empty, force one-way)
+  docker exec hummingbot-api sed -i "s|if self.position_mode == PositionMode.ONEWAY:|if self.position_mode == PositionMode.ONEWAY or 'testnet' in str(self._domain):|" "$PKG/bybit_perpetual_derivative.py"
+
+  # Clear cache and restart
+  docker exec hummingbot-api rm -rf "$PKG/__pycache__"
   docker restart hummingbot-api
+
+  # Then add demo credentials
+  curl -s -u admin:admin -X POST "http://localhost:8000/accounts/add-credential/master_account/bybit_perpetual_testnet" \
+    -H "Content-Type: application/json" \
+    -d '{"bybit_perpetual_testnet_api_key":"YOUR_DEMO_KEY","bybit_perpetual_testnet_secret_key":"YOUR_DEMO_SECRET"}'
   ```
 - **Demo account capital** is ~$100k (virtual). `fallback_capital` in pipeline config is set to 100000. If HB API can't fetch portfolio state (404 on `/portfolio/overview`), it uses this fallback. 0.3% = $300 per position.
 - **Bybit demo executor quirks**: The position executor may need position mode set to one-way. If executors keep failing with max retries, run via HB MCP: "Set position mode to one-way for BTC-USDT on bybit_perpetual_demo".
