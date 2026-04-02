@@ -144,6 +144,48 @@ e2_bulk_backtest          (weekly Sunday 04:00 UTC)
 - Per-engine: E1 max 2, E2 max 1
 - Position size: 0.3% of capital per trade
 
+## Position History & Analysis
+
+All candidates (including filtered ones) are stored in the `candidates` collection.
+Resolved positions have these additional fields:
+
+```
+testnet_placed_at          — timestamp when order was sent to HB API
+testnet_amount             — position size in base asset
+testnet_amount_usd         — position size in USD
+executor_id                — HB executor ID for tracking
+testnet_resolved_at        — timestamp when position closed
+testnet_fill_price         — actual entry price
+testnet_exit_price         — actual exit price
+testnet_pnl                — realized PnL in quote
+testnet_close_type         — TP, SL, TIME_LIMIT, FAILED, etc.
+testnet_filled_amount_quote — filled amount in quote
+testnet_status             — final executor status
+testnet_raw_result         — full HB API response (for debugging)
+```
+
+### Useful MongoDB queries for analysis
+
+```javascript
+// All resolved positions with PnL
+db.candidates.find({disposition: "RESOLVED_TESTNET"}, {engine:1, pair:1, direction:1, testnet_pnl:1, testnet_close_type:1, testnet_fill_price:1, testnet_exit_price:1})
+
+// Win rate per engine
+db.candidates.aggregate([
+  {$match: {disposition: "RESOLVED_TESTNET"}},
+  {$group: {_id: "$engine", total: {$sum: 1}, wins: {$sum: {$cond: [{$gt: ["$testnet_pnl", 0]}, 1, 0]}}}}
+])
+
+// All active positions right now
+db.candidates.find({disposition: "TESTNET_ACTIVE"})
+
+// Candidates that triggered but were filtered (for strategy analysis)
+db.candidates.find({trigger_fired: true, disposition: {$ne: "CANDIDATE_READY"}})
+
+// All E1 candidates for a specific pair
+db.candidates.find({engine: "E1", pair: "XRP-USDT"}).sort({timestamp_utc: -1})
+```
+
 ## Gotchas
 
 - **CandlesDownloaderTask writes parquet only at the end** — if killed mid-run, all data is lost. The scheduled task uses 7-day retention (fast). Use separate backfill scripts for historical data.
@@ -158,4 +200,6 @@ e2_bulk_backtest          (weekly Sunday 04:00 UTC)
   docker cp "$HOST_PKG/bybit_perpetual_utils.py" "hummingbot-api:$CONTAINER_PKG/bybit_perpetual_utils.py"
   docker restart hummingbot-api
   ```
+- **Demo account capital** is ~$100k (virtual). `fallback_capital` in pipeline config is set to 100000. If HB API can't fetch portfolio state (404 on `/portfolio/overview`), it uses this fallback. 0.3% = $300 per position.
+- **Bybit demo executor quirks**: The position executor may need position mode set to one-way. If executors keep failing with max retries, run via HB MCP: "Set position mode to one-way for BTC-USDT on bybit_perpetual_demo".
 - **Git push requires token** — hermes user has no credential helper. Use the temporary URL method documented above.

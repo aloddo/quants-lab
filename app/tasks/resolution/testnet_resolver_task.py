@@ -194,10 +194,12 @@ class TestnetResolverTask(BaseTask):
 
                 # Check if executor is done
                 exec_status = status.get("status", "").lower()
-                if exec_status in ("completed", "failed", "stopped", "closed"):
+                if exec_status in ("completed", "failed", "stopped", "closed", "terminated"):
                     fill_price = status.get("entry_price") or status.get("fill_price")
                     exit_price = status.get("close_price") or status.get("exit_price")
                     pnl = status.get("pnl") or status.get("net_pnl_quote")
+                    close_type = status.get("close_type")
+                    filled_amount = status.get("filled_amount_quote")
 
                     await db["candidates"].update_one(
                         {"candidate_id": doc["candidate_id"]},
@@ -207,6 +209,8 @@ class TestnetResolverTask(BaseTask):
                             "testnet_fill_price": fill_price,
                             "testnet_exit_price": exit_price,
                             "testnet_pnl": pnl,
+                            "testnet_close_type": close_type,
+                            "testnet_filled_amount_quote": filled_amount,
                             "testnet_status": exec_status,
                             "testnet_raw_result": status,
                         }},
