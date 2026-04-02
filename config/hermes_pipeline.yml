@@ -1,0 +1,103 @@
+tasks:
+  # ═══════ Layer 1: Data Collection ═══════════════════════
+  candles_downloader_bybit:
+    enabled: true
+    task_class: app.tasks.data_collection.candles_downloader_task.CandlesDownloaderTask
+    schedule:
+      type: cron
+      cron: "5 * * * *"
+      timezone: UTC
+    max_retries: 3
+    retry_delay_seconds: 120
+    timeout_seconds: 1800
+    config:
+      connector_name: "bybit_perpetual"
+      quote_asset: "USDT"
+      intervals: ["1h", "5m"]
+      days_data_retention: 365
+      min_notional_size: 10
+    tags: [data, candles, bybit]
+
+  bybit_derivatives:
+    enabled: true
+    task_class: app.tasks.data_collection.bybit_derivatives_task.BybitDerivativesTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 600
+    config:
+      pairs: "auto"
+      min_volume_usd: 10000000
+      oi_interval: "1h"
+      funding_limit: 10
+      oi_limit: 10
+      ls_limit: 10
+    tags: [data, derivatives, bybit]
+
+  # ═══════ Layer 2: Feature Computation ═══════════════════
+  feature_computation:
+    enabled: true
+    task_class: app.tasks.screening.feature_computation_task.FeatureComputationTask
+    schedule:
+      type: frequency
+      frequency_hours: 999
+    dependencies:
+      - task_name: "candles_downloader_bybit"
+        on_success: true
+        delay_seconds: 10
+      - task_name: "bybit_derivatives"
+        on_success: true
+        delay_seconds: 5
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 600
+    config:
+      connector_name: "bybit_perpetual"
+      interval: "1h"
+      min_bars: 30
+    tags: [features, computation]
+
+  # ═══════ Layer 3: Signal Scanning ═══════════════════════
+  signal_scan:
+    enabled: true
+    task_class: app.tasks.screening.signal_scan_task.SignalScanTask
+    schedule:
+      type: frequency
+      frequency_hours: 999
+    dependencies:
+      - task_name: "feature_computation"
+        on_success: true
+        delay_seconds: 5
+    max_retries: 1
+    timeout_seconds: 300
+    config:
+      engines: ["E1", "E2"]
+      connector_name: "bybit_perpetual"
+      top_n: 10
+      telegram_chat_id: "-1003576397888"
+    tags: [screening, signals]
+
+  # ═══════ Layer 4: Testnet Resolution ════════════════════
+  testnet_resolver:
+    enabled: true
+    task_class: app.tasks.resolution.testnet_resolver_task.TestnetResolverTask
+    schedule:
+      type: cron
+      cron: "*/5 * * * *"
+      timezone: UTC
+    dependencies:
+      - task_name: "signal_scan"
+        on_success: true
+        delay_seconds: 5
+    max_retries: 2
+    timeout_seconds: 120
+    config:
+      connector: "bybit_perpetual_testnet"
+      account: "master_account"
+      position_size_pct: 0.003
+      fallback_capital: 500
+      engines: ["E1", "E2"]
+    tags: [resolution, testnet]
