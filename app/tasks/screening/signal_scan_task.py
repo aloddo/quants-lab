@@ -119,17 +119,23 @@ class SignalScanTask(BaseTask):
 
     async def _send_telegram(self, engine: str, cand) -> None:
         """Send Telegram alert for CANDIDATE_READY signals."""
-        if not self.notification_manager or not self.telegram_chat_id:
+        if not self.notification_manager:
             return
+        from core.notifiers.base import NotificationMessage
         msg = (
-            f"🔔 {engine} Signal — {cand.pair}\n"
+            f"<b>{engine} Signal — {cand.pair}</b>\n"
             f"Direction: {cand.direction}\n"
             f"Trigger: {cand.trigger_reason}\n"
             f"Score: {cand.composite_score:.2f}\n"
             f"Price: {cand.decision_price}"
         )
         try:
-            await self.notification_manager.send_notification(msg)
+            notification = NotificationMessage(
+                title=f"{engine} Signal — {cand.pair}",
+                message=msg,
+                level="warning",
+            )
+            await self.notification_manager.send_notification(notification)
         except Exception as e:
             logger.warning(f"Telegram send failed: {e}")
 

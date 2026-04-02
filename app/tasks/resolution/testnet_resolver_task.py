@@ -125,6 +125,20 @@ class TestnetResolverTask(BaseTask):
             executor_id = result.get("executor_id") or result.get("id")
             logger.info(f"Placed testnet order for {engine}/{pair}: executor_id={executor_id}")
 
+            # Notify via Telegram
+            if self.notification_manager:
+                from core.notifiers.base import NotificationMessage
+                await self.notification_manager.send_notification(NotificationMessage(
+                    title=f"Testnet Order — {engine}/{pair}",
+                    message=(
+                        f"<b>Testnet Order Placed</b>\n"
+                        f"Engine: {engine} | Pair: {pair}\n"
+                        f"Side: {side} | Amount: ${amount_usd:.0f}\n"
+                        f"Executor: {executor_id}"
+                    ),
+                    level="info",
+                ))
+
             # Update candidate in MongoDB
             db = self.mongodb_client.get_database()
             await db["candidates"].update_one(
@@ -189,6 +203,22 @@ class TestnetResolverTask(BaseTask):
                         f"Resolved {doc['engine']}/{doc['pair']}: "
                         f"status={exec_status}, pnl={pnl}"
                     )
+
+                    # Notify via Telegram
+                    if self.notification_manager:
+                        from core.notifiers.base import NotificationMessage
+                        emoji = "✅" if pnl and float(pnl) > 0 else "❌"
+                        await self.notification_manager.send_notification(NotificationMessage(
+                            title=f"Testnet Resolved — {doc['engine']}/{doc['pair']}",
+                            message=(
+                                f"<b>{emoji} Position Closed</b>\n"
+                                f"Engine: {doc['engine']} | Pair: {doc['pair']}\n"
+                                f"Status: {exec_status}\n"
+                                f"Fill: {fill_price} → Exit: {exit_price}\n"
+                                f"PnL: {pnl}"
+                            ),
+                            level="success" if pnl and float(pnl) > 0 else "error",
+                        ))
 
             except Exception as e:
                 stats["errors"] += 1
