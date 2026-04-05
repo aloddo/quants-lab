@@ -30,6 +30,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+from app.engines.fmt import fp
+
 from app.engines.models import DecisionSnapshot, validate_staleness
 
 
@@ -129,15 +131,15 @@ def evaluate_e1(snap: DecisionSnapshot) -> E1Candidate:
     if price > fr.range_high_20:
         direction = "LONG"
         breakout_level = fr.range_high_20
-        trigger_reason = f"Breakout above range high {fr.range_high_20:.2f} (price={price:.2f})"
+        trigger_reason = f"Breakout above range high {fp(fr.range_high_20)} (price={fp(price)})"
     elif price < fr.range_low_20:
         direction = "SHORT"
         breakout_level = fr.range_low_20
-        trigger_reason = f"Breakdown below range low {fr.range_low_20:.2f} (price={price:.2f})"
+        trigger_reason = f"Breakdown below range low {fp(fr.range_low_20)} (price={fp(price)})"
     else:
         cand.trigger_fired = False
         cand.disposition = "SKIPPED_NO_TRIGGER"
-        cand.trigger_reason = f"Price {price:.2f} inside range [{fr.range_low_20:.2f}, {fr.range_high_20:.2f}]"
+        cand.trigger_reason = f"Price {fp(price)} inside range [{fp(fr.range_low_20)}, {fp(fr.range_high_20)}]"
         return cand
 
     cand.trigger_fired = True

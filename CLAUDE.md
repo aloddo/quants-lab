@@ -125,12 +125,13 @@ e2_bulk_backtest          (weekly Sunday 04:00 UTC)
 
 ## Engine parameters (locked)
 
-### E1 Compression Breakout
-- ATR percentile < 0.20 (compression) + price breaks 20-period range
-- Hard filters: BTC not Risk-Off, volume > 1.3x 20-period avg
-- 5m entry quality gate: distance < 0.3 ATR, body < 0.5 ATR, gap < 5 bps
+### E1 Compression Breakout (V3.2 locked, Apr 2026)
+- ATR percentile < 0.35 (compression) + price breaks 30-period range
+- Hard filters: BTC not Risk-Off, volume > 1.6x 20-period avg
+- 5m entry quality gate: DISABLED (stress tested — was rejecting 98.6% of valid triggers)
 - TP: +3%, SL: -1.5%, time limit: 24h
-- Allowlist: XRP, OP, WLD, AVAX, APT, ARB, DOT, DOGE, LTC, BCH (BTC BLOCKED)
+- Allowlist: 38 ALLOW pairs from bulk backtest (pair_historical collection)
+- All engine metadata in `app/engines/registry.py`
 
 ### E2 Range Fade
 - ATR percentile < 0.30, range NOT expanding, boundary touch + rejection
@@ -239,9 +240,10 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
 - **Feature TTL is 90 days** — if you need longer history for backtesting, query parquet directly, don't rely on MongoDB features.
 - **The `timestamp` field in derivatives collections uses milliseconds** (Bybit convention), but QL features use Python datetime objects. Watch for unit mismatches.
 - **`core/` FeatureStorage uses `insert_many`** which creates duplicates. Our FeatureComputationTask uses upsert instead — don't use FeatureStorage.save_features() directly.
-- **Bybit demo trading** uses `bybit_perpetual_testnet` connector patched to point at `api-demo.bybit.com`. Three patches required inside the Docker container. **IMPORTANT: use `sed` for patching** (Python file I/O doesn't persist reliably in Docker overlay FS). Re-apply after any container rebuild:
+- **Bybit demo trading** uses `bybit_perpetual_testnet` connector patched to point at `api-demo.bybit.com`. Four patches required inside the Docker container. **IMPORTANT: use `sed` for patching** (Python file I/O doesn't persist reliably in Docker overlay FS). Re-apply after any container rebuild:
   ```bash
   PKG="/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/derivative/bybit_perpetual"
+  BASE="/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/exchange_py_base.py"
 
   # 1. URL patches (REST + WebSocket) — public WS must point to mainnet (demo has no public WS)
   docker exec hummingbot-api sed -i 's|api-testnet.bybit.com|api-demo.bybit.com|' "$PKG/bybit_perpetual_constants.py"
@@ -254,8 +256,33 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
   # 3. Position mode fix (demo set-position-mode returns empty, force one-way)
   docker exec hummingbot-api sed -i "s|if self.position_mode == PositionMode.ONEWAY:|if self.position_mode == PositionMode.ONEWAY or 'testnet' in str(self._domain):|" "$PKG/bybit_perpetual_derivative.py"
 
+  # 4. Dynamic pair rate limiter fix (add_trading_pair doesn't rebuild throttler)
+  #    Without this, any pair added dynamically (e.g. PUMPFUN-USDT from pair selector)
+  #    crashes with: 'NoneType' object has no attribute 'weight'
+  #    PR submitted: https://github.com/hummingbot/hummingbot/compare/main...aloddo:hummingbot-1:feat/fix-dynamic-pair-rate-limits
+  docker exec hummingbot-api sed -i 's/        super().__init__(balance_asset_limit)/        super().__init__(balance_asset_limit)\n        self._rate_limits_share_pct = rate_limits_share_pct/' "$BASE"
+  docker exec hummingbot-api python3 -c "
+import pathlib
+p = pathlib.Path('$BASE')
+content = p.read_text()
+old = '        return await self.order_book_tracker.add_trading_pair(trading_pair)\n\n    async def remove_trading_pair'
+new = '''        result = await self.order_book_tracker.add_trading_pair(trading_pair)
+        if result:
+            # Rebuild throttler to include rate limits for the new trading pair
+            self._throttler = AsyncThrottler(
+                rate_limits=self.rate_limits_rules,
+                limits_share_percentage=self._rate_limits_share_pct)
+        return result
+
+    async def remove_trading_pair'''
+content = content.replace(old, new)
+p.write_text(content)
+print('PATCHED')
+"
+
   # Clear cache and restart
   docker exec hummingbot-api rm -rf "$PKG/__pycache__"
+  docker exec hummingbot-api find /opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector -name "__pycache__" -exec rm -rf {} + 2>/dev/null
   docker restart hummingbot-api
 
   # Then add demo credentials

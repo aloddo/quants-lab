@@ -28,6 +28,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+from app.engines.fmt import fp
+
 from app.engines.models import DecisionSnapshot, validate_staleness
 
 # Constants
@@ -143,8 +145,8 @@ def evaluate_e2(
         cand.trigger_fired = False
         cand.disposition = "SKIPPED_NO_TRIGGER"
         cand.trigger_reason = (
-            f"Price range [{c_low:.2f}, {c_high:.2f}] inside "
-            f"[{fr.range_low_20:.2f}, {fr.range_high_20:.2f}] — no low boundary touch"
+            f"Price range [{fp(c_low)}, {fp(c_high)}] inside "
+            f"[{fp(fr.range_low_20)}, {fp(fr.range_high_20)}] — no low boundary touch"
         )
         return cand
 
@@ -156,7 +158,7 @@ def evaluate_e2(
         cand.trigger_fired = False
         cand.disposition = "SKIPPED_NO_REJECTION"
         cand.trigger_reason = (
-            f"Touched low {boundary:.2f} but closed at/below ({c_close:.2f}) — no rejection"
+            f"Touched low {fp(boundary)} but closed at/below ({fp(c_close)}) — no rejection"
         )
         return cand
 
@@ -189,8 +191,8 @@ def evaluate_e2(
                 cand.trigger_fired = False
                 cand.disposition = "FILTERED_EXPANSION"
                 cand.filter_reason = (
-                    f"Momentum candle: body={candle_body_val:.2f} > "
-                    f"{body_threshold:.2f} (0.8 * ATR={fr.atr_14_1h:.2f})"
+                    f"Momentum candle: body={fp(candle_body_val)} > "
+                    f"{fp(body_threshold)} (0.8 * ATR={fp(fr.atr_14_1h)})"
                 )
                 cand.direction = direction
                 return cand
@@ -220,15 +222,15 @@ def evaluate_e2(
     if distance_to_midpoint < min_reward:
         cand.disposition = "FILTERED_MIN_REWARD"
         cand.filter_reason = (
-            f"Distance to midpoint ({distance_to_midpoint:.2f}) < "
-            f"0.5 ATR ({min_reward:.2f}) — no room"
+            f"Distance to midpoint ({fp(distance_to_midpoint)}) < "
+            f"0.5 ATR ({fp(min_reward)}) — no room"
         )
         return cand
 
     cand.trigger_reason = (
-        f"Range fade {direction}: boundary={boundary:.2f}, "
-        f"close={c_close:.2f} (rejected), midpoint={midpoint:.2f}, "
-        f"SL={cand.sl_price:.2f}"
+        f"Range fade {direction}: boundary={fp(boundary)}, "
+        f"close={fp(c_close)} (rejected), midpoint={fp(midpoint)}, "
+        f"SL={fp(cand.sl_price)}"
     )
 
     cand.disposition = "CANDIDATE_READY"

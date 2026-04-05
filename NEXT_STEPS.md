@@ -97,7 +97,7 @@ git config user.email "your@email"
 ```
 
 ### Docker patch persistence
-The 3 patches on the HB API Docker container are lost on rebuild. Options:
+The 4 patches on the HB API Docker container are lost on rebuild (see CLAUDE.md for full commands). Options:
 - **Short term**: Re-apply with `sed` after each rebuild (documented in CLAUDE.md)
 - **Long term**: Fork the hummingbot-api Docker image, bake patches in, push to private registry
 - **Best**: Submit PR to hummingbot to add `bybit_perpetual_demo` as a native domain
@@ -152,19 +152,39 @@ The 7 FeatureBase subclasses write to MongoDB with consistent schema. For ML:
 | Portfolio-level position limits | Done |
 | Weekly re-optimization cron | Done |
 | E2E testing (features, signals, orders) | Done |
-| Bybit demo connector via HB native (3 patches) | Done |
+| Bybit demo connector via HB native (4 patches) | Done |
 | CLAUDE.md + ARCHITECTURE.md | Done |
 | Pipeline running in tmux | Done |
 | 9 commits pushed | Done |
+
+## Completed Apr 2-3 2026
+
+| Item | Status |
+|------|--------|
+| Engine registry (`app/engines/registry.py`) | Done — centralizes resolution, candles, exit params |
+| E1 bulk backtest (365d, 46 pairs, 5m resolution) | Done — 38 ALLOW, 2173 trades, PF 3.78 |
+| E1 stress tests (delay, slippage, expiry, regimes) | Done — all passed including +15bps |
+| E1 Monte Carlo (10k sims, block=7) | Done — 0% ruin at 0.3% sizing |
+| E1 long/short analysis | Done — both sides positive (L: PF 4.08, S: PF 2.86) |
+| entry_quality_filter=False validated | Done ��� 9x more signals, 6x more PnL, PF 4.0 |
+| Live/backtest parameter alignment | Done — ATR 0.35, range 30, volume 1.6x |
+| Telegram failure alerts (NotifyingTaskMixin) | Done — all 6 pipeline tasks |
+| Slippage + latency tracking in resolver | Done — bps, bucket, exec_latency_ms |
+| Would-have-won tracking (SKIPPED_CONCURRENCY) | Done |
+| CLI scripts (bulk_backtest, stress_test, L/S, MC) | Done |
+| Claude Code skills (.claude/skills/) | Done — 4 skills, engine-agnostic |
+| BulkBacktestTask reads from registry | Done — no hard-coded resolution/controller |
+| Pipeline config simplified (hermes_pipeline.yml) | Done — removed resolution overrides |
 
 ## What Was NOT Completed
 
 | Item | Why | Next Step |
 |------|-----|-----------|
-| Bulk backtests | Alberto wants to run from Jupyter on Air | Priority 1 |
+| E2 bulk backtest + validation | E1 first per governance rules | Priority 1 (next) |
+| Feature store refactor (raw values only) | Partial — compression check moved, volume flag still baked | Priority 2 |
 | Historical signal replay | Not built | Priority 2 |
-| Feed health monitoring | Time | Priority 2 |
+| Feed health monitoring task | Not built | Priority 2 |
+| Daily summary Telegram | Not built | Priority 3 |
 | Incremental features | Optimization, not blocking | Priority 3 |
-| E1 threshold tuning | Needs backtest data first | Priority 3 |
 | Docker patch persistence | Short-term sed works | Priority 4 |
 | MCP remote integration | Nice-to-have | Priority 4 |

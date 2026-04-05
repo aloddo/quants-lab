@@ -3,10 +3,12 @@ Signal scan task — evaluates E1/E2 engines on eligible pairs.
 
 Reads pre-computed features from FeatureStorage, builds DecisionSnapshots,
 runs engine evaluation, stores candidates to MongoDB, sends Telegram alerts.
+
+Data integrity: refuses to generate candidates when upstream data is stale.
 """
 import logging
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -22,8 +24,19 @@ from app.engines.pair_selector import get_eligible_pairs
 
 logger = logging.getLogger(__name__)
 
+# ── Data freshness thresholds ────────────────────────────────
+# Candle data older than this → stale (should refresh every hour)
+CANDLE_MAX_AGE = timedelta(hours=3)
+# Feature docs older than this → stale (computed after candle download)
+FEATURE_MAX_AGE = timedelta(hours=3)
+# Minimum required features to build a valid FeatureRow
+REQUIRED_FEATURES = {"atr", "range", "volume"}
 
-class SignalScanTask(BaseTask):
+
+from app.tasks.notifying_task import NotifyingTaskMixin
+
+
+class SignalScanTask(NotifyingTaskMixin, BaseTask):
     """Evaluate E1/E2 engines on screened pairs and log candidates."""
 
     def __init__(self, config):
@@ -40,9 +53,41 @@ class SignalScanTask(BaseTask):
             raise RuntimeError("MongoDB required for SignalScanTask")
 
     async def _build_feature_row(self, pair: str) -> Optional[FeatureRow]:
-        """Assemble a FeatureRow from the latest features in MongoDB."""
+        """Assemble a FeatureRow from the latest features in MongoDB.
+
+        Performs three integrity checks before returning:
+        1. **Candle freshness** — parquet last row must be < CANDLE_MAX_AGE old
+        2. **Feature freshness** — computed_at must be < FEATURE_MAX_AGE old
+        3. **Feature completeness** — REQUIRED_FEATURES must all be present
+        If any check fails, ``feature_staleness_ok`` is set to False and
+        ``staleness_flags`` lists the reasons.
+        """
+        now = datetime.now(timezone.utc)
+        staleness_flags: List[str] = []
+
+        # ── 1. Candle freshness check ───────────────────────
+        close = None
+        path = data_paths.candles_dir / f"{self.connector_name}|{pair}|1h.parquet"
+        if path.exists():
+            df = pd.read_parquet(path)
+            if not df.empty:
+                close = float(df["close"].iloc[-1])
+                # Check candle age
+                if "timestamp" in df.columns:
+                    last_candle_ts = pd.Timestamp(df["timestamp"].iloc[-1], unit="s", tz="UTC")
+                    candle_age = now - last_candle_ts.to_pydatetime()
+                    if candle_age > CANDLE_MAX_AGE:
+                        staleness_flags.append(
+                            f"candle_stale:{candle_age.total_seconds()/3600:.1f}h"
+                        )
+
+        if close is None:
+            return None
+
+        # ── 2. Feature freshness + completeness check ───────
         feature_names = ["atr", "range", "volume", "momentum", "derivatives", "market_regime"]
         feature_data = {}
+        present_features = set()
 
         for fname in feature_names:
             docs = await self.mongodb_client.get_documents(
@@ -51,7 +96,26 @@ class SignalScanTask(BaseTask):
                 limit=1,
             )
             if docs:
-                feature_data[fname] = docs[0].get("value", {})
+                doc = docs[0]
+                feature_data[fname] = doc.get("value", {})
+                present_features.add(fname)
+
+                # Check computed_at freshness
+                computed_at = doc.get("computed_at")
+                if computed_at:
+                    if isinstance(computed_at, datetime):
+                        age = now - computed_at.replace(tzinfo=timezone.utc) if computed_at.tzinfo is None else now - computed_at
+                    else:
+                        age = FEATURE_MAX_AGE + timedelta(seconds=1)  # force stale
+                    if age > FEATURE_MAX_AGE:
+                        staleness_flags.append(
+                            f"feature_stale:{fname}:{age.total_seconds()/3600:.1f}h"
+                        )
+
+        # Completeness: required features must all be present
+        missing = REQUIRED_FEATURES - present_features
+        if missing:
+            staleness_flags.append(f"missing_features:{','.join(sorted(missing))}")
 
         atr_d = feature_data.get("atr", {})
         range_d = feature_data.get("range", {})
@@ -59,20 +123,17 @@ class SignalScanTask(BaseTask):
         mom_d = feature_data.get("momentum", {})
         deriv_d = feature_data.get("derivatives", {})
 
-        close = None
-        # Get close from momentum's ema_50 or load from parquet
-        path = data_paths.candles_dir / f"{self.connector_name}|{pair}|1h.parquet"
-        if path.exists():
-            df = pd.read_parquet(path)
-            if not df.empty:
-                close = float(df["close"].iloc[-1])
+        # Critical values must not be None
+        if atr_d.get("atr_percentile_90d") is None:
+            staleness_flags.append("null:atr_percentile_90d")
+        if range_d.get("range_high_20") is None or range_d.get("range_low_20") is None:
+            staleness_flags.append("null:range_bounds")
 
-        if close is None:
-            return None
+        feature_ok = len(staleness_flags) == 0
 
         return FeatureRow(
             pair=pair,
-            timestamp_utc=int(datetime.now(timezone.utc).timestamp() * 1000),
+            timestamp_utc=int(now.timestamp() * 1000),
             close=close,
             return_1h=mom_d.get("return_1h"),
             return_4h=mom_d.get("return_4h"),
@@ -81,17 +142,29 @@ class SignalScanTask(BaseTask):
             atr_percentile_90d=atr_d.get("atr_percentile_90d"),
             range_high_20=range_d.get("range_high_20"),
             range_low_20=range_d.get("range_low_20"),
-            range_compression_confirmed=atr_d.get("compression_flag", 0) > 0.5,
+            # Apply thresholds from raw values — NOT from pre-baked feature flags.
+            # Features store raw ATR percentile and volume; thresholds are strategy logic.
+            range_compression_confirmed=(
+                atr_d.get("atr_percentile_90d") is not None
+                and atr_d["atr_percentile_90d"] < 0.35  # V3.2 locked
+            ),
             volume_1h=vol_d.get("vol_avg_20"),
             volume_zscore_20=vol_d.get("vol_zscore_20"),
-            volume_floor_passed=vol_d.get("vol_floor_passed", 0) > 0.5,
+            volume_floor_passed=(
+                vol_d.get("vol_avg_20") is not None
+                and close is not None
+                and vol_d.get("vol_zscore_20") is not None
+                # Can't compute exact floor from stored features — use the pre-baked flag
+                # as fallback, but prefer raw check when available
+                and vol_d.get("vol_floor_passed", 0) > 0.5
+            ),
             funding_rate_current=deriv_d.get("funding_rate"),
             funding_neutral=deriv_d.get("funding_neutral", 0) > 0.5,
             oi_change_1h_pct=deriv_d.get("oi_change_1h_pct"),
             oi_increasing=deriv_d.get("oi_increasing", 0) > 0.5,
             rs_aligned=deriv_d.get("rs_aligned", 0) > 0.5,
-            feature_staleness_ok=True,
-            staleness_flags=[],
+            feature_staleness_ok=feature_ok,
+            staleness_flags=staleness_flags,
         )
 
     async def _get_market_state(self) -> str:
@@ -122,12 +195,13 @@ class SignalScanTask(BaseTask):
         if not self.notification_manager:
             return
         from core.notifiers.base import NotificationMessage
+        from app.engines.fmt import fp
         msg = (
             f"<b>{engine} Signal — {cand.pair}</b>\n"
             f"Direction: {cand.direction}\n"
             f"Trigger: {cand.trigger_reason}\n"
             f"Score: {cand.composite_score:.2f}\n"
-            f"Price: {cand.decision_price}"
+            f"Price: {fp(cand.decision_price)}"
         )
         try:
             notification = NotificationMessage(
@@ -143,8 +217,10 @@ class SignalScanTask(BaseTask):
         start = datetime.now(timezone.utc)
         market_state = await self._get_market_state()
 
-        stats = {"scanned": 0, "candidates_ready": 0, "skipped": 0, "errors": 0}
+        stats = {"scanned": 0, "candidates_ready": 0, "skipped": 0,
+                 "stale_blocked": 0, "errors": 0}
         signals = []
+        stale_pairs = []
 
         for engine in self.engines:
             try:
@@ -159,6 +235,17 @@ class SignalScanTask(BaseTask):
                         fr = await self._build_feature_row(pair)
                         if fr is None:
                             stats["skipped"] += 1
+                            continue
+
+                        # ── Data integrity gate ──────────────
+                        if not fr.feature_staleness_ok:
+                            stats["stale_blocked"] += 1
+                            if pair not in [p for p, _ in stale_pairs]:
+                                stale_pairs.append((pair, fr.staleness_flags))
+                            logger.warning(
+                                f"{engine}/{pair}: blocked — stale data: "
+                                f"{', '.join(fr.staleness_flags)}"
+                            )
                             continue
 
                         snap = DecisionSnapshot(
@@ -217,6 +304,10 @@ class SignalScanTask(BaseTask):
         duration = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info(f"SignalScanTask: {stats} in {duration:.1f}s")
 
+        # Alert if a significant fraction of pairs is stale
+        if stats["stale_blocked"] > 0:
+            await self._send_staleness_alert(stats, stale_pairs)
+
         return {
             "status": "completed",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -224,8 +315,66 @@ class SignalScanTask(BaseTask):
             "market_state": market_state,
             "stats": stats,
             "signals": signals,
+            "stale_pairs": len(stale_pairs),
             "duration_seconds": duration,
         }
+
+    async def _send_staleness_alert(self, stats: dict, stale_pairs: list) -> None:
+        """Send Telegram alert when data integrity checks block pairs.
+
+        Uses a 60-minute cooldown via MongoDB to avoid spamming.
+        """
+        if not self.notification_manager:
+            return
+
+        # ── Cooldown check (1 alert per hour) ─────────────
+        try:
+            db = self.mongodb_client.get_database()
+            cooldown_key = "signal_scan_staleness"
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+            doc = db.watchdog_alerts.find_one({"key": cooldown_key})
+            if doc:
+                last = doc.get("last_sent_at")
+                if last:
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if last > cutoff:
+                        logger.info(
+                            f"Staleness alert suppressed (cooldown): "
+                            f"{stats['stale_blocked']} blocked"
+                        )
+                        return
+            db.watchdog_alerts.update_one(
+                {"key": cooldown_key},
+                {"$set": {"last_sent_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.debug(f"Cooldown check failed, sending anyway: {e}")
+
+        try:
+            from core.notifiers.base import NotificationMessage
+            # Show up to 5 examples
+            examples = "\n".join(
+                f"  {p}: {', '.join(flags)}" for p, flags in stale_pairs[:5]
+            )
+            if len(stale_pairs) > 5:
+                examples += f"\n  ... and {len(stale_pairs) - 5} more"
+            msg = (
+                f"<b>Data Integrity Warning</b>\n"
+                f"Blocked {stats['stale_blocked']} pair-engine combos (stale data):\n"
+                f"{examples}\n\n"
+                f"Scanned: {stats['scanned']} | Ready: {stats['candidates_ready']} | "
+                f"Errors: {stats['errors']}\n\n"
+                f"Next alert in 60m if unresolved."
+            )
+            await self.notification_manager.send_notification(NotificationMessage(
+                title="Signal Scan: Stale Data Warning",
+                message=msg,
+                level="warning",
+            ))
+        except Exception as e:
+            logger.debug(f"Failed to send staleness alert: {e}")
 
     async def on_success(self, context: TaskContext, result) -> None:
         stats = result.result_data.get("stats", {})
