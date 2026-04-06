@@ -1,4 +1,4 @@
-"""20-period range boundaries, width, and expansion detection."""
+"""Range boundaries, width, and expansion detection."""
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -11,7 +11,7 @@ from core.features.models import Feature
 
 class RangeConfig(FeatureConfig):
     name: str = "range"
-    period: int = 20
+    period: int = 30  # V3.2 locked, validated via stress testing (Apr 2026)
     expansion_lookback: int = 5
     expansion_threshold: float = 0.20
 

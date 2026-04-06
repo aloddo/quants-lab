@@ -27,7 +27,10 @@ from app.features.volume_feature import VolumeFeature
 logger = logging.getLogger(__name__)
 
 
-class FeatureComputationTask(BaseTask):
+from app.tasks.notifying_task import NotifyingTaskMixin
+
+
+class FeatureComputationTask(NotifyingTaskMixin, BaseTask):
     """Compute features for all pairs in parquet cache and store to MongoDB."""
 
     def __init__(self, config):
@@ -96,8 +99,14 @@ class FeatureComputationTask(BaseTask):
             logger.warning(f"Failed to fetch derivatives for {pair}: {e}")
         return result
 
-    async def _upsert_features(self, features: List[Feature]) -> int:
-        """Upsert features by (feature_name, trading_pair) — no duplicates."""
+    async def _upsert_features(
+        self, features: List[Feature], data_timestamp_utc: Optional[datetime] = None
+    ) -> int:
+        """Upsert features by (feature_name, trading_pair) — no duplicates.
+
+        Stores both the compute time (``timestamp``) and the source data time
+        (``data_timestamp_utc``) so downstream tasks can check freshness.
+        """
         db = self.mongodb_client.get_database()
         collection = db["features"]
         # Ensure compound index exists
@@ -108,6 +117,9 @@ class FeatureComputationTask(BaseTask):
         count = 0
         for f in features:
             doc = f.to_mongo()
+            if data_timestamp_utc is not None:
+                doc["data_timestamp_utc"] = data_timestamp_utc
+            doc["computed_at"] = datetime.now(timezone.utc)
             await collection.update_one(
                 {"feature_name": f.feature_name, "trading_pair": f.trading_pair},
                 {"$set": doc},
@@ -195,9 +207,14 @@ class FeatureComputationTask(BaseTask):
                 )
                 features_to_save.append(regime_feature)
 
+                # Determine the data timestamp (latest candle close time)
+                data_ts = None
+                if "timestamp" in candles.data.columns and not candles.data.empty:
+                    data_ts = pd.Timestamp(candles.data["timestamp"].iloc[-1], unit="s", tz="UTC").to_pydatetime()
+
                 # Upsert all features (no duplicates)
                 if features_to_save:
-                    n = await self._upsert_features(features_to_save)
+                    n = await self._upsert_features(features_to_save, data_timestamp_utc=data_ts)
                     stats["features_saved"] += n
 
                 stats["pairs"] += 1

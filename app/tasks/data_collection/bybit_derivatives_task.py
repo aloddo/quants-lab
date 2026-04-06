@@ -23,7 +23,10 @@ from core.tasks import BaseTask, TaskContext
 logger = logging.getLogger(__name__)
 
 
-class BybitDerivativesTask(BaseTask):
+from app.tasks.notifying_task import NotifyingTaskMixin
+
+
+class BybitDerivativesTask(NotifyingTaskMixin, BaseTask):
     """Fetch funding rates, open interest, and L/S ratio for Bybit USDT perpetuals."""
 
     def __init__(self, config):

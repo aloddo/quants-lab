@@ -23,6 +23,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def clear_stale_locks():
+    """Clear all is_running flags in task_schedules on startup.
+
+    A fresh process cannot have running tasks, so any is_running=True
+    left over from a previous crash is stale.  Without this, the
+    orchestrator permanently refuses to schedule the locked tasks.
+    """
+    from pymongo import MongoClient
+
+    mongo_uri = os.getenv("MONGO_URI")
+    mongo_db = os.getenv("MONGO_DATABASE", "quants_lab")
+    if not mongo_uri:
+        return
+
+    client = MongoClient(mongo_uri)
+    db = client[mongo_db]
+    result = db.task_schedules.update_many(
+        {"is_running": True},
+        {"$set": {"is_running": False, "current_execution_id": None}},
+    )
+    if result.modified_count:
+        logger.warning(
+            f"Startup: cleared {result.modified_count} stale task lock(s) "
+            f"from previous run"
+        )
+    client.close()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='QuantsLab Task Management CLI',
@@ -109,10 +137,13 @@ async def run_tasks(config_path: str, verbose: bool = False):
     # Add config/ prefix if not present
     if not config_path.startswith('config/') and not os.path.isabs(config_path):
         config_path = f'config/{config_path}'
-    
+
     logger.info(f"Starting QuantsLab Task Runner v2.0")
     logger.info(f"Config: {config_path}")
-    
+
+    # Clear stale locks from any previous crashed run
+    await clear_stale_locks()
+
     try:
         # Run tasks without API server (API disabled by default)
         runner = TaskRunner(config_path=config_path, enable_api=False)
@@ -129,11 +160,14 @@ async def trigger_task(task_name: str, config_path: str, timeout: int):
     # Add config/ prefix if not present
     if not config_path.startswith('config/') and not os.path.isabs(config_path):
         config_path = f'config/{config_path}'
-    
+
     logger.info(f"Triggering task: {task_name}")
     logger.info(f"Config: {config_path}")
     logger.info(f"Timeout: {timeout}s")
-    
+
+    # Clear stale locks from any previous crashed run
+    await clear_stale_locks()
+
     try:
         runner = TaskRunner(config_path=config_path)
 
@@ -180,11 +214,14 @@ async def serve_api(config_path: str, host: str, port: int):
     # Add config/ prefix if not present
     if not config_path.startswith('config/') and not os.path.isabs(config_path):
         config_path = f'config/{config_path}'
-    
+
     logger.info(f"Starting QuantsLab API Server")
     logger.info(f"Config: {config_path}")
     logger.info(f"Server: http://{host}:{port}")
-    
+
+    # Clear stale locks from any previous crashed run
+    await clear_stale_locks()
+
     try:
         # Create runner with API enabled and configure host/port
         runner = TaskRunner(config_path=config_path, enable_api=True)

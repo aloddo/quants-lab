@@ -103,6 +103,19 @@ tasks:
       max_portfolio_positions: 3
     tags: [resolution, testnet]
 
+  # ═══════ Infrastructure: Watchdog ══════════════════════
+  watchdog:
+    enabled: true
+    task_class: app.tasks.watchdog_task.WatchdogTask
+    schedule:
+      type: cron
+      cron: "*/5 * * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 60
+    config: {}
+    tags: [infra, watchdog]
+
   # ═══════ Weekly: Re-optimization ════════════════════════
   e1_bulk_backtest:
     enabled: true
@@ -112,17 +125,11 @@ tasks:
       cron: "0 3 * * 0"
       timezone: UTC
     max_retries: 1
-    timeout_seconds: 7200
+    timeout_seconds: 14400
     config:
       engine: "E1"
       connector_name: "bybit_perpetual"
-      controller_name: "e1_compression_breakout"
-      controller_config:
-        total_amount_quote: 100
-        max_executors_per_side: 1
-        cooldown_time: 60
-      backtest_days: 180
-      resolution: "1h"
+      backtest_days: 365
       trade_cost: 0.000375
     tags: [backtesting, e1, weekly]
 
@@ -138,12 +145,6 @@ tasks:
     config:
       engine: "E2"
       connector_name: "bybit_perpetual"
-      controller_name: "e2_range_fade"
-      controller_config:
-        total_amount_quote: 100
-        max_executors_per_side: 1
-        cooldown_time: 60
-      backtest_days: 180
-      resolution: "1h"
+      backtest_days: 365
       trade_cost: 0.000375
     tags: [backtesting, e2, weekly]

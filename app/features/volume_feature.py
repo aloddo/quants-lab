@@ -14,7 +14,7 @@ from app.features.helpers import zscore
 class VolumeConfig(FeatureConfig):
     name: str = "volume"
     window: int = 20
-    floor_multiplier: float = 1.3
+    floor_multiplier: float = 1.6  # V3.2 locked, validated via stress testing (Apr 2026)
 
 
 class VolumeFeature(FeatureBase[VolumeConfig]):

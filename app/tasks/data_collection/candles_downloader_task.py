@@ -14,7 +14,10 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 
-class CandlesDownloaderTask(BaseTask):
+from app.tasks.notifying_task import NotifyingTaskMixin
+
+
+class CandlesDownloaderTask(NotifyingTaskMixin, BaseTask):
     """Download OHLC candles data from exchanges and store as parquet files."""
     
     def __init__(self, config):
@@ -62,21 +65,45 @@ class CandlesDownloaderTask(BaseTask):
         """Main execution logic."""
         start_execution = datetime.now(timezone.utc)
         logging.info(f"Starting candles downloader for {self.connector_name}")
-        
+
         try:
+            # Pre-load existing parquet into the CLOB cache so that
+            # get_candles() only fetches the incremental gap from the API
+            # instead of re-downloading the full retention window each time.
+            logging.info("Loading existing parquet cache for incremental fetch...")
+            self.clob.load_candles_cache(connector_name=self.connector_name)
+            cached_count = len(self.clob._candles_cache)
+            logging.info(f"Pre-loaded {cached_count} cached candle sets from parquet")
+
             # Calculate time range
             end_time = datetime.now(timezone.utc)
             start_time = pd.Timestamp(
                 time.time() - self.days_data_retention * 24 * 60 * 60,
                 unit="s"
             ).tz_localize(timezone.utc).timestamp()
-            
+
             logging.info(f"Time range: {start_time} to {end_time}")
             
             # Get trading pairs
             trading_rules = await self.clob.get_trading_rules(self.connector_name)
-            trading_pairs = trading_rules.get_all_trading_pairs()
-            
+            all_trading_pairs = trading_rules.get_all_trading_pairs()
+
+            # On scheduled runs (cache loaded), only update pairs that already
+            # have parquet data.  New pairs need a separate backfill — downloading
+            # a full year of 5m data for 500+ pairs takes hours and blocks the
+            # pipeline.
+            if cached_count > 0:
+                cached_pairs = {k[1] for k in self.clob._candles_cache.keys()}
+                trading_pairs = [p for p in all_trading_pairs if p in cached_pairs]
+                skipped = len(all_trading_pairs) - len(trading_pairs)
+                if skipped:
+                    logging.info(
+                        f"Incremental mode: updating {len(trading_pairs)} cached pairs, "
+                        f"skipping {skipped} pairs without existing data"
+                    )
+            else:
+                trading_pairs = all_trading_pairs
+
             # Track statistics
             stats = {
                 "pairs_processed": 0,
@@ -85,7 +112,7 @@ class CandlesDownloaderTask(BaseTask):
                 "candles_downloaded": 0,
                 "errors": 0
             }
-            
+
             # Process each trading pair and interval
             for i, trading_pair in enumerate(trading_pairs):
                 for interval in self.intervals:

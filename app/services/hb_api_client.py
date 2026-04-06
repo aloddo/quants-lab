@@ -96,6 +96,21 @@ class HBApiClient:
             logger.warning(f"ensure_trading_pair({trading_pair}): {e}")
             return False
 
+    async def get_trading_rules(
+        self, connector_name: str, trading_pair: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Fetch trading rules via HB API (native endpoint).
+
+        CLOBDataSource excludes testnet connectors, so we go through the
+        API which has the live connector instance.
+        """
+        params = {}
+        if trading_pair:
+            params["trading_pairs"] = trading_pair
+        return await self._request(
+            "GET", f"/connectors/{connector_name}/trading-rules", params=params
+        )
+
     async def create_executor(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new executor (position, grid, etc.)."""
         return await self._request("POST", "/executors/", json=config)

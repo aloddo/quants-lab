@@ -1,0 +1,11 @@
+{
+  "ruin_pct": 0.0,
+  "median_dd_pct": 0.08,
+  "p95_dd_pct": 0.12,
+  "p99_dd_pct": 0.14,
+  "p5_pnl": 2818.43,
+  "median_pnl": 3352.26,
+  "p95_pnl": 3874.34,
+  "n_trades": 2173,
+  "n_sims": 10000
+}

@@ -1,41 +1,52 @@
 """
-Bulk backtest task — runs E1 or E2 backtests across all pairs with parquet data.
+Bulk backtest task — runs backtests across all pairs with parquet data.
+
+Uses the engine registry (app/engines/registry.py) to determine resolution,
+candles config, exit params, and config class per engine. No hard-coded
+engine-specific logic here.
 
 Records PF, WR, Sharpe, max_dd per pair per engine.
 Writes verdicts (ALLOW/WATCH/BLOCK) to MongoDB pair_historical collection.
+Stores individual trades to backtest_trades collection for post-hoc analysis.
 Schedule: manual trigger or weekly cron.
 """
+import gc
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
+from decimal import Decimal
 from typing import Any, Dict, List
 
 from core.backtesting.engine import BacktestingEngine
 from core.data_paths import data_paths
 from core.tasks import BaseTask, TaskContext
 
+from app.engines.registry import get_engine, build_backtest_config
+
 logger = logging.getLogger(__name__)
 
 # Verdict thresholds
-PF_ALLOW = 1.3     # profit factor >= 1.3 → ALLOW
-PF_WATCH = 1.0     # 1.0 <= PF < 1.3 → WATCH
+PF_ALLOW = 1.3     # profit factor >= 1.3 -> ALLOW
+PF_WATCH = 1.0     # 1.0 <= PF < 1.3 -> WATCH
 MIN_TRADES = 10     # need at least 10 trades for statistical significance
 
 
-class BulkBacktestTask(BaseTask):
-    """Run backtests for E1 or E2 across all pairs and update pair_historical."""
+from app.tasks.notifying_task import NotifyingTaskMixin
+
+
+class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
+    """Run backtests for any registered engine across all pairs and update pair_historical."""
 
     def __init__(self, config):
         super().__init__(config)
         task_config = self.config.config
         self.engine_name = task_config.get("engine", "E1")
         self.connector_name = task_config.get("connector_name", "bybit_perpetual")
-        self.controller_name = task_config.get("controller_name")
-        self.controller_config = task_config.get("controller_config", {})
-        self.backtest_days = task_config.get("backtest_days", 180)
-        self.backtesting_resolution = task_config.get("resolution", "1h")
-        self.trade_cost = task_config.get("trade_cost", 0.000375)  # 0.0375% blended
-        self.min_bars = task_config.get("min_bars", 500)
+        self.backtest_days = task_config.get("backtest_days", 365)
+        self.trade_cost = task_config.get("trade_cost", 0.000375)
+
+        # Resolution and intervals come from the engine registry
+        engine_meta = get_engine(self.engine_name)
+        self.backtesting_resolution = engine_meta["backtesting_resolution"]
 
     async def setup(self, context: TaskContext) -> None:
         await super().setup(context)
@@ -52,20 +63,6 @@ class BulkBacktestTask(BaseTask):
                 pairs.append(parts[1])
         return sorted(pairs)
 
-    def _make_controller_config(self, pair: str) -> Dict[str, Any]:
-        """Build controller config dict for a specific pair."""
-        base = {
-            "controller_name": self.controller_name,
-            "controller_type": "directional_trading",
-            "connector_name": self.connector_name,
-            "trading_pair": pair,
-            "total_amount_quote": 100,
-            "max_executors_per_side": 1,
-            "cooldown_time": 60,
-        }
-        base.update(self.controller_config)
-        return base
-
     def _compute_verdict(self, pf: float, trades: int) -> str:
         """Determine ALLOW/WATCH/BLOCK from backtest results."""
         if trades < MIN_TRADES:
@@ -76,25 +73,86 @@ class BulkBacktestTask(BaseTask):
             return "WATCH"
         return "BLOCK"
 
+    async def _store_trades(self, db, bt_result, pair: str, period_label: str, run_id: str):
+        """Store individual trade records from a backtest result."""
+        if not hasattr(bt_result, "executors_df") or bt_result.executors_df is None:
+            return 0
+        edf = bt_result.executors_df
+        if len(edf) == 0:
+            return 0
+
+        trades_coll = db["backtest_trades"]
+
+        docs = []
+        for _, row in edf.iterrows():
+            doc = {
+                "engine": self.engine_name,
+                "pair": pair,
+                "period": period_label,
+                "run_id": run_id,
+                "timestamp": float(row.get("timestamp", 0)),
+                "close_timestamp": float(row.get("close_timestamp", 0)),
+                "side": str(row.get("side", "")),
+                "close_type": str(row.get("close_type", "")),
+                "net_pnl_quote": float(row["net_pnl_quote"]) if "net_pnl_quote" in row and row["net_pnl_quote"] is not None else None,
+                "net_pnl_pct": float(row["net_pnl_pct"]) if "net_pnl_pct" in row and row["net_pnl_pct"] is not None else None,
+                "cum_fees_quote": float(row["cum_fees_quote"]) if "cum_fees_quote" in row and row["cum_fees_quote"] is not None else None,
+                "filled_amount_quote": float(row["filled_amount_quote"]) if "filled_amount_quote" in row and row["filled_amount_quote"] is not None else None,
+            }
+            # Convert any remaining Decimal values
+            for k, v in doc.items():
+                if isinstance(v, Decimal):
+                    doc[k] = float(v)
+            docs.append(doc)
+
+        if docs:
+            # Clear previous trades for this engine+pair+period, then insert
+            await trades_coll.delete_many({
+                "engine": self.engine_name, "pair": pair, "run_id": run_id,
+            })
+            await trades_coll.insert_many(docs)
+
+        return len(docs)
+
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
         pairs = self._discover_pairs()
-        logger.info(f"BulkBacktest {self.engine_name}: found {len(pairs)} pairs with 1h data")
-
-        # Load backtesting engine (loads all parquet data)
-        bt_engine = BacktestingEngine(load_cached_data=True)
+        logger.info(
+            f"BulkBacktest {self.engine_name}: found {len(pairs)} pairs, "
+            f"resolution={self.backtesting_resolution}, days={self.backtest_days}"
+        )
 
         now_ts = int(datetime.now(timezone.utc).timestamp())
         start_ts = now_ts - self.backtest_days * 86400
-        period_label = f"{datetime.utcfromtimestamp(start_ts).strftime('%Y-%m-%d')}_{datetime.utcfromtimestamp(now_ts).strftime('%Y-%m-%d')}"
+        period_label = (
+            f"{datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime('%Y-%m-%d')}"
+            f"_{datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y-%m-%d')}"
+        )
+        run_id = f"{self.engine_name}_{period_label}_{now_ts}"
+
+        # Ensure indexes on backtest_trades for efficient querying
+        db = self.mongodb_client.get_database()
+        await db["backtest_trades"].create_index([
+            ("engine", 1), ("pair", 1), ("run_id", 1),
+        ])
+        await db["backtest_trades"].create_index([("run_id", 1)])
 
         stats = {"pairs_tested": 0, "allow": 0, "watch": 0, "block": 0, "errors": 0}
         results = []
 
+        total_trades_stored = 0
+
         for pair in pairs:
             try:
-                config_dict = self._make_controller_config(pair)
-                config_instance = bt_engine.get_controller_config_instance_from_dict(config_dict)
+                # Fresh engine per pair — reusing corrupts state (HB bug)
+                bt_engine = BacktestingEngine(load_cached_data=True)
+
+                # Build config via registry — handles candles, exit params, trailing stop
+                config_instance = build_backtest_config(
+                    engine_name=self.engine_name,
+                    connector=self.connector_name,
+                    pair=pair,
+                )
 
                 bt_result = await bt_engine.run_backtesting(
                     config=config_instance,
@@ -104,13 +162,18 @@ class BulkBacktestTask(BaseTask):
                     trade_cost=self.trade_cost,
                 )
 
+                # Workaround: close_types returns int(0) when no trades
+                if not isinstance(bt_result.results.get("close_types"), dict):
+                    bt_result.results["close_types"] = {}
+
                 r = bt_result.results
                 trades = r.get("total_executors", 0)
-                pf = r.get("profit_factor", 0)
-                wr = r.get("win_rate", 0) if r.get("win_rate") else 0
+                pf = r.get("profit_factor", 0) or 0
+                wr = (r.get("accuracy_long", 0) or 0) * 100
                 sharpe = r.get("sharpe_ratio", None)
                 max_dd = r.get("max_drawdown_pct", None)
-                pnl = r.get("net_pnl_quote", 0)
+                pnl = r.get("net_pnl_quote", 0) or 0
+                close_types = r.get("close_types", {})
 
                 verdict = self._compute_verdict(pf, trades)
 
@@ -118,6 +181,7 @@ class BulkBacktestTask(BaseTask):
                     "engine": self.engine_name,
                     "pair": pair,
                     "period": period_label,
+                    "run_id": run_id,
                     "trades": trades,
                     "profit_factor": pf,
                     "win_rate": wr,
@@ -126,34 +190,41 @@ class BulkBacktestTask(BaseTask):
                     "sharpe": sharpe,
                     "n_long": r.get("total_long", 0),
                     "n_short": r.get("total_short", 0),
+                    "close_types": {str(k): v for k, v in close_types.items()},
                     "verdict": verdict,
                     "created_at": int(datetime.now(timezone.utc).timestamp() * 1000),
                 }
 
-                # Upsert to MongoDB
-                db = self.mongodb_client.get_database()
                 await db["pair_historical"].update_one(
                     {"engine": self.engine_name, "pair": pair},
                     {"$set": doc},
                     upsert=True,
                 )
 
+                # Store individual trades for post-hoc analysis
+                n_stored = await self._store_trades(db, bt_result, pair, period_label, run_id)
+                total_trades_stored += n_stored
+
                 stats["pairs_tested"] += 1
                 stats[verdict.lower()] = stats.get(verdict.lower(), 0) + 1
                 results.append({"pair": pair, "pf": pf, "wr": wr, "trades": trades, "verdict": verdict})
 
-                logger.info(f"  {pair}: PF={pf:.2f} WR={wr:.1f}% trades={trades} → {verdict}")
+                logger.info(f"  {pair}: PF={pf:.2f} WR={wr:.1f}% trades={trades} -> {verdict}")
+
+                del bt_engine, bt_result
+                gc.collect()
 
             except Exception as e:
                 stats["errors"] += 1
-                logger.error(f"  {pair}: backtest failed — {e}")
+                logger.error(f"  {pair}: backtest failed -- {e}")
 
         duration = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info(
             f"BulkBacktest {self.engine_name} complete: "
             f"{stats['pairs_tested']} tested, {stats['allow']} ALLOW, "
             f"{stats['watch']} WATCH, {stats['block']} BLOCK, "
-            f"{stats['errors']} errors in {duration:.0f}s"
+            f"{stats['errors']} errors, {total_trades_stored} trades stored "
+            f"in {duration:.0f}s"
         )
 
         return {
@@ -162,7 +233,9 @@ class BulkBacktestTask(BaseTask):
             "execution_id": context.execution_id,
             "engine": self.engine_name,
             "period": period_label,
+            "run_id": run_id,
             "stats": stats,
+            "total_trades_stored": total_trades_stored,
             "results": results,
             "duration_seconds": duration,
         }
@@ -170,7 +243,7 @@ class BulkBacktestTask(BaseTask):
     async def on_success(self, context: TaskContext, result) -> None:
         stats = result.result_data.get("stats", {})
         logger.info(
-            f"BulkBacktest: {stats['pairs_tested']} pairs — "
+            f"BulkBacktest: {stats['pairs_tested']} pairs -- "
             f"ALLOW={stats['allow']} WATCH={stats['watch']} BLOCK={stats['block']}"
         )
 

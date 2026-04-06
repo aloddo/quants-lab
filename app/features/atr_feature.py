@@ -15,7 +15,7 @@ class ATRConfig(FeatureConfig):
     name: str = "atr"
     atr_period: int = 14
     percentile_window: int = 90 * 24  # 90 days of 1h bars
-    compression_threshold: float = 0.20
+    compression_threshold: float = 0.35  # V3.2 locked, validated via stress testing (Apr 2026)
 
 
 class ATRFeature(FeatureBase[ATRConfig]):

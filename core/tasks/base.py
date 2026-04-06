@@ -243,7 +243,7 @@ class BaseTask(ABC):
         """
         Hook called on task failure.
         Override in subclasses for custom failure handling.
-        
+
         Args:
             context: Task execution context
             result: Task execution result
