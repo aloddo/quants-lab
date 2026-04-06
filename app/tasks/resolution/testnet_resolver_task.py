@@ -6,11 +6,13 @@ On CANDIDATE_READY: creates PositionExecutor with TP/SL/time limit.
 On subsequent runs: polls executor status, records fills and outcomes.
 """
 import logging
+import math
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from core.tasks import BaseTask, TaskContext
+from core.data_sources.clob import CLOBDataSource
 from app.services.hb_api_client import HBApiClient
 
 logger = logging.getLogger(__name__)
@@ -45,9 +47,37 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
         self.engines = task_config.get("engines", ["E1", "E2"])
         self.max_portfolio_positions = task_config.get("max_portfolio_positions", 3)
         self.hb_client = HBApiClient()
+        self.clob = CLOBDataSource()
+        self._trading_rules: Dict[str, Any] = {}  # pair -> TradingRule
 
     async def setup(self, context: TaskContext) -> None:
         await super().setup(context)
+        await self._refresh_trading_rules()
+        await self._setup_checks()
+
+    async def _refresh_trading_rules(self) -> None:
+        """Load trading rules from HB connector via CLOBDataSource."""
+        try:
+            rules = await self.clob.get_trading_rules(self.connector)
+            self._trading_rules = {r.trading_pair: r for r in rules.data}
+            logger.info(f"Loaded trading rules for {len(self._trading_rules)} pairs")
+        except Exception as e:
+            logger.warning(f"Could not load trading rules: {e}")
+
+    def _quantize_amount(self, pair: str, raw_amount: float) -> float:
+        """Quantize order amount to the pair's min_base_amount_increment."""
+        rule = self._trading_rules.get(pair)
+        if rule and rule.min_base_amount_increment:
+            step = float(rule.min_base_amount_increment)
+            quantized = math.floor(raw_amount / step) * step
+            # Respect min order size
+            if rule.min_order_size and quantized < float(rule.min_order_size):
+                return 0.0
+            return quantized
+        # Fallback: round to 3 decimals (legacy behaviour)
+        return round(raw_amount, 3)
+
+    async def _setup_checks(self) -> None:
         if not self.mongodb_client:
             raise RuntimeError("MongoDB required for TestnetResolverTask")
         if not await self.hb_client.health_check():
@@ -99,7 +129,11 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
             logger.error(f"Invalid decision_price for {pair}: {price}")
             return
 
-        amount = round(amount_usd / price, 3)
+        raw_amount = amount_usd / price
+        amount = self._quantize_amount(pair, raw_amount)
+        if amount <= 0:
+            logger.warning(f"Order amount too small for {pair}: ${amount_usd:.2f} / {price} = {raw_amount} (below min)")
+            return
         side = 1 if direction == "LONG" else 2
 
         # TP/SL as percentages for triple barrier
