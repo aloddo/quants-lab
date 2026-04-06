@@ -97,7 +97,7 @@ git config user.email "your@email"
 ```
 
 ### Docker patch persistence
-The 4 patches on the HB API Docker container are lost on rebuild (see CLAUDE.md for full commands). Options:
+The 3 patches on the HB API Docker container are lost on rebuild (see CLAUDE.md for full commands). Old patch #4 (throttler rebuild) was removed — replaced by resolver-level fix (`HBApiClient.ensure_trading_pair()`). Options:
 - **Short term**: Re-apply with `sed` after each rebuild (documented in CLAUDE.md)
 - **Long term**: Fork the hummingbot-api Docker image, bake patches in, push to private registry
 - **Best**: Submit PR to hummingbot to add `bybit_perpetual_demo` as a native domain
@@ -152,7 +152,7 @@ The 7 FeatureBase subclasses write to MongoDB with consistent schema. For ML:
 | Portfolio-level position limits | Done |
 | Weekly re-optimization cron | Done |
 | E2E testing (features, signals, orders) | Done |
-| Bybit demo connector via HB native (4 patches) | Done |
+| Bybit demo connector via HB native (3 patches + resolver pre-registration) | Done |
 | CLAUDE.md + ARCHITECTURE.md | Done |
 | Pipeline running in tmux | Done |
 | 9 commits pushed | Done |
