@@ -240,7 +240,7 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
 - **Feature TTL is 90 days** — if you need longer history for backtesting, query parquet directly, don't rely on MongoDB features.
 - **The `timestamp` field in derivatives collections uses milliseconds** (Bybit convention), but QL features use Python datetime objects. Watch for unit mismatches.
 - **`core/` FeatureStorage uses `insert_many`** which creates duplicates. Our FeatureComputationTask uses upsert instead — don't use FeatureStorage.save_features() directly.
-- **Bybit demo trading** uses `bybit_perpetual_testnet` connector patched to point at `api-demo.bybit.com`. Three patches required inside the Docker container. **IMPORTANT: use `sed` for patching** (Python file I/O doesn't persist reliably in Docker overlay FS). Re-apply after any container rebuild:
+- **Bybit demo trading** uses `bybit_perpetual_testnet` connector patched to point at `api-demo.bybit.com`. Two config patches required inside the Docker container (URL redirect + position mode). **No behavior patches.** Re-apply after any container rebuild:
   ```bash
   PKG="/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/derivative/bybit_perpetual"
 
@@ -249,10 +249,7 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
   docker exec hummingbot-api sed -i 's|stream-testnet.bybit.com/v5/public|stream.bybit.com/v5/public|' "$PKG/bybit_perpetual_constants.py"
   docker exec hummingbot-api sed -i 's|stream-testnet.bybit.com/v5/private|stream-demo.bybit.com/v5/private|' "$PKG/bybit_perpetual_constants.py"
 
-  # 2. Rate limit fix (connector initializes without pairs, needs defaults)
-  docker exec hummingbot-api sed -i 's|return web_utils.build_rate_limits(self.trading_pairs)|pairs = self.trading_pairs or ["BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","BCH-USDT","LTC-USDT"]; return web_utils.build_rate_limits(pairs)|' "$PKG/bybit_perpetual_derivative.py"
-
-  # 3. Position mode fix (demo set-position-mode returns empty, force one-way)
+  # 2. Position mode fix (demo set-position-mode returns empty, force one-way)
   docker exec hummingbot-api sed -i "s|if self.position_mode == PositionMode.ONEWAY:|if self.position_mode == PositionMode.ONEWAY or 'testnet' in str(self._domain):|" "$PKG/bybit_perpetual_derivative.py"
 
   # Clear cache and restart
@@ -265,7 +262,7 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
     -H "Content-Type: application/json" \
     -d '{"bybit_perpetual_testnet_api_key":"YOUR_DEMO_KEY","bybit_perpetual_testnet_secret_key":"YOUR_DEMO_SECRET"}'
   ```
-  **NOTE:** Old patch #4 (throttler rebuild in exchange_py_base.py) was removed Apr 6 2026. It was insufficient because the HB API backend bypasses `connector.add_trading_pair()` in 3 places (trading_service.py, accounts_service.py, unified_connector_service.py), doing raw `_trading_pairs.append()` without rebuilding the throttler. The fix is now at the resolver level: `HBApiClient.ensure_trading_pair()` calls `/market-data/trading-pair/add` before creating any executor, which goes through the proper `add_trading_pair()` path and builds rate limits for the new pair.
+  **PAIR ALLOWLIST:** Only trade pairs that HB natively supports (no dynamic pair addition). The allowlist lives in MongoDB `pair_historical` collection (verdict=ALLOW). Micro-cap / newly-listed pairs (PIPPIN, PUMPFUN, TRUMP, etc.) are BLOCKED — they cause rate limiter crashes in the connector. The resolver's `ensure_trading_pair()` call handles pre-registration for allowed pairs. Never add exotic pairs to the allowlist without testing them manually first via the HB MCP.
 - **Demo account capital** is ~$100k (virtual). `fallback_capital` in pipeline config is set to 100000. If HB API can't fetch portfolio state (404 on `/portfolio/overview`), it uses this fallback. 0.3% = $300 per position.
 - **Bybit demo executor quirks**: The position executor may need position mode set to one-way. If executors keep failing with max retries, run via HB MCP: "Set position mode to one-way for BTC-USDT on bybit_perpetual_demo".
 - **Git push requires token** — hermes user has no credential helper. Use the temporary URL method documented above.
