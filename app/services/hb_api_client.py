@@ -70,6 +70,32 @@ class HBApiClient:
         """Get portfolio overview for position sizing."""
         return await self._request("GET", "/portfolio/overview", params={"account_names": account_name})
 
+    async def ensure_trading_pair(
+        self, connector_name: str, trading_pair: str, account_name: str = "master_account"
+    ) -> bool:
+        """Pre-register a trading pair so the connector builds its rate limits.
+
+        Calls /market-data/trading-pair/add which goes through the proper
+        add_trading_pair() path (rebuilds the throttler).  Without this,
+        pairs added only via _trading_pairs.append() crash with
+        'NoneType' object has no attribute 'weight'.
+        """
+        try:
+            result = await self._request(
+                "POST",
+                "/market-data/trading-pair/add",
+                json={
+                    "connector_name": connector_name,
+                    "trading_pair": trading_pair,
+                    "account_name": account_name,
+                    "timeout": 30.0,
+                },
+            )
+            return result.get("success", False)
+        except Exception as e:
+            logger.warning(f"ensure_trading_pair({trading_pair}): {e}")
+            return False
+
     async def create_executor(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new executor (position, grid, etc.)."""
         return await self._request("POST", "/executors/", json=config)

@@ -29,7 +29,10 @@ ENGINE_PARAMS = {
 }
 
 
-class TestnetResolverTask(BaseTask):
+from app.tasks.notifying_task import NotifyingTaskMixin
+
+
+class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
     """Place and track orders on Bybit demo via HB executors."""
 
     def __init__(self, config):
@@ -70,6 +73,20 @@ class TestnetResolverTask(BaseTask):
         )
         return len(docs)
 
+    async def _mark_skipped(self, reason: str) -> None:
+        """Mark all CANDIDATE_READY as skipped with reason (for would-have-won analysis)."""
+        db = self.mongodb_client.get_database()
+        result = await db["candidates"].update_many(
+            {"disposition": "CANDIDATE_READY"},
+            {"$set": {
+                "disposition": "SKIPPED_CONCURRENCY",
+                "skipped_reason": reason,
+                "skipped_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+            }},
+        )
+        if result.modified_count > 0:
+            logger.info(f"Marked {result.modified_count} candidates as SKIPPED ({reason})")
+
     async def _place_order(self, candidate: dict, capital: float) -> None:
         engine = candidate["engine"]
         pair = candidate["pair"]
@@ -96,6 +113,11 @@ class TestnetResolverTask(BaseTask):
             sl_pct = abs(float(sl_abs) - price) / price if sl_abs else 0.015
 
         time_limit = params.get("time_limit_hours", 24) * 3600
+
+        # Pre-register pair so HB connector builds rate limits (prevents 'weight' crash)
+        registered = await self.hb_client.ensure_trading_pair(self.connector, pair, self.account)
+        if not registered:
+            logger.warning(f"Could not pre-register {pair} — executor may fail")
 
         request_body = {
             "account_name": self.account,
@@ -174,6 +196,37 @@ class TestnetResolverTask(BaseTask):
                     close_type = status.get("close_type")
                     filled_amount = status.get("filled_amount_quote")
 
+                    # Compute slippage vs decision price
+                    decision_price = doc.get("decision_price")
+                    slippage_bps = None
+                    slippage_bucket = None
+                    if decision_price and fill_price:
+                        try:
+                            dp = float(decision_price)
+                            fp = float(fill_price)
+                            if dp > 0:
+                                direction = doc.get("direction", "LONG")
+                                raw_slip = (fp - dp) / dp * 10000
+                                slippage_bps = raw_slip if direction == "LONG" else -raw_slip
+                                abs_slip = abs(slippage_bps)
+                                slippage_bucket = (
+                                    "safe" if abs_slip < 10
+                                    else "borderline" if abs_slip < 20
+                                    else "danger"
+                                )
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Execution latency
+                    placed_at = doc.get("testnet_placed_at")
+                    signal_ts = doc.get("timestamp_utc")
+                    exec_latency_ms = None
+                    if placed_at and signal_ts:
+                        try:
+                            exec_latency_ms = int(placed_at) - int(signal_ts)
+                        except (ValueError, TypeError):
+                            pass
+
                     await db["candidates"].update_one(
                         {"candidate_id": doc["candidate_id"]},
                         {"$set": {
@@ -186,6 +239,9 @@ class TestnetResolverTask(BaseTask):
                             "testnet_filled_amount_quote": filled_amount,
                             "testnet_status": exec_status,
                             "testnet_raw_result": status,
+                            "testnet_slippage_bps": slippage_bps,
+                            "testnet_slippage_bucket": slippage_bucket,
+                            "testnet_exec_latency_ms": exec_latency_ms,
                         }},
                     )
                     stats["resolved"] += 1
@@ -222,6 +278,8 @@ class TestnetResolverTask(BaseTask):
 
         if total_active >= self.max_portfolio_positions:
             logger.info(f"Portfolio limit: {total_active}/{self.max_portfolio_positions} — skipping")
+            # Mark skipped signals for would-have-won analysis
+            await self._mark_skipped("portfolio_full")
         else:
             for engine in self.engines:
                 params = ENGINE_PARAMS.get(engine, ENGINE_PARAMS["E1"])
@@ -229,6 +287,7 @@ class TestnetResolverTask(BaseTask):
                 active_count = await self._count_active_positions(engine)
 
                 if active_count >= max_concurrent or total_active >= self.max_portfolio_positions:
+                    await self._mark_skipped(f"{engine}_concurrent_limit")
                     continue
 
                 ready_docs = await self.mongodb_client.get_documents(
@@ -236,10 +295,27 @@ class TestnetResolverTask(BaseTask):
                 )
 
                 slots = min(max_concurrent - active_count, self.max_portfolio_positions - total_active)
-                for doc in ready_docs[:slots]:
+                placed = ready_docs[:slots]
+                skipped = ready_docs[slots:]
+
+                for doc in placed:
                     await self._place_order(doc, capital)
                     stats["new_orders"] += 1
                     total_active += 1
+
+                # Mark overflow signals as skipped (for would-have-won tracking)
+                db = self.mongodb_client.get_database()
+                for doc in skipped:
+                    await db["candidates"].update_one(
+                        {"candidate_id": doc["candidate_id"]},
+                        {"$set": {
+                            "disposition": "SKIPPED_CONCURRENCY",
+                            "skipped_reason": f"{engine}_slots_full",
+                            "skipped_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+                        }},
+                    )
+                    stats.setdefault("skipped", 0)
+                    stats["skipped"] += 1
 
         stats["poll_stats"] = await self._poll_active_positions()
 
