@@ -35,6 +35,7 @@ V3.2 Canonical params (locked):
   short_trend_ema_period    = 200
 """
 
+from decimal import Decimal
 from typing import List, Dict, Any, Optional
 
 import numpy as np
@@ -42,10 +43,15 @@ import pandas as pd
 import pandas_ta as ta
 from pydantic import Field
 
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
     DirectionalTradingControllerBase,
     DirectionalTradingControllerConfigBase,
+)
+from hummingbot.strategy_v2.executors.position_executor.data_types import (
+    PositionExecutorConfig,
+    TripleBarrierConfig,
 )
 
 # Entry quality constants — BTC-calibrated per V7.1 Section 6
@@ -312,15 +318,17 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
                 idx = row.name
                 bar_ts = float(idx.timestamp() if hasattr(idx, "timestamp") else float(idx) / 1e9)
 
+            atr_val = float(row.get("atr", float("nan")))
             rows.append({
                 "direction":      be,
                 "breakout_level": bl,
+                "atr_1h":         atr_val,
                 "start_ts":       bar_ts,
                 "expiry_ts":      bar_ts + expiry_secs,
             })
 
         if not rows:
-            return pd.DataFrame(columns=["direction", "breakout_level", "start_ts", "expiry_ts"])
+            return pd.DataFrame(columns=["direction", "breakout_level", "atr_1h", "start_ts", "expiry_ts"])
 
         return pd.DataFrame(rows)
 
@@ -354,6 +362,9 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
         df_5m["setup_active"]            = 0
         df_5m["setup_direction"]         = 0
         df_5m["breakout_level"]          = float("nan")
+        df_5m["atr_1h"]                  = float("nan")
+        df_5m["tp_price"]               = float("nan")
+        df_5m["sl_price"]               = float("nan")
         df_5m["setup_age_minutes"]       = float("nan")
         df_5m["trigger_5m_pass"]         = 0
         df_5m["entry_quality_pass"]      = 0
@@ -364,6 +375,7 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
         for _, setup in setups_df.iterrows():
             direction = int(setup["direction"])
             level     = float(setup["breakout_level"])
+            atr_1h    = float(setup.get("atr_1h", float("nan")))
             start_ts  = float(setup["start_ts"])
             expiry_ts = float(setup["expiry_ts"])
 
@@ -375,6 +387,16 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
             df_5m.loc[window_idx, "setup_active"]    = 1
             df_5m.loc[window_idx, "setup_direction"] = direction
             df_5m.loc[window_idx, "breakout_level"]  = level
+            df_5m.loc[window_idx, "atr_1h"]          = atr_1h
+
+            # Dynamic TP/SL: breakout_level +/- ATR multiples
+            if not pd.isna(atr_1h):
+                if direction == 1:  # LONG
+                    df_5m.loc[window_idx, "tp_price"] = level + 1.5 * atr_1h
+                    df_5m.loc[window_idx, "sl_price"] = level - 1.0 * atr_1h
+                else:  # SHORT
+                    df_5m.loc[window_idx, "tp_price"] = level - 1.5 * atr_1h
+                    df_5m.loc[window_idx, "sl_price"] = level + 1.0 * atr_1h
 
             # Setup age in minutes
             df_5m.loc[window_idx, "setup_age_minutes"] = \
@@ -473,6 +495,16 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
         bool_cols = df_5m.select_dtypes(include="bool").columns
         df_5m[bool_cols] = df_5m[bool_cols].astype(int)
 
+        # Extract dynamic TP/SL from last signal bar for live executor config
+        if last_sig != 0 and len(df_5m) > 0:
+            last_row = df_5m.iloc[-1]
+            tp_val = last_row.get("tp_price")
+            sl_val = last_row.get("sl_price")
+            if tp_val is not None and not pd.isna(tp_val):
+                self.processed_data["tp_price"] = float(tp_val)
+            if sl_val is not None and not pd.isna(sl_val):
+                self.processed_data["sl_price"] = float(sl_val)
+
         # Drop string column before numeric select
         df_5m_num = df_5m.drop(columns=["entry_quality_fail_reason"], errors="ignore")
         numeric = df_5m_num.select_dtypes(include="number").copy()
@@ -488,6 +520,49 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
                 "breakout_level", "setup_age_minutes",
                 "trigger_5m_pass", "entry_quality_pass"]
         self.processed_data["features"] = pd.DataFrame(columns=cols)
+
+    def get_executor_config(self, trade_type: TradeType, price: Decimal, amount: Decimal):
+        """Build executor config with dynamic TP/SL from ATR-based levels.
+
+        TP = breakout_level +/- 1.5 * ATR(14, 1h)
+        SL = breakout_level -/+ 1.0 * ATR(14, 1h)
+        Converts absolute price levels to percentages for TripleBarrierConfig.
+        """
+        tp_abs = self.processed_data.get("tp_price")
+        sl_abs = self.processed_data.get("sl_price")
+
+        if tp_abs is not None and sl_abs is not None and float(price) > 0:
+            tp_pct = abs(Decimal(str(tp_abs)) - price) / price
+            sl_pct = abs(Decimal(str(sl_abs)) - price) / price
+
+            # Safety: clamp to reasonable bounds (0.1% – 10%)
+            tp_pct = max(Decimal("0.001"), min(tp_pct, Decimal("0.10")))
+            sl_pct = max(Decimal("0.001"), min(sl_pct, Decimal("0.10")))
+        else:
+            # Fallback to config defaults
+            tp_pct = self.config.take_profit
+            sl_pct = self.config.stop_loss
+
+        trailing = getattr(self.config, "trailing_stop", None)
+        return PositionExecutorConfig(
+            timestamp=self.market_data_provider.time(),
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            side=trade_type,
+            entry_price=price,
+            amount=amount,
+            triple_barrier_config=TripleBarrierConfig(
+                stop_loss=sl_pct,
+                take_profit=tp_pct,
+                time_limit=self.config.time_limit,
+                trailing_stop=trailing,
+                open_order_type=OrderType.MARKET,
+                take_profit_order_type=OrderType.MARKET,
+                stop_loss_order_type=OrderType.MARKET,
+                time_limit_order_type=OrderType.MARKET,
+            ),
+            leverage=self.config.leverage,
+        )
 
     def _evaluate_signal(self, df: pd.DataFrame):
         """Live path: read last-bar signal from features."""
