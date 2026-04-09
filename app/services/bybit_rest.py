@@ -159,3 +159,13 @@ async def fetch_tickers(session: aiohttp.ClientSession) -> list[dict]:
             "open_interest": float(t.get("openInterestValue", 0)),
         })
     return tickers
+
+
+async def fetch_all_prices(session: aiohttp.ClientSession) -> dict[str, float]:
+    """Fetch current prices for all USDT perpetuals.
+
+    Returns dict of pair -> last_price (e.g. {"BTC-USDT": 84500.0}).
+    Single API call, no rate limit issues at 60s polling interval.
+    """
+    tickers = await fetch_tickers(session)
+    return {t["pair"]: t["last_price"] for t in tickers if t["last_price"] > 0}
