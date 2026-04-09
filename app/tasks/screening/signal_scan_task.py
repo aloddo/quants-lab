@@ -237,17 +237,94 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
         except Exception as e:
             logger.warning(f"Telegram send failed: {e}")
 
+    async def _check_engine_circuit_breaker(self, engine: str) -> bool:
+        """Check if engine should be paused based on walk-forward test performance.
+
+        Returns True if engine is OK to run, False if it should be paused.
+        Checks engine_state collection for manual overrides, then
+        walk-forward test-period PF from pair_historical.
+        """
+        db = self.mongodb_client.get_database()
+
+        # Check manual override
+        state = await db["engine_state"].find_one({"engine": engine})
+        if state and state.get("force_enabled"):
+            logger.info(f"{engine}: circuit breaker overridden (force_enabled=true)")
+            return True
+
+        # Check walk-forward test PF (aggregated across ALLOW pairs)
+        pipeline = [
+            {"$match": {"engine": engine, "wf_avg_test_pf": {"$exists": True}}},
+            {"$group": {
+                "_id": None,
+                "avg_test_pf": {"$avg": "$wf_avg_test_pf"},
+                "count": {"$sum": 1},
+            }},
+        ]
+        results = []
+        async for doc in db["pair_historical"].aggregate(pipeline):
+            results.append(doc)
+
+        if not results:
+            # No walk-forward data yet — let it run
+            return True
+
+        agg = results[0]
+        avg_pf = agg["avg_test_pf"]
+        count = agg["count"]
+
+        if avg_pf < 1.0 and count >= 3:
+            # Pause engine
+            await db["engine_state"].update_one(
+                {"engine": engine},
+                {"$set": {
+                    "engine": engine,
+                    "paused": True,
+                    "paused_reason": f"Walk-forward test PF = {avg_pf:.2f} (< 1.0, {count} pairs)",
+                    "paused_at": datetime.now(timezone.utc),
+                }},
+                upsert=True,
+            )
+            logger.warning(f"{engine}: PAUSED by circuit breaker — WF test PF = {avg_pf:.2f}")
+
+            if self.notification_manager:
+                try:
+                    from core.notifiers.base import NotificationMessage
+                    await self.notification_manager.send_notification(NotificationMessage(
+                        title=f"{engine} PAUSED — Walk-Forward Test PF < 1.0",
+                        message=(
+                            f"<b>{engine} Engine Paused</b>\n\n"
+                            f"Walk-forward test PF = {avg_pf:.2f} (across {count} pairs)\n"
+                            f"Engine will not generate signals until:\n"
+                            f"1. Walk-forward results improve, OR\n"
+                            f"2. Manual override: db.engine_state.updateOne("
+                            f'{{engine: "{engine}"}}, {{$set: {{force_enabled: true}}}})'
+                        ),
+                        level="error",
+                    ))
+                except Exception:
+                    pass
+
+            return False
+
+        return True
+
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
         market_state = await self._get_market_state()
 
         stats = {"scanned": 0, "candidates_ready": 0, "skipped": 0,
-                 "stale_blocked": 0, "errors": 0}
+                 "stale_blocked": 0, "errors": 0, "engines_paused": 0}
         signals = []
         stale_pairs = []
 
         for engine in self.engines:
             try:
+                # ── Engine circuit breaker ─────────────
+                if not await self._check_engine_circuit_breaker(engine):
+                    stats["engines_paused"] += 1
+                    continue
+
                 eligible, rejections = await get_eligible_pairs(
                     self.mongodb_client, engine, top_n=self.top_n
                 )

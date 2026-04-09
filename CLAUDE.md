@@ -12,7 +12,13 @@ Owner: Alberto Loddo (GitHub: aloddo)
 quants-lab/                          # Fork of hummingbot/quants-lab
 ├── core/                            # UPSTREAM — do not modify. QL framework.
 ├── app/
-│   ├── engines/                     # Pure evaluation functions (E1, E2)
+│   ├── engines/                     # Strategy factory
+│   │   ├── strategy_registry.py     # StrategyMetadata + STRATEGY_REGISTRY (source of truth)
+│   │   ├── models.py                # CandidateBase, DecisionSnapshot, FeatureRow
+│   │   ├── e1_compression_breakout.py  # E1 eval function + E1Candidate
+│   │   ├── e2_range_fade.py         # E2 eval function + E2Candidate
+│   │   ├── pair_selector.py         # Pair ranking from pair_historical
+│   │   └── registry.py              # DEPRECATED — re-exports from strategy_registry
 │   ├── features/                    # 7 FeatureBase subclasses → MongoDB
 │   ├── services/                    # Bybit REST client, HB API client
 │   ├── controllers/directional_trading/  # HB V2 controllers (for backtesting)
@@ -20,10 +26,11 @@ quants-lab/                          # Fork of hummingbot/quants-lab
 │   │   ├── data_collection/         # CandlesDownloader, BybitDerivativesTask
 │   │   ├── screening/               # FeatureComputationTask, SignalScanTask
 │   │   ├── resolution/              # TestnetResolverTask
-│   │   └── backtesting/             # BulkBacktestTask
+│   │   └── backtesting/             # BulkBacktestTask, WalkForwardTask
 │   └── data/cache/candles/          # Parquet files (gitignored)
 ├── config/hermes_pipeline.yml       # YAML DAG — the full pipeline
 ├── scripts/                         # start_pipeline.sh, kill_switch.sh, status.sh
+├── tests/                           # pytest tests
 └── .env                             # Secrets — gitignored
 ```
 
@@ -31,10 +38,24 @@ quants-lab/                          # Fork of hummingbot/quants-lab
 
 1. **Never modify `core/`** — that's upstream QuantsLab. Fetch updates with `git fetch upstream && git merge upstream/main`.
 2. **Always use QL primitives** — FeatureBase for features, BaseTask for tasks, TaskOrchestrator for scheduling. No custom cron scripts, no SQLite.
-3. **Engine evaluation functions are pure** — `evaluate_e1()` and `evaluate_e2()` take a `DecisionSnapshot`, return a candidate. No side effects, no DB access.
-4. **MongoDB for everything dynamic** — features, candidates, pair_historical, derivatives, task executions.
-5. **Parquet for candle data** — written by CandlesDownloaderTask via CLOBDataSource.
-6. **Telegram bot token and chat IDs are in `.env`** — never commit secrets.
+3. **Engine evaluation functions are pure** — `evaluate_eN()` takes a `DecisionSnapshot`, returns a `CandidateBase` subclass. No side effects, no DB access.
+4. **Use the Strategy Registry** — all engine metadata lives in `app/engines/strategy_registry.py`. Add new engines via `python cli.py scaffold-strategy`. Signal scan and resolver dispatch generically via `get_evaluate_fn(engine)`.
+5. **MongoDB for everything dynamic** — features, candidates, pair_historical, derivatives, task executions.
+6. **Parquet for candle data** — written by CandlesDownloaderTask via CLOBDataSource.
+7. **Telegram bot token and chat IDs are in `.env`** — never commit secrets.
+
+## Adding a new strategy
+
+```bash
+python cli.py scaffold-strategy --name E3 --display "Mean Reversion RSI"
+```
+
+This generates engine eval function + controller templates. Then:
+1. Implement `evaluate_e3()` logic
+2. Implement the backtesting controller
+3. Add `StrategyMetadata` entry to `STRATEGY_REGISTRY`
+4. Add `E3` to signal_scan engines in `hermes_pipeline.yml`
+5. Run `validate_registry()` to verify
 
 ## Environment
 
