@@ -80,6 +80,21 @@ tasks:
       telegram_chat_id: "-1003576397888"
     tags: [screening, signals]
 
+  # ═══════ Layer 3b: Real-Time Breakout Monitor ═══════════
+  breakout_monitor:
+    enabled: true
+    task_class: app.tasks.screening.breakout_monitor_task.BreakoutMonitorTask
+    schedule:
+      type: cron
+      cron: "* * * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 30
+    config:
+      engine: "E1"
+      connector_name: "bybit_perpetual"
+    tags: [screening, realtime, breakout]
+
   # ═══════ Layer 4: Testnet Resolution ════════════════════
   testnet_resolver:
     enabled: true
