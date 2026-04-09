@@ -47,6 +47,9 @@ class E1Candidate(CandidateBase):
     entry_quality_check_passed: Optional[bool] = None
     entry_quality_fail_reason: str = ""
     max_adverse_excursion_before_fill: Optional[float] = None
+    # Dynamic exit levels (ATR-based, set by evaluate_e1)
+    tp_price: Optional[float] = None
+    sl_price: Optional[float] = None
     # Fillability
     touched_signal_price: Optional[bool] = None
     fillable_estimate: Optional[bool] = None
@@ -175,6 +178,16 @@ def evaluate_e1(snap: DecisionSnapshot) -> E1Candidate:
     cand.soft_filter_breakdown = breakdown
     cand.disposition = "CANDIDATE_READY"
     cand.composite_score = float(score) / 4.0
+
+    # Dynamic TP/SL based on ATR (1.5x for TP, 1.0x for SL)
+    atr = fr.atr_14_1h
+    if atr is not None and breakout_level is not None:
+        if direction == "LONG":
+            cand.tp_price = breakout_level + 1.5 * atr
+            cand.sl_price = breakout_level - 1.0 * atr
+        else:
+            cand.tp_price = breakout_level - 1.5 * atr
+            cand.sl_price = breakout_level + 1.0 * atr
 
     return cand
 
