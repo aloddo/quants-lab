@@ -1,6 +1,7 @@
 """
 Data models for the engine evaluation pipeline.
 
+CandidateBase: Common base for all engine candidate outputs.
 DecisionSnapshot: Immutable frozen inputs for engine evaluation.
 FeatureRow: Computed features for a pair at a point in time.
 
@@ -9,9 +10,53 @@ SQLite removed — all storage via MongoDB.
 """
 import time
 import uuid
+from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+
+@dataclass
+class CandidateBase:
+    """Common fields for all engine candidate outputs.
+
+    Every engine's candidate (E1Candidate, E2Candidate, etc.) inherits from
+    this.  The signal scan and testnet resolver can handle any engine's
+    candidates via this interface without engine-specific branching.
+    """
+    candidate_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    snapshot_id: str = ""
+    pair: str = ""
+    direction: str = ""
+    timestamp_utc: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    # Trigger
+    trigger_fired: bool = False
+    trigger_reason: str = ""
+
+    # Hard filters
+    hard_filters_passed: bool = False
+    hard_filter_fail_reason: str = ""
+
+    # Soft filters (optional, engine-specific scoring)
+    soft_filter_score: int = 0
+
+    # State
+    market_state: str = ""
+    feature_staleness_flags: list = field(default_factory=list)
+    composite_score: float = 0.0
+
+    # Disposition
+    disposition: str = "PENDING"
+    filter_reason: str = ""
+
+    # Price levels
+    decision_price: Optional[float] = None
+    signal_level: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        """Convert to dict for MongoDB storage."""
+        return asdict(self)
 
 
 class FeatureRow(BaseModel):
@@ -62,6 +107,13 @@ class FeatureRow(BaseModel):
     rs_vs_btc_4h: Optional[float] = None
     rs_vs_btc_24h: Optional[float] = None
     rs_aligned: bool = False
+
+    # Latest candle OHLC (for engines that need intra-candle data like E2)
+    candle_high: Optional[float] = None
+    candle_low: Optional[float] = None
+    candle_open: Optional[float] = None
+    # Range expansion rate (for E2 range stability check)
+    range_expanding: Optional[float] = None
 
     # Shadow columns for E2/E3
     oi_direction: Optional[int] = None

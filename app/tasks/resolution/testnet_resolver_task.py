@@ -13,21 +13,9 @@ from typing import Any, Dict, Optional
 
 from core.tasks import BaseTask, TaskContext
 from app.services.hb_api_client import HBApiClient
+from app.engines.strategy_registry import get_strategy
 
 logger = logging.getLogger(__name__)
-
-ENGINE_PARAMS = {
-    "E1": {
-        "tp_pct": 0.03,
-        "sl_pct": 0.015,
-        "time_limit_hours": 24,
-        "max_concurrent": 2,
-    },
-    "E2": {
-        "time_limit_hours": 12,
-        "max_concurrent": 1,
-    },
-}
 
 
 from app.tasks.notifying_task import NotifyingTaskMixin
@@ -120,7 +108,7 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
         engine = candidate["engine"]
         pair = candidate["pair"]
         direction = candidate["direction"]
-        params = ENGINE_PARAMS.get(engine, ENGINE_PARAMS["E1"])
+        meta = get_strategy(engine)
 
         amount_usd = capital * self.position_size_pct
         price = candidate.get("decision_price", 0)
@@ -135,17 +123,19 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
             return
         side = 1 if direction == "LONG" else 2
 
-        # TP/SL as percentages for triple barrier
-        if engine == "E1":
-            tp_pct = params["tp_pct"]
-            sl_pct = params["sl_pct"]
-        elif engine == "E2":
-            tp_abs = candidate.get("tp_price")
-            sl_abs = candidate.get("sl_price")
-            tp_pct = abs(float(tp_abs) - price) / price if tp_abs else 0.03
-            sl_pct = abs(float(sl_abs) - price) / price if sl_abs else 0.015
+        # TP/SL: use candidate-level prices if available, fall back to registry pcts
+        tp_abs = candidate.get("tp_price")
+        sl_abs = candidate.get("sl_price")
+        if tp_abs and price > 0:
+            tp_pct = abs(float(tp_abs) - price) / price
+        else:
+            tp_pct = float(meta.exit_params.get("take_profit", "0.03"))
+        if sl_abs and price > 0:
+            sl_pct = abs(float(sl_abs) - price) / price
+        else:
+            sl_pct = float(meta.exit_params.get("stop_loss", "0.015"))
 
-        time_limit = params.get("time_limit_hours", 24) * 3600
+        time_limit = meta.exit_params.get("time_limit", 86400)
 
         # Pre-register pair so HB connector builds rate limits (prevents 'weight' crash)
         registered = await self.hb_client.ensure_trading_pair(self.connector, pair, self.account)
@@ -315,8 +305,8 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
             await self._mark_skipped("portfolio_full")
         else:
             for engine in self.engines:
-                params = ENGINE_PARAMS.get(engine, ENGINE_PARAMS["E1"])
-                max_concurrent = params.get("max_concurrent", 2)
+                meta = get_strategy(engine)
+                max_concurrent = meta.max_concurrent
                 active_count = await self._count_active_positions(engine)
 
                 if active_count >= max_concurrent or total_active >= self.max_portfolio_positions:
