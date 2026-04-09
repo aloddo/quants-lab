@@ -17,10 +17,9 @@ from core.data_paths import data_paths
 from core.data_structures.candles import Candles
 from core.tasks import BaseTask, TaskContext
 
-from app.engines.e1_compression_breakout import evaluate_e1, E1Candidate
-from app.engines.e2_range_fade import evaluate_e2, E2Candidate
-from app.engines.models import DecisionSnapshot, FeatureRow
+from app.engines.models import CandidateBase, DecisionSnapshot, FeatureRow
 from app.engines.pair_selector import get_eligible_pairs
+from app.engines.strategy_registry import get_evaluate_fn
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +81,15 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
 
         # ── 1. Candle freshness check ───────────────────────
         close = None
+        candle_high, candle_low, candle_open = None, None, None
         path = data_paths.candles_dir / f"{self.connector_name}|{pair}|1h.parquet"
         if path.exists():
             df = pd.read_parquet(path)
             if not df.empty:
                 close = float(df["close"].iloc[-1])
+                candle_high = float(df["high"].iloc[-1])
+                candle_low = float(df["low"].iloc[-1])
+                candle_open = float(df["open"].iloc[-1])
                 # Check candle age
                 if "timestamp" in df.columns:
                     last_candle_ts = pd.Timestamp(df["timestamp"].iloc[-1], unit="s", tz="UTC")
@@ -178,6 +181,12 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
             oi_change_1h_pct=deriv_d.get("oi_change_1h_pct"),
             oi_increasing=deriv_d.get("oi_increasing", 0) > 0.5,
             rs_aligned=deriv_d.get("rs_aligned", 0) > 0.5,
+            # Candle OHLC (for engines like E2 that need intra-candle data)
+            candle_high=candle_high,
+            candle_low=candle_low,
+            candle_open=candle_open,
+            # Range expansion (for E2 range stability check)
+            range_expanding=range_d.get("range_expanding"),
             feature_staleness_ok=feature_ok,
             staleness_flags=staleness_flags,
         )
@@ -280,30 +289,9 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
                             staleness_flags=fr.staleness_flags,
                         )
 
-                        if engine == "E1":
-                            cand = evaluate_e1(snap)
-                        elif engine == "E2":
-                            # Get candle high/low for E2
-                            path = data_paths.candles_dir / f"{self.connector_name}|{pair}|1h.parquet"
-                            c_high, c_low, c_open = None, None, None
-                            if path.exists():
-                                df = pd.read_parquet(path)
-                                if not df.empty:
-                                    c_high = float(df["high"].iloc[-1])
-                                    c_low = float(df["low"].iloc[-1])
-                                    c_open = float(df["open"].iloc[-1])
-                            # Range expanding from features
-                            range_docs = await self.mongodb_client.get_documents(
-                                "features",
-                                {"feature_name": "range", "trading_pair": pair},
-                                limit=1,
-                            )
-                            range_exp = None
-                            if range_docs:
-                                range_exp = range_docs[0].get("value", {}).get("range_expanding")
-                            cand = evaluate_e2(snap, c_high, c_low, c_open, range_exp)
-                        else:
-                            continue
+                        # Generic dispatch via strategy registry
+                        evaluate_fn = get_evaluate_fn(engine)
+                        cand = evaluate_fn(snap)
 
                         # Store candidate (always, even filtered)
                         await self._store_candidate(engine, cand)

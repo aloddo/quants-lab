@@ -121,11 +121,18 @@ Examples:
                             default='template_1_candles_optimization.yml',
                             help='Configuration file name (from config/ directory)')
     
-    # Validate config  
+    # Validate config
     validate_parser = subparsers.add_parser('validate-config', help='Validate task configuration')
     validate_parser.add_argument('--config', '-c', required=True,
                                 help='Configuration file name (from config/ directory)')
-    
+
+    # Scaffold a new strategy
+    scaffold_parser = subparsers.add_parser('scaffold-strategy', help='Generate files for a new trading strategy')
+    scaffold_parser.add_argument('--name', '-n', required=True,
+                                help='Engine name (e.g. E3)')
+    scaffold_parser.add_argument('--display', '-d', required=True,
+                                help='Display name (e.g. "Mean Reversion RSI")')
+
     return parser.parse_args()
 
 
@@ -332,9 +339,130 @@ def validate_config(config_path: str):
         sys.exit(1)
 
 
+def scaffold_strategy(name: str, display_name: str):
+    """Generate template files for a new trading strategy."""
+    import re
+
+    # Derive file names
+    snake = re.sub(r'[^a-z0-9]+', '_', display_name.lower()).strip('_')
+    engine_file = f"app/engines/{name.lower()}_{snake}.py"
+    controller_file = f"app/controllers/directional_trading/{name.lower()}_{snake}.py"
+
+    # Check nothing exists already
+    for path in [engine_file, controller_file]:
+        if os.path.exists(path):
+            logger.error(f"File already exists: {path}")
+            sys.exit(1)
+
+    # Engine evaluation function template
+    engine_content = f'''"""
+Engine {name} — {display_name}
+
+TODO: Describe the strategy thesis here.
+"""
+from dataclasses import dataclass, field
+from typing import Optional
+
+from app.engines.models import CandidateBase, DecisionSnapshot, validate_staleness
+
+
+@dataclass
+class {name}Candidate(CandidateBase):
+    """{name}-specific candidate fields (extends CandidateBase)."""
+    # TODO: Add engine-specific fields here
+    pass
+
+
+def evaluate_{name.lower()}(snap: DecisionSnapshot) -> {name}Candidate:
+    """
+    {name} evaluation pipeline. Reads ONLY from snapshot.
+
+    TODO: Implement your strategy logic here.
+    """
+    cand = {name}Candidate(
+        snapshot_id=snap.snapshot_id,
+        pair=snap.pair,
+        market_state=snap.market_state,
+    )
+
+    fr = snap.features
+    if fr is None:
+        cand.disposition = "FILTERED_STALENESS"
+        cand.filter_reason = "No feature data in snapshot"
+        return cand
+
+    # Validate staleness
+    stale_ok, stale_flags = validate_staleness(snap)
+    cand.feature_staleness_flags = stale_flags
+    if not stale_ok:
+        cand.disposition = "FILTERED_STALENESS"
+        cand.filter_reason = f"Stale: {{stale_flags}}"
+        return cand
+
+    # TODO: Implement trigger logic
+    cand.trigger_fired = False
+    cand.disposition = "SKIPPED_NO_TRIGGER"
+    cand.trigger_reason = "Not implemented yet"
+    return cand
+'''
+
+    # Controller template
+    controller_content = f'''"""
+{name} {display_name} — HB V2 Controller for backtesting.
+
+TODO: Implement the controller for backtesting this strategy.
+"""
+from decimal import Decimal
+from typing import List, Optional
+
+from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
+    DirectionalTradingControllerBase,
+    DirectionalTradingControllerConfigBase,
+)
+
+
+class {name}{snake.title().replace("_", "")}Config(DirectionalTradingControllerConfigBase):
+    """Configuration for {name} {display_name} controller."""
+    controller_name: str = "{name.lower()}_{snake}"
+    # TODO: Add strategy-specific config fields
+
+
+class {name}{snake.title().replace("_", "")}Controller(DirectionalTradingControllerBase):
+    """Backtesting controller for {name} {display_name}."""
+
+    def __init__(self, config: {name}{snake.title().replace("_", "")}Config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.config = config
+
+    async def update_processed_data(self):
+        """Process candle data and compute indicators."""
+        # TODO: Implement signal computation on self.candles_df
+        pass
+'''
+
+    # Write files
+    os.makedirs(os.path.dirname(engine_file), exist_ok=True)
+    os.makedirs(os.path.dirname(controller_file), exist_ok=True)
+
+    with open(engine_file, 'w') as f:
+        f.write(engine_content)
+    with open(controller_file, 'w') as f:
+        f.write(controller_content)
+
+    print(f"\\nStrategy '{name} — {display_name}' scaffolded:\\n")
+    print(f"  Engine:     {engine_file}")
+    print(f"  Controller: {controller_file}")
+    print(f"\\nNext steps:")
+    print(f"  1. Implement evaluate_{name.lower()}() in {engine_file}")
+    print(f"  2. Implement controller in {controller_file}")
+    print(f"  3. Add entry to STRATEGY_REGISTRY in app/engines/strategy_registry.py")
+    print(f"  4. Add '{name}' to engines list in config/hermes_pipeline.yml signal_scan")
+    print(f"  5. Run: python cli.py validate-config --config hermes_pipeline.yml")
+
+
 async def main():
     args = parse_args()
-    
+
     if args.command == 'run-tasks':
         await run_tasks(args.config, args.verbose)
     elif args.command == 'trigger-task':
@@ -347,6 +475,8 @@ async def main():
         list_tasks(args.config)
     elif args.command == 'validate-config':
         validate_config(args.config)
+    elif args.command == 'scaffold-strategy':
+        scaffold_strategy(args.name, args.display)
     else:
         logger.error("No command specified. Use --help for usage.")
         sys.exit(1)

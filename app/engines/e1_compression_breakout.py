@@ -25,14 +25,12 @@ Entry Quality Constraint on 5m trigger (3 checks, ALL must pass):
 Migrated from crypto-quant/engines/e1_compression_breakout.py.
 SQLite removed — candidate storage handled by task layer.
 """
-import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
 from app.engines.fmt import fp
 
-from app.engines.models import DecisionSnapshot, validate_staleness
+from app.engines.models import CandidateBase, DecisionSnapshot, validate_staleness
 
 
 # Gap threshold constants — BTC-calibrated (Phase 1).
@@ -41,31 +39,10 @@ GAP_THRESHOLD_ATR_MULT = 0.15
 
 
 @dataclass
-class E1Candidate:
-    candidate_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    snapshot_id: str = ""
-    pair: str = ""
-    direction: str = ""
-    timestamp_utc: int = field(default_factory=lambda: int(time.time() * 1000))
-    # Trigger
-    trigger_fired: bool = False
-    trigger_reason: str = ""
-    # Hard filters
-    hard_filters_passed: bool = False
-    hard_filter_fail_reason: str = ""
-    # Soft filters
-    soft_filter_score: int = 0
+class E1Candidate(CandidateBase):
+    """E1-specific candidate fields (extends CandidateBase)."""
+    # Soft filter breakdown
     soft_filter_breakdown: dict = field(default_factory=dict)
-    # State
-    market_state: str = ""
-    feature_staleness_flags: list = field(default_factory=list)
-    composite_score: float = 0.0
-    # Disposition (set by execute layer)
-    disposition: str = "PENDING"
-    filter_reason: str = ""
-    # P3 execution quality fields
-    decision_price: Optional[float] = None
-    signal_level: Optional[float] = None
     # Entry quality (set after 5m trigger)
     entry_quality_check_passed: Optional[bool] = None
     entry_quality_fail_reason: str = ""

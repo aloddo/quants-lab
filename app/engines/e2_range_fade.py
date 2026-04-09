@@ -23,14 +23,12 @@ EXIT:
 Migrated from crypto-quant/engines/e2_range_fade.py.
 SQLite removed — candidate storage handled by task layer.
 """
-import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
 from app.engines.fmt import fp
 
-from app.engines.models import DecisionSnapshot, validate_staleness
+from app.engines.models import CandidateBase, DecisionSnapshot, validate_staleness
 
 # Constants
 VOLUME_ZSCORE_CEILING = 1.5
@@ -44,28 +42,9 @@ RANGE_EXPANDING_MAX = 0.20
 
 
 @dataclass
-class E2Candidate:
-    candidate_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    snapshot_id: str = ""
-    pair: str = ""
-    direction: str = ""
-    timestamp_utc: int = field(default_factory=lambda: int(time.time() * 1000))
-    # Trigger
-    trigger_fired: bool = False
-    trigger_reason: str = ""
-    # Hard filters
-    hard_filters_passed: bool = False
-    hard_filter_fail_reason: str = ""
-    # State
-    market_state: str = ""
-    feature_staleness_flags: list = field(default_factory=list)
-    composite_score: float = 0.0
-    # Disposition
-    disposition: str = "PENDING"
-    filter_reason: str = ""
+class E2Candidate(CandidateBase):
+    """E2-specific candidate fields (extends CandidateBase)."""
     # Price levels
-    decision_price: Optional[float] = None
-    signal_level: Optional[float] = None
     entry_price: Optional[float] = None
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
@@ -76,20 +55,15 @@ class E2Candidate:
     candle_body: Optional[float] = None
     volume_zscore: Optional[float] = None
     oi_change_1h: Optional[float] = None
-    # Soft filter score (schema compat)
-    soft_filter_score: int = 0
 
 
-def evaluate_e2(
-    snap: DecisionSnapshot,
-    candle_high: Optional[float] = None,
-    candle_low: Optional[float] = None,
-    candle_open: Optional[float] = None,
-    range_expanding: Optional[float] = None,
-) -> E2Candidate:
+def evaluate_e2(snap: DecisionSnapshot) -> E2Candidate:
     """
     Full E2 evaluation pipeline. Reads ONLY from snapshot.
     Returns E2Candidate with disposition.
+
+    Candle OHLC and range_expanding are read from FeatureRow
+    (populated by signal scan before calling this function).
     """
     cand = E2Candidate(
         snapshot_id=snap.snapshot_id,
@@ -121,6 +95,7 @@ def evaluate_e2(
         return cand
 
     # 3b: Range expanding filter
+    range_expanding = fr.range_expanding
     if range_expanding is not None and range_expanding > RANGE_EXPANDING_MAX:
         cand.trigger_fired = False
         cand.disposition = "SKIPPED_RANGE_EXPANDING"
@@ -133,10 +108,10 @@ def evaluate_e2(
         cand.filter_reason = "Range high/low not computed"
         return cand
 
-    c_high = candle_high if candle_high is not None else fr.close
-    c_low = candle_low if candle_low is not None else fr.close
+    c_high = fr.candle_high if fr.candle_high is not None else fr.close
+    c_low = fr.candle_low if fr.candle_low is not None else fr.close
     c_close = fr.close
-    c_open = candle_open
+    c_open = fr.candle_open
 
     # P3: LONG ONLY
     touched_low = c_low <= fr.range_low_20
