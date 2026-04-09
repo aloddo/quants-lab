@@ -223,6 +223,27 @@ class FeatureComputationTask(NotifyingTaskMixin, BaseTask):
                 stats["errors"] += 1
                 logger.error(f"Error computing features for {pair}: {e}")
 
+        # ── External features pass ──────────────────────────────
+        from app.features import ALL_EXTERNAL_FEATURES
+        if ALL_EXTERNAL_FEATURES:
+            ext_count = 0
+            for ExtFeatureClass in ALL_EXTERNAL_FEATURES:
+                try:
+                    ext_feature = ExtFeatureClass()
+                    for pair in pairs:
+                        try:
+                            feature = await ext_feature.fetch(pair, self.connector_name)
+                            if feature and feature.value:
+                                await self._upsert_features([feature])
+                                ext_count += 1
+                        except Exception as e:
+                            logger.warning(f"External feature {ext_feature.config.name}/{pair}: {e}")
+                except Exception as e:
+                    logger.error(f"External feature class {ExtFeatureClass}: {e}")
+            if ext_count:
+                stats["features_saved"] += ext_count
+                logger.info(f"External features: {ext_count} saved from {len(ALL_EXTERNAL_FEATURES)} sources")
+
         duration = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info(
             f"FeatureComputationTask: {stats['pairs']} pairs, "

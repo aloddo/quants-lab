@@ -131,6 +131,22 @@ tasks:
     config: {}
     tags: [infra, watchdog]
 
+  # ═══════ Daily: Performance Tracking ════════════════════
+  performance_report:
+    enabled: true
+    task_class: app.tasks.reporting.performance_report_task.PerformanceReportTask
+    schedule:
+      type: cron
+      cron: "0 0 * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 120
+    config:
+      engines: ["E1", "E2"]
+      rolling_days: 30
+      weekly_summary_day: 6
+    tags: [reporting, performance, daily]
+
   # ═══════ Weekly: Re-optimization ════════════════════════
   e1_bulk_backtest:
     enabled: true
