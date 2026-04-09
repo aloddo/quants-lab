@@ -24,8 +24,8 @@ class RangeFeature(FeatureBase[RangeConfig]):
     def calculate(self, data: pd.DataFrame) -> pd.DataFrame:
         df = data.copy()
         p = self.config.period
-        df["range_high_20"] = df["high"].rolling(p).max()
-        df["range_low_20"] = df["low"].rolling(p).min()
+        df["range_high_20"] = df["high"].shift(1).rolling(p).max()
+        df["range_low_20"] = df["low"].shift(1).rolling(p).min()
         df["range_width"] = df["range_high_20"] - df["range_low_20"]
         # Range expanding = % change of range width over last N bars
         df["range_expanding"] = df["range_width"].pct_change(self.config.expansion_lookback)
