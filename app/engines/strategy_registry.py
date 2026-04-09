@@ -86,6 +86,10 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         config_class_name="E1CompressionBreakoutConfig",
         intervals=["1h", "5m"],
         backtesting_resolution="5m",
+        # Fallback exit params — E1 now computes dynamic ATR-based TP/SL
+        # in evaluate_e1() (tp_price/sl_price on E1Candidate) and in the
+        # controller's get_executor_config(). These values are used only
+        # when dynamic levels are unavailable.
         exit_params={
             "stop_loss": Decimal("0.015"),
             "take_profit": Decimal("0.03"),
