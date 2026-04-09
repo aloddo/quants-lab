@@ -36,6 +36,21 @@ REQUIRED_FEATURES = {"atr", "range", "volume"}
 from app.tasks.notifying_task import NotifyingTaskMixin
 
 
+
+# Pairs that are actually tradeable via HB API (must match the rate limiter
+# configuration in the Docker container).  If a pair isn't in this set, the
+# executor will crash with a missing throttler pool.  This acts as a hard
+# safety gate regardless of what pair_historical says.
+TRADEABLE_PAIRS: set[str] = {
+    "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT",
+    "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "UNI-USDT",
+    "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT", "SUI-USDT",
+    "SEI-USDT", "WLD-USDT", "LTC-USDT", "BCH-USDT", "BNB-USDT",
+    "CRV-USDT", "1000PEPE-USDT", "ALGO-USDT", "GALA-USDT",
+    "ONT-USDT", "TAO-USDT", "ZEC-USDT",
+}
+
+
 class SignalScanTask(NotifyingTaskMixin, BaseTask):
     """Evaluate E1/E2 engines on screened pairs and log candidates."""
 
@@ -231,6 +246,15 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
 
                 for pair_info in eligible:
                     pair = pair_info["pair"]
+
+                    # ── Tradeable-pair safety gate ─────────
+                    if pair not in TRADEABLE_PAIRS:
+                        logger.warning(
+                            f"{engine}/{pair}: skipped — not in TRADEABLE_PAIRS"
+                        )
+                        stats["skipped"] += 1
+                        continue
+
                     try:
                         fr = await self._build_feature_row(pair)
                         if fr is None:

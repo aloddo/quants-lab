@@ -76,7 +76,7 @@ tasks:
     config:
       engines: ["E1", "E2"]
       connector_name: "bybit_perpetual"
-      top_n: 10
+      top_n: 0
       telegram_chat_id: "-1003576397888"
     tags: [screening, signals]
 

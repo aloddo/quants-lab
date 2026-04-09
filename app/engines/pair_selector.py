@@ -111,9 +111,10 @@ async def get_eligible_pairs(
     else:
         ranked = candidates
 
-    # Step 4: Build output
+    # Step 4: Build output (top_n <= 0 means return all)
+    selected = ranked if top_n <= 0 else ranked[:top_n]
     result = []
-    for i, c in enumerate(ranked[:top_n]):
+    for i, c in enumerate(selected):
         result.append({
             "pair": c["pair"],
             "rank": i + 1,

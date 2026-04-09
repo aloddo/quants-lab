@@ -249,8 +249,11 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
   docker exec hummingbot-api sed -i 's|stream-testnet.bybit.com/v5/public|stream.bybit.com/v5/public|' "$PKG/bybit_perpetual_constants.py"
   docker exec hummingbot-api sed -i 's|stream-testnet.bybit.com/v5/private|stream-demo.bybit.com/v5/private|' "$PKG/bybit_perpetual_constants.py"
 
-  # 2. Rate limit fix (connector initializes without pairs, needs defaults)
-  docker exec hummingbot-api sed -i 's|return web_utils.build_rate_limits(self.trading_pairs)|pairs = self.trading_pairs or ["BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","BCH-USDT","LTC-USDT"]; return web_utils.build_rate_limits(pairs)|' "$PKG/bybit_perpetual_derivative.py"
+  # 2. Rate limit fix — executor creation bypasses add_market(), so the throttler never gets
+  #    per-pair rate limit pools. This patch provides defaults matching the pair allowlist.
+  #    MUST match pairs in MongoDB pair_historical (verdict=ALLOW). If you add a new pair to
+  #    the allowlist, add it here too or it will fail with "Failed to submit BUY order".
+  docker exec hummingbot-api sed -i 's|return web_utils.build_rate_limits(self.trading_pairs)|pairs = self.trading_pairs or ["BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT","ADA-USDT","AVAX-USDT","LINK-USDT","DOT-USDT","UNI-USDT","NEAR-USDT","APT-USDT","ARB-USDT","OP-USDT","SUI-USDT","SEI-USDT","WLD-USDT","LTC-USDT","BCH-USDT","BNB-USDT","CRV-USDT","1000PEPE-USDT","ALGO-USDT","GALA-USDT","ONT-USDT","TAO-USDT","ZEC-USDT"]; return web_utils.build_rate_limits(pairs)|' "$PKG/bybit_perpetual_derivative.py"
 
   # 3. Position mode fix (demo set-position-mode returns empty, force one-way)
   docker exec hummingbot-api sed -i "s|if self.position_mode == PositionMode.ONEWAY:|if self.position_mode == PositionMode.ONEWAY or 'testnet' in str(self._domain):|" "$PKG/bybit_perpetual_derivative.py"
@@ -265,7 +268,7 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
     -H "Content-Type: application/json" \
     -d '{"bybit_perpetual_testnet_api_key":"YOUR_DEMO_KEY","bybit_perpetual_testnet_secret_key":"YOUR_DEMO_SECRET"}'
   ```
-  **NOTE:** Old patch #4 (throttler rebuild in exchange_py_base.py) was removed Apr 6 2026. It was insufficient because the HB API backend bypasses `connector.add_trading_pair()` in 3 places (trading_service.py, accounts_service.py, unified_connector_service.py), doing raw `_trading_pairs.append()` without rebuilding the throttler. The fix is now at the resolver level: `HBApiClient.ensure_trading_pair()` calls `/market-data/trading-pair/add` before creating any executor, which goes through the proper `add_trading_pair()` path and builds rate limits for the new pair.
+  **PAIR ALLOWLIST:** Only trade pairs listed in the rate limiter patch above. The allowlist is mirrored in MongoDB `pair_historical` (verdict=ALLOW). Micro-cap / newly-listed pairs (PIPPIN, PUMPFUN, TRUMP, etc.) are permanently BLOCKED — they must be in BOTH the rate limiter patch AND pair_historical to work. Never add a pair to one without the other.
 - **Demo account capital** is ~$100k (virtual). `fallback_capital` in pipeline config is set to 100000. If HB API can't fetch portfolio state (404 on `/portfolio/overview`), it uses this fallback. 0.3% = $300 per position.
 - **Bybit demo executor quirks**: The position executor may need position mode set to one-way. If executors keep failing with max retries, run via HB MCP: "Set position mode to one-way for BTC-USDT on bybit_perpetual_demo".
 - **Git push requires token** — hermes user has no credential helper. Use the temporary URL method documented above.
