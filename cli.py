@@ -133,6 +133,21 @@ Examples:
     scaffold_parser.add_argument('--display', '-d', required=True,
                                 help='Display name (e.g. "Mean Reversion RSI")')
 
+    # Research process tracking
+    research_parser = subparsers.add_parser('research', help='Research process tracking')
+    research_sub = research_parser.add_subparsers(dest='research_command')
+
+    rs_status = research_sub.add_parser('status', help='Show research phase for an engine')
+    rs_status.add_argument('--engine', '-e', required=True)
+
+    rs_advance = research_sub.add_parser('advance', help='Record completion of a research phase')
+    rs_advance.add_argument('--engine', '-e', required=True)
+    rs_advance.add_argument('--phase', '-p', required=True,
+                           help='Phase name (e.g. P1_REGIME, P2_MONTECARLO)')
+    rs_advance.add_argument('--notes', default='', help='Free-text notes')
+
+    rs_all = research_sub.add_parser('all', help='Show research status for all engines')
+
     return parser.parse_args()
 
 
@@ -452,12 +467,96 @@ class {name}{snake.title().replace("_", "")}Controller(DirectionalTradingControl
     print(f"\\nStrategy '{name} — {display_name}' scaffolded:\\n")
     print(f"  Engine:     {engine_file}")
     print(f"  Controller: {controller_file}")
-    print(f"\\nNext steps:")
+    print(f"\\nResearch process (enforced — engine blocked from trading until Phase 2 complete):")
+    print(f"  P0_IDEA         Define hypothesis + success criteria")
+    print(f"  P1_BASELINE     Walk-forward backtest")
+    print(f"  P1_REGIME       Regime stress tests (bear/shock/range/bull)")
+    print(f"  P1_ASYMMETRY    Long/short analysis + direction decision")
+    print(f"  P1_SENSITIVITY  Parameter sensitivity (+/- 1 step)")
+    print(f"  P1_OPTIMIZED    Optuna optimization (optional)")
+    print(f"  P1_VALIDATED    One-shot validation on holdout")
+    print(f"  P2_DEGRADATION  Slippage/delay/distribution stress tests")
+    print(f"  P2_MONTECARLO   Block bootstrap, ruin < 1%")
+    print(f"  P3_PAPER        Paper trading (20+ signals, slippage < 15bps)")
+    print(f"\\nTrack progress: python cli.py research status --engine {name}")
+    print(f"Advance phase:  python cli.py research advance --engine {name} --phase P0_IDEA")
+    print(f"\\nCode steps:")
     print(f"  1. Implement evaluate_{name.lower()}() in {engine_file}")
     print(f"  2. Implement controller in {controller_file}")
     print(f"  3. Add entry to STRATEGY_REGISTRY in app/engines/strategy_registry.py")
     print(f"  4. Add '{name}' to engines list in config/hermes_pipeline.yml signal_scan")
-    print(f"  5. Run: python cli.py validate-config --config hermes_pipeline.yml")
+
+
+async def research_command(args):
+    """Handle research process tracking commands."""
+    from pymongo import MongoClient
+    from app.engines.research_tracker import ResearchTracker, ResearchPhase, PHASE_REQUIREMENTS
+
+    mongo_uri = os.getenv("MONGO_URI")
+    if not mongo_uri:
+        logger.error("MONGO_URI not set")
+        sys.exit(1)
+
+    client = MongoClient(mongo_uri)
+    db = client[os.getenv("MONGO_DATABASE", "quants_lab")]
+    tracker = ResearchTracker(db)
+
+    if args.research_command == 'status':
+        status = await tracker.get_status_summary(args.engine)
+        print(f"\n{status}")
+
+        # Show requirements for next phase
+        phase = await tracker.get_phase(args.engine)
+        next_val = phase.value + 10
+        try:
+            next_phase = ResearchPhase(next_val)
+            reqs = PHASE_REQUIREMENTS.get(next_phase, [])
+            if reqs:
+                print(f"\n  Next phase ({next_phase.name}) requires:")
+                for r in reqs:
+                    print(f"    - {r}")
+        except ValueError:
+            pass
+
+    elif args.research_command == 'advance':
+        # For CLI advancement, collect evidence interactively
+        phase_name = args.phase.upper()
+        try:
+            phase_enum = ResearchPhase[phase_name]
+        except KeyError:
+            logger.error(f"Unknown phase: {phase_name}")
+            print(f"Valid phases: {[p.name for p in ResearchPhase]}")
+            sys.exit(1)
+
+        reqs = PHASE_REQUIREMENTS.get(phase_enum, [])
+        print(f"\nAdvancing {args.engine} to {phase_name}")
+        print(f"Required evidence: {reqs}")
+        print(f"(Pass evidence via code or notebook — CLI records the advance)")
+
+        # Minimal evidence for CLI-driven advance
+        evidence = {"advanced_via": "cli", "notes": args.notes}
+        for r in reqs:
+            evidence[r] = f"[recorded via CLI — see notes]"
+
+        ok = await tracker.advance(args.engine, phase_name, evidence, args.notes)
+        if ok:
+            print(f"Advanced {args.engine} to {phase_name}")
+        else:
+            print(f"Failed to advance — check requirements")
+            sys.exit(1)
+
+    elif args.research_command == 'all':
+        from app.engines.strategy_registry import STRATEGY_REGISTRY
+        print("\n=== Research Status ===")
+        for engine in STRATEGY_REGISTRY:
+            status = await tracker.get_status_summary(engine)
+            print(f"\n{status}")
+
+    else:
+        logger.error("Unknown research command. Use: status, advance, all")
+        sys.exit(1)
+
+    client.close()
 
 
 async def main():
@@ -477,6 +576,8 @@ async def main():
         validate_config(args.config)
     elif args.command == 'scaffold-strategy':
         scaffold_strategy(args.name, args.display)
+    elif args.command == 'research':
+        await research_command(args)
     else:
         logger.error("No command specified. Use --help for usage.")
         sys.exit(1)
