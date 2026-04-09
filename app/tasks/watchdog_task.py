@@ -1,7 +1,10 @@
 """
-Watchdog task — two jobs:
+Watchdog task — health checks:
 1. Reap stale task locks (prevents permanent pipeline blockage after crashes).
-2. Check data freshness (alerts if candles or features go stale).
+2. Check task execution recency.
+3. Check candle data freshness.
+4. Check feature freshness.
+5. Check HB API and QL API health.
 
 Runs every 5 minutes.  Sends Telegram alerts with cooldown (max 1 per hour
 for the same issue category).
@@ -12,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 from pymongo import MongoClient
 
 from core.tasks import BaseTask, TaskContext, TaskResult, TaskStatus
@@ -68,7 +72,12 @@ class WatchdogTask(BaseTask):
         if feature_issues:
             issues.extend(feature_issues)
 
-        # ── 5. Alert with cooldown ────────────────────────────
+        # ── 5. Check API health ─────────────────────────────────
+        api_issues = await self._check_api_health()
+        if api_issues:
+            issues.extend(api_issues)
+
+        # ── 6. Alert with cooldown ────────────────────────────
         # Lock reaps always alert (they're actionable and self-healing).
         # Health issues use cooldown to avoid spam.
         if reaped:
@@ -201,6 +210,30 @@ class WatchdogTask(BaseTask):
                     issues.append(
                         f"BTC feature '{fname}' is {age.total_seconds()/3600:.1f}h old"
                     )
+        return issues
+
+    # ── API health checks ──────────────────────────────────
+
+    async def _check_api_health(self) -> list:
+        """Check that HB API (:8000) and QL API (:8001) are reachable."""
+        issues = []
+        checks = [
+            ("HB API", "http://localhost:8000/", os.getenv("HUMMINGBOT_API_USERNAME", "admin"),
+             os.getenv("HUMMINGBOT_API_PASSWORD", "admin")),
+            ("QL API", "http://localhost:8001/health", None, None),
+        ]
+        timeout = aiohttp.ClientTimeout(total=5)
+        for label, url, user, pwd in checks:
+            try:
+                auth = aiohttp.BasicAuth(user, pwd) if user else None
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, auth=auth) as resp:
+                        if resp.status >= 500:
+                            issues.append(f"{label} returned HTTP {resp.status}")
+            except aiohttp.ClientError as e:
+                issues.append(f"{label} unreachable: {type(e).__name__}")
+            except Exception as e:
+                issues.append(f"{label} check failed: {e}")
         return issues
 
     # ── Alerting with cooldown ───────────────────────────────
