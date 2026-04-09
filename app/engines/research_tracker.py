@@ -190,7 +190,7 @@ class ResearchTracker:
         }
 
         coll = self.db[COLLECTION]
-        await coll.update_one(
+        result = coll.update_one(
             {"engine": engine},
             {
                 "$set": {
@@ -206,6 +206,8 @@ class ResearchTracker:
             },
             upsert=True,
         )
+        if hasattr(result, '__await__'):
+            await result
 
         logger.info(f"{engine}: advanced to {phase}")
         return True
@@ -243,9 +245,12 @@ class ResearchTracker:
         )
 
     async def _get_doc(self, engine: str) -> Optional[Dict]:
-        """Get checklist document from MongoDB."""
+        """Get checklist document from MongoDB.
+
+        Handles both pymongo (sync) and motor (async) clients.
+        """
         coll = self.db[COLLECTION]
-        # Handle both motor (async) and pymongo (sync) clients
-        if hasattr(coll, 'find_one') and not hasattr(coll.find_one, '__await__'):
-            return coll.find_one({"engine": engine})
-        return await coll.find_one({"engine": engine})
+        result = coll.find_one({"engine": engine})
+        if hasattr(result, '__await__'):
+            return await result
+        return result
