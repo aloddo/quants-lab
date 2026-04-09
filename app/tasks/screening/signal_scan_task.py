@@ -238,11 +238,14 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
             logger.warning(f"Telegram send failed: {e}")
 
     async def _check_engine_circuit_breaker(self, engine: str) -> bool:
-        """Check if engine should be paused based on walk-forward test performance.
+        """Check if engine should be paused.
 
-        Returns True if engine is OK to run, False if it should be paused.
-        Checks engine_state collection for manual overrides, then
-        walk-forward test-period PF from pair_historical.
+        Gates (checked in order):
+        1. Manual override (force_enabled in engine_state)
+        2. Research phase gate (must have passed P2_MONTECARLO to paper trade)
+        3. Walk-forward test PF (aggregate test PF must be >= 1.0)
+
+        Returns True if engine is OK to run, False if paused.
         """
         db = self.mongodb_client.get_database()
 
@@ -251,6 +254,23 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
         if state and state.get("force_enabled"):
             logger.info(f"{engine}: circuit breaker overridden (force_enabled=true)")
             return True
+
+        # Research phase gate — engine must have passed Phase 2
+        try:
+            from app.engines.research_tracker import ResearchTracker, PAPER_TRADE_MINIMUM
+            tracker = ResearchTracker(db)
+            phase = await tracker.get_phase(engine)
+            if phase.value < PAPER_TRADE_MINIMUM.value:
+                logger.info(
+                    f"{engine}: blocked by research gate — "
+                    f"phase={phase.name}, need={PAPER_TRADE_MINIMUM.name}. "
+                    f"Override: db.engine_state.updateOne("
+                    f'{{engine: "{engine}"}}, {{$set: {{force_enabled: true}}}})'
+                )
+                return False
+        except Exception as e:
+            # Don't block on research tracker errors — fall through to other checks
+            logger.debug(f"{engine}: research tracker check failed: {e}")
 
         # Check walk-forward test PF (aggregated across ALLOW pairs)
         pipeline = [
