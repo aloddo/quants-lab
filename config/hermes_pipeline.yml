@@ -148,3 +148,42 @@ tasks:
       backtest_days: 365
       trade_cost: 0.000375
     tags: [backtesting, e2, weekly]
+
+  # ═══════ Weekly: Walk-Forward Validation ═════════════════
+  e1_walk_forward:
+    enabled: true
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "E1"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, e1, walk-forward, weekly]
+
+  e2_walk_forward:
+    enabled: true
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 6 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 7200
+    config:
+      engine: "E2"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, e2, walk-forward, weekly]
