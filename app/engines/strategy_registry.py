@@ -84,8 +84,8 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         evaluate_fn=_lazy_e1,
         controller_module="app.controllers.directional_trading.e1_compression_breakout",
         config_class_name="E1CompressionBreakoutConfig",
-        intervals=["1h", "5m"],
-        backtesting_resolution="5m",
+        intervals=["1h", "1m"],
+        backtesting_resolution="1m",
         # Fallback exit params — E1 now computes dynamic ATR-based TP/SL
         # in evaluate_e1() (tp_price/sl_price on E1Candidate) and in the
         # controller's get_executor_config(). These values are used only
@@ -94,11 +94,10 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
             "stop_loss": Decimal("0.015"),
             "take_profit": Decimal("0.03"),
             "time_limit": 86400,
-            "entry_quality_filter": False,
         },
         trailing_stop={
             "activation_price": Decimal("0.015"),
-            "trailing_delta": Decimal("0.005"),
+            "trailing_delta": Decimal("0.010"),
         },
         direction="BOTH",
         blocked_pairs=["BTC-USDT"],

@@ -149,6 +149,21 @@ tasks:
     config: {}
     tags: [infra, watchdog]
 
+  # ═══════ Daily: Signal Attribution ══════════════════════
+  signal_attribution:
+    enabled: true
+    task_class: app.tasks.backtesting.signal_attribution_task.SignalAttributionTask
+    schedule:
+      type: cron
+      cron: "0 1 * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 600
+    config:
+      lookback_hours: 48
+      connector_name: "bybit_perpetual"
+    tags: [reporting, attribution, daily]
+
   # ═══════ Daily: Performance Tracking ════════════════════
   performance_report:
     enabled: true

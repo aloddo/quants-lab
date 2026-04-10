@@ -136,6 +136,7 @@ class WatchdogTask(BaseTask):
             await self._send_health_alert(db, issues)
         else:
             logger.info("Watchdog: all checks passed")
+            self._clear_issue_state(db)  # reset escalation timer
 
         client.close()
 
@@ -544,6 +545,43 @@ class WatchdogTask(BaseTask):
         )
         return True
 
+    def _get_issue_level(self, db, issues: list) -> int:
+        """
+        Return escalation level based on how long issues have been unresolved.
+
+        L1 (< 30 min): first detection
+        L2 (30-120 min): unresolved warning
+        L3 (>= 120 min): critical with diagnostics
+
+        Tracks first_seen_at per issue fingerprint in watchdog_state.
+        Clears resolved issues from state.
+        """
+        now = datetime.utcnow()
+        # Use a stable fingerprint for the current issue set
+        issue_key = "active_issues"
+        doc = db.watchdog_state.find_one({"_id": issue_key}) or {}
+        first_seen = doc.get("first_seen_at")
+
+        if first_seen is None:
+            # First detection
+            db.watchdog_state.update_one(
+                {"_id": issue_key},
+                {"$set": {"first_seen_at": now, "issues": issues}},
+                upsert=True,
+            )
+            return 1
+
+        age_min = (now - first_seen).total_seconds() / 60
+        if age_min >= 120:
+            return 3
+        if age_min >= 30:
+            return 2
+        return 1
+
+    def _clear_issue_state(self, db):
+        """Call when watchdog runs clean (no issues) to reset escalation timer."""
+        db.watchdog_state.delete_one({"_id": "active_issues"})
+
     async def _send_lock_alert(self, reaped: list, healed: list = None):
         """Lock reaps always alert immediately (they're self-healing actions)."""
         try:
@@ -582,25 +620,76 @@ class WatchdogTask(BaseTask):
             logger.debug(f"Watchdog: failed to send heal alert: {e}")
 
     async def _send_health_alert(self, db, issues: list):
-        """Health issues use cooldown — max 1 Telegram per hour."""
+        """
+        Tiered health alerts.
+
+        L1 (first detection): normal — Watchdog Health Alert
+        L2 (>30 min unresolved): ⚠️ UNRESOLVED — with elapsed time
+        L3 (>2h unresolved): 🚨 CRITICAL — diagnostic dump
+        """
+        level = self._get_issue_level(db, issues)
+
         if not self._should_alert(db, "health_issues"):
             logger.info(f"Watchdog: {len(issues)} issue(s) suppressed (cooldown)")
             return
+
         try:
-            if hasattr(self, "notification_manager") and self.notification_manager:
-                from core.notifiers.base import NotificationMessage
-                body = "\n".join(f"\u2022 {i}" for i in issues)
-                await self.notification_manager.send_notification(NotificationMessage(
-                    title="Watchdog Health Alert",
-                    message=(
-                        f"<b>Watchdog — {len(issues)} issue(s)</b>\n\n"
-                        f"{body}\n\n"
-                        f"Next alert in {ALERT_COOLDOWN_MINUTES}m if unresolved.\n"
-                        f"Check: <code>bash scripts/status.sh</code>"
-                    ),
-                    level="error" if any("never" in i.lower() or "missing" in i.lower()
-                                         or "streak" in i.lower() for i in issues) else "warning",
-                ))
+            if not (hasattr(self, "notification_manager") and self.notification_manager):
+                return
+
+            from core.notifiers.base import NotificationMessage
+            body = "\n".join(f"\u2022 {i}" for i in issues)
+
+            if level == 1:
+                title = "Watchdog Health Alert"
+                header = f"<b>Watchdog — {len(issues)} issue(s)</b>"
+                suffix = (
+                    f"\n\nNext alert in {ALERT_COOLDOWN_MINUTES}m if unresolved.\n"
+                    f"Check: <code>bash scripts/status.sh</code>"
+                )
+                alert_level = "warning"
+
+            elif level == 2:
+                doc = db.watchdog_state.find_one({"_id": "active_issues"}) or {}
+                first_seen = doc.get("first_seen_at")
+                elapsed = ""
+                if first_seen:
+                    age_min = (datetime.utcnow() - first_seen).total_seconds() / 60
+                    elapsed = f" (unresolved {age_min:.0f}m)"
+                title = f"UNRESOLVED: Watchdog{elapsed}"
+                header = f"<b>\u26a0\ufe0f UNRESOLVED{elapsed} — {len(issues)} issue(s)</b>"
+                suffix = "\n\nCheck: <code>bash scripts/status.sh</code>"
+                alert_level = "error"
+
+            else:  # level == 3
+                doc = db.watchdog_state.find_one({"_id": "active_issues"}) or {}
+                first_seen = doc.get("first_seen_at")
+                elapsed = ""
+                if first_seen:
+                    age_min = (datetime.utcnow() - first_seen).total_seconds() / 60
+                    elapsed = f" ({age_min:.0f}m)"
+                title = f"CRITICAL: Watchdog{elapsed}"
+                header = f"<b>\U0001f6a8 CRITICAL — Unresolved {len(issues)} issue(s){elapsed}</b>"
+                # Add diagnostic dump
+                try:
+                    import subprocess
+                    proc = subprocess.run(
+                        ["bash", "scripts/status.sh"],
+                        capture_output=True, text=True, timeout=10,
+                        cwd="/Users/hermes/quants-lab",
+                    )
+                    diag = proc.stdout[:500] if proc.stdout else "status.sh failed"
+                except Exception as ex:
+                    diag = f"Diagnostic unavailable: {ex}"
+                suffix = f"\n\n<code>{diag}</code>\n\nManual check required."
+                alert_level = "error"
+
+            await self.notification_manager.send_notification(NotificationMessage(
+                title=title,
+                message=f"{header}\n\n{body}{suffix}",
+                level=alert_level,
+            ))
+
         except Exception as e:
             logger.debug(f"Watchdog: failed to send health alert: {e}")
 

@@ -78,8 +78,11 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
 
                 exec_status = status.get("status", "").lower()
                 if exec_status in ("completed", "failed", "stopped", "closed", "terminated"):
-                    fill_price = status.get("entry_price") or status.get("fill_price")
-                    exit_price = status.get("close_price") or status.get("exit_price")
+                    custom_info = status.get("custom_info") or {}
+                    fill_price = (status.get("entry_price") or status.get("fill_price")
+                                  or custom_info.get("current_position_average_price"))
+                    exit_price = (status.get("close_price") or status.get("exit_price")
+                                  or custom_info.get("close_price"))
                     pnl = status.get("pnl") or status.get("net_pnl_quote")
                     close_type = status.get("close_type")
                     filled_amount = status.get("filled_amount_quote")
@@ -190,6 +193,19 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
         capital = await get_capital(self.hb_client, self.account, self.fallback_capital)
 
         for engine in self.engines:
+            # Shadow engines are evaluated-only — never place real orders
+            try:
+                from app.engines.strategy_registry import get_strategy
+                meta = get_strategy(engine)
+                if meta.shadow_of:
+                    logger.info(
+                        f"{engine}: shadow engine (shadow of {meta.shadow_of}) "
+                        f"— skipping placement"
+                    )
+                    continue
+            except KeyError:
+                pass  # engine not in registry, proceed normally
+
             # Check engine/portfolio limits
             limit_reason = await check_portfolio_limits(
                 db, engine, self.engines, self.max_portfolio_positions,

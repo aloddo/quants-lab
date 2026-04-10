@@ -162,6 +162,17 @@ async def place_order(
 
     time_limit = meta.exit_params.get("time_limit", 86400)
 
+    triple_barrier = {
+        "take_profit": str(tp_pct),
+        "stop_loss": str(sl_pct),
+        "time_limit": time_limit,
+    }
+    if meta.trailing_stop:
+        triple_barrier["trailing_stop"] = {
+            "activation_price": str(meta.trailing_stop["activation_price"]),
+            "trailing_delta": str(meta.trailing_stop["trailing_delta"]),
+        }
+
     # Pre-register pair so HB connector builds rate limits
     registered = await hb_client.ensure_trading_pair(connector, pair, account)
     if not registered:
@@ -176,11 +187,7 @@ async def place_order(
             "side": side,
             "amount": str(amount),
             "leverage": 1,
-            "triple_barrier_config": {
-                "take_profit": str(tp_pct),
-                "stop_loss": str(sl_pct),
-                "time_limit": time_limit,
-            },
+            "triple_barrier_config": triple_barrier,
         },
     }
 
@@ -203,6 +210,7 @@ async def place_order(
                 "testnet_tp_pct": tp_pct,
                 "testnet_sl_pct": sl_pct,
                 "testnet_time_limit": time_limit,
+                "testnet_trailing_stop": meta.trailing_stop if meta.trailing_stop else None,
             }},
         )
 

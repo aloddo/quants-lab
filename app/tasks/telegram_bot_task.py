@@ -44,6 +44,7 @@ class TelegramBotTask(BaseTask):
             "/status": self._handle_status,
             "/pnl": self._handle_pnl,
             "/heal": self._handle_heal,
+            "/shadow": self._handle_shadow,
             "/help": self._handle_help,
         }
 
@@ -134,8 +135,89 @@ class TelegramBotTask(BaseTask):
             "/status — System health check\n"
             "/pnl — Performance summary\n"
             "/heal — Recent watchdog self-healing actions\n"
+            "/shadow — Shadow engine vs live comparison\n"
             "/help — This message"
         )
+
+    async def _handle_shadow(self) -> str:
+        """Compare shadow engines vs their live counterparts via signal attribution."""
+        from pymongo import MongoClient
+        from app.engines.strategy_registry import STRATEGY_REGISTRY
+
+        mongo_uri = os.getenv("MONGO_URI")
+        mongo_db_name = os.getenv("MONGO_DATABASE", "quants_lab")
+        if not mongo_uri:
+            return "No MONGO_URI configured."
+
+        client = MongoClient(mongo_uri)
+        db = client[mongo_db_name]
+
+        # Find shadow engines
+        shadows = {
+            name: meta for name, meta in STRATEGY_REGISTRY.items()
+            if meta.shadow_of
+        }
+
+        if not shadows:
+            client.close()
+            return (
+                "<b>Shadow Engines</b>\n\n"
+                "No shadow engines registered.\n\n"
+                "To create one, add a StrategyMetadata entry with "
+                "<code>shadow_of=\"E1\"</code> to STRATEGY_REGISTRY."
+            )
+
+        lines = ["<b>Shadow Engine Comparison</b>\n"]
+
+        cutoff_ms = int(
+            (__import__("datetime").datetime.utcnow() -
+             __import__("datetime").timedelta(days=14)).timestamp() * 1000
+        )
+
+        for shadow_name, shadow_meta in shadows.items():
+            live_name = shadow_meta.shadow_of
+            lines.append(f"\n<b>{shadow_name}</b> vs <b>{live_name}</b> (14d)\n")
+
+            for eng in [live_name, shadow_name]:
+                # Attributed candidates (theoretical outcomes)
+                attr_pipeline = [
+                    {"$match": {
+                        "engine": eng,
+                        "trigger_fired": True,
+                        "attr_computed_at": {"$exists": True},
+                        "timestamp_utc": {"$gte": cutoff_ms},
+                    }},
+                    {"$group": {
+                        "_id": None,
+                        "total": {"$sum": 1},
+                        "wins": {"$sum": {"$cond": [
+                            {"$eq": ["$attr_theoretical_close", "TP"]}, 1, 0
+                        ]}},
+                        "avg_pnl": {"$avg": "$attr_theoretical_pnl_pct"},
+                    }},
+                ]
+                attr_res = list(db.candidates.aggregate(attr_pipeline))
+                if attr_res:
+                    a = attr_res[0]
+                    total = a["total"]
+                    wr = a["wins"] / total * 100 if total > 0 else 0
+                    avg_pnl = a.get("avg_pnl") or 0
+                    label = "[SHADOW]" if eng == shadow_name else "[LIVE]"
+                    lines.append(
+                        f"  {label} {eng}: {total} signals, "
+                        f"WR={wr:.0f}%, avg_pnl={avg_pnl:.2f}%"
+                    )
+                else:
+                    label = "[SHADOW]" if eng == shadow_name else "[LIVE]"
+                    lines.append(f"  {label} {eng}: no attributed data yet")
+
+        lines.append(
+            "\n<i>Attribution runs daily. "
+            "Promote: <code>python cli.py promote-shadow --engine SHADOW --to LIVE</code></i>"
+        )
+
+        client.close()
+        return "\n".join(lines)
 
     async def _handle_heal(self) -> str:
         """Show recent watchdog self-healing actions from watchdog_state."""

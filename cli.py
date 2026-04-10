@@ -133,6 +133,16 @@ Examples:
     scaffold_parser.add_argument('--display', '-d', required=True,
                                 help='Display name (e.g. "Mean Reversion RSI")')
 
+    # Promote a shadow engine to live
+    shadow_parser = subparsers.add_parser(
+        'promote-shadow',
+        help='Promote a shadow engine: show parameter diff and emit update instructions',
+    )
+    shadow_parser.add_argument('--engine', '-e', required=True,
+                               help='Shadow engine name (e.g. E1_shadow)')
+    shadow_parser.add_argument('--to', required=True,
+                               help='Live engine to promote into (e.g. E1)')
+
     # Research process tracking
     research_parser = subparsers.add_parser('research', help='Research process tracking')
     research_sub = research_parser.add_subparsers(dest='research_command')
@@ -249,6 +259,17 @@ async def serve_api(config_path: str, host: str, port: int):
         runner = TaskRunner(config_path=config_path, enable_api=True)
         runner.api_host = host
         runner.api_port = port
+
+        # Inject dashboard router AFTER TaskRunner is initialised (so core.tasks.api
+        # is fully imported and app is the same object uvicorn will serve).
+        try:
+            from core.tasks.api import app as fastapi_app
+            from app.web.dashboard import router as dashboard_router
+            fastapi_app.include_router(dashboard_router)
+            logger.info("Dashboard mounted at /dashboard")
+        except Exception as e:
+            logger.warning(f"Could not mount dashboard router: {e}")
+
         await runner.start()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
@@ -487,6 +508,62 @@ class {name}{snake.title().replace("_", "")}Controller(DirectionalTradingControl
     print(f"  4. Add '{name}' to engines list in config/hermes_pipeline.yml signal_scan")
 
 
+def promote_shadow(shadow_name: str, live_name: str):
+    """
+    Show parameter diff between a shadow engine and its live counterpart.
+    Emits the exact code change needed to promote the shadow to live.
+
+    Does NOT auto-modify strategy_registry.py — human review is required.
+    """
+    from app.engines.strategy_registry import STRATEGY_REGISTRY
+
+    if shadow_name not in STRATEGY_REGISTRY:
+        print(f"Error: '{shadow_name}' not found in STRATEGY_REGISTRY.")
+        print(f"Registered engines: {list(STRATEGY_REGISTRY.keys())}")
+        sys.exit(1)
+
+    if live_name not in STRATEGY_REGISTRY:
+        print(f"Error: '{live_name}' not found in STRATEGY_REGISTRY.")
+        sys.exit(1)
+
+    shadow = STRATEGY_REGISTRY[shadow_name]
+    live = STRATEGY_REGISTRY[live_name]
+
+    if shadow.shadow_of != live_name:
+        print(f"Warning: {shadow_name}.shadow_of = '{shadow.shadow_of}', expected '{live_name}'")
+
+    print(f"\nPromote {shadow_name} → {live_name}\n{'='*50}\n")
+
+    # Show parameter diff
+    diffs = []
+    for attr in ("exit_params", "trailing_stop", "direction", "blocked_pairs",
+                 "required_features", "max_concurrent"):
+        s_val = getattr(shadow, attr, None)
+        l_val = getattr(live, attr, None)
+        if s_val != l_val:
+            diffs.append((attr, l_val, s_val))
+
+    if not diffs:
+        print("No parameter differences found — shadow is identical to live engine.")
+        print(f"\nTo remove the shadow, delete the '{shadow_name}' entry from STRATEGY_REGISTRY.")
+        return
+
+    print("Parameter changes:\n")
+    for attr, live_val, shadow_val in diffs:
+        print(f"  {attr}:")
+        print(f"    live:   {live_val}")
+        print(f"    shadow: {shadow_val}")
+        print()
+
+    print("\nTo promote, apply these changes to app/engines/strategy_registry.py:\n")
+    print(f"  In the '{live_name}' StrategyMetadata entry:")
+    for attr, _, shadow_val in diffs:
+        print(f"    {attr} = {repr(shadow_val)},")
+
+    print(f"\nThen remove the '{shadow_name}' entry from STRATEGY_REGISTRY.")
+    print("\nRestart pipeline after changes: sudo launchctl stop com.quantslab.pipeline")
+
+
 async def research_command(args):
     """Handle research process tracking commands."""
     from pymongo import MongoClient
@@ -578,6 +655,8 @@ async def main():
         scaffold_strategy(args.name, args.display)
     elif args.command == 'research':
         await research_command(args)
+    elif args.command == 'promote-shadow':
+        promote_shadow(args.engine, getattr(args, 'to'))
     else:
         logger.error("No command specified. Use --help for usage.")
         sys.exit(1)

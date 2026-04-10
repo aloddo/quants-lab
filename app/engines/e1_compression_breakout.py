@@ -188,12 +188,15 @@ def evaluate_e1(snap: DecisionSnapshot) -> E1Candidate:
         range_width = fr.range_high_20 - fr.range_low_20
 
     if range_width and range_width > 0:
+        # ATR buffer below/above breakout level to absorb brief whipsaw re-entries.
+        # 0.5×ATR gives noise tolerance without moving SL too far from thesis invalidation.
+        atr_buffer = (fr.atr_14_1h * 0.5) if fr.atr_14_1h else 0.0
         if direction == "LONG":
             cand.tp_price = price + range_width
-            cand.sl_price = breakout_level  # re-entry into range = thesis invalid
+            cand.sl_price = breakout_level - atr_buffer  # allow brief dip below range high
         else:
             cand.tp_price = price - range_width
-            cand.sl_price = breakout_level  # re-entry into range = thesis invalid
+            cand.sl_price = breakout_level + atr_buffer  # allow brief spike above range low
 
         # R:R gate — reject if risk exceeds reward
         tp_dist = abs(cand.tp_price - price)
