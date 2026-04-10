@@ -27,6 +27,9 @@ class ATRFeature(FeatureBase[ATRConfig]):
         df = data.copy()
         df["atr_14_1h"] = atr(df, self.config.atr_period)
         df["atr_percentile_90d"] = percentile_rank(df["atr_14_1h"], self.config.percentile_window)
+        df["atr_median_90d"] = df["atr_14_1h"].rolling(
+            window=self.config.percentile_window, min_periods=100,
+        ).median()
         df["compression_flag"] = df["atr_percentile_90d"] < self.config.compression_threshold
         return df
 
@@ -38,6 +41,8 @@ class ATRFeature(FeatureBase[ATRConfig]):
             value["atr_14_1h"] = float(last["atr_14_1h"])
         if pd.notna(last["atr_percentile_90d"]):
             value["atr_percentile_90d"] = float(last["atr_percentile_90d"])
+        if pd.notna(last.get("atr_median_90d")):
+            value["atr_median_90d"] = float(last["atr_median_90d"])
         value["compression_flag"] = 1.0 if last.get("compression_flag") else 0.0
 
         return Feature(

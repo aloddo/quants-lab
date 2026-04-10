@@ -6,19 +6,22 @@ On CANDIDATE_READY: creates PositionExecutor with TP/SL/time limit.
 On subsequent runs: polls executor status, records fills and outcomes.
 """
 import logging
-import math
-import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from core.tasks import BaseTask, TaskContext
+from app.engines.fmt import fp, fmt_duration, fmt_pnl
 from app.services.hb_api_client import HBApiClient
-from app.engines.strategy_registry import get_strategy
+from app.tasks.notifying_task import NotifyingTaskMixin
+from app.tasks.resolution.placement import (
+    check_duplicate,
+    check_portfolio_limits,
+    get_capital,
+    mark_skipped,
+    place_order,
+)
 
 logger = logging.getLogger(__name__)
-
-
-from app.tasks.notifying_task import NotifyingTaskMixin
 
 
 class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
@@ -34,7 +37,7 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
         self.engines = task_config.get("engines", ["E1", "E2"])
         self.max_portfolio_positions = task_config.get("max_portfolio_positions", 3)
         self.hb_client = HBApiClient()
-        self._trading_rules: Dict[str, Any] = {}  # pair -> {min_base_amount_increment, min_order_size, ...}
+        self._trading_rules: Dict[str, Any] = {}
 
     async def setup(self, context: TaskContext) -> None:
         await super().setup(context)
@@ -42,27 +45,13 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
         await self._setup_checks()
 
     async def _refresh_trading_rules(self) -> None:
-        """Load trading rules from HB API (CLOBDataSource excludes testnet connectors)."""
+        """Load trading rules from HB API."""
         try:
             rules = await self.hb_client.get_trading_rules(self.connector)
-            self._trading_rules = rules  # {pair: {min_base_amount_increment, ...}}
+            self._trading_rules = rules
             logger.info(f"Loaded trading rules for {len(self._trading_rules)} pairs")
         except Exception as e:
             logger.warning(f"Could not load trading rules: {e}")
-
-    def _quantize_amount(self, pair: str, raw_amount: float) -> float:
-        """Quantize order amount to the pair's min_base_amount_increment."""
-        rule = self._trading_rules.get(pair)
-        if rule:
-            step = rule.get("min_base_amount_increment", 0)
-            if step and step > 0:
-                quantized = math.floor(raw_amount / step) * step
-                min_size = rule.get("min_order_size", 0) or 0
-                if quantized < min_size:
-                    return 0.0
-                return quantized
-        # Fallback: round to 3 decimals (legacy behaviour)
-        return round(raw_amount, 3)
 
     async def _setup_checks(self) -> None:
         if not self.mongodb_client:
@@ -70,130 +59,6 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
         if not await self.hb_client.health_check():
             raise RuntimeError(
                 f"Hummingbot API at {self.hb_client.base_url} is unreachable."
-            )
-
-    async def _get_capital(self) -> float:
-        try:
-            portfolio = await self.hb_client.get_portfolio_state(self.account)
-            if isinstance(portfolio, dict):
-                for token_data in portfolio.get("tokens", []):
-                    if token_data.get("token") == "USDT":
-                        return float(token_data.get("balance", self.fallback_capital))
-            return self.fallback_capital
-        except Exception as e:
-            logger.warning(f"Could not fetch capital: {e}, using fallback {self.fallback_capital}")
-            return self.fallback_capital
-
-    async def _count_active_positions(self, engine: str) -> int:
-        docs = await self.mongodb_client.get_documents(
-            "candidates", {"engine": engine, "disposition": "TESTNET_ACTIVE"},
-        )
-        return len(docs)
-
-    async def _mark_skipped(self, reason: str) -> None:
-        """Mark all CANDIDATE_READY as skipped with reason (for would-have-won analysis)."""
-        db = self.mongodb_client.get_database()
-        result = await db["candidates"].update_many(
-            {"disposition": "CANDIDATE_READY"},
-            {"$set": {
-                "disposition": "SKIPPED_CONCURRENCY",
-                "skipped_reason": reason,
-                "skipped_at": int(datetime.now(timezone.utc).timestamp() * 1000),
-            }},
-        )
-        if result.modified_count > 0:
-            logger.info(f"Marked {result.modified_count} candidates as SKIPPED ({reason})")
-
-    async def _place_order(self, candidate: dict, capital: float) -> None:
-        engine = candidate["engine"]
-        pair = candidate["pair"]
-        direction = candidate["direction"]
-        meta = get_strategy(engine)
-
-        amount_usd = capital * self.position_size_pct
-        price = candidate.get("decision_price", 0)
-        if price <= 0:
-            logger.error(f"Invalid decision_price for {pair}: {price}")
-            return
-
-        raw_amount = amount_usd / price
-        amount = self._quantize_amount(pair, raw_amount)
-        if amount <= 0:
-            logger.warning(f"Order amount too small for {pair}: ${amount_usd:.2f} / {price} = {raw_amount} (below min)")
-            return
-        side = 1 if direction == "LONG" else 2
-
-        # TP/SL: use candidate-level prices if available, fall back to registry pcts
-        tp_abs = candidate.get("tp_price")
-        sl_abs = candidate.get("sl_price")
-        if tp_abs and price > 0:
-            tp_pct = abs(float(tp_abs) - price) / price
-        else:
-            tp_pct = float(meta.exit_params.get("take_profit", "0.03"))
-        if sl_abs and price > 0:
-            sl_pct = abs(float(sl_abs) - price) / price
-        else:
-            sl_pct = float(meta.exit_params.get("stop_loss", "0.015"))
-
-        time_limit = meta.exit_params.get("time_limit", 86400)
-
-        # Pre-register pair so HB connector builds rate limits (prevents 'weight' crash)
-        registered = await self.hb_client.ensure_trading_pair(self.connector, pair, self.account)
-        if not registered:
-            logger.warning(f"Could not pre-register {pair} — executor may fail")
-
-        request_body = {
-            "account_name": self.account,
-            "executor_config": {
-                "type": "position_executor",
-                "connector_name": self.connector,
-                "trading_pair": pair,
-                "side": side,
-                "amount": str(amount),
-                "leverage": 1,
-                "triple_barrier_config": {
-                    "take_profit": str(tp_pct),
-                    "stop_loss": str(sl_pct),
-                    "time_limit": time_limit,
-                },
-            },
-        }
-
-        try:
-            result = await self.hb_client.create_executor(request_body)
-            executor_id = result.get("executor_id") or result.get("id")
-            logger.info(f"Placed demo order for {engine}/{pair}: executor_id={executor_id}")
-
-            if self.notification_manager:
-                from core.notifiers.base import NotificationMessage
-                await self.notification_manager.send_notification(NotificationMessage(
-                    title=f"Demo Order — {engine}/{pair}",
-                    message=(
-                        f"<b>Demo Order Placed</b>\n"
-                        f"Engine: {engine} | Pair: {pair}\n"
-                        f"Side: {'LONG' if direction == 'LONG' else 'SHORT'} | Amount: ${amount_usd:.0f}\n"
-                        f"Executor: {executor_id}"
-                    ),
-                    level="info",
-                ))
-
-            db = self.mongodb_client.get_database()
-            await db["candidates"].update_one(
-                {"candidate_id": candidate["candidate_id"]},
-                {"$set": {
-                    "disposition": "TESTNET_ACTIVE",
-                    "executor_id": executor_id,
-                    "testnet_placed_at": int(datetime.now(timezone.utc).timestamp() * 1000),
-                    "testnet_amount": amount,
-                    "testnet_amount_usd": amount_usd,
-                }},
-            )
-        except Exception as e:
-            logger.error(f"Failed to place demo order for {engine}/{pair}: {e}")
-            db = self.mongodb_client.get_database()
-            await db["candidates"].update_one(
-                {"candidate_id": candidate["candidate_id"]},
-                {"$set": {"disposition": "TESTNET_FAILED", "testnet_error": str(e)}},
             )
 
     async def _poll_active_positions(self) -> Dict[str, int]:
@@ -226,10 +91,10 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
                     if decision_price and fill_price:
                         try:
                             dp = float(decision_price)
-                            fp = float(fill_price)
+                            fp_val = float(fill_price)
                             if dp > 0:
                                 direction = doc.get("direction", "LONG")
-                                raw_slip = (fp - dp) / dp * 10000
+                                raw_slip = (fp_val - dp) / dp * 10000
                                 slippage_bps = raw_slip if direction == "LONG" else -raw_slip
                                 abs_slip = abs(slippage_bps)
                                 slippage_bucket = (
@@ -250,11 +115,18 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
                         except (ValueError, TypeError):
                             pass
 
+                    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+                    # Position duration
+                    duration_s = None
+                    if placed_at:
+                        duration_s = (now_ms - int(placed_at)) / 1000
+
                     await db["candidates"].update_one(
                         {"candidate_id": doc["candidate_id"]},
                         {"$set": {
                             "disposition": "RESOLVED_TESTNET",
-                            "testnet_resolved_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+                            "testnet_resolved_at": now_ms,
                             "testnet_fill_price": fill_price,
                             "testnet_exit_price": exit_price,
                             "testnet_pnl": pnl,
@@ -270,19 +142,39 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
                     stats["resolved"] += 1
                     logger.info(f"Resolved {doc['engine']}/{doc['pair']}: {exec_status}, pnl={pnl}")
 
+                    # Rich close notification
                     if self.notification_manager:
-                        from core.notifiers.base import NotificationMessage
-                        emoji = "+" if pnl and float(pnl) > 0 else "-"
-                        await self.notification_manager.send_notification(NotificationMessage(
-                            title=f"Position Closed — {doc['engine']}/{doc['pair']}",
-                            message=(
-                                f"<b>{emoji} Position Closed</b>\n"
-                                f"Engine: {doc['engine']} | Pair: {doc['pair']}\n"
-                                f"Close type: {close_type}\n"
-                                f"PnL: {pnl}"
-                            ),
-                            level="success" if pnl and float(pnl) > 0 else "error",
-                        ))
+                        try:
+                            from core.notifiers.base import NotificationMessage
+
+                            pnl_float = float(pnl) if pnl is not None else 0
+                            amount_usd = doc.get("testnet_amount_usd", 0)
+
+                            slip_str = ""
+                            if slippage_bps is not None:
+                                slip_str = f"Slippage: {slippage_bps:.1f} bps ({slippage_bucket})"
+                            latency_str = ""
+                            if exec_latency_ms is not None:
+                                latency_str = f"Latency: {fmt_duration(exec_latency_ms / 1000)}"
+                            meta_parts = [s for s in [slip_str, latency_str] if s]
+                            meta_line = " | ".join(meta_parts)
+
+                            duration_str = fmt_duration(duration_s) if duration_s else "N/A"
+
+                            await self.notification_manager.send_notification(NotificationMessage(
+                                title=f"Position Closed — {close_type}",
+                                message=(
+                                    f"<b>{'✅' if pnl_float > 0 else '❌'} Position Closed — {close_type}</b>\n"
+                                    f"{doc['engine']}/{doc['pair']} {doc.get('direction', '')}\n"
+                                    f"Fill: {fp(fill_price)} → Exit: {fp(exit_price)}\n"
+                                    f"PnL: {fmt_pnl(pnl_float, amount_usd)}\n"
+                                    + (f"{meta_line}\n" if meta_line else "")
+                                    + f"Duration: {duration_str}"
+                                ),
+                                level="success" if pnl_float > 0 else "error",
+                            ))
+                        except Exception as e:
+                            logger.warning(f"Close notification failed: {e}")
 
             except Exception as e:
                 stats["errors"] += 1
@@ -292,53 +184,67 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
 
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
-        stats = {"new_orders": 0, "poll_stats": {}, "errors": 0}
-        capital = await self._get_capital()
+        stats = {"new_orders": 0, "skipped": 0, "poll_stats": {}, "errors": 0}
+        db = self.mongodb_client.get_database()
 
-        total_active = 0
-        for eng in self.engines:
-            total_active += await self._count_active_positions(eng)
+        capital = await get_capital(self.hb_client, self.account, self.fallback_capital)
 
-        if total_active >= self.max_portfolio_positions:
-            logger.info(f"Portfolio limit: {total_active}/{self.max_portfolio_positions} — skipping")
-            # Mark skipped signals for would-have-won analysis
-            await self._mark_skipped("portfolio_full")
-        else:
-            for engine in self.engines:
-                meta = get_strategy(engine)
-                max_concurrent = meta.max_concurrent
-                active_count = await self._count_active_positions(engine)
-
-                if active_count >= max_concurrent or total_active >= self.max_portfolio_positions:
-                    await self._mark_skipped(f"{engine}_concurrent_limit")
-                    continue
-
-                ready_docs = await self.mongodb_client.get_documents(
+        for engine in self.engines:
+            # Check engine/portfolio limits
+            limit_reason = await check_portfolio_limits(
+                db, engine, self.engines, self.max_portfolio_positions,
+            )
+            if limit_reason:
+                # Mark all CANDIDATE_READY for this engine as skipped
+                ready = await self.mongodb_client.get_documents(
                     "candidates", {"engine": engine, "disposition": "CANDIDATE_READY"},
                 )
-
-                slots = min(max_concurrent - active_count, self.max_portfolio_positions - total_active)
-                placed = ready_docs[:slots]
-                skipped = ready_docs[slots:]
-
-                for doc in placed:
-                    await self._place_order(doc, capital)
-                    stats["new_orders"] += 1
-                    total_active += 1
-
-                # Mark overflow signals as skipped (for would-have-won tracking)
-                db = self.mongodb_client.get_database()
-                for doc in skipped:
-                    await db["candidates"].update_one(
-                        {"candidate_id": doc["candidate_id"]},
-                        {"$set": {
-                            "disposition": "SKIPPED_CONCURRENCY",
-                            "skipped_reason": f"{engine}_slots_full",
-                            "skipped_at": int(datetime.now(timezone.utc).timestamp() * 1000),
-                        }},
-                    )
-                    stats.setdefault("skipped", 0)
+                for doc in ready:
+                    await mark_skipped(db, doc["candidate_id"], "SKIPPED_CONCURRENCY", limit_reason)
                     stats["skipped"] += 1
+                continue
+
+            ready_docs = await self.mongodb_client.get_documents(
+                "candidates", {"engine": engine, "disposition": "CANDIDATE_READY"},
+            )
+
+            for doc in ready_docs:
+                # Per-position dedup guard
+                skip_reason = await check_duplicate(
+                    db, engine, doc["pair"], doc.get("direction", ""),
+                )
+                if skip_reason:
+                    disposition = (
+                        "SKIPPED_DUPLICATE" if skip_reason == "duplicate_active"
+                        else "SKIPPED_DIRECTION_CONFLICT"
+                    )
+                    await mark_skipped(db, doc["candidate_id"], disposition, skip_reason)
+                    stats["skipped"] += 1
+                    logger.info(f"Skipped {engine}/{doc['pair']}: {skip_reason}")
+                    continue
+
+                # Re-check portfolio limits (may have filled a slot above)
+                limit_reason = await check_portfolio_limits(
+                    db, engine, self.engines, self.max_portfolio_positions,
+                )
+                if limit_reason:
+                    await mark_skipped(db, doc["candidate_id"], "SKIPPED_CONCURRENCY", limit_reason)
+                    stats["skipped"] += 1
+                    continue
+
+                executor_id = await place_order(
+                    candidate=doc,
+                    capital=capital,
+                    position_size_pct=self.position_size_pct,
+                    connector=self.connector,
+                    account=self.account,
+                    hb_client=self.hb_client,
+                    trading_rules=self._trading_rules,
+                    db=db,
+                    notification_manager=self.notification_manager,
+                )
+                if executor_id:
+                    stats["new_orders"] += 1
 
         stats["poll_stats"] = await self._poll_active_positions()
 

@@ -2,39 +2,58 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>com.quantslab.pipeline</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/hermes/miniforge3/envs/quants-lab/bin/python</string>
-        <string>cli.py</string>
-        <string>run-tasks</string>
-        <string>--config</string>
-        <string>config/hermes_pipeline.yml</string>
-    </array>
-
-    <key>WorkingDirectory</key>
-    <string>/Users/hermes/quants-lab</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/Users/hermes/miniforge3/envs/quants-lab/bin:/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-
-    <key>StandardOutPath</key>
-    <string>/Users/hermes/Library/Logs/quantslab/pipeline.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/hermes/Library/Logs/quantslab/pipeline.err</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BYBIT_DEMO_API_KEY</key>
+		<string>AcDCUXcfAS0bEuKsjX</string>
+		<key>BYBIT_DEMO_API_SECRET</key>
+		<string>Qii6QYSmYj7IT0og6YyJXiTYrrZew0lhWHD4</string>
+		<key>ENVIRONMENT</key>
+		<string>development</string>
+		<key>HUMMINGBOT_API_HOST</key>
+		<string>localhost</string>
+		<key>HUMMINGBOT_API_PORT</key>
+		<string>8000</string>
+		<key>HUMMINGBOT_API_USERNAME</key>
+		<string>admin</string>
+		<key>MONGO_DATABASE</key>
+		<string>quants_lab</string>
+		<key>MONGO_URI</key>
+		<string>mongodb://localhost:27017/quants_lab</string>
+		<key>PATH</key>
+		<string>/Users/hermes/miniforge3/envs/quants-lab/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>TELEGRAM_BOT_TOKEN</key>
+		<string>8358347300:AAGVQ7x-uihUOPx_CBu1k3H4vyF-QwmrAVA</string>
+		<key>TELEGRAM_CHAT_ID</key>
+		<string>81062935</string>
+		<key>TELEGRAM_ENABLED</key>
+		<string>true</string>
+		<key>TELEGRAM_PARSE_MODE</key>
+		<string>HTML</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.quantslab.pipeline</string>
+	<key>UserName</key>
+	<string>hermes</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/hermes/miniforge3/envs/quants-lab/bin/python</string>
+		<string>cli.py</string>
+		<string>run-tasks</string>
+		<string>--config</string>
+		<string>config/hermes_pipeline.yml</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/ql-pipeline-launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/ql-pipeline-launchd.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/hermes/quants-lab</string>
 </dict>
 </plist>

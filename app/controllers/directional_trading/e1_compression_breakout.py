@@ -100,6 +100,10 @@ class E1CompressionBreakoutConfig(DirectionalTradingControllerConfigBase):
     # Default = 12 bars = 1h. Entry window ≠ position hold time (time_limit = 24h).
     setup_expiry_bars: int = Field(default=12)               # 12 × 5m = 1h
 
+    # Exit mode: "range" (default) | "atr" (legacy) | "fixed" (registry pcts)
+    exit_mode: str = Field(default="range")
+    min_rr: float = Field(default=1.0)                       # minimum R:R for range mode
+
     candles_config: List[CandlesConfig] = Field(default_factory=list)
 
     def model_post_init(self, __context) -> None:
@@ -319,16 +323,23 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
                 bar_ts = float(idx.timestamp() if hasattr(idx, "timestamp") else float(idx) / 1e9)
 
             atr_val = float(row.get("atr", float("nan")))
+            rh = float(row.get("range_high", float("nan")))
+            rl = float(row.get("range_low", float("nan")))
             rows.append({
                 "direction":      be,
                 "breakout_level": bl,
                 "atr_1h":         atr_val,
+                "range_high":     rh,
+                "range_low":      rl,
                 "start_ts":       bar_ts,
                 "expiry_ts":      bar_ts + expiry_secs,
             })
 
         if not rows:
-            return pd.DataFrame(columns=["direction", "breakout_level", "atr_1h", "start_ts", "expiry_ts"])
+            return pd.DataFrame(columns=[
+                "direction", "breakout_level", "atr_1h",
+                "range_high", "range_low", "start_ts", "expiry_ts",
+            ])
 
         return pd.DataFrame(rows)
 
@@ -372,10 +383,15 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
 
         iloc_map = {ts: i for i, ts in enumerate(ts_5m)}
 
+        exit_mode = getattr(c, "exit_mode", "range")
+        min_rr = getattr(c, "min_rr", 1.0)
+
         for _, setup in setups_df.iterrows():
             direction = int(setup["direction"])
             level     = float(setup["breakout_level"])
             atr_1h    = float(setup.get("atr_1h", float("nan")))
+            range_high = float(setup.get("range_high", float("nan")))
+            range_low  = float(setup.get("range_low", float("nan")))
             start_ts  = float(setup["start_ts"])
             expiry_ts = float(setup["expiry_ts"])
 
@@ -389,14 +405,9 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
             df_5m.loc[window_idx, "breakout_level"]  = level
             df_5m.loc[window_idx, "atr_1h"]          = atr_1h
 
-            # Dynamic TP/SL: breakout_level +/- ATR multiples
-            if not pd.isna(atr_1h):
-                if direction == 1:  # LONG
-                    df_5m.loc[window_idx, "tp_price"] = level + 1.5 * atr_1h
-                    df_5m.loc[window_idx, "sl_price"] = level - 1.0 * atr_1h
-                else:  # SHORT
-                    df_5m.loc[window_idx, "tp_price"] = level - 1.5 * atr_1h
-                    df_5m.loc[window_idx, "sl_price"] = level + 1.0 * atr_1h
+            # TP/SL assignment deferred to per-trigger (needs 5m close price)
+            # Store range data for per-trigger R:R computation
+            range_width = range_high - range_low if not (pd.isna(range_high) or pd.isna(range_low)) else float("nan")
 
             # Setup age in minutes
             df_5m.loc[window_idx, "setup_age_minutes"] = \
@@ -424,29 +435,55 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
 
                 if not c.entry_quality_filter:
                     df_5m.loc[idx, "entry_quality_pass"] = 1
-                    valid_triggers.append(idx)
-                    continue
-
-                # Entry quality checks
-                distance = abs(close_5m - level)
-                body     = abs(close_5m - open_5m)
-                gap_bps  = (distance / abs(level)) * 10_000 if level != 0 else 9999.0
-                atr_bps  = (atr_5m   / abs(level)) * 10_000 if level != 0 else 9999.0
-                gap_thr  = min(c.entry_gap_bps_floor, c.entry_gap_atr_mult * atr_bps)
-
-                dist_ok = distance < c.entry_distance_atr_mult * atr_5m
-                body_ok = body     < c.entry_body_atr_mult     * atr_5m
-                gap_ok  = gap_bps  < gap_thr
-
-                if dist_ok and body_ok and gap_ok:
-                    df_5m.loc[idx, "entry_quality_pass"] = 1
-                    valid_triggers.append(idx)
                 else:
-                    reasons = []
-                    if not dist_ok: reasons.append(f"dist>{c.entry_distance_atr_mult}xATR")
-                    if not body_ok: reasons.append(f"body>{c.entry_body_atr_mult}xATR")
-                    if not gap_ok:  reasons.append(f"gap>{gap_thr:.1f}bps")
-                    df_5m.loc[idx, "entry_quality_fail_reason"] = "|".join(reasons)
+                    # Entry quality checks
+                    distance = abs(close_5m - level)
+                    body     = abs(close_5m - open_5m)
+                    gap_bps  = (distance / abs(level)) * 10_000 if level != 0 else 9999.0
+                    atr_bps  = (atr_5m   / abs(level)) * 10_000 if level != 0 else 9999.0
+                    gap_thr  = min(c.entry_gap_bps_floor, c.entry_gap_atr_mult * atr_bps)
+
+                    dist_ok = distance < c.entry_distance_atr_mult * atr_5m
+                    body_ok = body     < c.entry_body_atr_mult     * atr_5m
+                    gap_ok  = gap_bps  < gap_thr
+
+                    if not (dist_ok and body_ok and gap_ok):
+                        reasons = []
+                        if not dist_ok: reasons.append(f"dist>{c.entry_distance_atr_mult}xATR")
+                        if not body_ok: reasons.append(f"body>{c.entry_body_atr_mult}xATR")
+                        if not gap_ok:  reasons.append(f"gap>{gap_thr:.1f}bps")
+                        df_5m.loc[idx, "entry_quality_fail_reason"] = "|".join(reasons)
+                        continue
+                    df_5m.loc[idx, "entry_quality_pass"] = 1
+
+                # Compute TP/SL based on exit_mode (needs actual 5m entry price)
+                if exit_mode == "range" and not pd.isna(range_width) and range_width > 0:
+                    if direction == 1:  # LONG
+                        tp_p = close_5m + range_width
+                        sl_p = level  # breakout_level = range_high; re-entry = invalid
+                    else:
+                        tp_p = close_5m - range_width
+                        sl_p = level  # breakout_level = range_low; re-entry = invalid
+                    # R:R gate
+                    tp_dist = abs(tp_p - close_5m)
+                    sl_dist = abs(sl_p - close_5m)
+                    if sl_dist > 0 and tp_dist / sl_dist < min_rr:
+                        df_5m.loc[idx, "entry_quality_fail_reason"] = (
+                            f"rr={tp_dist/sl_dist:.2f}<{min_rr}"
+                        )
+                        continue
+                    df_5m.loc[idx, "tp_price"] = tp_p
+                    df_5m.loc[idx, "sl_price"] = sl_p
+                elif exit_mode == "atr" and not pd.isna(atr_1h):
+                    if direction == 1:
+                        df_5m.loc[idx, "tp_price"] = level + 1.5 * atr_1h
+                        df_5m.loc[idx, "sl_price"] = level - 1.0 * atr_1h
+                    else:
+                        df_5m.loc[idx, "tp_price"] = level - 1.5 * atr_1h
+                        df_5m.loc[idx, "sl_price"] = level + 1.0 * atr_1h
+                # "fixed" mode: no tp_price/sl_price set → falls back to config defaults in get_executor_config
+
+                valid_triggers.append(idx)
 
             # Assign signal to the Nth valid trigger
             if len(valid_triggers) > self._trigger_index:
@@ -522,10 +559,12 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
         self.processed_data["features"] = pd.DataFrame(columns=cols)
 
     def get_executor_config(self, trade_type: TradeType, price: Decimal, amount: Decimal):
-        """Build executor config with dynamic TP/SL from ATR-based levels.
+        """Build executor config with dynamic TP/SL.
 
-        TP = breakout_level +/- 1.5 * ATR(14, 1h)
-        SL = breakout_level -/+ 1.0 * ATR(14, 1h)
+        Exit modes:
+        - range: TP = entry +/- range_width, SL = opposite boundary (R:R gated)
+        - atr:   TP = level +/- 1.5×ATR, SL = level -/+ 1.0×ATR
+        - fixed: uses config take_profit/stop_loss percentages
         Converts absolute price levels to percentages for TripleBarrierConfig.
         """
         tp_abs = self.processed_data.get("tp_price")

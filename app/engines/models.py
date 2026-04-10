@@ -77,10 +77,12 @@ class FeatureRow(BaseModel):
     open_5m: Optional[float] = None
     realized_vol_4h: Optional[float] = None
     atr_percentile_90d: Optional[float] = None  # 0.0-1.0
+    atr_median_90d: Optional[float] = None  # median ATR over 90d (normal volatility reference)
 
     # Range compression
     range_high_20: Optional[float] = None
     range_low_20: Optional[float] = None
+    range_width: Optional[float] = None  # range_high_20 - range_low_20
     range_compression_confirmed: bool = False  # ATR percentile < 20th
 
     # Volume

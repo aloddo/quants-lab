@@ -59,7 +59,7 @@ class StrategyMetadata:
     )
 
     # Portfolio limits
-    max_concurrent: int = 2
+    max_concurrent: int = 20
 
     # Runtime state
     enabled: bool = True
@@ -103,7 +103,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         direction="BOTH",
         blocked_pairs=["BTC-USDT"],
         required_features=["atr", "range", "volume", "momentum", "derivatives"],
-        max_concurrent=2,
+        max_concurrent=20,
     ),
     "E2": StrategyMetadata(
         name="E2",
@@ -122,7 +122,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         direction="LONG_ONLY",
         blocked_pairs=[],
         required_features=["atr", "range", "volume", "derivatives"],
-        max_concurrent=1,
+        max_concurrent=20,
     ),
 }
 

@@ -93,6 +93,7 @@ tasks:
     config:
       engine: "E1"
       connector_name: "bybit_perpetual"
+      max_portfolio_positions: 40
     tags: [screening, realtime, breakout]
 
   # ═══════ Layer 4: Testnet Resolution ════════════════════
@@ -107,6 +108,9 @@ tasks:
       - task_name: "signal_scan"
         on_success: true
         delay_seconds: 5
+      - task_name: "breakout_monitor"
+        on_success: true
+        delay_seconds: 2
     max_retries: 2
     timeout_seconds: 120
     config:
@@ -115,8 +119,22 @@ tasks:
       position_size_pct: 0.003
       fallback_capital: 100000
       engines: ["E1", "E2"]
-      max_portfolio_positions: 3
+      max_portfolio_positions: 40
     tags: [resolution, testnet]
+
+  # ═══════ Infrastructure: Telegram Bot ═════════════════
+  telegram_bot:
+    enabled: true
+    task_class: app.tasks.telegram_bot_task.TelegramBotTask
+    schedule:
+      type: cron
+      cron: "* * * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 20
+    config:
+      poll_timeout: 5
+    tags: [infra, telegram]
 
   # ═══════ Infrastructure: Watchdog ══════════════════════
   watchdog:
@@ -149,7 +167,7 @@ tasks:
 
   # ═══════ Weekly: Re-optimization ════════════════════════
   e1_bulk_backtest:
-    enabled: true
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
     task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
     schedule:
       type: cron
@@ -165,7 +183,7 @@ tasks:
     tags: [backtesting, e1, weekly]
 
   e2_bulk_backtest:
-    enabled: true
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
     task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
     schedule:
       type: cron
@@ -182,7 +200,7 @@ tasks:
 
   # ═══════ Weekly: Walk-Forward Validation ═════════════════
   e1_walk_forward:
-    enabled: true
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
     task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
     schedule:
       type: cron
@@ -201,7 +219,7 @@ tasks:
     tags: [backtesting, e1, walk-forward, weekly]
 
   e2_walk_forward:
-    enabled: true
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
     task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
     schedule:
       type: cron

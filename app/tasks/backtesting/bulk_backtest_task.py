@@ -20,7 +20,7 @@ from core.backtesting.engine import BacktestingEngine
 from core.data_paths import data_paths
 from core.tasks import BaseTask, TaskContext
 
-from app.engines.registry import get_engine, build_backtest_config
+from app.engines.strategy_registry import build_backtest_config
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,9 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         self.trade_cost = task_config.get("trade_cost", 0.000375)
 
         # Resolution and intervals come from the engine registry
-        engine_meta = get_engine(self.engine_name)
-        self.backtesting_resolution = engine_meta["backtesting_resolution"]
+        from app.engines.strategy_registry import get_strategy
+        engine_meta = get_strategy(self.engine_name)
+        self.backtesting_resolution = engine_meta.backtesting_resolution
 
     async def setup(self, context: TaskContext) -> None:
         await super().setup(context)

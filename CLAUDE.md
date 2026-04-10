@@ -79,6 +79,51 @@ Or source the .env first:
 set -a && source /Users/hermes/quants-lab/.env && set +a
 ```
 
+## Process supervision (resilience)
+
+The pipeline runs under **three layers of protection** so a crash never means lost money:
+
+### Layer 1 — LaunchDaemon (primary, 2026-04-10)
+`/Library/LaunchDaemons/com.quantslab.pipeline.plist` and `com.quantslab.api.plist`
+- `KeepAlive: true` — launchd restarts the process within 10s of any crash
+- `RunAtLoad: true` — starts automatically on machine reboot
+- Runs as `hermes` user, no GUI session needed
+- Source plists: `scripts/launchd/com.quantslab.pipeline.plist` and `com.quantslab.api.plist`
+
+```bash
+# Manage via (as admin/root):
+sudo launchctl list | grep quantslab          # check status
+sudo launchctl stop com.quantslab.pipeline    # stop (will restart in 10s)
+sudo launchctl unload /Library/LaunchDaemons/com.quantslab.pipeline.plist  # permanent stop
+sudo launchctl load /Library/LaunchDaemons/com.quantslab.pipeline.plist    # re-enable
+
+# Logs:
+tail -f /tmp/ql-pipeline-launchd.log
+tail -f /tmp/ql-api-launchd.log
+
+# Reinstall after plist changes:
+sudo cp scripts/launchd/com.quantslab.pipeline.plist /Library/LaunchDaemons/
+sudo cp scripts/launchd/com.quantslab.api.plist /Library/LaunchDaemons/
+sudo chown root:wheel /Library/LaunchDaemons/com.quantslab.*.plist
+sudo launchctl unload /Library/LaunchDaemons/com.quantslab.pipeline.plist && sudo launchctl load /Library/LaunchDaemons/com.quantslab.pipeline.plist
+sudo launchctl unload /Library/LaunchDaemons/com.quantslab.api.plist && sudo launchctl load /Library/LaunchDaemons/com.quantslab.api.plist
+```
+
+### Layer 2 — Restart loops in start_pipeline.sh (fallback)
+`scripts/start_pipeline.sh` runs both processes inside `while true; do ... sleep 10; done` loops.
+Use this if launchd is not available (e.g., fresh machine setup before daemon install):
+```bash
+bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
+```
+
+### Layer 3 — Backtest isolation (crash prevention)
+**Backtests are DISABLED in hermes_pipeline.yml** (`e1_bulk_backtest`, `e2_bulk_backtest`, `e1_walk_forward`, `e2_walk_forward` all `enabled: false`).
+Heavy backtests run in a separate process, never sharing memory with the live trading pipeline:
+```bash
+bash scripts/run_backtest.sh e1_bulk_backtest   # safe, isolated
+bash scripts/run_backtest.sh e1_walk_forward
+```
+
 ## Common operations
 
 ### Check system status
@@ -86,15 +131,10 @@ set -a && source /Users/hermes/quants-lab/.env && set +a
 bash /Users/hermes/quants-lab/scripts/status.sh
 ```
 
-### Start the pipeline (tmux)
-```bash
-bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
-```
-
 ### Emergency stop
 ```bash
 bash /Users/hermes/quants-lab/scripts/kill_switch.sh        # pause + close positions
-bash /Users/hermes/quants-lab/scripts/kill_switch.sh --full  # also kill tmux sessions
+bash /Users/hermes/quants-lab/scripts/kill_switch.sh --full  # also stop launchd services
 ```
 
 ### Trigger a single task
@@ -102,9 +142,10 @@ bash /Users/hermes/quants-lab/scripts/kill_switch.sh --full  # also kill tmux se
 MONGO_URI=... python cli.py trigger-task --task feature_computation --config config/hermes_pipeline.yml
 ```
 
-### Run bulk backtest
+### Run a backtest (isolated — never in the live pipeline)
 ```bash
-MONGO_URI=... python cli.py trigger-task --task e1_bulk_backtest --config config/hermes_pipeline.yml
+bash scripts/run_backtest.sh e1_bulk_backtest
+bash scripts/run_backtest.sh e1_walk_forward
 ```
 
 ### Push to GitHub

@@ -179,9 +179,37 @@ def evaluate_e1(snap: DecisionSnapshot) -> E1Candidate:
     cand.disposition = "CANDIDATE_READY"
     cand.composite_score = float(score) / 4.0
 
-    # Dynamic TP/SL based on ATR (1.5x for TP, 1.0x for SL)
-    atr = fr.atr_14_1h
-    if atr is not None and breakout_level is not None:
+    # Dynamic TP/SL: range-based exits with R:R gate
+    # TP = 1× range width from entry (expected expansion)
+    # SL = opposite range boundary (thesis invalidation)
+    # Fallback to ATR-based if range data unavailable
+    range_width = None
+    if fr.range_high_20 is not None and fr.range_low_20 is not None:
+        range_width = fr.range_high_20 - fr.range_low_20
+
+    if range_width and range_width > 0:
+        if direction == "LONG":
+            cand.tp_price = price + range_width
+            cand.sl_price = breakout_level  # re-entry into range = thesis invalid
+        else:
+            cand.tp_price = price - range_width
+            cand.sl_price = breakout_level  # re-entry into range = thesis invalid
+
+        # R:R gate — reject if risk exceeds reward
+        tp_dist = abs(cand.tp_price - price)
+        sl_dist = abs(cand.sl_price - price)
+        if sl_dist > 0:
+            rr = tp_dist / sl_dist
+            if rr < 1.0:
+                cand.disposition = "FILTERED_MIN_REWARD"
+                cand.filter_reason = (
+                    f"R:R {rr:.2f} < 1.0 "
+                    f"(TP {tp_dist/price*100:.1f}%, SL {sl_dist/price*100:.1f}%)"
+                )
+                return cand
+    elif fr.atr_14_1h is not None and breakout_level is not None:
+        # Fallback: ATR-based exits (only when range data missing)
+        atr = fr.atr_14_1h
         if direction == "LONG":
             cand.tp_price = breakout_level + 1.5 * atr
             cand.sl_price = breakout_level - 1.0 * atr
