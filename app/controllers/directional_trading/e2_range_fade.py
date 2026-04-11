@@ -1,25 +1,35 @@
 """
 E2 — Range Fade Controller (Quants Lab / Hummingbot V2)
-V1 P3 — Chop Regime Mean Reversion
+V2 — Chop Regime Mean Reversion with ADX regime filter.
+
+Self-contained: no quants-lab imports. Same code runs in backtest and live.
+
+Thesis: In confirmed ranging regimes (ADX < 25), fade touches of the range
+boundary when price rejects and closes back inside. The key insight is that
+low ATR alone is NOT sufficient to confirm a range — ADX separates genuine
+chop from early-trend compression.
 
 Architecture (single layer, 1h only):
 ──────────────────────────────────────
+Regime Gate (must pass before any trigger check):
+  - ADX(14) < 25 — confirmed non-trending
+
 Trigger (all must be true on candle N):
   1. ATR percentile < 0.30 (compression)
   2. Range NOT expanding (5-bar width growth ≤ 20%)
-  3. Low boundary touch: candle low ≤ range_low_20
-  4. Rejection: close > range_low_20
-  5. No breakout confirmation:
+  3. Range boundaries stable (max shift ≤ 15% of width over 10 bars)
+  4. Low boundary touch: candle low ≤ range_low_30
+  5. Rejection: close > range_low_30
+  6. No breakout confirmation:
      a. Volume z-score ≤ 1.5
-     b. OI change 1h ≤ 2.0% (if available)
-     c. Candle body ≤ 0.8 × ATR(14)
+     b. Candle body ≤ 0.8 × ATR(14)
 
 Exit:
   - TP: range midpoint
-  - SL: range_low - 0.75 × ATR
+  - SL: range_low - 1.0 × ATR (widened from 0.75 to reduce noise stops)
   - Time limit: 12h
 
-Direction: LONG ONLY (P3 locked)
+Direction: LONG ONLY
 """
 from decimal import Decimal
 from typing import List
@@ -44,13 +54,17 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
 class E2RangeFadeConfig(DirectionalTradingControllerConfigBase):
     controller_name: str = "e2_range_fade"
 
+    # Regime gate — ADX must be below this to confirm non-trending
+    adx_period: int = Field(default=14)
+    adx_threshold: float = Field(default=25.0)
+
     # ATR compression
     atr_period: int = Field(default=14)
     atr_compression_window: int = Field(default=90)  # days
     atr_compression_threshold: float = Field(default=0.30)
 
     # Range
-    range_period: int = Field(default=20)
+    range_period: int = Field(default=30)
     range_expansion_lookback: int = Field(default=5)
     range_expansion_max: float = Field(default=0.20)
 
@@ -59,26 +73,19 @@ class E2RangeFadeConfig(DirectionalTradingControllerConfigBase):
     volume_zscore_ceiling: float = Field(default=1.5)
     body_atr_ratio_max: float = Field(default=0.8)
 
-    # ── Structural filters (V2) ──────────────────────────
-    # Directional bias: slope of close over range_period, normalized by ATR.
-    # Positive = drifting up, negative = drifting down.
-    # Block LONG when slope < -threshold (falling knife).
-    # Block SHORT when slope > +threshold (rising into strength).
-    # 0 = disabled.
-    drift_threshold: float = Field(default=0.0)
-
-    # Range stability: max % that range_high and range_low have shifted
-    # over the last `range_stability_lookback` bars.  Filters out
-    # staircase trends disguised as ranges.  0 = disabled.
-    range_stability_max: float = Field(default=0.0)
+    # Range stability: max % that range boundaries have shifted
+    # over the lookback. Filters staircase trends disguised as ranges.
+    range_stability_max: float = Field(default=0.15)
     range_stability_lookback: int = Field(default=10)
 
-    # Range quality: minimum number of boundary touches (within 0.5 ATR)
-    # on the trade side over the range_period.  0 = disabled.
+    # Directional bias (0 = disabled)
+    drift_threshold: float = Field(default=0.0)
+
+    # Range quality: min boundary touches (0 = disabled)
     min_boundary_touches: int = Field(default=0)
 
-    # Exit
-    stop_atr_multiple: float = Field(default=0.75)
+    # Exit — SL widened from 0.75 to 1.0 to reduce noise stops
+    stop_atr_multiple: float = Field(default=1.0)
     min_reward_atr_multiple: float = Field(default=0.5)
 
     candles_config: List[CandlesConfig] = Field(default_factory=list)
@@ -86,9 +93,10 @@ class E2RangeFadeConfig(DirectionalTradingControllerConfigBase):
     def model_post_init(self, __context) -> None:
         if not self.candles_config:
             lookback = self.atr_compression_window * 24 + self.atr_period + 50
+            candles_connector = self.connector_name.replace("_testnet", "").replace("_demo", "")
             self.candles_config = [
                 CandlesConfig(
-                    connector=self.connector_name,
+                    connector=candles_connector,
                     trading_pair=self.trading_pair,
                     interval="1h",
                     max_records=max(lookback, self.range_period + 10),
@@ -97,11 +105,12 @@ class E2RangeFadeConfig(DirectionalTradingControllerConfigBase):
 
 
 class E2RangeFadeController(DirectionalTradingControllerBase):
-    """E2 Range Fade — V1, 1h single-layer, LONG ONLY."""
+    """E2 Range Fade — V2, 1h single-layer, LONG ONLY, ADX regime filter."""
 
     def __init__(self, config: E2RangeFadeConfig, *args, **kwargs):
         self.config = config
         self.atr_lookback_bars = config.atr_compression_window * 24
+        self._candles_connector = config.connector_name.replace("_testnet", "").replace("_demo", "")
         super().__init__(config, *args, **kwargs)
 
     def get_candles_config(self) -> List[CandlesConfig]:
@@ -111,7 +120,7 @@ class E2RangeFadeController(DirectionalTradingControllerBase):
         c = self.config
 
         df = self.market_data_provider.get_candles_df(
-            connector_name=c.connector_name,
+            connector_name=self._candles_connector,
             trading_pair=c.trading_pair,
             interval="1h",
             max_records=self.atr_lookback_bars + c.atr_period + 50,
@@ -128,9 +137,22 @@ class E2RangeFadeController(DirectionalTradingControllerBase):
         self.processed_data["signal"] = signal
         self.processed_data["features"] = df
 
+        # Extract TP/SL from last bar for get_executor_config()
+        if signal != 0 and len(df) > 0:
+            last = df.iloc[-1]
+            tp = last.get("tp_price")
+            sl = last.get("sl_price")
+            if tp is not None and not pd.isna(tp):
+                self.processed_data["tp_price"] = float(tp)
+            if sl is not None and not pd.isna(sl):
+                self.processed_data["sl_price"] = float(sl)
+
     def _compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         c = self.config
         df = df.copy()
+
+        # ADX — regime gate (must compute before anything else)
+        df["adx"] = ta.adx(df["high"], df["low"], df["close"], length=c.adx_period)[f"ADX_{c.adx_period}"]
 
         # ATR
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=c.atr_period)
@@ -146,9 +168,9 @@ class E2RangeFadeController(DirectionalTradingControllerBase):
         else:
             df["atr_pct"] = np.nan
 
-        # Range
-        df["range_high"] = df["high"].rolling(c.range_period).max()
-        df["range_low"] = df["low"].rolling(c.range_period).min()
+        # Range — shift(1) excludes current bar (aligns with live RangeFeature)
+        df["range_high"] = df["high"].shift(1).rolling(c.range_period).max()
+        df["range_low"] = df["low"].shift(1).rolling(c.range_period).min()
         df["range_width"] = df["range_high"] - df["range_low"]
         df["range_expanding"] = df["range_width"].pct_change(c.range_expansion_lookback)
         df["range_midpoint"] = (df["range_high"] + df["range_low"]) / 2
@@ -227,6 +249,8 @@ class E2RangeFadeController(DirectionalTradingControllerBase):
         c = self.config
 
         # All conditions must be true (LONG ONLY)
+        # Regime gate: ADX must confirm non-trending
+        ranging = df["adx"].notna() & (df["adx"] < c.adx_threshold)
         compressed = df["atr_pct"].notna() & (df["atr_pct"] < c.atr_compression_threshold)
         not_expanding = df["range_expanding"].isna() | (df["range_expanding"] <= c.range_expansion_max)
         boundary_touch = df["range_low"].notna() & (df["low"] <= df["range_low"])
@@ -258,7 +282,7 @@ class E2RangeFadeController(DirectionalTradingControllerBase):
             enough_touches = True
 
         signal_mask = (
-            compressed & not_expanding & boundary_touch & rejection
+            ranging & compressed & not_expanding & boundary_touch & rejection
             & no_vol_spike & no_momentum & min_reward_ok
             & no_downward_drift & range_stable & enough_touches
         )

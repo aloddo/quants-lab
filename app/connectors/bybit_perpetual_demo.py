@@ -21,9 +21,11 @@ DEMO_DOMAIN = "bybit_perpetual_demo"
 # ── Patch URL dicts ──────────────────────────────────────
 CONSTANTS.REST_URLS[DEMO_DOMAIN] = "https://api-demo.bybit.com/"
 
-CONSTANTS.WSS_LINEAR_PUBLIC_URLS[DEMO_DOMAIN] = "wss://stream-demo.bybit.com/v5/public/linear"
+# Public WS must point to mainnet — demo has no public WebSocket feed
+CONSTANTS.WSS_LINEAR_PUBLIC_URLS[DEMO_DOMAIN] = "wss://stream.bybit.com/v5/public/linear"
+CONSTANTS.WSS_NON_LINEAR_PUBLIC_URLS[DEMO_DOMAIN] = "wss://stream.bybit.com/v5/public/inverse"
+# Private WS to demo
 CONSTANTS.WSS_LINEAR_PRIVATE_URLS[DEMO_DOMAIN] = "wss://stream-demo.bybit.com/v5/private"
-CONSTANTS.WSS_NON_LINEAR_PUBLIC_URLS[DEMO_DOMAIN] = "wss://stream-demo.bybit.com/v5/public/inverse"
 CONSTANTS.WSS_NON_LINEAR_PRIVATE_URLS[DEMO_DOMAIN] = "wss://stream-demo.bybit.com/v5/private"
 
 # ── Patch domain registration ────────────────────────────

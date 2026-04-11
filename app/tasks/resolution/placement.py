@@ -45,14 +45,16 @@ async def check_duplicate(db, engine: str, pair: str, direction: str) -> Optiona
     Rules (strategy-agnostic):
     - HARD BLOCK: same (engine, pair, direction) already TESTNET_ACTIVE
     - SOFT BLOCK: same (engine, pair) opposite direction already TESTNET_ACTIVE
-    - Cross-engine same pair is ALLOWED (different strategies)
+    - HARD BLOCK: cross-engine same pair+direction already TESTNET_ACTIVE
     """
+    active_filter = {"$in": ["TESTNET_ACTIVE", "PLACING"]}
+
     # Exact duplicate
     existing = await db["candidates"].find_one({
         "engine": engine,
         "pair": pair,
         "direction": direction,
-        "disposition": "TESTNET_ACTIVE",
+        "disposition": active_filter,
     })
     if existing:
         return "duplicate_active"
@@ -62,10 +64,24 @@ async def check_duplicate(db, engine: str, pair: str, direction: str) -> Optiona
         "engine": engine,
         "pair": pair,
         "direction": {"$ne": direction},
-        "disposition": "TESTNET_ACTIVE",
+        "disposition": active_filter,
     })
     if opposite:
         return "direction_conflict"
+
+    # Cross-engine same pair+direction (prevents silent double sizing)
+    cross_engine = await db["candidates"].find_one({
+        "engine": {"$ne": engine},
+        "pair": pair,
+        "direction": direction,
+        "disposition": active_filter,
+    })
+    if cross_engine:
+        logger.warning(
+            f"Cross-engine exposure blocked: {engine}/{pair}/{direction} — "
+            f"already active on {cross_engine['engine']}"
+        )
+        return "cross_engine_exposure"
 
     return None
 
@@ -80,21 +96,39 @@ async def check_portfolio_limits(
     meta = get_strategy(engine)
     max_concurrent = meta.max_concurrent
 
+    active_dispositions = {"$in": ["TESTNET_ACTIVE", "PLACING"]}
+
     # Per-engine count
     engine_active = await db["candidates"].count_documents(
-        {"engine": engine, "disposition": "TESTNET_ACTIVE"},
+        {"engine": engine, "disposition": active_dispositions},
     )
     if engine_active >= max_concurrent:
         return f"{engine}_concurrent_limit"
 
     # Portfolio count
     total_active = await db["candidates"].count_documents(
-        {"disposition": "TESTNET_ACTIVE"},
+        {"disposition": active_dispositions},
     )
     if total_active >= max_portfolio:
         return "portfolio_full"
 
     return None
+
+
+async def claim_candidate(db, candidate_id: str) -> bool:
+    """Atomically claim a candidate for placement (CANDIDATE_READY → PLACING).
+
+    Uses findOneAndUpdate so only one caller wins the race between breakout_monitor
+    and testnet_resolver.  Returns True if this caller won the claim.
+    """
+    result = await db["candidates"].find_one_and_update(
+        {"candidate_id": candidate_id, "disposition": "CANDIDATE_READY"},
+        {"$set": {
+            "disposition": "PLACING",
+            "claim_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+        }},
+    )
+    return result is not None
 
 
 async def mark_skipped(db, candidate_id: str, disposition: str, reason: str) -> None:
@@ -121,6 +155,7 @@ async def place_order(
     trading_rules: Dict[str, Any],
     db,
     notification_manager=None,
+    capital_source: str = "api",
 ) -> Optional[str]:
     """Place an order via HB API and update MongoDB.
 
@@ -178,6 +213,28 @@ async def place_order(
     if not registered:
         logger.warning(f"Could not pre-register {pair} — executor may fail")
 
+    # Exchange-level duplicate check: verify no open position on this pair
+    try:
+        exchange_positions = await hb_client.get_exchange_positions(connector, account)
+        for pos in exchange_positions:
+            pos_pair = pos.get("trading_pair") or pos.get("pair", "")
+            pos_amount = float(pos.get("amount", 0) or 0)
+            if pos_pair == pair and abs(pos_amount) > 0:
+                logger.error(
+                    f"Exchange conflict: {pair} already has open position "
+                    f"(side={pos.get('side')}, amount={pos_amount}). Skipping."
+                )
+                await db["candidates"].update_one(
+                    {"candidate_id": candidate["candidate_id"]},
+                    {"$set": {
+                        "disposition": "SKIPPED_EXCHANGE_CONFLICT",
+                        "skipped_reason": f"exchange_position_exists_{pos.get('side')}",
+                    }},
+                )
+                return None
+    except Exception as e:
+        logger.warning(f"Could not check exchange positions for {pair}: {e}")
+
     request_body = {
         "account_name": account,
         "executor_config": {
@@ -196,6 +253,18 @@ async def place_order(
     try:
         result = await hb_client.create_executor(request_body)
         executor_id = result.get("executor_id") or result.get("id")
+
+        if not executor_id:
+            logger.error(f"HB API returned no executor_id for {engine}/{pair}: {result}")
+            await db["candidates"].update_one(
+                {"candidate_id": candidate["candidate_id"]},
+                {"$set": {
+                    "disposition": "TESTNET_FAILED",
+                    "testnet_error": "executor_id_missing_from_api_response",
+                }},
+            )
+            return None
+
         logger.info(f"Placed demo order for {engine}/{pair}: executor_id={executor_id}")
 
         # Update candidate in MongoDB
@@ -211,6 +280,7 @@ async def place_order(
                 "testnet_sl_pct": sl_pct,
                 "testnet_time_limit": time_limit,
                 "testnet_trailing_stop": meta.trailing_stop if meta.trailing_stop else None,
+                "capital_source": capital_source,
             }},
         )
 
@@ -261,15 +331,21 @@ async def place_order(
 
 async def get_capital(
     hb_client: HBApiClient, account: str, fallback: float,
-) -> float:
-    """Fetch USDT capital from HB API, with fallback."""
+) -> tuple[float, str]:
+    """Fetch USDT capital from HB API, with fallback.
+
+    Returns (capital, source) where source is "api" or "fallback".
+    """
     try:
         portfolio = await hb_client.get_portfolio_state(account)
         if isinstance(portfolio, dict):
             for token_data in portfolio.get("tokens", []):
                 if token_data.get("token") == "USDT":
-                    return float(token_data.get("balance", fallback))
-        return fallback
+                    return float(token_data.get("balance", fallback)), "api"
+            logger.warning(f"No USDT token in portfolio response, using fallback {fallback}")
+        else:
+            logger.warning(f"Unexpected portfolio response type {type(portfolio)}, using fallback {fallback}")
+        return fallback, "fallback"
     except Exception as e:
         logger.warning(f"Could not fetch capital: {e}, using fallback {fallback}")
-        return fallback
+        return fallback, "fallback"

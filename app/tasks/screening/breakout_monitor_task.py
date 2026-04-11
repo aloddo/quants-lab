@@ -30,9 +30,11 @@ from app.tasks.notifying_task import NotifyingTaskMixin
 from app.tasks.resolution.placement import (
     check_duplicate,
     check_portfolio_limits,
+    claim_candidate,
     get_capital,
     place_order,
 )
+from app.tasks.screening.signal_scan_task import TRADEABLE_PAIRS
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +105,16 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
             "pair_historical",
             {"engine": self.engine_name, "verdict": "ALLOW"},
         )
-        self._allow_pairs = [d["pair"] for d in allow_docs]
+        engine_meta = get_strategy(self.engine_name)
+        raw_pairs = [d["pair"] for d in allow_docs]
+        self._allow_pairs = [
+            p for p in raw_pairs
+            if p in TRADEABLE_PAIRS and p not in engine_meta.blocked_pairs
+        ]
+        filtered = len(raw_pairs) - len(self._allow_pairs)
+        if filtered:
+            logger.info(f"{self.engine_name}: filtered {filtered} pairs "
+                        f"(TRADEABLE_PAIRS + blocked_pairs gate)")
 
         # Load features for each ALLOW pair
         cache = {}
@@ -117,6 +128,7 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
                 )
                 if docs:
                     feat[fname] = docs[0].get("value", {})
+                    feat[f"{fname}_computed_at"] = docs[0].get("computed_at")
             if feat.get("atr") and feat.get("range"):
                 cache[pair] = feat
 
@@ -142,9 +154,25 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
         if atr_pct is None:
             return None
 
+        # Validate feature freshness (3h max age, matching signal_scan)
+        staleness_flags = []
+        now = datetime.now(timezone.utc)
+        max_age = timedelta(hours=3)
+        for fname in ["atr", "range", "volume", "derivatives"]:
+            computed_at = feat.get(f"{fname}_computed_at")
+            if computed_at:
+                if hasattr(computed_at, 'replace'):
+                    computed_at = computed_at.replace(tzinfo=timezone.utc)
+                age = now - computed_at
+                if age > max_age:
+                    staleness_flags.append(f"feature_stale:{fname}:{age.total_seconds()/3600:.1f}h")
+            elif fname in ("atr", "range"):
+                staleness_flags.append(f"missing_computed_at:{fname}")
+        feature_staleness_ok = len(staleness_flags) == 0
+
         return FeatureRow(
             pair=pair,
-            timestamp_utc=int(datetime.now(timezone.utc).timestamp() * 1000),
+            timestamp_utc=int(now.timestamp() * 1000),
             close=live_price,
             atr_14_1h=atr_d.get("atr_14_1h"),
             atr_percentile_90d=atr_pct,
@@ -161,13 +189,12 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
             oi_change_1h_pct=deriv_d.get("oi_change_1h_pct"),
             oi_increasing=deriv_d.get("oi_increasing", 0) > 0.5,
             rs_aligned=deriv_d.get("rs_aligned", 0) > 0.5,
-            # Candle OHLC not available in real-time — use live price as proxy
             candle_high=live_price,
             candle_low=live_price,
             candle_open=live_price,
             range_expanding=range_d.get("range_expanding"),
-            feature_staleness_ok=True,
-            staleness_flags=[],
+            feature_staleness_ok=feature_staleness_ok,
+            staleness_flags=staleness_flags,
         )
 
     def _is_debounced_memory(self, pair: str, direction: str) -> bool:
@@ -209,6 +236,16 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
 
+        # Shadow engine check — never place orders for shadow variants
+        meta = get_strategy(self.engine_name)
+        if meta.shadow_of:
+            return {
+                "status": "completed",
+                "timestamp": start.isoformat(),
+                "execution_id": context.execution_id,
+                "stats": {"note": f"shadow engine (of {meta.shadow_of}) — skipped"},
+            }
+
         # Refresh feature cache if needed
         await self._refresh_feature_cache()
 
@@ -238,6 +275,10 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
 
             fr = self._build_feature_row(pair, price)
             if fr is None:
+                continue
+
+            if not fr.feature_staleness_ok:
+                logger.warning(f"BreakoutMonitor: {pair} skipped — stale features: {fr.staleness_flags}")
                 continue
 
             stats["checked"] += 1
@@ -317,6 +358,10 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
             # Direct placement for speed (bypass resolver queue)
             hb = await self._get_hb_client()
             if hb:
+                # Atomic claim — prevents double placement with resolver
+                if not await claim_candidate(db, doc["candidate_id"]):
+                    logger.info(f"Breakout {pair}: claim lost (resolver may have it)")
+                    continue
                 # Check dedup and portfolio limits
                 skip_reason = await check_duplicate(db, self.engine_name, pair, direction)
                 if not skip_reason:
@@ -326,7 +371,7 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
                 if skip_reason:
                     logger.info(f"Breakout {pair} skipped placement: {skip_reason}")
                 else:
-                    capital = await get_capital(hb, self.account, self.fallback_capital)
+                    capital, capital_source = await get_capital(hb, self.account, self.fallback_capital)
                     executor_id = await place_order(
                         candidate=doc,
                         capital=capital,
@@ -337,6 +382,7 @@ class BreakoutMonitorTask(NotifyingTaskMixin, BaseTask):
                         trading_rules=self._trading_rules,
                         db=db,
                         notification_manager=self.notification_manager,
+                        capital_source=capital_source,
                     )
                     if executor_id:
                         stats["placed"] += 1

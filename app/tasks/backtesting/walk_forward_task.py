@@ -25,10 +25,14 @@ from app.tasks.notifying_task import NotifyingTaskMixin
 
 logger = logging.getLogger(__name__)
 
-# Verdict thresholds (same as BulkBacktestTask)
+# Verdict thresholds (aligned with BulkBacktestTask)
 PF_ALLOW = 1.3
 PF_WATCH = 1.0
-MIN_TRADES = 10
+SHARPE_ALLOW = 1.0
+SHARPE_WATCH = 0.0
+MAX_DD_ALLOW = -0.15
+MAX_DD_WATCH = -0.20
+MIN_TRADES = 30
 
 # Overfitting detection
 OVERFIT_RATIO_THRESHOLD = 2.0  # train_pf / test_pf > 2.0 = red flag
@@ -56,23 +60,50 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
         if not self.mongodb_client:
             raise RuntimeError("MongoDB required for WalkForwardBacktestTask")
 
-    def _discover_pairs(self) -> List[str]:
-        """Find pairs with sufficient 1h parquet data."""
+    def _discover_pairs(self, start_ts: int = 0) -> List[str]:
+        """Find pairs with sufficient parquet data covering the backtest window."""
+        import pandas as pd
         candles_dir = data_paths.candles_dir
+        resolution = self.backtesting_resolution
         pairs = []
+        skipped = []
         for f in candles_dir.glob(f"{self.connector_name}|*|1h.parquet"):
             parts = f.stem.split("|")
-            if len(parts) == 3:
-                pairs.append(parts[1])
+            if len(parts) != 3:
+                continue
+            pair = parts[1]
+            if start_ts > 0:
+                res_file = candles_dir / f"{self.connector_name}|{pair}|{resolution}.parquet"
+                if not res_file.exists():
+                    skipped.append(pair)
+                    continue
+                df = pd.read_parquet(res_file, columns=["timestamp"])
+                if df["timestamp"].min() > start_ts:
+                    skipped.append(pair)
+                    continue
+            pairs.append(pair)
+        if skipped:
+            logger.info(f"Skipped {len(skipped)} pairs (insufficient {resolution} data): {skipped[:5]}...")
         return sorted(pairs)
 
-    def _compute_folds(self) -> List[Dict[str, Any]]:
-        """Compute rolling train/test fold timestamps.
+    def _get_data_end_time(self) -> int:
+        """Find earliest end time across resolution parquet files."""
+        import pandas as pd
+        candles_dir = data_paths.candles_dir
+        resolution = self.backtesting_resolution
+        min_end = float("inf")
+        for f in list(candles_dir.glob(f"{self.connector_name}|*|{resolution}.parquet"))[:5]:
+            df = pd.read_parquet(f, columns=["timestamp"])
+            end = df["timestamp"].max()
+            if end < min_end:
+                min_end = end
+        if min_end == float("inf"):
+            return int(datetime.now(timezone.utc).timestamp())
+        return int(min_end)
 
-        Returns list of dicts with: fold_index, train_start, train_end,
-        test_start, test_end (all as epoch seconds).
-        """
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+    def _compute_folds(self, end_ts: int = 0) -> List[Dict[str, Any]]:
+        """Compute rolling train/test fold timestamps."""
+        now_ts = end_ts or int(datetime.now(timezone.utc).timestamp())
         history_start = now_ts - self.total_days * 86400
 
         folds = []
@@ -108,20 +139,43 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
 
         return folds
 
-    def _compute_verdict(self, pf: float, trades: int) -> str:
+    def _compute_verdict(self, pf: float, trades: int,
+                          sharpe: float = 0.0, max_dd: float = 0.0) -> str:
         if trades < MIN_TRADES:
             return "BLOCK"
-        if pf >= PF_ALLOW:
+        if (pf >= PF_ALLOW and sharpe >= SHARPE_ALLOW
+                and max_dd >= MAX_DD_ALLOW):
             return "ALLOW"
-        if pf >= PF_WATCH:
+        if (pf >= PF_WATCH and sharpe >= SHARPE_WATCH
+                and max_dd >= MAX_DD_WATCH):
             return "WATCH"
         return "BLOCK"
 
     async def _run_single_backtest(
         self, pair: str, start_ts: int, end_ts: int,
+        shared_candles: dict = None,
     ) -> Dict[str, Any]:
         """Run a single backtest and return metrics dict."""
-        bt_engine = BacktestingEngine(load_cached_data=True)
+        bt_engine = BacktestingEngine(load_cached_data=(shared_candles is None))
+        if shared_candles:
+            bt_engine._bt_engine.backtesting_data_provider.candles_feeds = shared_candles
+
+            # Patch: prevent API fallback when cached data doesn't fully cover
+            # the time window. Return cached data as-is (truncated is fine).
+            provider = bt_engine._bt_engine.backtesting_data_provider
+            _orig_get_feed = provider.get_candles_feed
+
+            async def _patched_get_feed(config):
+                from hummingbot.strategy_v2.backtesting.backtesting_data_provider import BacktestingDataProvider
+                key = BacktestingDataProvider._generate_candle_feed_key(config)
+                import pandas as pd
+                existing = provider.candles_feeds.get(key, pd.DataFrame())
+                if not existing.empty:
+                    return existing
+                return await _orig_get_feed(config)
+
+            provider.get_candles_feed = _patched_get_feed
+            provider.initialize_candles_feed = lambda config: _patched_get_feed(config)
 
         config_instance = build_backtest_config(
             engine_name=self.engine_name,
@@ -165,8 +219,18 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
 
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start_time = datetime.now(timezone.utc)
-        pairs = self._discover_pairs()
-        folds = self._compute_folds()
+
+        # Data-aligned end time and pair filtering
+        data_end = self._get_data_end_time()
+        history_start = data_end - self.total_days * 86400
+        pairs = self._discover_pairs(start_ts=history_start)
+        folds = self._compute_folds(end_ts=data_end)
+
+        # Shared cache — load once, reuse across all pairs/folds
+        _cache = BacktestingEngine(load_cached_data=True)
+        shared_candles = _cache._bt_engine.backtesting_data_provider.candles_feeds.copy()
+        del _cache
+        gc.collect()
 
         logger.info(
             f"WalkForward {self.engine_name}: {len(pairs)} pairs, "
@@ -211,6 +275,7 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
                     try:
                         train_metrics = await self._run_single_backtest(
                             pair, fold["train_start"], fold["train_end"],
+                            shared_candles=shared_candles,
                         )
                         train_metrics["period_type"] = "train"
                         train_metrics["fold_index"] = fold_idx
@@ -223,6 +288,7 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
                     try:
                         test_metrics = await self._run_single_backtest(
                             pair, fold["test_start"], fold["test_end"],
+                            shared_candles=shared_candles,
                         )
                         test_metrics["period_type"] = "test"
                         test_metrics["fold_index"] = fold_idx
@@ -261,6 +327,8 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
                             "test_pf": test_metrics["profit_factor"],
                             "train_trades": train_metrics["trades"],
                             "test_trades": test_metrics["trades"],
+                            "test_sharpe": test_metrics.get("sharpe", 0),
+                            "test_max_dd": test_metrics.get("max_dd_pct", 0),
                         })
 
                 # Aggregate test-period metrics for this pair
@@ -271,7 +339,11 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
                 if test_results:
                     avg_test_pf = sum(fr["test_pf"] for fr in test_results) / len(test_results)
                     avg_train_pf = sum(fr["train_pf"] for fr in test_results) / len(test_results)
-                    verdict = self._compute_verdict(avg_test_pf, sum(fr["test_trades"] for fr in test_results))
+                    avg_test_sharpe = sum(fr.get("test_sharpe", 0) or 0 for fr in test_results) / len(test_results)
+                    avg_test_dd = sum(fr.get("test_max_dd", 0) or 0 for fr in test_results) / len(test_results)
+                    total_test_trades = sum(fr["test_trades"] for fr in test_results)
+                    verdict = self._compute_verdict(avg_test_pf, total_test_trades,
+                        sharpe=avg_test_sharpe, max_dd=avg_test_dd)
 
                     # Overfitting check
                     overfit = False

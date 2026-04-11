@@ -54,6 +54,20 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
     TripleBarrierConfig,
 )
 
+def _percentile_rank(series: pd.Series, window: int) -> pd.Series:
+    """Rolling percentile rank (0-1) of the last value vs the window.
+
+    Inlined from app.features.helpers to keep the controller self-contained
+    (no quants-lab imports — required for HB bot deployment).
+    """
+    def _pct(s):
+        if len(s) < 2:
+            return float("nan")
+        v = s.iloc[-1]
+        return (s.iloc[:-1] < v).sum() / (len(s) - 1)
+    return series.rolling(window, min_periods=max(100, window // 10)).apply(_pct, raw=False)
+
+
 class E1CompressionBreakoutConfig(DirectionalTradingControllerConfigBase):
     """V7.2 Phase 1 config — V3.2 canonical defaults, 1m confirmation architecture."""
     controller_name: str = "e1_compression_breakout"
@@ -104,15 +118,18 @@ class E1CompressionBreakoutConfig(DirectionalTradingControllerConfigBase):
             max_1h = max(lookback_bars, self.range_period + 5,
                          self.risk_off_ema_period + 5)
             max_1m = self.setup_expiry_bars + 14 + 10  # expiry window + ATR-14 + buffer
+            # Candles use the base connector (public market data) — strip _testnet/_demo
+            # suffix since the candles factory only knows the base connector name.
+            candles_connector = self.connector_name.replace("_testnet", "").replace("_demo", "")
             self.candles_config = [
                 CandlesConfig(
-                    connector=self.connector_name,
+                    connector=candles_connector,
                     trading_pair=self.trading_pair,
                     interval="1h",
                     max_records=max_1h,
                 ),
                 CandlesConfig(
-                    connector=self.connector_name,
+                    connector=candles_connector,
                     trading_pair=self.trading_pair,
                     interval="1m",
                     max_records=max_1m,
@@ -134,6 +151,9 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
             config.range_period + 5,
             config.risk_off_ema_period + 5,
         )
+        # Candles use the base connector (public market data) — strip _testnet/_demo
+        # since the candles factory only knows base connector names.
+        self._candles_connector = config.connector_name.replace("_testnet", "").replace("_demo", "")
         super().__init__(config, *args, **kwargs)
 
     def get_candles_config(self) -> List[CandlesConfig]:
@@ -150,7 +170,7 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
 
         # ── 1h data ──
         df_1h = self.market_data_provider.get_candles_df(
-            connector_name=c.connector_name,
+            connector_name=self._candles_connector,
             trading_pair=c.trading_pair,
             interval="1h",
             max_records=self.max_records,
@@ -167,7 +187,7 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
 
         # ── 1m data ──
         df_1m = self.market_data_provider.get_candles_df(
-            connector_name=c.connector_name,
+            connector_name=self._candles_connector,
             trading_pair=c.trading_pair,
             interval="1m",
             max_records=c.setup_expiry_bars + 14 + 10,
@@ -200,13 +220,15 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=c.atr_period)
 
         # ATR percentile — full feed, strict
-        feed_key = f"{c.connector_name}_{c.trading_pair}_1h"
-        df_full = self.market_data_provider.candles_feeds.get(feed_key)
+        feed_key = f"{self._candles_connector}_{c.trading_pair}_1h"
+        feed_obj = self.market_data_provider.candles_feeds.get(feed_key)
+        df_full = feed_obj.candles_df if feed_obj is not None and hasattr(feed_obj, 'candles_df') else feed_obj
         if df_full is not None and len(df_full) >= self.atr_lookback_bars \
                 and "timestamp" in df_full.columns:
             ff = df_full.copy()
             ff["_atr"] = ta.atr(ff["high"], ff["low"], ff["close"], length=c.atr_period)
-            ff["_atr_pct"] = ff["_atr"].rolling(self.atr_lookback_bars).rank(pct=True)
+            # Align with live feature: percentile_rank excludes current bar
+            ff["_atr_pct"] = _percentile_rank(ff["_atr"], self.atr_lookback_bars)
             atr_map = ff.set_index("timestamp")["_atr_pct"].to_dict()
             key_col = df["timestamp"] if "timestamp" in df.columns \
                 else (df.index.astype("int64") // 1_000_000_000)
@@ -323,14 +345,19 @@ class E1CompressionBreakoutController(DirectionalTradingControllerBase):
             atr_val = float(row.get("atr", float("nan")))
             rh = float(row.get("range_high", float("nan")))
             rl = float(row.get("range_low", float("nan")))
+            # Candle timestamps are open times (Bybit convention). Breakout is
+            # confirmed at the close, so the 1m confirmation window must start
+            # AFTER the 1h candle closes (bar_ts + 3600s).
+            confirm_start_ts = bar_ts + 3600
+
             rows.append({
                 "direction":      be,
                 "breakout_level": bl,
                 "atr_1h":         atr_val,
                 "range_high":     rh,
                 "range_low":      rl,
-                "start_ts":       bar_ts,
-                "expiry_ts":      bar_ts + expiry_secs,
+                "start_ts":       confirm_start_ts,
+                "expiry_ts":      confirm_start_ts + expiry_secs,
             })
 
         if not rows:

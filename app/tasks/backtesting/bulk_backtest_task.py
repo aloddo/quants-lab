@@ -24,10 +24,14 @@ from app.engines.strategy_registry import build_backtest_config
 
 logger = logging.getLogger(__name__)
 
-# Verdict thresholds
-PF_ALLOW = 1.3     # profit factor >= 1.3 -> ALLOW
-PF_WATCH = 1.0     # 1.0 <= PF < 1.3 -> WATCH
-MIN_TRADES = 10     # need at least 10 trades for statistical significance
+# Verdict thresholds (multi-criteria — PF alone is not enough)
+PF_ALLOW = 1.3
+PF_WATCH = 1.0
+SHARPE_ALLOW = 1.0
+SHARPE_WATCH = 0.0
+MAX_DD_ALLOW = -0.15   # -15% max drawdown
+MAX_DD_WATCH = -0.20   # -20%
+MIN_TRADES = 30        # need at least 30 trades for statistical significance
 
 
 from app.tasks.notifying_task import NotifyingTaskMixin
@@ -54,23 +58,79 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         if not self.mongodb_client:
             raise RuntimeError("MongoDB required for BulkBacktestTask")
 
-    def _discover_pairs(self) -> List[str]:
-        """Find pairs with sufficient 1h parquet data."""
+    def _discover_pairs(self, start_ts: int = 0) -> List[str]:
+        """Find pairs with sufficient parquet data covering the backtest window.
+
+        Skips pairs whose backtesting-resolution data starts AFTER the backtest
+        start time — those would trigger a live API fetch that hangs.
+        """
+        import pandas as pd
         candles_dir = data_paths.candles_dir
+        resolution = self.backtesting_resolution
         pairs = []
+        skipped = []
         for f in candles_dir.glob(f"{self.connector_name}|*|1h.parquet"):
             parts = f.stem.split("|")
-            if len(parts) == 3:
-                pairs.append(parts[1])
+            if len(parts) != 3:
+                continue
+            pair = parts[1]
+            # Check resolution data covers backtest start
+            if start_ts > 0:
+                res_file = candles_dir / f"{self.connector_name}|{pair}|{resolution}.parquet"
+                if not res_file.exists():
+                    skipped.append(pair)
+                    continue
+                df = pd.read_parquet(res_file, columns=["timestamp"])
+                if df["timestamp"].min() > start_ts:
+                    skipped.append(pair)
+                    continue
+            pairs.append(pair)
+        if skipped:
+            logger.info(f"Skipped {len(skipped)} pairs (insufficient {resolution} data): {skipped[:5]}...")
         return sorted(pairs)
 
-    def _compute_verdict(self, pf: float, trades: int) -> str:
-        """Determine ALLOW/WATCH/BLOCK from backtest results."""
+    def _get_data_end_time(self, pairs: List[str]) -> int:
+        """Find the earliest end time across all resolution parquet files.
+
+        Uses the backtesting resolution (e.g. 1m) as the binding constraint
+        since that's what the BacktestingEngine iterates over. Falls back to
+        now() if no parquet files exist.
+        """
+        import pandas as pd
+        candles_dir = data_paths.candles_dir
+        min_end = float("inf")
+        resolution = self.backtesting_resolution
+
+        for pair in pairs[:5]:  # sample first 5 pairs (all downloaded together)
+            f = candles_dir / f"{self.connector_name}|{pair}|{resolution}.parquet"
+            if f.exists():
+                df = pd.read_parquet(f, columns=["timestamp"])
+                end = df["timestamp"].max()
+                if end < min_end:
+                    min_end = end
+
+        if min_end == float("inf"):
+            logger.warning("No parquet data found for end time — using now()")
+            return int(datetime.now(timezone.utc).timestamp())
+
+        logger.info(f"Data end time: {datetime.fromtimestamp(min_end, tz=timezone.utc)} "
+                     f"(resolution={resolution})")
+        return int(min_end)
+
+    def _compute_verdict(self, pf: float, trades: int,
+                          sharpe: float = 0.0, max_dd: float = 0.0) -> str:
+        """Determine ALLOW/WATCH/BLOCK from backtest results.
+
+        Multi-criteria: a pair must pass ALL thresholds for a given tier.
+        PF alone is not enough — Sharpe and max drawdown are hard gates.
+        """
         if trades < MIN_TRADES:
             return "BLOCK"
-        if pf >= PF_ALLOW:
+        if (pf >= PF_ALLOW and sharpe >= SHARPE_ALLOW
+                and max_dd >= MAX_DD_ALLOW):
             return "ALLOW"
-        if pf >= PF_WATCH:
+        if (pf >= PF_WATCH and sharpe >= SHARPE_WATCH
+                and max_dd >= MAX_DD_WATCH):
             return "WATCH"
         return "BLOCK"
 
@@ -117,19 +177,24 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
-        pairs = self._discover_pairs()
+        # Pre-compute time window so we can filter pairs by data coverage
+        _end_probe = self._get_data_end_time(self._discover_pairs())
+        _start_probe = _end_probe - self.backtest_days * 86400
+        pairs = self._discover_pairs(start_ts=_start_probe)
         logger.info(
             f"BulkBacktest {self.engine_name}: found {len(pairs)} pairs, "
             f"resolution={self.backtesting_resolution}, days={self.backtest_days}"
         )
 
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        start_ts = now_ts - self.backtest_days * 86400
+        # Use actual parquet data end time — not now() — to avoid triggering
+        # live API fetches when data is a few hours stale.
+        end_ts = self._get_data_end_time(pairs)
+        start_ts = end_ts - self.backtest_days * 86400
         period_label = (
             f"{datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime('%Y-%m-%d')}"
-            f"_{datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y-%m-%d')}"
+            f"_{datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime('%Y-%m-%d')}"
         )
-        run_id = f"{self.engine_name}_{period_label}_{now_ts}"
+        run_id = f"{self.engine_name}_{period_label}_{end_ts}"
 
         # Ensure indexes on backtest_trades for efficient querying
         db = self.mongodb_client.get_database()
@@ -143,10 +208,18 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
         total_trades_stored = 0
 
+        # Pre-load parquet cache ONCE — reused across all pairs (saves ~2GB)
+        _shared_cache = BacktestingEngine(load_cached_data=True)
+        shared_candles = _shared_cache._bt_engine.backtesting_data_provider.candles_feeds.copy()
+        del _shared_cache
+        gc.collect()
+
         for pair in pairs:
             try:
-                # Fresh engine per pair — reusing corrupts state (HB bug)
-                bt_engine = BacktestingEngine(load_cached_data=True)
+                # Fresh engine per pair (HB bug: state corrupts on reuse)
+                # but inject shared cache to avoid reloading parquet
+                bt_engine = BacktestingEngine(load_cached_data=False)
+                bt_engine._bt_engine.backtesting_data_provider.candles_feeds = shared_candles
 
                 # Build config via registry — handles candles, exit params, trailing stop
                 config_instance = build_backtest_config(
@@ -158,7 +231,7 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                 bt_result = await bt_engine.run_backtesting(
                     config=config_instance,
                     start=start_ts,
-                    end=now_ts,
+                    end=end_ts,
                     backtesting_resolution=self.backtesting_resolution,
                     trade_cost=self.trade_cost,
                 )
@@ -176,7 +249,8 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                 pnl = r.get("net_pnl_quote", 0) or 0
                 close_types = r.get("close_types", {})
 
-                verdict = self._compute_verdict(pf, trades)
+                verdict = self._compute_verdict(pf, trades,
+                    sharpe=sharpe or 0.0, max_dd=max_dd or 0.0)
 
                 doc = {
                     "engine": self.engine_name,

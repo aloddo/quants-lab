@@ -38,24 +38,57 @@ quants-lab/                          # Fork of hummingbot/quants-lab
 
 1. **Never modify `core/`** — that's upstream QuantsLab. Fetch updates with `git fetch upstream && git merge upstream/main`.
 2. **Always use QL primitives** — FeatureBase for features, BaseTask for tasks, TaskOrchestrator for scheduling. No custom cron scripts, no SQLite.
-3. **Engine evaluation functions are pure** — `evaluate_eN()` takes a `DecisionSnapshot`, returns a `CandidateBase` subclass. No side effects, no DB access.
-4. **Use the Strategy Registry** — all engine metadata lives in `app/engines/strategy_registry.py`. Add new engines via `python cli.py scaffold-strategy`. Signal scan and resolver dispatch generically via `get_evaluate_fn(engine)`.
-5. **MongoDB for everything dynamic** — features, candidates, pair_historical, derivatives, task executions.
-6. **Parquet for candle data** — written by CandlesDownloaderTask via CLOBDataSource.
-7. **Telegram bot token and chat IDs are in `.env`** — never commit secrets.
+3. **The controller IS the strategy** — one self-contained HB V2 controller file runs in both backtest (BacktestingEngine) and live (HB bot container). No separate eval functions, no custom signal pipelines.
+4. **Controllers must be self-contained** — only import from `hummingbot.*`, `pandas`, `pandas_ta`, `numpy`, `pydantic`, stdlib. No `app.*` imports. Inline any helpers.
+5. **Use the Strategy Registry** — all engine metadata lives in `app/engines/strategy_registry.py`. Every engine has `deployment_mode="hb_native"`. Add new engines via `python cli.py scaffold-strategy`.
+6. **MongoDB for everything dynamic** — features, candidates, pair_historical, derivatives, task executions.
+7. **Parquet for candle data** — written by CandlesDownloaderTask via CLOBDataSource.
+8. **Telegram bot token and chat IDs are in `.env`** — never commit secrets.
 
-## Adding a new strategy
+## Strategy lifecycle (HB-native)
 
+**This is the only way to create, validate, and deploy strategies.**
+
+```
+IDEA → CONTROLLER → BACKTEST → WALK-FORWARD → DEPLOY (one command)
+```
+
+### 1. Scaffold
 ```bash
 python cli.py scaffold-strategy --name E3 --display "Mean Reversion RSI"
 ```
+Generates a self-contained HB V2 controller. No eval function, no quants-lab imports.
 
-This generates engine eval function + controller templates. Then:
-1. Implement `evaluate_e3()` logic
-2. Implement the backtesting controller
-3. Add `StrategyMetadata` entry to `STRATEGY_REGISTRY`
-4. Add `E3` to signal_scan engines in `hermes_pipeline.yml`
-5. Run `validate_registry()` to verify
+### 2. Implement
+Edit `app/controllers/directional_trading/e3_mean_reversion_rsi.py`:
+- `update_processed_data()` — compute features from candle feeds, emit signal
+- `get_executor_config()` — build executor with dynamic TP/SL
+
+### 3. Register
+Add `StrategyMetadata` to `STRATEGY_REGISTRY` with `deployment_mode="hb_native"`.
+
+### 4. Backtest + Validate
+```bash
+python cli.py trigger-task --task e3_bulk_backtest --config config/hermes_pipeline.yml
+python cli.py trigger-task --task e3_walk_forward --config config/hermes_pipeline.yml
+```
+Same controller code. Same `update_processed_data()`. Gates per quant-governance.
+
+### 5. Deploy
+```bash
+python cli.py deploy --engine E3                    # all ALLOW pairs
+python cli.py deploy --engine E3 --pair ETH-USDT    # single pair test
+python cli.py deploy --engine E3 --dry-run           # preview configs
+python cli.py bot-status --engine E3                 # check status
+python cli.py bot-stop --engine E3                   # stop bot
+```
+Deploys the controller as an HB bot container with WebSocket candle feeds. HB handles signal detection, executor creation, and position lifecycle natively.
+
+### Custom Docker image
+Bot containers use `quants-lab/hummingbot:demo` (Bybit demo patches baked in). Rebuild after HB version updates:
+```bash
+docker build -f /tmp/Dockerfile.hb-demo -t quants-lab/hummingbot:demo .
+```
 
 ## Environment
 
@@ -169,21 +202,30 @@ git remote set-url origin https://github.com/aloddo/quants-lab.git  # clean up i
 | `bybit_ls_ratio` | Long/short ratio history | 90 days |
 | `task_executions` | QL task execution history | 90 days |
 
-## Pipeline DAG
+## Architecture: QL data pipeline + HB-native bots
 
 ```
-candles_downloader_bybit  (hourly at :05)
-bybit_derivatives         (every 15 min)
-    ↓ (both on_success)
-feature_computation       (dependency-triggered)
-    ↓ (on_success)
-signal_scan               (dependency-triggered)
-    ↓ (on_success)
-testnet_resolver          (every 5 min + dependency-triggered)
+QL Data Pipeline (TaskOrchestrator, hermes_pipeline.yml):
+  candles_downloader_bybit  (hourly at :05)
+  bybit_derivatives         (every 15 min)
+      ↓ (both on_success)
+  feature_computation       (dependency-triggered)
+      ↓ (feeds analytics/monitoring only)
 
-e1_bulk_backtest          (weekly Sunday 03:00 UTC)
-e2_bulk_backtest          (weekly Sunday 04:00 UTC)
+HB-Native Bots (one Docker container per engine):
+  E1 bot: WebSocket feeds → E1Controller.update_processed_data() → auto executor
+  E2 bot: (same pattern, when migrated)
+
+  Deploy: python cli.py deploy --engine E1
+  Status: python cli.py bot-status --engine E1
+  Stop:   python cli.py bot-stop --engine E1
+
+Backtesting (isolated, never in live pipeline):
+  e1_bulk_backtest          (weekly Sunday 03:00 UTC)
+  e2_bulk_backtest          (weekly Sunday 04:00 UTC)
 ```
+
+**Legacy tasks (E2 only, until migrated):** signal_scan, testnet_resolver
 
 ## Engine parameters (locked)
 

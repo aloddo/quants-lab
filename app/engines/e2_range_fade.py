@@ -147,8 +147,14 @@ def evaluate_e2(snap: DecisionSnapshot) -> E2Candidate:
         cand.direction = direction
         return cand
 
-    # No OI expansion
-    if fr.oi_change_1h_pct is not None and fr.oi_change_1h_pct > OI_EXPANSION_CEILING_PCT:
+    # No OI expansion — require OI data (skip pair if missing)
+    if fr.oi_change_1h_pct is None:
+        cand.trigger_fired = False
+        cand.disposition = "FILTERED_STALENESS"
+        cand.filter_reason = "OI data missing — cannot confirm no-breakout"
+        cand.direction = direction
+        return cand
+    if fr.oi_change_1h_pct > OI_EXPANSION_CEILING_PCT:
         cand.trigger_fired = False
         cand.disposition = "FILTERED_EXPANSION"
         cand.filter_reason = (
@@ -199,6 +205,16 @@ def evaluate_e2(snap: DecisionSnapshot) -> E2Candidate:
         cand.filter_reason = (
             f"Distance to midpoint ({fp(distance_to_midpoint)}) < "
             f"0.5 ATR ({fp(min_reward)}) — no room"
+        )
+        return cand
+
+    # STEP 4b: Risk-reward check — TP distance must exceed SL distance
+    tp_dist = abs(cand.tp_price - c_close)
+    sl_dist = abs(cand.sl_price - c_close)
+    if sl_dist > 0 and tp_dist / sl_dist < 1.0:
+        cand.disposition = "FILTERED_MIN_REWARD"
+        cand.filter_reason = (
+            f"R:R {tp_dist/sl_dist:.2f} < 1.0 — reward does not exceed risk"
         )
         return cand
 

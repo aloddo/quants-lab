@@ -32,10 +32,12 @@ Each arrow is a gate. You cannot skip one. You cannot run two simultaneously.
 
 ## Current State
 
-Check `app/engines/registry.py` for registered engines and their configuration.
+Check `app/engines/strategy_registry.py` for registered engines and their configuration.
+All engines MUST have `deployment_mode="hb_native"`. The controller IS the strategy.
 Check MongoDB `pair_historical` for current verdicts per engine.
-Check `candidates` collection for paper trading results.
-Pipeline runs on Mac Mini via TaskOrchestrator DAG (`config/hermes_pipeline.yml`).
+Deploy: `python cli.py deploy --engine EN`. Status: `python cli.py bot-status --engine EN`.
+Data pipeline runs on Mac Mini via TaskOrchestrator DAG (`config/hermes_pipeline.yml`).
+Bots run as HB Docker containers via `quants-lab/hummingbot:demo` image.
 
 ---
 

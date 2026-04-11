@@ -16,6 +16,7 @@ from app.tasks.notifying_task import NotifyingTaskMixin
 from app.tasks.resolution.placement import (
     check_duplicate,
     check_portfolio_limits,
+    claim_candidate,
     get_capital,
     mark_skipped,
     place_order,
@@ -61,12 +62,16 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
                 f"Hummingbot API at {self.hb_client.base_url} is unreachable."
             )
 
+    # Unfilled order timeout: if executor hasn't filled in this many seconds, investigate
+    UNFILLED_TIMEOUT_S = 900  # 15 minutes
+
     async def _poll_active_positions(self) -> Dict[str, int]:
-        stats = {"polled": 0, "resolved": 0, "errors": 0}
+        stats = {"polled": 0, "resolved": 0, "errors": 0, "unfilled_detected": 0}
         docs = await self.mongodb_client.get_documents(
             "candidates", {"disposition": "TESTNET_ACTIVE"},
         )
         db = self.mongodb_client.get_database()
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         for doc in docs:
             executor_id = doc.get("executor_id")
@@ -77,107 +82,185 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
                 stats["polled"] += 1
 
                 exec_status = status.get("status", "").lower()
-                if exec_status in ("completed", "failed", "stopped", "closed", "terminated"):
-                    custom_info = status.get("custom_info") or {}
-                    fill_price = (status.get("entry_price") or status.get("fill_price")
-                                  or custom_info.get("current_position_average_price"))
-                    exit_price = (status.get("close_price") or status.get("exit_price")
-                                  or custom_info.get("close_price"))
-                    pnl = status.get("pnl") or status.get("net_pnl_quote")
-                    close_type = status.get("close_type")
-                    filled_amount = status.get("filled_amount_quote")
+                filled_amount = status.get("filled_amount_quote")
+                close_type = status.get("close_type")
 
-                    # Compute slippage vs decision price
-                    decision_price = doc.get("decision_price")
-                    slippage_bps = None
-                    slippage_bucket = None
-                    if decision_price and fill_price:
-                        try:
-                            dp = float(decision_price)
-                            fp_val = float(fill_price)
-                            if dp > 0:
-                                direction = doc.get("direction", "LONG")
-                                raw_slip = (fp_val - dp) / dp * 10000
-                                slippage_bps = raw_slip if direction == "LONG" else -raw_slip
-                                abs_slip = abs(slippage_bps)
-                                slippage_bucket = (
-                                    "safe" if abs_slip < 10
-                                    else "borderline" if abs_slip < 20
-                                    else "danger"
-                                )
-                        except (ValueError, TypeError):
-                            pass
+                # ── Step 5: Unfilled order timeout ──
+                # If executor is still active but placed >15min ago with 0 filled,
+                # check the exchange to see if there's actually a position
+                if exec_status in ("running", "active", "not_started"):
+                    placed_at = doc.get("testnet_placed_at", 0)
+                    age_s = (now_ms - int(placed_at)) / 1000 if placed_at else 0
+                    filled_zero = filled_amount is not None and float(filled_amount) == 0
 
-                    # Execution latency
-                    placed_at = doc.get("testnet_placed_at")
-                    signal_ts = doc.get("timestamp_utc")
-                    exec_latency_ms = None
-                    if placed_at and signal_ts:
-                        try:
-                            exec_latency_ms = int(placed_at) - int(signal_ts)
-                        except (ValueError, TypeError):
-                            pass
+                    if filled_zero and age_s > self.UNFILLED_TIMEOUT_S:
+                        pair = doc.get("pair", "?")
+                        engine = doc.get("engine", "?")
+                        has_pos = await self._check_exchange_position(pair)
 
-                    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        if has_pos:
+                            logger.error(
+                                f"EXCHANGE MISMATCH: {engine}/{pair} executor says unfilled "
+                                f"but exchange has position. Age: {age_s/60:.0f}min"
+                            )
+                            await self._send_mismatch_alert(doc, "executor_unfilled_exchange_has_position")
+                            stats["unfilled_detected"] += 1
+                        else:
+                            logger.warning(
+                                f"Unfilled timeout: {engine}/{pair} — no fill after "
+                                f"{age_s/60:.0f}min, no exchange position. Marking NEVER_FILLED."
+                            )
+                            await db["candidates"].update_one(
+                                {"candidate_id": doc["candidate_id"]},
+                                {"$set": {
+                                    "disposition": "RESOLVED_TESTNET",
+                                    "testnet_resolved_at": now_ms,
+                                    "testnet_close_type": "NEVER_FILLED",
+                                    "testnet_pnl": 0.0,
+                                    "testnet_filled_amount_quote": 0.0,
+                                    "testnet_status": "unfilled_timeout",
+                                }},
+                            )
+                            stats["resolved"] += 1
+                            # Stop the executor so HB frees resources
+                            try:
+                                await self.hb_client.stop_executor(executor_id)
+                            except Exception:
+                                pass
+                    continue
 
-                    # Position duration
-                    duration_s = None
-                    if placed_at:
-                        duration_s = (now_ms - int(placed_at)) / 1000
+                if exec_status not in ("completed", "failed", "stopped", "closed", "terminated"):
+                    continue
 
-                    await db["candidates"].update_one(
-                        {"candidate_id": doc["candidate_id"]},
-                        {"$set": {
-                            "disposition": "RESOLVED_TESTNET",
-                            "testnet_resolved_at": now_ms,
-                            "testnet_fill_price": fill_price,
-                            "testnet_exit_price": exit_price,
-                            "testnet_pnl": pnl,
-                            "testnet_close_type": close_type,
-                            "testnet_filled_amount_quote": filled_amount,
-                            "testnet_status": exec_status,
-                            "testnet_raw_result": status,
-                            "testnet_slippage_bps": slippage_bps,
-                            "testnet_slippage_bucket": slippage_bucket,
-                            "testnet_exec_latency_ms": exec_latency_ms,
-                        }},
-                    )
-                    stats["resolved"] += 1
-                    logger.info(f"Resolved {doc['engine']}/{doc['pair']}: {exec_status}, pnl={pnl}")
+                # ── Step 3: Cross-verify filled_amount=0 after crash ──
+                filled_zero = filled_amount is not None and float(filled_amount) == 0
+                is_cleanup = close_type in ("SYSTEM_CLEANUP", "FAILED")
 
-                    # Rich close notification
-                    if self.notification_manager:
-                        try:
-                            from core.notifiers.base import NotificationMessage
+                if filled_zero and is_cleanup:
+                    pair = doc.get("pair", "?")
+                    engine = doc.get("engine", "?")
+                    has_pos = await self._check_exchange_position(pair)
 
-                            pnl_float = float(pnl) if pnl is not None else 0
-                            amount_usd = doc.get("testnet_amount_usd", 0)
+                    if has_pos:
+                        logger.error(
+                            f"EXCHANGE MISMATCH: {engine}/{pair} executor reports "
+                            f"filled=0/{close_type} but exchange has open position. "
+                            f"NOT resolving — manual intervention needed."
+                        )
+                        await db["candidates"].update_one(
+                            {"candidate_id": doc["candidate_id"]},
+                            {"$set": {
+                                "reconciliation_divergent": True,
+                                "reconciliation_reason": "exchange_mismatch_filled_zero",
+                                "reconciliation_needs_manual": True,
+                                "reconciliation_checked_at": now_ms,
+                            }},
+                        )
+                        await self._send_mismatch_alert(doc, "crash_recovery_mismatch")
+                        stats["errors"] += 1
+                        continue
 
-                            slip_str = ""
-                            if slippage_bps is not None:
-                                slip_str = f"Slippage: {slippage_bps:.1f} bps ({slippage_bucket})"
-                            latency_str = ""
-                            if exec_latency_ms is not None:
-                                latency_str = f"Latency: {fmt_duration(exec_latency_ms / 1000)}"
-                            meta_parts = [s for s in [slip_str, latency_str] if s]
-                            meta_line = " | ".join(meta_parts)
+                # ── Normal resolution ──
+                custom_info = status.get("custom_info") or {}
+                fill_price = (status.get("entry_price") or status.get("fill_price")
+                              or custom_info.get("current_position_average_price"))
+                exit_price = (status.get("close_price") or status.get("exit_price")
+                              or custom_info.get("close_price"))
+                pnl = status.get("pnl") or status.get("net_pnl_quote")
 
-                            duration_str = fmt_duration(duration_s) if duration_s else "N/A"
+                # Label NEVER_FILLED correctly
+                if filled_zero and is_cleanup:
+                    close_type = "NEVER_FILLED"
 
-                            await self.notification_manager.send_notification(NotificationMessage(
-                                title=f"Position Closed — {close_type}",
-                                message=(
-                                    f"<b>{'✅' if pnl_float > 0 else '❌'} Position Closed — {close_type}</b>\n"
-                                    f"{doc['engine']}/{doc['pair']} {doc.get('direction', '')}\n"
-                                    f"Fill: {fp(fill_price)} → Exit: {fp(exit_price)}\n"
-                                    f"PnL: {fmt_pnl(pnl_float, amount_usd)}\n"
-                                    + (f"{meta_line}\n" if meta_line else "")
-                                    + f"Duration: {duration_str}"
-                                ),
-                                level="success" if pnl_float > 0 else "error",
-                            ))
-                        except Exception as e:
-                            logger.warning(f"Close notification failed: {e}")
+                # Compute slippage vs decision price
+                decision_price = doc.get("decision_price")
+                slippage_bps = None
+                slippage_bucket = None
+                if decision_price and fill_price:
+                    try:
+                        dp = float(decision_price)
+                        fp_val = float(fill_price)
+                        if dp > 0:
+                            direction = doc.get("direction", "LONG")
+                            raw_slip = (fp_val - dp) / dp * 10000
+                            slippage_bps = raw_slip if direction == "LONG" else -raw_slip
+                            abs_slip = abs(slippage_bps)
+                            slippage_bucket = (
+                                "safe" if abs_slip < 10
+                                else "borderline" if abs_slip < 20
+                                else "danger"
+                            )
+                    except (ValueError, TypeError):
+                        pass
+
+                # Execution latency
+                placed_at = doc.get("testnet_placed_at")
+                signal_ts = doc.get("timestamp_utc")
+                exec_latency_ms = None
+                if placed_at and signal_ts:
+                    try:
+                        exec_latency_ms = int(placed_at) - int(signal_ts)
+                    except (ValueError, TypeError):
+                        pass
+
+                # Position duration
+                duration_s = None
+                if placed_at:
+                    duration_s = (now_ms - int(placed_at)) / 1000
+
+                await db["candidates"].update_one(
+                    {"candidate_id": doc["candidate_id"]},
+                    {"$set": {
+                        "disposition": "RESOLVED_TESTNET",
+                        "testnet_resolved_at": now_ms,
+                        "testnet_fill_price": fill_price,
+                        "testnet_exit_price": exit_price,
+                        "testnet_pnl": pnl,
+                        "testnet_close_type": close_type,
+                        "testnet_filled_amount_quote": filled_amount,
+                        "testnet_status": exec_status,
+                        "testnet_raw_result": status,
+                        "testnet_slippage_bps": slippage_bps,
+                        "testnet_slippage_bucket": slippage_bucket,
+                        "testnet_exec_latency_ms": exec_latency_ms,
+                    }},
+                )
+                stats["resolved"] += 1
+                logger.info(f"Resolved {doc['engine']}/{doc['pair']}: {exec_status}, pnl={pnl}")
+
+                # Rich close notification
+                if self.notification_manager:
+                    try:
+                        from core.notifiers.base import NotificationMessage
+
+                        pnl_float = float(pnl) if pnl is not None else 0
+                        amount_usd = doc.get("testnet_amount_usd", 0)
+
+                        slip_str = ""
+                        if slippage_bps is not None:
+                            slip_str = f"Slippage: {slippage_bps:.1f} bps ({slippage_bucket})"
+                        latency_str = ""
+                        if exec_latency_ms is not None:
+                            latency_str = f"Latency: {fmt_duration(exec_latency_ms / 1000)}"
+                        meta_parts = [s for s in [slip_str, latency_str] if s]
+                        meta_line = " | ".join(meta_parts)
+
+                        duration_str = fmt_duration(duration_s) if duration_s else "N/A"
+
+                        await self.notification_manager.send_notification(NotificationMessage(
+                            title=f"Position Closed — {close_type}",
+                            message=(
+                                f"<b>{'✅' if pnl_float > 0 else '❌'} Position Closed — {close_type}</b>\n"
+                                f"{doc['engine']}/{doc['pair']} {doc.get('direction', '')}\n"
+                                f"Fill: {fp(fill_price)} → Exit: {fp(exit_price)}\n"
+                                f"PnL: {fmt_pnl(pnl_float, amount_usd)}\n"
+                                + (f"{meta_line}\n" if meta_line else "")
+                                + f"Duration: {duration_str}"
+                            ),
+                            level="success" if pnl_float > 0 else "error",
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Close notification failed: {e}")
 
             except Exception as e:
                 stats["errors"] += 1
@@ -190,7 +273,7 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
         stats = {"new_orders": 0, "skipped": 0, "poll_stats": {}, "errors": 0}
         db = self.mongodb_client.get_database()
 
-        capital = await get_capital(self.hb_client, self.account, self.fallback_capital)
+        capital, capital_source = await get_capital(self.hb_client, self.account, self.fallback_capital)
 
         for engine in self.engines:
             # Shadow engines are evaluated-only — never place real orders
@@ -225,6 +308,11 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
             )
 
             for doc in ready_docs:
+                # Atomic claim — prevents double placement with breakout_monitor
+                if not await claim_candidate(db, doc["candidate_id"]):
+                    logger.info(f"Resolver: {doc['pair']} claim lost (already placing)")
+                    continue
+
                 # Per-position dedup guard
                 skip_reason = await check_duplicate(
                     db, engine, doc["pair"], doc.get("direction", ""),
@@ -258,6 +346,7 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
                     trading_rules=self._trading_rules,
                     db=db,
                     notification_manager=self.notification_manager,
+                    capital_source=capital_source,
                 )
                 if executor_id:
                     stats["new_orders"] += 1
@@ -272,6 +361,42 @@ class TestnetResolverTask(NotifyingTaskMixin, BaseTask):
             "stats": stats,
             "duration_seconds": duration,
         }
+
+    async def _check_exchange_position(self, pair: str) -> bool:
+        """Check if a pair has an open position on the exchange."""
+        try:
+            positions = await self.hb_client.get_exchange_positions(
+                self.connector, self.account,
+            )
+            for pos in positions:
+                pos_pair = pos.get("trading_pair") or pos.get("pair", "")
+                pos_amount = float(pos.get("amount", 0) or 0)
+                if pos_pair == pair and abs(pos_amount) > 0:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"Cannot check exchange position for {pair}: {e}")
+            return True  # assume worst case
+
+    async def _send_mismatch_alert(self, doc: dict, reason: str) -> None:
+        """Send urgent Telegram alert for exchange mismatch."""
+        if not self.notification_manager:
+            return
+        try:
+            from core.notifiers.base import NotificationMessage
+            await self.notification_manager.send_notification(NotificationMessage(
+                title="EXCHANGE MISMATCH",
+                message=(
+                    f"<b>EXCHANGE MISMATCH — Manual check needed</b>\n"
+                    f"{doc.get('engine')}/{doc.get('pair')} {doc.get('direction')}\n"
+                    f"Reason: {reason}\n"
+                    f"Executor says unfilled but exchange has position.\n"
+                    f"Check Bybit demo UI immediately."
+                ),
+                level="error",
+            ))
+        except Exception as e:
+            logger.warning(f"Mismatch alert failed: {e}")
 
     async def cleanup(self, context: TaskContext, result) -> None:
         await self.hb_client.close()

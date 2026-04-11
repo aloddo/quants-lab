@@ -61,6 +61,8 @@ tasks:
     tags: [features, computation]
 
   # ═══════ Layer 3: Signal Scanning ═══════════════════════
+  # ═══════ Layer 3: Signal Scanning (legacy — E2 only) ═════
+  # E1 is deployed as HB-native bot (see: python cli.py deploy --engine E1)
   signal_scan:
     enabled: true
     task_class: app.tasks.screening.signal_scan_task.SignalScanTask
@@ -74,15 +76,16 @@ tasks:
     max_retries: 1
     timeout_seconds: 300
     config:
-      engines: ["E1", "E2"]
+      engines: ["E2"]
       connector_name: "bybit_perpetual"
       top_n: 0
       telegram_chat_id: "-1003576397888"
     tags: [screening, signals]
 
   # ═══════ Layer 3b: Real-Time Breakout Monitor ═══════════
+  # DISABLED: E1 uses HB-native bot with WebSocket feeds
   breakout_monitor:
-    enabled: true
+    enabled: false
     task_class: app.tasks.screening.breakout_monitor_task.BreakoutMonitorTask
     schedule:
       type: cron
@@ -96,7 +99,8 @@ tasks:
       max_portfolio_positions: 40
     tags: [screening, realtime, breakout]
 
-  # ═══════ Layer 4: Testnet Resolution ════════════════════
+  # ═══════ Layer 4: Testnet Resolution (legacy — E2 only) ═
+  # E1 executor lifecycle managed natively by HB bot
   testnet_resolver:
     enabled: true
     task_class: app.tasks.resolution.testnet_resolver_task.TestnetResolverTask
@@ -108,9 +112,6 @@ tasks:
       - task_name: "signal_scan"
         on_success: true
         delay_seconds: 5
-      - task_name: "breakout_monitor"
-        on_success: true
-        delay_seconds: 2
     max_retries: 2
     timeout_seconds: 120
     config:
@@ -118,7 +119,7 @@ tasks:
       account: "master_account"
       position_size_pct: 0.003
       fallback_capital: 100000
-      engines: ["E1", "E2"]
+      engines: ["E2"]
       max_portfolio_positions: 40
     tags: [resolution, testnet]
 

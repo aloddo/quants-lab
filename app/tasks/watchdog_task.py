@@ -34,10 +34,10 @@ TASK_SILENCE_MINUTES = 90
 # Minimum time between Telegram alerts (prevents spam)
 ALERT_COOLDOWN_MINUTES = 60
 # Critical tasks that must have recent successful executions
+# E1 runs as HB-native bot — signal_scan only needed for E2 (legacy)
 CRITICAL_TASKS = [
     "candles_downloader_bybit",
     "feature_computation",
-    "signal_scan",
 ]
 
 # Self-healing limits
@@ -116,6 +116,29 @@ class WatchdogTask(BaseTask):
         stuck = await self._check_stuck_executors(db)
         if stuck:
             healed.extend([f"Stopped stuck: {s}" for s in stuck])
+
+        # ── 6b. Exchange reconciliation (3-way) ────────────────
+        try:
+            from app.tasks.resolution.reconciliation import reconcile_positions
+            recon = await reconcile_positions(db)
+            if recon.get("ghost_recovered", 0) > 0:
+                healed.append(
+                    f"Recovered {recon['ghost_recovered']} ghost position(s) from executor history"
+                )
+            if recon.get("ghost_unresolved", 0) > 0:
+                issues.append(
+                    f"Reconciliation: {recon['ghost_unresolved']} ghost position(s) "
+                    f"could not be recovered — manual check needed"
+                )
+            if recon.get("exchange_mismatches", 0) > 0:
+                issues.append(
+                    f"Reconciliation: {recon['exchange_mismatches']} untracked exchange "
+                    f"position(s) — check Bybit demo UI"
+                )
+            if recon.get("orphan_executors", 0) > 0:
+                issues.append(f"Reconciliation: {recon['orphan_executors']} orphan executor(s)")
+        except Exception as e:
+            logger.warning(f"Reconciliation check failed: {e}")
 
         # ── 7. Failure streaks ────────────────────────────────
         failure_alerts = self._check_failure_streaks(db)
@@ -324,6 +347,27 @@ class WatchdogTask(BaseTask):
         stuck = []
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
+        # Orphan cleanup: TESTNET_ACTIVE/PLACING with null/missing executor_id
+        orphans = list(db.candidates.find({
+            "disposition": {"$in": ["TESTNET_ACTIVE", "PLACING"]},
+            "$or": [{"executor_id": None}, {"executor_id": {"$exists": False}}],
+        }))
+        for doc in orphans:
+            cid = doc.get("candidate_id", "?")
+            pair = doc.get("pair", "?")
+            engine = doc.get("engine", "?")
+            logger.warning(f"Watchdog: orphan candidate {cid} ({engine}/{pair}) — "
+                           "TESTNET_ACTIVE with no executor_id, resolving")
+            db.candidates.update_one(
+                {"candidate_id": cid},
+                {"$set": {
+                    "disposition": "RESOLVED_TESTNET",
+                    "testnet_close_type": "ORPHAN_NULL_EXECUTOR",
+                    "testnet_resolved_at": now_ms,
+                }},
+            )
+            stuck.append(f"{engine}/{pair} (orphan)")
+
         active = list(db.candidates.find({"disposition": "TESTNET_ACTIVE"}))
 
         for doc in active:
@@ -342,27 +386,38 @@ class WatchdogTask(BaseTask):
             engine = doc.get("engine", "?")
             age_h = (now_ms - int(placed_at)) / 3600000
 
+            stop_succeeded = False
             if executor_id:
                 try:
                     from app.services.hb_api_client import HBApiClient
                     hb = HBApiClient()
                     await hb.stop_executor(executor_id)
                     await hb.close()
+                    stop_succeeded = True
                     logger.info(f"Watchdog: stopped stuck executor {executor_id} "
                                 f"({engine}/{pair}, {age_h:.1f}h old)")
                 except Exception as e:
                     logger.warning(f"Watchdog: failed to stop executor {executor_id}: {e}")
 
-            # Mark as resolved regardless (executor may be gone already)
-            db.candidates.update_one(
-                {"candidate_id": doc["candidate_id"]},
-                {"$set": {
-                    "disposition": "RESOLVED_TESTNET",
-                    "testnet_close_type": "WATCHDOG_STOP",
-                    "testnet_resolved_at": now_ms,
-                }},
-            )
-            stuck.append(f"{engine}/{pair} ({age_h:.1f}h)")
+            if stop_succeeded or not executor_id:
+                db.candidates.update_one(
+                    {"candidate_id": doc["candidate_id"]},
+                    {"$set": {
+                        "disposition": "RESOLVED_TESTNET",
+                        "testnet_close_type": "WATCHDOG_STOP",
+                        "testnet_resolved_at": now_ms,
+                    }},
+                )
+                stuck.append(f"{engine}/{pair} ({age_h:.1f}h)")
+            else:
+                db.candidates.update_one(
+                    {"candidate_id": doc["candidate_id"]},
+                    {"$set": {
+                        "watchdog_stop_failed": True,
+                        "watchdog_stop_error": "executor stop failed",
+                    }},
+                )
+                logger.warning(f"Watchdog: {engine}/{pair} stop failed — keeping TESTNET_ACTIVE")
 
         return stuck
 
@@ -371,7 +426,7 @@ class WatchdogTask(BaseTask):
     def _check_failure_streaks(self, db) -> list:
         """Detect tasks failing 5+ times consecutively."""
         alerts = []
-        check_tasks = CRITICAL_TASKS + ["breakout_monitor", "testnet_resolver"]
+        check_tasks = CRITICAL_TASKS + ["testnet_resolver"]
 
         for task_name in check_tasks:
             recent = list(db.task_executions.find(

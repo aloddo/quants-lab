@@ -21,13 +21,15 @@ description: "Run QuantsLab backtests via BacktestingEngine. Covers controller c
 
 ## Engine Registry
 
-All engine-specific configuration (resolution, candles, exit params, config class) lives in `app/engines/registry.py`. This is the single source of truth.
+All engine-specific configuration lives in `app/engines/strategy_registry.py`. Single source of truth.
+All engines MUST have `deployment_mode="hb_native"`. The controller IS the strategy —
+same code runs in backtest (BacktestingEngine) and live (HB bot container).
 
 ```python
-from app.engines.registry import get_engine, build_backtest_config
+from app.engines.strategy_registry import get_strategy, build_backtest_config
 
 # Get metadata for any registered engine
-meta = get_engine("E1")  # resolution, intervals, exit_params, etc.
+meta = get_strategy("E1")  # resolution, intervals, exit_params, deployment_mode, etc.
 
 # Build a complete backtest config -- handles candles, exits, trailing stop
 config = build_backtest_config(engine_name="E1", connector="bybit_perpetual", pair="BTC-USDT")

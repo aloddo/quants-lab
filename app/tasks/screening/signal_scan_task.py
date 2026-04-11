@@ -19,7 +19,7 @@ from core.tasks import BaseTask, TaskContext
 
 from app.engines.models import CandidateBase, DecisionSnapshot, FeatureRow
 from app.engines.pair_selector import get_eligible_pairs
-from app.engines.strategy_registry import get_evaluate_fn
+from app.engines.strategy_registry import get_evaluate_fn, get_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +286,8 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
             results.append(doc)
 
         if not results:
-            # No walk-forward data yet — let it run
+            # No walk-forward data yet — let it run but log warning
+            logger.warning(f"{engine}: no walk-forward data — running without WF validation")
             return True
 
         agg = results[0]
@@ -345,6 +346,8 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
                     stats["engines_paused"] += 1
                     continue
 
+                meta = get_strategy(engine)
+
                 eligible, rejections = await get_eligible_pairs(
                     self.mongodb_client, engine, top_n=self.top_n
                 )
@@ -358,6 +361,12 @@ class SignalScanTask(NotifyingTaskMixin, BaseTask):
                         logger.warning(
                             f"{engine}/{pair}: skipped — not in TRADEABLE_PAIRS"
                         )
+                        stats["skipped"] += 1
+                        continue
+
+                    # ── Blocked-pair safety gate ─────────
+                    if pair in meta.blocked_pairs:
+                        logger.info(f"{engine}/{pair}: skipped — blocked_pairs")
                         stats["skipped"] += 1
                         continue
 

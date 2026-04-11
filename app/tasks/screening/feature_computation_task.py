@@ -83,18 +83,23 @@ class FeatureComputationTask(NotifyingTaskMixin, BaseTask):
         )
 
     async def _get_derivatives_data(self, pair: str) -> Dict[str, list]:
-        """Fetch latest derivatives data from MongoDB for a pair."""
+        """Fetch latest derivatives data from MongoDB for a pair.
+
+        Uses direct collection access with timestamp_utc sort (the actual field
+        name in derivatives collections) instead of get_documents() which sorts
+        by "timestamp" (wrong field, core/ upstream limitation).
+        """
         result = {"oi": [], "funding": [], "ls": []}
         try:
-            result["oi"] = await self.mongodb_client.get_documents(
-                "bybit_open_interest", {"pair": pair}, limit=10
-            )
-            result["funding"] = await self.mongodb_client.get_documents(
-                "bybit_funding_rates", {"pair": pair}, limit=10
-            )
-            result["ls"] = await self.mongodb_client.get_documents(
-                "bybit_ls_ratio", {"pair": pair}, limit=10
-            )
+            db = self.mongodb_client.get_database()
+            query = {"pair": pair}
+            for coll_name, key in [
+                ("bybit_open_interest", "oi"),
+                ("bybit_funding_rates", "funding"),
+                ("bybit_ls_ratio", "ls"),
+            ]:
+                cursor = db[coll_name].find(query).sort("timestamp_utc", -1).limit(10)
+                result[key] = await cursor.to_list(length=10)
         except Exception as e:
             logger.warning(f"Failed to fetch derivatives for {pair}: {e}")
         return result
@@ -250,8 +255,12 @@ class FeatureComputationTask(NotifyingTaskMixin, BaseTask):
             f"{stats['features_saved']} features, {stats['errors']} errors in {duration:.1f}s"
         )
 
+        status = "completed" if stats["errors"] == 0 else "partial"
+        if status == "partial":
+            logger.warning(f"FeatureComputationTask finished with {stats['errors']} errors — status=partial")
+
         return {
-            "status": "completed",
+            "status": status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "execution_id": context.execution_id,
             "stats": stats,

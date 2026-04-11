@@ -1,9 +1,24 @@
 ---
 name: research-process
-description: "Repeatable research and deployment process for quant strategy development. Covers Phase 0 (idea) through Phase 4 (paper trading). Built from E1/E2 development sessions. Load when designing, backtesting, or validating any strategy."
+description: "HB-native strategy lifecycle: idea → self-contained controller → backtest → walk-forward → deploy. One controller, one signal path, same code for backtest and live. Load when designing, backtesting, or validating any strategy."
 ---
 
-# Quant Research & Deployment Process
+# Quant Research & Deployment Process (HB-Native)
+
+**The controller IS the strategy.** One self-contained HB V2 controller runs in both
+BacktestingEngine (validation) and HB bot container (live). No separate eval functions,
+no custom signal pipelines, no breakout monitors.
+
+```
+scaffold → implement controller → register → backtest → walk-forward → deploy
+python cli.py scaffold-strategy --name EN --display "..."
+python cli.py trigger-task --task eN_bulk_backtest
+python cli.py trigger-task --task eN_walk_forward
+python cli.py deploy --engine EN
+```
+
+Controllers must be self-contained: only `hummingbot.*`, `pandas`, `pandas_ta`, `numpy`,
+`pydantic`, stdlib. No `app.*` imports. Inline any helpers.
 
 ---
 

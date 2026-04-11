@@ -8,12 +8,13 @@ errors before the pipeline runs.
 Usage:
     from app.engines.strategy_registry import STRATEGY_REGISTRY, get_strategy, validate_registry
 
-Adding a new engine:
-    1. Write evaluate_eN() in app/engines/eN_*.py (pure function)
-    2. Write HB V2 controller in app/controllers/directional_trading/eN_*.py
-    3. Add StrategyMetadata entry to STRATEGY_REGISTRY below
-    4. Run validate_registry() to check everything resolves
-    5. Add engine name to signal_scan engines list in hermes_pipeline.yml
+Adding a new engine (HB-native):
+    1. Write self-contained HB V2 controller in app/controllers/directional_trading/eN_*.py
+       (no quants-lab imports — only hummingbot.*, pandas, pandas_ta, numpy, pydantic, stdlib)
+    2. Add StrategyMetadata entry to STRATEGY_REGISTRY below (deployment_mode="hb_native")
+    3. Run validate_registry() to check everything resolves
+    4. Backtest: python cli.py trigger-task --task eN_bulk_backtest
+    5. Deploy: python cli.py deploy --engine EN
 """
 import importlib
 import logging
@@ -35,17 +36,18 @@ class StrategyMetadata:
     display_name: str              # e.g. "Compression Breakout"
 
     # Evaluation function: (DecisionSnapshot) -> CandidateBase
-    evaluate_fn: Callable
+    # DEPRECATED for HB-native strategies (controller handles everything)
+    evaluate_fn: Optional[Callable] = None
 
-    # Backtesting controller
-    controller_module: str         # e.g. "app.controllers.directional_trading.e1_..."
-    config_class_name: str         # e.g. "E1CompressionBreakoutConfig"
+    # Controller (primary — same code for backtest and live)
+    controller_module: str = ""    # e.g. "app.controllers.directional_trading.e1_..."
+    config_class_name: str = ""    # e.g. "E1CompressionBreakoutConfig"
 
     # Timeframes
-    intervals: List[str]           # e.g. ["1h", "5m"]
-    backtesting_resolution: str    # e.g. "5m"
+    intervals: List[str] = field(default_factory=lambda: ["1h"])
+    backtesting_resolution: str = "1m"
 
-    # Exit parameters (used by testnet resolver + backtesting)
+    # Exit parameters (used by backtesting + fallback for HB executor)
     exit_params: Dict[str, Any] = field(default_factory=dict)
     trailing_stop: Optional[Dict[str, Any]] = None
 
@@ -65,6 +67,24 @@ class StrategyMetadata:
     enabled: bool = True
     shadow_of: Optional[str] = None  # if set, this is a shadow variant of another engine
 
+    # ── HB-native deployment ─────────────────────────────────
+    controller_file: str = ""      # filename for bots/controllers/ (e.g. "e1_compression_breakout.py")
+    hb_connector: str = "bybit_perpetual_demo"
+    deployment_mode: str = "hb_native"  # "hb_native" | "legacy"
+
+    # Default config overrides for deployment (merged with controller defaults)
+    default_config: Dict[str, Any] = field(default_factory=dict)
+
+    # Pair source: "pair_historical" reads from MongoDB, "explicit" uses pair_allowlist
+    pair_source: str = "pair_historical"
+    pair_allowlist: List[str] = field(default_factory=list)
+
+    # Bot deployment
+    bot_image: str = "quants-lab/hummingbot:demo"  # Docker image (with patches baked in)
+    total_amount_quote: float = 300.0   # per pair position size in quote
+    cooldown_time: int = 3600           # seconds between signals on same pair
+    max_drawdown_quote: Optional[float] = None  # per-controller drawdown limit
+
 
 # ── Registry ──────────────────────────────────────────────
 
@@ -80,29 +100,39 @@ def _lazy_e2():
 STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
     "E1": StrategyMetadata(
         name="E1",
-        display_name="Compression Breakout",
-        evaluate_fn=_lazy_e1,
-        controller_module="app.controllers.directional_trading.e1_compression_breakout",
-        config_class_name="E1CompressionBreakoutConfig",
-        intervals=["1h", "1m"],
-        backtesting_resolution="1m",
-        # Fallback exit params — E1 now computes dynamic ATR-based TP/SL
-        # in evaluate_e1() (tp_price/sl_price on E1Candidate) and in the
-        # controller's get_executor_config(). These values are used only
-        # when dynamic levels are unavailable.
+        display_name="Volume Ignition",
+        controller_module="app.controllers.directional_trading.e1_volume_ignition",
+        config_class_name="E1VolumeIgnitionConfig",
+        intervals=["1h"],
+        backtesting_resolution="1h",
         exit_params={
-            "stop_loss": Decimal("0.015"),
-            "take_profit": Decimal("0.03"),
-            "time_limit": 86400,
+            "stop_loss": Decimal("0.005"),
+            "take_profit": Decimal("0.01"),
+            "time_limit": 14400,  # 4 hours
         },
         trailing_stop={
-            "activation_price": Decimal("0.015"),
-            "trailing_delta": Decimal("0.010"),
+            "activation_price": Decimal("0.005"),
+            "trailing_delta": Decimal("0.003"),
         },
         direction="BOTH",
-        blocked_pairs=["BTC-USDT"],
-        required_features=["atr", "range", "volume", "momentum", "derivatives"],
+        blocked_pairs=[],
+        required_features=["atr", "volume"],
         max_concurrent=20,
+        controller_file="e1_volume_ignition.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "volume_threshold": 3.0,
+            "body_atr_threshold": 2.0,
+            "tp_atr_mult": 1.0,
+            "sl_atr_mult": 0.5,
+            "trailing_activation_atr": 0.5,
+            "trailing_delta_atr": 0.3,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=1800,  # 30min cooldown (faster strategy)
+        max_drawdown_quote=500.0,
     ),
     "E2": StrategyMetadata(
         name="E2",
@@ -122,6 +152,8 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         blocked_pairs=[],
         required_features=["atr", "range", "volume", "derivatives"],
         max_concurrent=20,
+        # E2 stays on legacy pipeline until migrated
+        deployment_mode="legacy",
     ),
 }
 
@@ -162,20 +194,6 @@ def get_config_class(name: str):
 
 # ── Backtesting support (migrated from registry.py) ──────
 
-def _build_candles_config(
-    connector: str, pair: str, intervals: List[str],
-) -> List[CandlesConfig]:
-    MAX_RECORDS = {"1h": 50, "5m": 50}
-    configs = []
-    for interval in intervals:
-        mr = MAX_RECORDS.get(interval, 50)
-        configs.append(CandlesConfig(
-            connector=connector, trading_pair=pair,
-            interval=interval, max_records=mr,
-        ))
-    return configs
-
-
 def build_backtest_config(
     engine_name: str,
     connector: str,
@@ -183,14 +201,17 @@ def build_backtest_config(
     total_amount_quote: Decimal = Decimal("100"),
     **overrides,
 ):
-    """Build a complete controller config for backtesting."""
+    """Build a complete controller config for backtesting.
+
+    Does NOT set candles_config — lets the controller's model_post_init()
+    compute the correct lookback sizes (e.g. E1 needs 2224 bars of 1h for
+    90-day ATR percentile).
+    """
     from hummingbot.strategy_v2.executors.position_executor.data_types import TrailingStop
     from hummingbot.core.data_type.common import OrderType
 
     meta = get_strategy(engine_name)
     ConfigClass = get_config_class(engine_name)
-
-    candles = _build_candles_config(connector, pair, meta.intervals)
 
     config_kwargs = {
         "id": f"{engine_name.lower()}_bulk_{pair}",
@@ -200,7 +221,7 @@ def build_backtest_config(
         "max_executors_per_side": 1,
         "cooldown_time": 60,
         "leverage": 1,
-        "candles_config": candles,
+        # candles_config deliberately omitted — controller computes correct lookbacks
     }
 
     config_kwargs.update(meta.exit_params)
@@ -243,13 +264,14 @@ def validate_registry() -> List[str]:
                 f"not found in {meta.controller_module}"
             )
 
-        # 3. Evaluate function
-        try:
-            fn = get_evaluate_fn(name)
-            if not callable(fn):
-                errors.append(f"{name}: evaluate_fn is not callable: {fn}")
-        except Exception as e:
-            errors.append(f"{name}: evaluate_fn resolution failed: {e}")
+        # 3. Evaluate function (optional for HB-native strategies)
+        if meta.evaluate_fn is not None:
+            try:
+                fn = get_evaluate_fn(name)
+                if not callable(fn):
+                    errors.append(f"{name}: evaluate_fn is not callable: {fn}")
+            except Exception as e:
+                errors.append(f"{name}: evaluate_fn resolution failed: {e}")
 
         # 4. Required features
         try:

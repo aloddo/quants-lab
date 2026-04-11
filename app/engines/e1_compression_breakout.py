@@ -22,6 +22,13 @@ Entry Quality Constraint on 5m trigger (3 checks, ALL must pass):
   - 5m candle body < 0.5x ATR(14) on 5m
   - Gap < min(5 bps, 0.15 × ATR_5m in bps) — BTC-calibrated constants
 
+LIVE vs BACKTEST DIVERGENCE (documented, intentional):
+  - Live path uses 1h close for breakout detection (evaluate_e1)
+  - Backtest controller uses 1m confirmation bars after 1h setup
+  - The 5m entry quality gate (check_entry_quality_5m) is RESERVED but not
+    called — stress testing showed 98.6% rejection rate. Re-enable only after
+    5m ATR features are computed in the pipeline.
+
 Migrated from crypto-quant/engines/e1_compression_breakout.py.
 SQLite removed — candidate storage handled by task layer.
 """
@@ -229,6 +236,10 @@ def check_entry_quality_5m(
     """
     Entry quality gate on 5m trigger (V7.1 Section 6).
     Returns (passed, fail_reason).
+
+    RESERVED: Not called by evaluate_e1(). Stress testing showed 98.6% rejection
+    rate — too aggressive for current signal quality. Re-enable once 5m ATR features
+    are computed in the pipeline (atr_14_5m field in FeatureRow).
 
     WARNING: Gap threshold constants (5 bps, 0.15x) are BTC-calibrated.
     """

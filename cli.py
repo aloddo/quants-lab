@@ -51,6 +51,45 @@ async def clear_stale_locks():
     client.close()
 
 
+async def run_startup_exchange_audit():
+    """Verify exchange positions match MongoDB state before trading starts.
+
+    Detects orphaned positions left by a previous crash. Must run AFTER
+    clear_stale_locks() and BEFORE the task orchestrator starts.
+    """
+    from pymongo import MongoClient
+    from app.tasks.resolution.reconciliation import startup_exchange_audit
+
+    mongo_uri = os.getenv("MONGO_URI")
+    mongo_db = os.getenv("MONGO_DATABASE", "quants_lab")
+    if not mongo_uri:
+        return
+
+    client = MongoClient(mongo_uri)
+    db = client[mongo_db]
+
+    logger.info("Startup: running exchange position audit...")
+    try:
+        result = await startup_exchange_audit(db)
+        if result.get("skipped"):
+            logger.warning("Startup: exchange audit skipped (HB API unavailable)")
+        elif result.get("orphan_positions", 0) > 0 or result.get("stale_candidates", 0) > 0:
+            logger.warning(
+                f"Startup: exchange audit found issues — "
+                f"{result.get('orphan_positions', 0)} orphan position(s), "
+                f"{result.get('stale_candidates', 0)} stale candidate(s)"
+            )
+        else:
+            logger.info(
+                f"Startup: exchange audit clean — "
+                f"{result.get('exchange_positions', 0)} position(s) verified"
+            )
+    except Exception as e:
+        logger.error(f"Startup: exchange audit failed: {e}")
+    finally:
+        client.close()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='QuantsLab Task Management CLI',
@@ -112,8 +151,8 @@ Examples:
                              help='Configuration file name (from config/ directory)')
     serve_parser.add_argument('--port', '-p', type=int, default=8000,
                              help='API server port')
-    serve_parser.add_argument('--host', default='0.0.0.0',
-                             help='API server host')
+    serve_parser.add_argument('--host', default='127.0.0.1',
+                             help='API server host (default: 127.0.0.1, use 0.0.0.0 for remote access)')
     
     # List tasks
     list_parser = subparsers.add_parser('list-tasks', help='List available tasks')
@@ -142,6 +181,23 @@ Examples:
                                help='Shadow engine name (e.g. E1_shadow)')
     shadow_parser.add_argument('--to', required=True,
                                help='Live engine to promote into (e.g. E1)')
+
+    # ── Bot Orchestration ──────────────────────────────────
+    deploy_parser = subparsers.add_parser('deploy', help='Deploy engine as HB-native bot')
+    deploy_parser.add_argument('--engine', '-e', required=True, help='Engine name (e.g. E1)')
+    deploy_parser.add_argument('--pair', '-p', help='Single pair to deploy (testing)')
+    deploy_parser.add_argument('--dry-run', action='store_true', help='Show configs without deploying')
+    deploy_parser.add_argument('--profile', default='master_account', help='HB credentials profile')
+
+    bot_status_parser = subparsers.add_parser('bot-status', help='Check HB bot status')
+    bot_status_parser.add_argument('--engine', '-e', help='Engine name (omit for all bots)')
+
+    bot_stop_parser = subparsers.add_parser('bot-stop', help='Stop HB bot')
+    bot_stop_parser.add_argument('--engine', '-e', required=True, help='Engine name')
+
+    bot_redeploy_parser = subparsers.add_parser('bot-redeploy', help='Stop, regenerate configs, redeploy')
+    bot_redeploy_parser.add_argument('--engine', '-e', required=True, help='Engine name')
+    bot_redeploy_parser.add_argument('--profile', default='master_account', help='HB credentials profile')
 
     # Research process tracking
     research_parser = subparsers.add_parser('research', help='Research process tracking')
@@ -175,6 +231,9 @@ async def run_tasks(config_path: str, verbose: bool = False):
 
     # Clear stale locks from any previous crashed run
     await clear_stale_locks()
+
+    # Verify exchange positions match MongoDB state
+    await run_startup_exchange_audit()
 
     try:
         # Run tasks without API server (API disabled by default)
@@ -269,6 +328,24 @@ async def serve_api(config_path: str, host: str, port: int):
             logger.info("Dashboard mounted at /dashboard")
         except Exception as e:
             logger.warning(f"Could not mount dashboard router: {e}")
+
+        # Optional bearer token auth (set QUANTS_LAB_API_TOKEN to enable)
+        api_token = os.environ.get("QUANTS_LAB_API_TOKEN")
+        if api_token:
+            from starlette.middleware.base import BaseHTTPMiddleware
+            from starlette.responses import JSONResponse
+
+            class BearerAuthMiddleware(BaseHTTPMiddleware):
+                async def dispatch(self, request, call_next):
+                    if request.url.path in ("/health", "/docs", "/openapi.json"):
+                        return await call_next(request)
+                    auth = request.headers.get("authorization", "")
+                    if auth != f"Bearer {api_token}":
+                        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+                    return await call_next(request)
+
+            fastapi_app.add_middleware(BearerAuthMiddleware)
+            logger.info("API auth enabled (QUANTS_LAB_API_TOKEN set)")
 
         await runner.start()
     except KeyboardInterrupt:
@@ -376,136 +453,111 @@ def validate_config(config_path: str):
 
 
 def scaffold_strategy(name: str, display_name: str):
-    """Generate template files for a new trading strategy."""
+    """Generate a self-contained HB V2 controller for a new strategy."""
     import re
 
-    # Derive file names
     snake = re.sub(r'[^a-z0-9]+', '_', display_name.lower()).strip('_')
-    engine_file = f"app/engines/{name.lower()}_{snake}.py"
     controller_file = f"app/controllers/directional_trading/{name.lower()}_{snake}.py"
 
-    # Check nothing exists already
-    for path in [engine_file, controller_file]:
-        if os.path.exists(path):
-            logger.error(f"File already exists: {path}")
-            sys.exit(1)
+    if os.path.exists(controller_file):
+        logger.error(f"File already exists: {controller_file}")
+        sys.exit(1)
 
-    # Engine evaluation function template
-    engine_content = f'''"""
-Engine {name} — {display_name}
+    config_cls = f"{name}{snake.title().replace('_', '')}Config"
+    ctrl_cls = f"{name}{snake.title().replace('_', '')}Controller"
 
-TODO: Describe the strategy thesis here.
-"""
-from dataclasses import dataclass, field
-from typing import Optional
-
-from app.engines.models import CandidateBase, DecisionSnapshot, validate_staleness
-
-
-@dataclass
-class {name}Candidate(CandidateBase):
-    """{name}-specific candidate fields (extends CandidateBase)."""
-    # TODO: Add engine-specific fields here
-    pass
-
-
-def evaluate_{name.lower()}(snap: DecisionSnapshot) -> {name}Candidate:
-    """
-    {name} evaluation pipeline. Reads ONLY from snapshot.
-
-    TODO: Implement your strategy logic here.
-    """
-    cand = {name}Candidate(
-        snapshot_id=snap.snapshot_id,
-        pair=snap.pair,
-        market_state=snap.market_state,
-    )
-
-    fr = snap.features
-    if fr is None:
-        cand.disposition = "FILTERED_STALENESS"
-        cand.filter_reason = "No feature data in snapshot"
-        return cand
-
-    # Validate staleness
-    stale_ok, stale_flags = validate_staleness(snap)
-    cand.feature_staleness_flags = stale_flags
-    if not stale_ok:
-        cand.disposition = "FILTERED_STALENESS"
-        cand.filter_reason = f"Stale: {{stale_flags}}"
-        return cand
-
-    # TODO: Implement trigger logic
-    cand.trigger_fired = False
-    cand.disposition = "SKIPPED_NO_TRIGGER"
-    cand.trigger_reason = "Not implemented yet"
-    return cand
-'''
-
-    # Controller template
     controller_content = f'''"""
-{name} {display_name} — HB V2 Controller for backtesting.
+{name} — {display_name} (HB V2 Controller)
 
-TODO: Implement the controller for backtesting this strategy.
+Self-contained: no quants-lab imports. Same code runs in backtest and live.
+
+Thesis: TODO describe the inefficiency and why it's exploitable.
+
+Trigger: TODO
+Exit: TODO
 """
-from decimal import Decimal
-from typing import List, Optional
+from typing import List, Dict, Any, Optional
 
+import pandas as pd
+import pandas_ta as ta
+from pydantic import Field
+
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
     DirectionalTradingControllerBase,
     DirectionalTradingControllerConfigBase,
 )
+from hummingbot.strategy_v2.executors.position_executor.data_types import (
+    PositionExecutorConfig,
+    TripleBarrierConfig,
+)
 
 
-class {name}{snake.title().replace("_", "")}Config(DirectionalTradingControllerConfigBase):
-    """Configuration for {name} {display_name} controller."""
+class {config_cls}(DirectionalTradingControllerConfigBase):
+    """Configuration for {name} {display_name}."""
     controller_name: str = "{name.lower()}_{snake}"
+
     # TODO: Add strategy-specific config fields
+    candles_config: List[CandlesConfig] = Field(default_factory=list)
+
+    def model_post_init(self, __context) -> None:
+        if not self.candles_config:
+            self.candles_config = [
+                CandlesConfig(
+                    connector=self.connector_name,
+                    trading_pair=self.trading_pair,
+                    interval="1h",
+                    max_records=500,
+                ),
+            ]
 
 
-class {name}{snake.title().replace("_", "")}Controller(DirectionalTradingControllerBase):
-    """Backtesting controller for {name} {display_name}."""
+class {ctrl_cls}(DirectionalTradingControllerBase):
+    """{name} {display_name} — backtest + live controller."""
 
-    def __init__(self, config: {name}{snake.title().replace("_", "")}Config, *args, **kwargs):
-        super().__init__(config, *args, **kwargs)
+    def __init__(self, config: {config_cls}, *args, **kwargs):
         self.config = config
+        super().__init__(config, *args, **kwargs)
+
+    def get_candles_config(self) -> List[CandlesConfig]:
+        return self.config.candles_config
 
     async def update_processed_data(self):
-        """Process candle data and compute indicators."""
-        # TODO: Implement signal computation on self.candles_df
-        pass
+        """Fetch candles, compute features, emit signal."""
+        c = self.config
+        df = self.market_data_provider.get_candles_df(
+            connector_name=c.connector_name,
+            trading_pair=c.trading_pair,
+            interval="1h",
+            max_records=500,
+        )
+        if df is None or len(df) < 50:
+            self.processed_data["signal"] = 0
+            self.processed_data["signal_reason"] = "insufficient_data"
+            return
+
+        # TODO: compute indicators and set signal
+        # self.processed_data["signal"] = 1 for LONG, -1 for SHORT, 0 for no signal
+        self.processed_data["signal"] = 0
+        self.processed_data["signal_reason"] = "not_implemented"
 '''
 
-    # Write files
-    os.makedirs(os.path.dirname(engine_file), exist_ok=True)
     os.makedirs(os.path.dirname(controller_file), exist_ok=True)
-
-    with open(engine_file, 'w') as f:
-        f.write(engine_content)
     with open(controller_file, 'w') as f:
         f.write(controller_content)
 
-    print(f"\\nStrategy '{name} — {display_name}' scaffolded:\\n")
-    print(f"  Engine:     {engine_file}")
+    print(f"\nStrategy '{name} — {display_name}' scaffolded:\n")
     print(f"  Controller: {controller_file}")
-    print(f"\\nResearch process (enforced — engine blocked from trading until Phase 2 complete):")
-    print(f"  P0_IDEA         Define hypothesis + success criteria")
-    print(f"  P1_BASELINE     Walk-forward backtest")
-    print(f"  P1_REGIME       Regime stress tests (bear/shock/range/bull)")
-    print(f"  P1_ASYMMETRY    Long/short analysis + direction decision")
-    print(f"  P1_SENSITIVITY  Parameter sensitivity (+/- 1 step)")
-    print(f"  P1_OPTIMIZED    Optuna optimization (optional)")
-    print(f"  P1_VALIDATED    One-shot validation on holdout")
-    print(f"  P2_DEGRADATION  Slippage/delay/distribution stress tests")
-    print(f"  P2_MONTECARLO   Block bootstrap, ruin < 1%")
-    print(f"  P3_PAPER        Paper trading (20+ signals, slippage < 15bps)")
-    print(f"\\nTrack progress: python cli.py research status --engine {name}")
-    print(f"Advance phase:  python cli.py research advance --engine {name} --phase P0_IDEA")
-    print(f"\\nCode steps:")
-    print(f"  1. Implement evaluate_{name.lower()}() in {engine_file}")
-    print(f"  2. Implement controller in {controller_file}")
-    print(f"  3. Add entry to STRATEGY_REGISTRY in app/engines/strategy_registry.py")
-    print(f"  4. Add '{name}' to engines list in config/hermes_pipeline.yml signal_scan")
+    print(f"\nProcess (HB-native):")
+    print(f"  1. Implement update_processed_data() in the controller")
+    print(f"  2. Add StrategyMetadata to STRATEGY_REGISTRY (deployment_mode='hb_native')")
+    print(f"  3. Backtest: python cli.py trigger-task --task {name.lower()}_bulk_backtest")
+    print(f"  4. Walk-forward: python cli.py trigger-task --task {name.lower()}_walk_forward")
+    print(f"  5. Deploy: python cli.py deploy --engine {name}")
+    print(f"\nResearch tracking:")
+    print(f"  python cli.py research status --engine {name}")
+    print(f"  python cli.py research advance --engine {name} --phase P0_IDEA")
 
 
 def promote_shadow(shadow_name: str, live_name: str):
@@ -636,6 +688,224 @@ async def research_command(args):
     client.close()
 
 
+BOTS_DIR = os.path.expanduser("~/hummingbot/hummingbot-api/bots")
+
+# Pairs that are tradeable via HB API (must match rate limiter patch).
+TRADEABLE_PAIRS: set = {
+    "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT",
+    "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT", "UNI-USDT",
+    "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT", "SUI-USDT",
+    "SEI-USDT", "WLD-USDT", "LTC-USDT", "BCH-USDT", "BNB-USDT",
+    "CRV-USDT", "1000PEPE-USDT", "ALGO-USDT", "GALA-USDT",
+    "ONT-USDT", "TAO-USDT", "ZEC-USDT",
+}
+
+
+async def deploy_engine(engine_name: str, single_pair: str = None,
+                        dry_run: bool = False, profile: str = "master_account"):
+    """Deploy an engine as an HB-native bot."""
+    from pymongo import MongoClient
+    from app.engines.strategy_registry import get_strategy
+    from app.services.hb_api_client import HBApiClient
+    import shutil
+
+    meta = get_strategy(engine_name)
+    if meta.deployment_mode != "hb_native":
+        logger.error(f"{engine_name} deployment_mode is '{meta.deployment_mode}', not 'hb_native'")
+        sys.exit(1)
+
+    if not meta.controller_file:
+        logger.error(f"{engine_name} has no controller_file set in registry")
+        sys.exit(1)
+
+    # 1. Get eligible pairs
+    if single_pair:
+        pairs = [single_pair]
+    else:
+        mongo_uri = os.getenv("MONGO_URI")
+        if not mongo_uri:
+            logger.error("MONGO_URI not set")
+            sys.exit(1)
+        client = MongoClient(mongo_uri)
+        db = client[os.getenv("MONGO_DATABASE", "quants_lab")]
+
+        if meta.pair_source == "pair_historical":
+            docs = list(db.pair_historical.find(
+                {"engine": engine_name, "verdict": "ALLOW"}, {"pair": 1}
+            ))
+            pairs = [d["pair"] for d in docs]
+        else:
+            pairs = meta.pair_allowlist
+
+        client.close()
+
+    # Filter by tradeable + blocked
+    pairs = [p for p in pairs if p in TRADEABLE_PAIRS and p not in meta.blocked_pairs]
+
+    if not pairs:
+        logger.error(f"No eligible pairs for {engine_name}")
+        sys.exit(1)
+
+    logger.info(f"Deploying {engine_name} on {len(pairs)} pairs")
+
+    # 2. Generate controller configs
+    config_names = []
+    configs = {}
+    for pair in pairs:
+        slug = pair.lower().replace("-", "_")
+        config_name = f"{engine_name.lower()}_{slug}"
+        config_names.append(config_name)
+
+        config = {
+            "id": config_name,
+            "controller_name": meta.controller_module.split(".")[-1],
+            "controller_type": "directional_trading",
+            "connector_name": meta.hb_connector,
+            "trading_pair": pair,
+            "total_amount_quote": meta.total_amount_quote,
+            "max_executors_per_side": 1,
+            "cooldown_time": meta.cooldown_time,
+            "leverage": 1,
+            "position_mode": "ONEWAY",
+            "stop_loss": str(meta.exit_params.get("stop_loss", "0.015")),
+            "take_profit": str(meta.exit_params.get("take_profit", "0.03")),
+            "time_limit": meta.exit_params.get("time_limit", 86400),
+        }
+
+        if meta.trailing_stop:
+            config["trailing_stop"] = {
+                "activation_price": str(meta.trailing_stop["activation_price"]),
+                "trailing_delta": str(meta.trailing_stop["trailing_delta"]),
+            }
+
+        # Merge strategy-specific defaults
+        config.update(meta.default_config)
+        configs[config_name] = config
+
+    if dry_run:
+        import json
+        print(f"\n=== Dry Run: {engine_name} on {len(pairs)} pairs ===\n")
+        print(f"Bot instance: {engine_name.lower()}_paper")
+        print(f"Connector: {meta.hb_connector}")
+        print(f"Controller: {meta.controller_file}")
+        print(f"Pairs: {', '.join(pairs)}")
+        print(f"\nSample config ({config_names[0]}):")
+        print(json.dumps(configs[config_names[0]], indent=2))
+        return
+
+    # 3. Sync controller file to bots directory
+    src = f"app/controllers/directional_trading/{meta.controller_file}"
+    dst = f"{BOTS_DIR}/controllers/directional_trading/{meta.controller_file}"
+    if os.path.exists(src):
+        shutil.copy2(src, dst)
+        logger.info(f"Synced controller: {src} → {dst}")
+    else:
+        logger.error(f"Controller file not found: {src}")
+        sys.exit(1)
+
+    # 4. Upload configs and deploy via HB API
+    hb = HBApiClient()
+    try:
+        if not await hb.health_check():
+            logger.error("HB API unreachable")
+            sys.exit(1)
+
+        # Controller is already synced to bots/ via filesystem (volume mount).
+        # The API upload is only needed if bots/ is NOT volume-mounted.
+        try:
+            with open(src) as f:
+                source_code = f.read()
+            controller_name = meta.controller_file.replace(".py", "")
+            await hb.upload_controller("directional_trading", controller_name, source_code)
+            logger.info(f"Uploaded controller via API: {controller_name}")
+        except Exception as e:
+            logger.info(f"API upload skipped (file synced via volume mount): {e}")
+
+        # Upload configs
+        for name, config in configs.items():
+            await hb.create_controller_config(name, config)
+        logger.info(f"Uploaded {len(configs)} controller configs")
+
+        # Add demo credentials if needed
+        env_key = os.getenv("BYBIT_DEMO_API_KEY")
+        env_secret = os.getenv("BYBIT_DEMO_API_SECRET")
+        if env_key and meta.hb_connector == "bybit_perpetual_demo":
+            try:
+                await hb.add_credential(profile, "bybit_perpetual_demo", {
+                    "bybit_perpetual_demo_api_key": env_key,
+                    "bybit_perpetual_demo_secret_key": env_secret,
+                })
+                logger.info("Added bybit_perpetual_demo credentials")
+            except Exception as e:
+                logger.warning(f"Credential add: {e} (may already exist)")
+
+        # Deploy bot
+        instance_name = f"{engine_name.lower()}_paper"
+        result = await hb.deploy_v2_bot(
+            instance_name=instance_name,
+            credentials_profile=profile,
+            controllers_config=config_names,
+            max_controller_drawdown_quote=meta.max_drawdown_quote,
+            image=meta.bot_image,
+            headless=True,
+        )
+        logger.info(f"Deployed bot: {instance_name}")
+        logger.info(f"Result: {result}")
+
+        # Start bot — use the unique instance name returned by deploy
+        actual_name = result.get("unique_instance_name", instance_name)
+        start_result = await hb.start_bot(actual_name)
+        logger.info(f"Started bot {actual_name}: {start_result}")
+
+        print(f"\n{engine_name} deployed successfully!")
+        print(f"  Bot: {instance_name}")
+        print(f"  Pairs: {len(pairs)}")
+        print(f"  Check status: python cli.py bot-status --engine {engine_name}")
+
+    finally:
+        await hb.close()
+
+
+async def bot_status(engine_name: str = None):
+    """Check HB bot status."""
+    from app.services.hb_api_client import HBApiClient
+
+    hb = HBApiClient()
+    try:
+        if not await hb.health_check():
+            logger.error("HB API unreachable")
+            sys.exit(1)
+
+        if engine_name:
+            instance_name = f"{engine_name.lower()}_paper"
+            status = await hb.get_bot_status(instance_name)
+        else:
+            status = await hb.get_bot_status()
+
+        import json
+        print(json.dumps(status, indent=2, default=str))
+    except Exception as e:
+        logger.error(f"Bot status error: {e}")
+    finally:
+        await hb.close()
+
+
+async def bot_stop(engine_name: str):
+    """Stop an HB bot."""
+    from app.services.hb_api_client import HBApiClient
+
+    hb = HBApiClient()
+    try:
+        instance_name = f"{engine_name.lower()}_paper"
+        result = await hb.stop_bot(instance_name)
+        logger.info(f"Stopped bot: {instance_name}")
+        print(f"Result: {result}")
+    except Exception as e:
+        logger.error(f"Bot stop error: {e}")
+    finally:
+        await hb.close()
+
+
 async def main():
     args = parse_args()
 
@@ -657,6 +927,15 @@ async def main():
         await research_command(args)
     elif args.command == 'promote-shadow':
         promote_shadow(args.engine, getattr(args, 'to'))
+    elif args.command == 'deploy':
+        await deploy_engine(args.engine, args.pair, args.dry_run, args.profile)
+    elif args.command == 'bot-status':
+        await bot_status(getattr(args, 'engine', None))
+    elif args.command == 'bot-stop':
+        await bot_stop(args.engine)
+    elif args.command == 'bot-redeploy':
+        await bot_stop(args.engine)
+        await deploy_engine(args.engine, profile=args.profile)
     else:
         logger.error("No command specified. Use --help for usage.")
         sys.exit(1)

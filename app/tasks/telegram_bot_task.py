@@ -391,11 +391,30 @@ class TelegramBotTask(BaseTask):
     async def _handle_status(self) -> str:
         lines = ["<b>\U0001f527 System Status</b>\n"]
 
-        # HB API
+        # HB API + bot status
         hb = HBApiClient()
         try:
             if await hb.health_check():
                 lines.append("\u2705 HB API: Running")
+                # Check HB-native bots
+                try:
+                    bot_status = await hb.get_bot_status()
+                    bots_data = bot_status.get("data", bot_status) if isinstance(bot_status, dict) else {}
+                    if bots_data and isinstance(bots_data, dict):
+                        for name, info in bots_data.items():
+                            status = info.get("status", "?") if isinstance(info, dict) else str(info)
+                            lines.append(f"  Bot {name}: {status}")
+                    elif not bots_data:
+                        lines.append("  No HB bots deployed")
+                except Exception:
+                    pass
+                # Active executors
+                try:
+                    exec_summary = await hb._request("GET", "/executors/summary")
+                    total = exec_summary.get("total_active", 0)
+                    lines.append(f"  Active executors: {total}")
+                except Exception:
+                    pass
             else:
                 lines.append("\u274c HB API: Unreachable")
         except Exception:
@@ -417,7 +436,7 @@ class TelegramBotTask(BaseTask):
 
         task_names = [
             "candles_downloader_bybit", "feature_computation",
-            "signal_scan", "breakout_monitor", "testnet_resolver",
+            "signal_scan", "testnet_resolver", "watchdog",
         ]
         for task_name in task_names:
             try:
