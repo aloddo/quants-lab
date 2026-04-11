@@ -60,10 +60,10 @@ class E1VolumeIgnitionConfig(DirectionalTradingControllerConfigBase):
     body_atr_threshold: float = Field(default=2.0)
 
     # Exit params (ATR-based)
-    tp_atr_mult: float = Field(default=1.0)       # TP = 1.0× ATR
-    sl_atr_mult: float = Field(default=0.5)        # SL = 0.5× ATR (R:R = 2:1)
-    trailing_activation_atr: float = Field(default=0.5)  # activate trailing at 0.5×ATR
-    trailing_delta_atr: float = Field(default=0.3)       # trail by 0.3×ATR
+    tp_atr_mult: float = Field(default=99.0)      # disabled — time + trailing only
+    sl_atr_mult: float = Field(default=99.0)       # disabled — time + trailing only
+    trailing_activation_atr: float = Field(default=1.0)  # activate trailing at 1.0×ATR
+    trailing_delta_atr: float = Field(default=0.5)       # trail by 0.5×ATR
 
     candles_config: List[CandlesConfig] = Field(default_factory=list)
 
@@ -164,8 +164,8 @@ class E1VolumeIgnitionController(DirectionalTradingControllerBase):
         if tp_abs is not None and sl_abs is not None and float(price) > 0:
             tp_pct = abs(Decimal(str(tp_abs)) - price) / price
             sl_pct = abs(Decimal(str(sl_abs)) - price) / price
-            tp_pct = max(Decimal("0.001"), min(tp_pct, Decimal("0.10")))
-            sl_pct = max(Decimal("0.001"), min(sl_pct, Decimal("0.10")))
+            tp_pct = max(Decimal("0.001"), min(tp_pct, Decimal("0.15")))
+            sl_pct = max(Decimal("0.001"), min(sl_pct, Decimal("0.15")))
         else:
             tp_pct = self.config.take_profit or Decimal("0.01")
             sl_pct = self.config.stop_loss or Decimal("0.005")

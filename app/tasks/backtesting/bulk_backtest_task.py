@@ -48,10 +48,12 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         self.backtest_days = task_config.get("backtest_days", 365)
         self.trade_cost = task_config.get("trade_cost", 0.000375)
 
-        # Resolution and intervals come from the engine registry
+        # Resolution, intervals, and pair source come from the engine registry
         from app.engines.strategy_registry import get_strategy
         engine_meta = get_strategy(self.engine_name)
         self.backtesting_resolution = engine_meta.backtesting_resolution
+        self.pair_source = engine_meta.pair_source
+        self.pair_allowlist = engine_meta.pair_allowlist
 
     async def setup(self, context: TaskContext) -> None:
         await super().setup(context)
@@ -178,9 +180,14 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
         # Pre-compute time window so we can filter pairs by data coverage
-        _end_probe = self._get_data_end_time(self._discover_pairs())
-        _start_probe = _end_probe - self.backtest_days * 86400
-        pairs = self._discover_pairs(start_ts=_start_probe)
+        if self.pair_source == "explicit" and self.pair_allowlist:
+            # Use explicit allowlist (e.g. S6 pair groups)
+            pairs = sorted(self.pair_allowlist)
+            _end_probe = self._get_data_end_time(pairs)
+        else:
+            _end_probe = self._get_data_end_time(self._discover_pairs())
+            _start_probe = _end_probe - self.backtest_days * 86400
+            pairs = self._discover_pairs(start_ts=_start_probe)
         logger.info(
             f"BulkBacktest {self.engine_name}: found {len(pairs)} pairs, "
             f"resolution={self.backtesting_resolution}, days={self.backtest_days}"
