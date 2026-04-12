@@ -303,6 +303,76 @@ tasks:
       trade_cost: 0.000375
     tags: [backtesting, s9, walk-forward, weekly]
 
+  e3_bulk_backtest:
+    enabled: false
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "E3"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, e3, weekly]
+
+  e3_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "E3"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, e3, walk-forward, weekly]
+
+  e4_bulk_backtest:
+    enabled: false
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "E4"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, e4, weekly]
+
+  e4_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "E4"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, e4, walk-forward, weekly]
+
   e2_bulk_backtest:
     enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
     task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask

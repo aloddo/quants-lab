@@ -255,6 +255,67 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         # E2 stays on legacy pipeline until migrated
         deployment_mode="legacy",
     ),
+    "E3": StrategyMetadata(
+        name="E3",
+        display_name="Funding Carry",
+        controller_module="app.controllers.directional_trading.e3_funding_carry",
+        config_class_name="E3FundingCarryConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "stop_loss": Decimal("0.05"),
+            "take_profit": Decimal("0.03"),
+            "time_limit": 432000,  # 5 days
+        },
+        trailing_stop=None,
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],
+        max_concurrent=20,
+        controller_file="e3_funding_carry.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "funding_streak_min": 3,
+            "funding_rate_threshold": 0.0001,
+            "funding_zscore_boost": 2.0,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=3600,
+    ),
+    "E4": StrategyMetadata(
+        name="E4",
+        display_name="Crowd Fade",
+        controller_module="app.controllers.directional_trading.e4_crowd_fade",
+        config_class_name="E4CrowdFadeConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "stop_loss": Decimal("0.03"),
+            "take_profit": Decimal("0.025"),
+            "time_limit": 172800,  # 48 hours
+        },
+        trailing_stop={
+            "activation_price": Decimal("0.01"),
+            "trailing_delta": Decimal("0.005"),
+        },
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],
+        max_concurrent=20,
+        controller_file="e4_crowd_fade.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "crowd_long_threshold": 0.65,
+            "crowd_short_threshold": 0.35,
+            "oi_rising_periods": 3,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=3600,
+    ),
 }
 
 

@@ -16,6 +16,9 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List
 
+import numpy as np
+import pandas as pd
+
 from core.backtesting.engine import BacktestingEngine
 from core.data_paths import data_paths
 from core.tasks import BaseTask, TaskContext
@@ -59,6 +62,82 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         await super().setup(context)
         if not self.mongodb_client:
             raise RuntimeError("MongoDB required for BulkBacktestTask")
+
+    async def _merge_derivatives_into_candles(
+        self, shared_candles: dict, pairs: List[str]
+    ) -> int:
+        """Merge derivatives data (funding, OI, LS ratio) from MongoDB into candle DataFrames.
+
+        For each pair's 1h candle feed, queries MongoDB for historical derivatives
+        data and adds funding_rate, oi_value, buy_ratio columns aligned by timestamp.
+        Forward-fills gaps (funding is 8h, OI/LS are 15min-1h).
+
+        Returns number of pairs enriched.
+        """
+        db = self.mongodb_client.get_database()
+        enriched = 0
+
+        for pair in pairs:
+            feed_key = f"{self.connector_name}_{pair}_1h"
+            if feed_key not in shared_candles:
+                continue
+
+            df = shared_candles[feed_key]
+            if df is None or len(df) == 0:
+                continue
+
+            ts_min = int(df["timestamp"].min())
+            ts_max = int(df["timestamp"].max())
+            # MongoDB derivatives store timestamp_utc as datetime or epoch ms
+            query = {"pair": pair}
+
+            try:
+                # Candle timestamps are epoch seconds; derivatives are epoch ms
+                candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+
+                # Funding rates
+                funding_cursor = db["bybit_funding_rates"].find(query).sort("timestamp_utc", 1)
+                funding_docs = await funding_cursor.to_list(length=100000)
+                if funding_docs:
+                    fdf = pd.DataFrame(funding_docs)
+                    if "timestamp_utc" in fdf.columns and "funding_rate" in fdf.columns:
+                        fdf["ts"] = pd.to_datetime(fdf["timestamp_utc"], unit="ms", utc=True)
+                        fdf = fdf.set_index("ts")[["funding_rate"]].sort_index()
+                        fdf = fdf[~fdf.index.duplicated(keep="last")]
+                        fdf_reindexed = fdf.reindex(candle_idx, method="ffill")
+                        df["funding_rate"] = fdf_reindexed["funding_rate"].values
+
+                # Open interest
+                oi_cursor = db["bybit_open_interest"].find(query).sort("timestamp_utc", 1)
+                oi_docs = await oi_cursor.to_list(length=100000)
+                if oi_docs:
+                    odf = pd.DataFrame(oi_docs)
+                    if "timestamp_utc" in odf.columns and "oi_value" in odf.columns:
+                        odf["ts"] = pd.to_datetime(odf["timestamp_utc"], unit="ms", utc=True)
+                        odf = odf.set_index("ts")[["oi_value"]].sort_index()
+                        odf = odf[~odf.index.duplicated(keep="last")]
+                        odf_reindexed = odf.reindex(candle_idx, method="ffill")
+                        df["oi_value"] = odf_reindexed["oi_value"].values
+
+                # LS ratio
+                ls_cursor = db["bybit_ls_ratio"].find(query).sort("timestamp_utc", 1)
+                ls_docs = await ls_cursor.to_list(length=100000)
+                if ls_docs:
+                    ldf = pd.DataFrame(ls_docs)
+                    if "timestamp_utc" in ldf.columns and "buy_ratio" in ldf.columns:
+                        ldf["ts"] = pd.to_datetime(ldf["timestamp_utc"], unit="ms", utc=True)
+                        ldf = ldf.set_index("ts")[["buy_ratio"]].sort_index()
+                        ldf = ldf[~ldf.index.duplicated(keep="last")]
+                        ldf_reindexed = ldf.reindex(candle_idx, method="ffill")
+                        df["buy_ratio"] = ldf_reindexed["buy_ratio"].values
+
+                shared_candles[feed_key] = df
+                enriched += 1
+
+            except Exception as e:
+                logger.warning(f"Failed to merge derivatives for {pair}: {e}")
+
+        return enriched
 
     def _discover_pairs(self, start_ts: int = 0) -> List[str]:
         """Find pairs with sufficient parquet data covering the backtest window.
@@ -220,6 +299,13 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         shared_candles = _shared_cache._bt_engine.backtesting_data_provider.candles_feeds.copy()
         del _shared_cache
         gc.collect()
+
+        # Merge derivatives data into candle DataFrames if engine needs it
+        from app.engines.strategy_registry import get_strategy
+        engine_meta = get_strategy(self.engine_name)
+        if "derivatives" in engine_meta.required_features:
+            n_enriched = await self._merge_derivatives_into_candles(shared_candles, pairs)
+            logger.info(f"Merged derivatives data into {n_enriched}/{len(pairs)} pairs")
 
         for pair in pairs:
             try:
