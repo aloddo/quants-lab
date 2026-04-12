@@ -98,8 +98,8 @@ class FeatureComputationTask(NotifyingTaskMixin, BaseTask):
                 ("bybit_funding_rates", "funding"),
                 ("bybit_ls_ratio", "ls"),
             ]:
-                cursor = db[coll_name].find(query).sort("timestamp_utc", -1).limit(10)
-                result[key] = await cursor.to_list(length=10)
+                cursor = db[coll_name].find(query).sort("timestamp_utc", -1).limit(50)
+                result[key] = await cursor.to_list(length=50)
         except Exception as e:
             logger.warning(f"Failed to fetch derivatives for {pair}: {e}")
         return result

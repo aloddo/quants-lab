@@ -104,7 +104,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         controller_module="app.controllers.directional_trading.e1_volume_ignition",
         config_class_name="E1VolumeIgnitionConfig",
         intervals=["1h"],
-        backtesting_resolution="1h",
+        backtesting_resolution="1m",
         exit_params={
             "stop_loss": Decimal("0.99"),
             "take_profit": Decimal("0.99"),
@@ -140,7 +140,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         controller_module="app.controllers.directional_trading.s6_spread_fade",
         config_class_name="S6SpreadFadeConfig",
         intervals=["1h"],
-        backtesting_resolution="1h",
+        backtesting_resolution="1m",
         exit_params={
             "stop_loss": Decimal("0.015"),
             "take_profit": Decimal("0.02"),
@@ -175,7 +175,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         controller_module="app.controllers.directional_trading.s7_hurst_adaptive",
         config_class_name="S7HurstAdaptiveConfig",
         intervals=["1h"],
-        backtesting_resolution="1h",
+        backtesting_resolution="1m",
         exit_params={
             "stop_loss": Decimal("0.02"),
             "take_profit": Decimal("0.025"),
@@ -207,7 +207,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         controller_module="app.controllers.directional_trading.s9_session_compression",
         config_class_name="S9SessionCompressionConfig",
         intervals=["1h"],
-        backtesting_resolution="1h",
+        backtesting_resolution="1m",
         exit_params={
             "stop_loss": Decimal("0.02"),
             "take_profit": Decimal("0.025"),
@@ -241,7 +241,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         controller_module="app.controllers.directional_trading.e2_range_fade",
         config_class_name="E2RangeFadeConfig",
         intervals=["1h"],
-        backtesting_resolution="1h",
+        backtesting_resolution="1m",
         exit_params={
             "stop_loss": Decimal("0.02"),
             "take_profit": Decimal("0.015"),

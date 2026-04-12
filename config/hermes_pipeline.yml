@@ -13,7 +13,7 @@ tasks:
     config:
       connector_name: "bybit_perpetual"
       quote_asset: "USDT"
-      intervals: ["1h", "5m"]
+      intervals: ["1h", "5m", "1m"]
       days_data_retention: 365
       min_notional_size: 10
     tags: [data, candles, bybit]

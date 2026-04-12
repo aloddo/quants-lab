@@ -167,3 +167,4 @@ cython_debug/
 # Outputs
 app/outputs/
 app/data/cache/
+.gstack/
