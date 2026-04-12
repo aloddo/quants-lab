@@ -120,42 +120,44 @@ class E4CrowdFadeController(DirectionalTradingControllerBase):
 
         # Check if derivatives columns are pre-merged (backtest mode)
         if "buy_ratio" in df.columns and "oi_value" in df.columns:
-            signal = self._signal_from_df(df)
+            df = self._compute_signals_vectorized(df)
         else:
-            # Live mode: fetch from Bybit REST API
+            # Live mode: fetch from Bybit REST API and compute scalar signal
             signal = self._signal_from_api(c.trading_pair)
+            df = df.copy()
+            df["signal"] = 0
+            if len(df) > 0:
+                df.iloc[-1, df.columns.get_loc("signal")] = signal
 
+        signal = int(df["signal"].iloc[-1]) if len(df) > 0 else 0
         self.processed_data["signal"] = signal
+        self.processed_data["features"] = df
 
-    def _signal_from_df(self, df: pd.DataFrame) -> int:
-        """Compute signal from DataFrame with buy_ratio + oi_value columns."""
+    def _compute_signals_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute signal column for every bar (required for BacktestingEngine)."""
         c = self.config
-        br = df["buy_ratio"].dropna()
-        oi = df["oi_value"].dropna()
+        df = df.copy()
+        df["signal"] = 0
 
-        if len(br) < 1 or len(oi) < c.oi_rising_periods + 1:
-            return 0
+        br = df["buy_ratio"]
+        oi = df["oi_value"]
 
-        current_br = float(br.iloc[-1])
-        signal = 0
+        # LS extreme conditions
+        crowd_long = br > c.crowd_long_threshold
+        crowd_short = br < c.crowd_short_threshold
 
-        # Check LS extreme
-        if current_br > c.crowd_long_threshold:
-            signal = -1  # crowd is long → SHORT
-        elif current_br < c.crowd_short_threshold:
-            signal = 1   # crowd is short → LONG
-        else:
-            return 0
+        # OI rising confirmation: OI increasing over last N periods
+        oi_diff = oi.diff()
+        oi_rising = oi_diff.rolling(
+            window=c.oi_rising_periods, min_periods=c.oi_rising_periods
+        ).min() > 0  # all diffs positive = monotonically rising
 
-        # OI confirmation: must be rising (crowding, not unwinding)
-        recent_oi = oi.tail(c.oi_rising_periods + 1).values
-        if len(recent_oi) >= 2:
-            oi_increasing = all(
-                recent_oi[i] <= recent_oi[i + 1]
-                for i in range(len(recent_oi) - 1)
-            )
-            if not oi_increasing:
-                return 0  # OI falling = liquidation cascade, don't fade
+        # Crowd long + OI rising → SHORT (-1)
+        df.loc[crowd_long & oi_rising, "signal"] = -1
+        # Crowd short + OI rising → LONG (1)
+        df.loc[crowd_short & oi_rising, "signal"] = 1
+
+        return df
 
         return signal
 

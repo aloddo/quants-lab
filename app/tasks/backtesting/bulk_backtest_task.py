@@ -217,9 +217,12 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
     async def _store_trades(self, db, bt_result, pair: str, period_label: str, run_id: str):
         """Store individual trade records from a backtest result."""
-        if not hasattr(bt_result, "executors_df") or bt_result.executors_df is None:
+        if not hasattr(bt_result, "executors") or not bt_result.executors:
             return 0
-        edf = bt_result.executors_df
+        try:
+            edf = bt_result.executors_df
+        except (KeyError, AttributeError):
+            return 0
         if len(edf) == 0:
             return 0
 
@@ -384,7 +387,8 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
             except Exception as e:
                 stats["errors"] += 1
-                logger.error(f"  {pair}: backtest failed -- {e}")
+                import traceback
+                logger.error(f"  {pair}: backtest failed -- {e}\n{traceback.format_exc()}")
 
         duration = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info(

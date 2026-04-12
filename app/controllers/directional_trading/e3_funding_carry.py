@@ -58,7 +58,7 @@ class E3FundingCarryConfig(DirectionalTradingControllerConfigBase):
 
     # Funding parameters
     funding_streak_min: int = Field(default=3, description="Min consecutive same-sign funding periods")
-    funding_rate_threshold: float = Field(default=0.0001, description="Min |funding_rate| to enter")
+    funding_rate_threshold: float = Field(default=0.00005, description="Min |funding_rate| to enter")
     funding_zscore_boost: float = Field(default=2.0, description="Z-score threshold for extra confidence")
 
     # Exit
@@ -114,46 +114,48 @@ class E3FundingCarryController(DirectionalTradingControllerBase):
 
         # Check if derivatives columns are pre-merged (backtest mode)
         if "funding_rate" in df.columns:
-            signal = self._signal_from_df(df)
+            df = self._compute_signals_vectorized(df)
         else:
-            # Live mode: fetch from Bybit REST API
+            # Live mode: fetch from Bybit REST API and compute scalar signal
             funding_rates = self._fetch_funding_live(c.trading_pair)
             signal = self._signal_from_funding_list(funding_rates)
+            df = df.copy()
+            df["signal"] = 0
+            if len(df) > 0:
+                df.iloc[-1, df.columns.get_loc("signal")] = signal
 
+        signal = int(df["signal"].iloc[-1]) if len(df) > 0 else 0
         self.processed_data["signal"] = signal
+        self.processed_data["features"] = df
 
-    def _signal_from_df(self, df: pd.DataFrame) -> int:
-        """Compute signal from DataFrame with funding_rate column (backtest mode)."""
+    def _compute_signals_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute signal column for every bar (required for BacktestingEngine)."""
         c = self.config
-        fr = df["funding_rate"].dropna()
-        if len(fr) < c.funding_streak_min:
-            return 0
+        df = df.copy()
+        df["signal"] = 0
 
-        # Get recent funding rates (most recent last)
-        recent = fr.tail(c.funding_streak_min).values
+        fr = df["funding_rate"]
 
-        # Check streak: all same sign
-        if all(r > 0 for r in recent):
-            sign = 1  # positive funding = longs pay shorts
-        elif all(r < 0 for r in recent):
-            sign = -1  # negative funding = shorts pay longs
-        else:
-            return 0
+        # Streak: count consecutive same-sign periods using rolling window
+        pos = (fr > 0).astype(int)
+        neg = (fr < 0).astype(int)
 
-        # Check magnitude threshold
-        current_rate = float(fr.iloc[-1])
-        if abs(current_rate) < c.funding_rate_threshold:
-            return 0
+        # Rolling sum of positive/negative — if sum == streak_min, all were same sign
+        pos_streak = pos.rolling(window=c.funding_streak_min, min_periods=c.funding_streak_min).sum()
+        neg_streak = neg.rolling(window=c.funding_streak_min, min_periods=c.funding_streak_min).sum()
 
-        # Optional z-score boost check
-        if "funding_zscore_30" in df.columns:
-            zscore = df["funding_zscore_30"].iloc[-1]
-            if pd.notna(zscore) and abs(zscore) > c.funding_zscore_boost:
-                pass  # extra confidence, could log or adjust sizing
+        all_positive = pos_streak == c.funding_streak_min
+        all_negative = neg_streak == c.funding_streak_min
 
-        # Positive funding → SHORT (collect from longs)
-        # Negative funding → LONG (collect from shorts)
-        return -sign
+        # Magnitude threshold
+        above_threshold = fr.abs() >= c.funding_rate_threshold
+
+        # Positive funding streak + above threshold → SHORT (-1)
+        df.loc[all_positive & above_threshold, "signal"] = -1
+        # Negative funding streak + above threshold → LONG (1)
+        df.loc[all_negative & above_threshold, "signal"] = 1
+
+        return df
 
     def _signal_from_funding_list(self, funding_rates: list) -> int:
         """Compute signal from list of funding rate dicts (live mode)."""
