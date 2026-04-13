@@ -161,6 +161,20 @@ async def fetch_tickers(session: aiohttp.ClientSession) -> list[dict]:
     return tickers
 
 
+async def fetch_demo_positions(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch open positions from the exchange.
+
+    DEPRECATED: Use BybitExchangeClient.fetch_positions() directly.
+    This wrapper delegates to the exchange client for backward compatibility.
+    """
+    from app.services.bybit_exchange_client import BybitExchangeClient
+    try:
+        return await BybitExchangeClient().fetch_positions(session)
+    except Exception as e:
+        logger.warning(f"fetch_demo_positions failed: {e}")
+        return []
+
+
 async def fetch_all_prices(session: aiohttp.ClientSession) -> dict[str, float]:
     """Fetch current prices for all USDT perpetuals.
 

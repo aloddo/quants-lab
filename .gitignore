@@ -168,3 +168,9 @@ cython_debug/
 app/outputs/
 app/data/cache/
 .gstack/
+
+# Trained ML models (pickle files, environment-specific)
+app/models/
+
+# Docker build context
+.docker-build/

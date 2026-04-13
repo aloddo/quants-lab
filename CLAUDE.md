@@ -2,7 +2,7 @@
 
 ## What is this repo
 
-Fork of `hummingbot/quants-lab` with a systematic crypto perpetual futures trading system built on QuantsLab primitives. Two engines: E1 (compression breakout) and E2 (range fade). Paper trading on Bybit demo (api-demo.bybit.com) via Hummingbot API.
+Fork of `hummingbot/quants-lab` with a systematic crypto perpetual futures trading system built on QuantsLab primitives. 7 registered strategies (E1-E4, S6, S7, S9) at various validation stages. Paper trading on Bybit demo (api-demo.bybit.com) via Hummingbot API. All backtesting uses 1m resolution with derivatives data (funding, OI, LS ratio) merged from MongoDB.
 
 Owner: Alberto Loddo (GitHub: aloddo)
 
@@ -19,9 +19,9 @@ quants-lab/                          # Fork of hummingbot/quants-lab
 │   │   ├── e2_range_fade.py         # E2 eval function + E2Candidate
 │   │   ├── pair_selector.py         # Pair ranking from pair_historical
 │   │   └── registry.py              # DEPRECATED — re-exports from strategy_registry
-│   ├── features/                    # 7 FeatureBase subclasses → MongoDB
+│   ├── features/                    # 8 FeatureBase subclasses → MongoDB (incl. derivatives w/ OI RSI, funding z-score, LS z-score)
 │   ├── services/                    # Bybit REST client, HB API client
-│   ├── controllers/directional_trading/  # HB V2 controllers (for backtesting)
+│   ├── controllers/directional_trading/  # HB V2 controllers (backtest + live) — E1-E4, S6, S7, S9
 │   ├── tasks/
 │   │   ├── data_collection/         # CandlesDownloader, BybitDerivativesTask
 │   │   ├── screening/               # FeatureComputationTask, SignalScanTask
@@ -96,7 +96,7 @@ docker build -f /tmp/Dockerfile.hb-demo -t quants-lab/hummingbot:demo .
 - **Python**: `/Users/hermes/miniforge3/envs/quants-lab/bin/python` (3.12, conda)
 - **MongoDB**: `mongodb://localhost:27017/quants_lab` (no auth, local only)
 - **HB API**: `http://localhost:8000` (admin/admin)
-- **Env vars needed**: `MONGO_URI`, `MONGO_DATABASE`, `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- **Env vars needed**: `MONGO_URI`, `MONGO_DATABASE`, `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `COINGLASS_API_KEY`
 - **All env vars are in** `/Users/hermes/quants-lab/.env`
 
 ## Running commands
@@ -198,56 +198,79 @@ git remote set-url origin https://github.com/aloddo/quants-lab.git  # clean up i
 | `pair_historical` | Backtest verdicts (ALLOW/WATCH/BLOCK) | none |
 | `engine_registry` | Engine metadata | none |
 | `bybit_funding_rates` | Funding rate history | 90 days |
+| `binance_funding_rates` | Binance funding rates (cross-exchange spread) | 90 days |
 | `bybit_open_interest` | OI history | 90 days |
 | `bybit_ls_ratio` | Long/short ratio history | 90 days |
+| `backtest_trades` | Individual backtest trades (indexed by engine+pair, run_id) | none |
 | `task_executions` | QL task execution history | 90 days |
+| `deribit_options_surface` | Raw Deribit options snapshots (BTC+ETH, every 15min) | 180 days |
+| `coinglass_liquidations` | Cross-exchange liquidation history | 365 days |
+| `coinglass_oi` | Cross-exchange OI OHLC | 365 days |
+| `fear_greed_index` | Daily Fear & Greed Index (since 2018) | none |
+| `ml_model_registry` | ML training governance reports | none |
+| `exchange_executions` | Bybit fills (source of truth), dedup by `exec_id` | none |
+| `exchange_closed_pnl` | Closed position round-trips, dedup by `order_id`+`pair` | none |
+| `paper_trades` | HB API bot history (bot's view of fills) | none |
+| `paper_position_snapshots` | Periodic exchange position snapshots | none |
+| `paper_controller_stats` | Per-controller performance from HB orchestration | none |
 
 ## Architecture: QL data pipeline + HB-native bots
 
 ```
 QL Data Pipeline (TaskOrchestrator, hermes_pipeline.yml):
-  candles_downloader_bybit  (hourly at :05)
-  bybit_derivatives         (every 15 min)
+  candles_downloader_bybit  (hourly at :05, 1h + 1m candles)
+  bybit_derivatives         (every 15 min → funding, OI, LS ratio to MongoDB)
+  binance_funding           (every 15 min → Binance funding rates to MongoDB)
+  deribit_options           (every 15 min → BTC+ETH options surface to MongoDB)
+  coinglass                 (every 15 min → liquidations + cross-exchange OI)
+  fear_greed                (daily → sentiment index)
       ↓ (both on_success)
-  feature_computation       (dependency-triggered)
+  feature_computation       (dependency-triggered, 8 feature types incl. derivatives + microstructure)
       ↓ (feeds analytics/monitoring only)
 
 HB-Native Bots (one Docker container per engine):
-  E1 bot: WebSocket feeds → E1Controller.update_processed_data() → auto executor
-  E2 bot: (same pattern, when migrated)
-
+  Any engine: WebSocket feeds → Controller.update_processed_data() → auto executor
   Deploy: python cli.py deploy --engine E1
   Status: python cli.py bot-status --engine E1
   Stop:   python cli.py bot-stop --engine E1
 
 Backtesting (isolated, never in live pipeline):
-  e1_bulk_backtest          (weekly Sunday 03:00 UTC)
-  e2_bulk_backtest          (weekly Sunday 04:00 UTC)
+  All engines: bulk_backtest + walk_forward tasks (all `enabled: false` in pipeline)
+  Run via: bash scripts/run_backtest.sh <task_name>
+  Resolution: 1m (all engines, changed Apr 2026)
+  Derivatives merge: BulkBacktestTask._merge_derivatives_into_candles() queries MongoDB
+    for funding_rate, oi_value, buy_ratio, binance_funding_rate → reindexes to candle
+    timestamps with ffill → injected as columns for engines with required_features: ["derivatives"]
+  Signals: controllers must compute vectorized signal columns in update_processed_data()
+    (BacktestingEngine calls it once, reads signal from processed_data["features"] DataFrame)
 ```
 
 **Legacy tasks (E2 only, until migrated):** signal_scan, testnet_resolver
 
-## Engine parameters (locked)
+## Engines and validation status
 
-### E1 Compression Breakout (V3.2 locked, Apr 2026)
-- ATR percentile < 0.35 (compression) + price breaks 30-period range
-- Hard filters: BTC not Risk-Off, volume > 1.6x 20-period avg
-- 5m entry quality gate: DISABLED (stress tested — was rejecting 98.6% of valid triggers)
-- TP: +3%, SL: -1.5%, time limit: 24h
-- Allowlist: 38 ALLOW pairs from bulk backtest (pair_historical collection)
-- All engine metadata in `app/engines/registry.py`
+All engine metadata lives in `app/engines/strategy_registry.py`. All backtests run at **1m resolution** (changed Apr 12, 2026 — prior results at 1h are invalidated by different SL mechanics).
 
-### E2 Range Fade
-- ATR percentile < 0.30, range NOT expanding, boundary touch + rejection
-- No breakout confirmation: vol z-score ≤ 1.5, OI change ≤ 2%, body ≤ 0.8 ATR
-- TP: range midpoint, SL: range_low - 0.75 ATR, time limit: 12h
-- LONG ONLY, allowlist: BTC, BCH, ADA
+| Engine | Thesis | Status | Notes |
+|--------|--------|--------|-------|
+| **E1** Compression Breakout | Low ATR + range breakout | **Abandoned** (1h backtest: 91% TL exits). Needs re-eval at 1m. | `e1_compression_breakout.py` |
+| **E2** Range Fade | Low ATR + boundary rejection, LONG ONLY | **ADX filter coded, not yet backtested at 1m** | `e2_range_fade.py` |
+| **E3** Funding Carry | Fade persistent funding direction | **Mild edge on majors** (XRP 1.21, SUI 1.18, ADA 1.10). OI filter adds +0.03-0.07 PF on 6/8 pairs. Best candidate for further tuning. | `e3_funding_carry.py` |
+| **E4** Crowd Fade | Fade LS ratio extremes + OI rising | **Shelved** (PF ~1.0, no alpha). Vectorized signal fix shipped. | `e4_crowd_fade.py` |
+| **H2** Funding Divergence | Fade Bybit-Binance funding spread z-score | **Dead** (365d, 43 pairs, 11K trades, 0 ALLOW). Governance FAILED: positive expectancy only in SHOCK regime. SL drag destroys trailing stop edge. | `h2_funding_divergence.py` |
+| **S6** Spread Fade | Alt-BTC spread mean reversion | **Dead at 1h** (PF 0.79-0.92). Untested at 1m. | `s6_spread_fade.py` |
+| **S7** Hurst Adaptive | Hurst regime + RSI/EMA | **Dead at 1h** (69K trades, all PF<1.06). Untested at 1m. | `s7_hurst_adaptive.py` |
+| **S9** Session Compression | Session-aware ATR breakout | **Dead at 1h** (48% SL, 42% TL). Untested at 1m. | `s9_session_compression.py` |
+| **M1** ML Ensemble Signal | XGBoost on microstructure + derivatives + options + liquidation features | **Dead** (v1+v2: 0 ALLOW across 35 pairs, 6503 trades. Global model doesn't generalize — signal counts vary 15-6770 per pair at same threshold.) | `m1_ml_ensemble.py` |
+
+**Important:** E1, S6, S7, S9 were all tested at 1h resolution. The switch to 1m resolution changes SL mechanics fundamentally (intra-bar noise is 60x smaller), so these verdicts may not hold. E3/E4 had a scalar signal bug (producing 0 trades) that was fixed with vectorized `_compute_signals_vectorized()` — first correct E3 run showed DOGE PF=1.40/65% WR.
+
+Strategies tested outside the registry (pandas-only or one-off, all dead): S1 Crowded Fragility, S2 Funding Mean Rev, S3 OI-Price Divergence (inconclusive, N=5), S4 BTC Lead-Lag, S5 Volume Ignition (Sharpe 6.22 in pandas, 0-12% WR in HB at 1h), S8 Funding Carry+Momentum.
 
 ### Portfolio limits
 - Max 3 concurrent positions across all engines
 - Max 2% total capital exposure
-- Per-engine: E1 max 2, E2 max 1
-- Position size: 0.3% of capital per trade
+- Position size: 0.3% of capital per trade ($300 on $100k demo)
 
 ## Position History & Analysis
 
@@ -375,4 +398,9 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
   **PAIR ALLOWLIST:** Only trade pairs listed in the rate limiter patch above. The allowlist is mirrored in MongoDB `pair_historical` (verdict=ALLOW). Micro-cap / newly-listed pairs (PIPPIN, PUMPFUN, TRUMP, etc.) are permanently BLOCKED — they must be in BOTH the rate limiter patch AND pair_historical to work. Never add a pair to one without the other.
 - **Demo account capital** is ~$100k (virtual). `fallback_capital` in pipeline config is set to 100000. If HB API can't fetch portfolio state (404 on `/portfolio/overview`), it uses this fallback. 0.3% = $300 per position.
 - **Bybit demo executor quirks**: The position executor may need position mode set to one-way. If executors keep failing with max retries, run via HB MCP: "Set position mode to one-way for BTC-USDT on bybit_perpetual_demo".
+- **Backtesting resolution is 1m for all engines** (Apr 2026). Prior results at 1h are invalidated — the BacktestingEngine checks SL on bar LOW/HIGH (intra-bar), which behaves fundamentally differently at 1m vs 1h. Don't trust old 1h verdicts.
+- **Controllers must compute vectorized signals.** The BacktestingEngine calls `update_processed_data()` once for the full DataFrame and reads the signal column. Scalar signal assignment produces 0 trades. Use `_compute_signals_vectorized()` pattern.
+- **Derivatives merge for backtesting** requires `required_features: ["derivatives"]` in the strategy registry. `_merge_derivatives_into_candles()` queries MongoDB, forward-fills to candle timestamps, and fills remaining NaN with neutral values (funding_rate=0, oi_value=bfill then 0, buy_ratio=0.5). This is critical because HB's `BacktestingEngineBase.prepare_market_data()` calls `dropna(inplace=True)` (how='any') — any NaN in any column kills the row. The neutral fills ensure no data loss from cross-collection coverage gaps.
+- **DerivativesFeature needs 50+ docs** per MongoDB collection for time-series indicators (OI RSI, funding z-score, LS z-score). The `HISTORY_DEPTH = 50` constant controls this. With fewer docs, RSI/z-score fields will be NaN.
+- **LS ratio history is limited** — Bybit API only returns ~17 days. Funding has 408 days, OI 367 days. LS-dependent strategies (E4) have shallow backtest windows.
 - **Git push requires token** — hermes user has no credential helper. Use the temporary URL method documented above.

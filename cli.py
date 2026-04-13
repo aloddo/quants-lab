@@ -6,6 +6,8 @@ import asyncio
 import argparse
 import sys
 import os
+
+import aiohttp
 from dotenv import load_dotenv
 
 from core.tasks.runner import TaskRunner
@@ -187,6 +189,7 @@ Examples:
     deploy_parser.add_argument('--engine', '-e', required=True, help='Engine name (e.g. E1)')
     deploy_parser.add_argument('--pair', '-p', help='Single pair to deploy (testing)')
     deploy_parser.add_argument('--dry-run', action='store_true', help='Show configs without deploying')
+    deploy_parser.add_argument('--force', action='store_true', help='Deploy even if positions exist on exchange')
     deploy_parser.add_argument('--profile', default='master_account', help='HB credentials profile')
 
     bot_status_parser = subparsers.add_parser('bot-status', help='Check HB bot status')
@@ -702,7 +705,8 @@ TRADEABLE_PAIRS: set = {
 
 
 async def deploy_engine(engine_name: str, single_pair: str = None,
-                        dry_run: bool = False, profile: str = "master_account"):
+                        dry_run: bool = False, profile: str = "master_account",
+                        force: bool = False):
     """Deploy an engine as an HB-native bot."""
     from pymongo import MongoClient
     from app.engines.strategy_registry import get_strategy
@@ -747,6 +751,37 @@ async def deploy_engine(engine_name: str, single_pair: str = None,
         sys.exit(1)
 
     logger.info(f"Deploying {engine_name} on {len(pairs)} pairs")
+
+    # 1b. PRE-DEPLOY SAFETY: check exchange for existing positions
+    try:
+        from app.services.bybit_exchange_client import BybitExchangeClient
+        exchange = BybitExchangeClient()
+        if exchange.is_configured():
+            async with aiohttp.ClientSession() as _session:
+                existing = await exchange.fetch_positions(_session)
+            existing_pairs = {p["pair"] for p in existing if p["qty"] > 0}
+            overlap = set(pairs) & existing_pairs
+            if overlap:
+                logger.warning(
+                    f"POSITION COLLISION: {len(overlap)} pair(s) already have "
+                    f"open positions on the exchange:"
+                )
+                for p in existing:
+                    if p["pair"] in overlap:
+                        logger.warning(
+                            f"  {p['pair']:12} {p['side']:5} qty={p['qty']:>10.4f} "
+                            f"entry={p['entry_price']:.5f} uPnL=${p['unrealised_pnl']:.2f}"
+                        )
+                if not force:
+                    logger.error(
+                        "Aborting to prevent doubled positions. "
+                        "Close existing positions first, or use --force to override."
+                    )
+                    sys.exit(1)
+                else:
+                    logger.warning("--force flag set, deploying despite existing positions")
+    except Exception as e:
+        logger.warning(f"Pre-deploy position check failed: {e} — proceeding with deploy")
 
     # 2. Generate controller configs
     config_names = []
@@ -928,7 +963,7 @@ async def main():
     elif args.command == 'promote-shadow':
         promote_shadow(args.engine, getattr(args, 'to'))
     elif args.command == 'deploy':
-        await deploy_engine(args.engine, args.pair, args.dry_run, args.profile)
+        await deploy_engine(args.engine, args.pair, args.dry_run, args.profile, getattr(args, 'force', False))
     elif args.command == 'bot-status':
         await bot_status(getattr(args, 'engine', None))
     elif args.command == 'bot-stop':

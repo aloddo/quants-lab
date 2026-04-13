@@ -130,13 +130,18 @@ class WatchdogTask(BaseTask):
                     f"Reconciliation: {recon['ghost_unresolved']} ghost position(s) "
                     f"could not be recovered — manual check needed"
                 )
-            if recon.get("exchange_mismatches", 0) > 0:
+            if recon.get("exchange_untracked", 0) > 0:
                 issues.append(
-                    f"Reconciliation: {recon['exchange_mismatches']} untracked exchange "
-                    f"position(s) — check Bybit demo UI"
+                    f"Reconciliation: {recon['exchange_untracked']} untracked exchange "
+                    f"position(s) — check Bybit UI"
                 )
             if recon.get("orphan_executors", 0) > 0:
                 issues.append(f"Reconciliation: {recon['orphan_executors']} orphan executor(s)")
+            if recon.get("size_mismatches", 0) > 0:
+                issues.append(
+                    f"Reconciliation: {recon['size_mismatches']} STACKED POSITION(s) — "
+                    f"exchange size >> bot volume. Ghost bot likely doubled exposure."
+                )
         except Exception as e:
             logger.warning(f"Reconciliation check failed: {e}")
 
