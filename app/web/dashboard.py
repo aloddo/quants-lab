@@ -244,12 +244,14 @@ async function loadOverview(){
 async function loadLive(){
   try{
     const d=await fj(API+'/live');const cl=d.closed_pnl||[];const ex=d.executions||[];
-    const tp=cl.reduce((s,c)=>s+parseFloat(c.pnl||0),0);
-    const tf2=ex.reduce((s,e)=>s+Math.abs(parseFloat(e.fee||0)),0);
-    const ap=cl.length>0?tp/cl.length:0;
-    const e1=document.getElementById('l-tp');e1.textContent='$'+ps(tp);e1.className='stat '+pc(tp);
+    const tradePnl=cl.reduce((s,c)=>s+parseFloat(c.pnl||0),0);
+    const tradeFees=d.trade_fees||0;
+    const fundingInc=d.funding_income||0;
+    const totalPnl=tradePnl+fundingInc;
+    const ap=cl.length>0?tradePnl/cl.length:0;
+    const e1=document.getElementById('l-tp');e1.textContent='$'+ps(totalPnl);e1.className='stat '+pc(totalPnl);
     const e2=document.getElementById('l-ap');e2.textContent='$'+ps(ap);e2.className='stat '+pc(ap);
-    document.getElementById('l-fe').textContent='$'+tf2.toFixed(4);
+    document.getElementById('l-fe').textContent='Fees: $'+tradeFees.toFixed(2)+' | Funding: $'+ps(fundingInc);
     // Equity chart
     if(cl.length>0){
       const so=[...cl].sort((a,b)=>a.created_time-b.created_time);let cm=0;
@@ -267,7 +269,7 @@ async function loadLive(){
     else{ce.innerHTML='<table><tr><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th style="text-align:right">PnL</th><th>When</th></tr>'+[...cl].sort((a,b)=>(b.created_time||0)-(a.created_time||0)).map(c=>{const pn=parseFloat(c.pnl||0);return'<tr><td><b>'+(c.pair||'?')+'</b></td><td>'+sb(c.side)+'</td><td class="n">'+fmt(c.qty,4)+'</td><td class="n">'+fmt(c.entry,4)+'</td><td class="n">'+fmt(c.exit,4)+'</td><td class="n '+pc(pn)+'">$'+ps(pn,4)+'</td><td class="muted">'+tf(c.created_time)+'</td></tr>'}).join('')+'</table>'}
     const ee=document.getElementById('ex-tbl');
     if(!ex.length){ee.innerHTML='<div class="empty">No executions</div>'}
-    else{ee.innerHTML='<table><tr><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Maker</th><th>When</th></tr>'+ex.slice(0,50).map(e=>{const f=parseFloat(e.fee||0);return'<tr><td><b>'+(e.pair||'?')+'</b></td><td>'+sb(e.side)+'</td><td class="n">'+fmt(e.qty,4)+'</td><td class="n">'+fmt(e.price,4)+'</td><td class="n '+(f<0?'green':'yellow')+'">'+ps(f,6)+'</td><td>'+(e.is_maker?'Y':'N')+'</td><td class="muted">'+tf(e.exec_time)+'</td></tr>'}).join('')+'</table>'}
+    else{ee.innerHTML='<table><tr><th>Type</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Maker</th><th>When</th></tr>'+ex.slice(0,50).map(e=>{const f=parseFloat(e.fee||0);const isFund=e.is_funding;const typ=isFund?'<span style="color:#f59e0b">FUND</span>':'TRADE';return'<tr'+(isFund?' style="opacity:.75"':'')+'><td>'+typ+'</td><td><b>'+(e.pair||'?')+'</b></td><td>'+sb(e.side)+'</td><td class="n">'+fmt(e.qty,4)+'</td><td class="n">'+fmt(e.price,4)+'</td><td class="n '+(f<0?'green':'yellow')+'">'+ps(f,6)+'</td><td>'+(isFund?'-':e.is_maker?'Y':'N')+'</td><td class="muted">'+tf(e.exec_time)+'</td></tr>'}).join('')+'</table>'}
   }catch(e){console.error('Live:',e)}
 }
 
@@ -742,15 +744,28 @@ async def api_live():
         pass
 
     executions = []
+    trade_fees = 0.0
+    funding_income = 0.0
     if db is not None:
-        for doc in db.exchange_executions.find().sort("exec_time", -1).limit(100):
+        for doc in db.exchange_executions.find().sort("exec_time", -1).limit(200):
+            fee = float(doc.get("exec_fee", 0))
+            is_funding = doc.get("order_type") == "UNKNOWN" and float(doc.get("closed_size", 0)) == 0
+            if is_funding:
+                funding_income += fee  # negative = received
+            else:
+                trade_fees += abs(fee)
             executions.append({
                 "pair": doc.get("pair", ""), "side": doc.get("side", ""),
                 "qty": doc.get("exec_qty"), "price": doc.get("exec_price"),
-                "fee": doc.get("exec_fee"), "is_maker": doc.get("is_maker", False),
+                "fee": fee, "is_maker": doc.get("is_maker", False),
                 "exec_time": doc.get("exec_time"),
+                "is_funding": is_funding,
+                "order_type": doc.get("order_type", ""),
             })
-    return _safe_json({"closed_pnl": closed_pnl, "executions": executions})
+    return _safe_json({
+        "closed_pnl": closed_pnl, "executions": executions,
+        "trade_fees": trade_fees, "funding_income": -funding_income,  # positive = we earned
+    })
 
 
 # ---------------------------------------------------------------------------
