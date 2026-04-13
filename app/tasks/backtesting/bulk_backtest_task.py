@@ -70,7 +70,18 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
         For each pair's 1h candle feed, queries MongoDB for historical derivatives
         data and adds funding_rate, oi_value, buy_ratio columns aligned by timestamp.
-        Forward-fills gaps (funding is 8h, OI/LS are 15min-1h).
+        Forward-fills gaps (funding is 8h, OI/LS are 15min-1h), then back-fills
+        and fills remaining NaN with neutral values.
+
+        NaN safety: BacktestingEngineBase.prepare_market_data() calls
+        dropna(inplace=True) on the merged DataFrame (how='any'). Any NaN
+        in ANY column kills the row. We must ensure derivatives columns never
+        contain NaN, even for timestamps before MongoDB coverage begins.
+
+        Neutral fill values:
+          funding_rate = 0.0   (no funding → no signal)
+          oi_value     = bfill then 0.0 (use earliest known, else zero)
+          buy_ratio    = 0.5   (balanced → no crowd signal)
 
         Returns number of pairs enriched.
         """
@@ -86,13 +97,9 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
             if df is None or len(df) == 0:
                 continue
 
-            ts_min = int(df["timestamp"].min())
-            ts_max = int(df["timestamp"].max())
-            # MongoDB derivatives store timestamp_utc as datetime or epoch ms
             query = {"pair": pair}
 
             try:
-                # Candle timestamps are epoch seconds; derivatives are epoch ms
                 candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
 
                 # Funding rates
@@ -105,7 +112,9 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                         fdf = fdf.set_index("ts")[["funding_rate"]].sort_index()
                         fdf = fdf[~fdf.index.duplicated(keep="last")]
                         fdf_reindexed = fdf.reindex(candle_idx, method="ffill")
-                        df["funding_rate"] = fdf_reindexed["funding_rate"].values
+                        df["funding_rate"] = fdf_reindexed["funding_rate"].fillna(0.0).values
+                else:
+                    df["funding_rate"] = 0.0
 
                 # Open interest
                 oi_cursor = db["bybit_open_interest"].find(query).sort("timestamp_utc", 1)
@@ -117,7 +126,9 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                         odf = odf.set_index("ts")[["oi_value"]].sort_index()
                         odf = odf[~odf.index.duplicated(keep="last")]
                         odf_reindexed = odf.reindex(candle_idx, method="ffill")
-                        df["oi_value"] = odf_reindexed["oi_value"].values
+                        df["oi_value"] = odf_reindexed["oi_value"].bfill().fillna(0.0).values
+                else:
+                    df["oi_value"] = 0.0
 
                 # LS ratio
                 ls_cursor = db["bybit_ls_ratio"].find(query).sort("timestamp_utc", 1)
@@ -129,7 +140,24 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                         ldf = ldf.set_index("ts")[["buy_ratio"]].sort_index()
                         ldf = ldf[~ldf.index.duplicated(keep="last")]
                         ldf_reindexed = ldf.reindex(candle_idx, method="ffill")
-                        df["buy_ratio"] = ldf_reindexed["buy_ratio"].values
+                        df["buy_ratio"] = ldf_reindexed["buy_ratio"].fillna(0.5).values
+                else:
+                    df["buy_ratio"] = 0.5
+
+                # Binance funding rates (for cross-exchange spread signals)
+                bin_cursor = db["binance_funding_rates"].find(query).sort("timestamp_utc", 1)
+                bin_docs = await bin_cursor.to_list(length=100000)
+                if bin_docs:
+                    bdf = pd.DataFrame(bin_docs)
+                    if "timestamp_utc" in bdf.columns and "funding_rate" in bdf.columns:
+                        bdf["ts"] = pd.to_datetime(bdf["timestamp_utc"], unit="ms", utc=True)
+                        bdf = bdf.set_index("ts")[["funding_rate"]].sort_index()
+                        bdf = bdf.rename(columns={"funding_rate": "binance_funding_rate"})
+                        bdf = bdf[~bdf.index.duplicated(keep="last")]
+                        bdf_reindexed = bdf.reindex(candle_idx, method="ffill")
+                        df["binance_funding_rate"] = bdf_reindexed["binance_funding_rate"].fillna(0.0).values
+                else:
+                    df["binance_funding_rate"] = 0.0
 
                 shared_candles[feed_key] = df
                 enriched += 1
@@ -137,7 +165,75 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
             except Exception as e:
                 logger.warning(f"Failed to merge derivatives for {pair}: {e}")
 
+        # Merge fear_greed_index and BTC regime features (pair-independent, do once)
+        await self._merge_sentiment_and_regime(shared_candles, pairs)
+
         return enriched
+
+    async def _merge_sentiment_and_regime(
+        self, shared_candles: dict, pairs: List[str]
+    ) -> None:
+        """Merge fear_greed_value and BTC regime features into all pair candles.
+
+        These are pair-independent features (same value for all pairs at a given time).
+        Loaded once from MongoDB / BTC candle parquet, then merged into each pair's 1h candles.
+
+        NaN safety: all columns filled with neutral defaults after merge.
+        """
+        db = self.mongodb_client.get_database()
+
+        # 1. Fear & Greed Index
+        fg_cursor = db["fear_greed_index"].find(
+            {}, {"timestamp_utc": 1, "value": 1, "_id": 0}
+        ).sort("timestamp_utc", 1)
+        fg_docs = await fg_cursor.to_list(length=100000)
+        fg_df = None
+        if fg_docs:
+            fgd = pd.DataFrame(fg_docs)
+            if "timestamp_utc" in fgd.columns and "value" in fgd.columns:
+                fgd["ts"] = pd.to_datetime(fgd["timestamp_utc"], unit="ms", utc=True)
+                fg_df = fgd.set_index("ts")[["value"]].rename(
+                    columns={"value": "fear_greed_value"}
+                ).sort_index()
+                fg_df = fg_df[~fg_df.index.duplicated(keep="last")]
+                logger.info(f"Fear & Greed: {len(fg_df)} entries loaded for merge")
+
+        # 2. BTC regime from parquet
+        btc_key = f"{self.connector_name}_BTC-USDT_1h"
+        btc_df = shared_candles.get(btc_key)
+        regime_df = None
+        if btc_df is not None and len(btc_df) > 200:
+            btc_idx = pd.to_datetime(btc_df["timestamp"], unit="s", utc=True)
+            close = btc_df["close"].values
+            close_s = pd.Series(close, index=btc_idx)
+            ret_4h = (close_s / close_s.shift(4) - 1) * 100
+            regime_df = pd.DataFrame({"btc_return_4h": ret_4h}).dropna()
+            logger.info(f"BTC regime: {len(regime_df)} bars for merge")
+
+        # 3. Merge into each pair's candle feed
+        for pair in pairs:
+            feed_key = f"{self.connector_name}_{pair}_1h"
+            df = shared_candles.get(feed_key)
+            if df is None or len(df) == 0:
+                continue
+
+            candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+
+            # Fear & Greed
+            if fg_df is not None:
+                fg_reindexed = fg_df.reindex(candle_idx, method="ffill")
+                df["fear_greed_value"] = fg_reindexed["fear_greed_value"].fillna(50.0).values
+            else:
+                df["fear_greed_value"] = 50.0
+
+            # BTC regime
+            if regime_df is not None:
+                reg_reindexed = regime_df.reindex(candle_idx, method="ffill")
+                df["btc_return_4h"] = reg_reindexed["btc_return_4h"].fillna(0.0).values
+            else:
+                df["btc_return_4h"] = 0.0
+
+            shared_candles[feed_key] = df
 
     def _discover_pairs(self, start_ts: int = 0) -> List[str]:
         """Find pairs with sufficient parquet data covering the backtest window.
@@ -204,14 +300,27 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
         Multi-criteria: a pair must pass ALL thresholds for a given tier.
         PF alone is not enough — Sharpe and max drawdown are hard gates.
+
+        Carry strategies (dd_gate_relaxed=True) use relaxed DD thresholds
+        because backtests run unlimited concurrent positions, inflating DD.
+        Production uses max 3 concurrent at $300 each.
         """
+        from app.engines.strategy_registry import get_strategy
+        engine_meta = get_strategy(self.engine_name)
+        if engine_meta.dd_gate_relaxed:
+            dd_allow = -0.50   # -50% (carry backtest concurrency)
+            dd_watch = -0.70   # -70%
+        else:
+            dd_allow = MAX_DD_ALLOW
+            dd_watch = MAX_DD_WATCH
+
         if trades < MIN_TRADES:
             return "BLOCK"
         if (pf >= PF_ALLOW and sharpe >= SHARPE_ALLOW
-                and max_dd >= MAX_DD_ALLOW):
+                and max_dd >= dd_allow):
             return "ALLOW"
         if (pf >= PF_WATCH and sharpe >= SHARPE_WATCH
-                and max_dd >= MAX_DD_WATCH):
+                and max_dd >= dd_watch):
             return "WATCH"
         return "BLOCK"
 

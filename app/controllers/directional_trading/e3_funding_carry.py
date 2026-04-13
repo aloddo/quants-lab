@@ -66,6 +66,29 @@ class E3FundingCarryConfig(DirectionalTradingControllerConfigBase):
     tp_pct: float = Field(default=0.03, description="Take profit as decimal (3%)")
     time_limit_seconds: int = Field(default=432000, description="5 days")
 
+    # OI filter (skip trades when OI is in bottom percentile — SHAP analysis shows
+    # low-OI environments have worst WR across most pairs)
+    oi_filter_enabled: bool = Field(default=False, description="Enable OI percentile filter")
+    oi_filter_min_pct: float = Field(default=0.20, description="Skip signal when OI rolling pct < this")
+    oi_filter_window: int = Field(default=168, description="OI percentile rolling window (hours)")
+
+    # BTC regime filter (only enter when BTC 4h return aligns with trade direction)
+    # A/B tested 2026-04-12: +0.15 PF on XRP/SUI, +0.25 on ADA at threshold=0.0
+    btc_regime_enabled: bool = Field(default=True, description="Enable BTC regime filter")
+    btc_regime_threshold: float = Field(default=0.0, description="Min |btc_return_4h| to suppress (0=any opposite blocks)")
+
+    # Volatility filter (skip when Amihud illiquidity is extreme — thin markets)
+    vol_filter_enabled: bool = Field(default=False, description="Enable volatility/illiquidity filter")
+    vol_filter_max_pct: float = Field(default=0.95, description="Skip signal when Amihud percentile > this")
+    vol_filter_window: int = Field(default=168, description="Amihud rolling percentile window (hours)")
+
+    # Time-of-day filter (only enter during specific UTC sessions)
+    tod_filter_enabled: bool = Field(default=False, description="Enable time-of-day session filter")
+    tod_allowed_hours: List[int] = Field(
+        default_factory=lambda: list(range(0, 24)),
+        description="UTC hours when signals are allowed (default: all)"
+    )
+
     # REST API fetch (live mode only)
     funding_api_url: str = Field(default="https://api.bybit.com", description="Bybit API base URL")
     funding_fetch_limit: int = Field(default=50, description="Number of funding records to fetch")
@@ -154,6 +177,45 @@ class E3FundingCarryController(DirectionalTradingControllerBase):
         df.loc[all_positive & above_threshold, "signal"] = -1
         # Negative funding streak + above threshold → LONG (1)
         df.loc[all_negative & above_threshold, "signal"] = 1
+
+        # OI filter: suppress signals when OI is in bottom percentile
+        if c.oi_filter_enabled and "oi_value" in df.columns:
+            oi = df["oi_value"]
+            oi_pct = oi.rolling(c.oi_filter_window, min_periods=24).rank(pct=True)
+            low_oi = oi_pct < c.oi_filter_min_pct
+            suppressed = (df["signal"] != 0) & low_oi
+            df.loc[suppressed, "signal"] = 0
+
+        # BTC regime filter: suppress signals where BTC 4h move opposes trade direction
+        # LONG signals suppressed when BTC is falling, SHORT when BTC is rising
+        if c.btc_regime_enabled and "btc_return_4h" in df.columns:
+            btc_ret = df["btc_return_4h"]
+            # For LONG (signal=1): suppress if BTC falling below -threshold
+            long_against_btc = (df["signal"] == 1) & (btc_ret < -c.btc_regime_threshold)
+            # For SHORT (signal=-1): suppress if BTC rising above +threshold
+            short_against_btc = (df["signal"] == -1) & (btc_ret > c.btc_regime_threshold)
+            df.loc[long_against_btc | short_against_btc, "signal"] = 0
+
+        # Volatility filter: suppress signals when Amihud illiquidity is extreme
+        # Amihud = |return| / volume — high values = thin, dangerous markets
+        if c.vol_filter_enabled:
+            close = df["close"]
+            volume = df["volume"]
+            ret_abs = close.pct_change().abs()
+            # Avoid division by zero
+            safe_vol = volume.replace(0, np.nan)
+            amihud = ret_abs / safe_vol
+            amihud_pct = amihud.rolling(c.vol_filter_window, min_periods=24).rank(pct=True)
+            illiquid = amihud_pct > c.vol_filter_max_pct
+            suppressed = (df["signal"] != 0) & illiquid
+            df.loc[suppressed, "signal"] = 0
+
+        # Time-of-day filter: only allow signals during specified UTC hours
+        if c.tod_filter_enabled and "timestamp" in df.columns:
+            hours = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.hour
+            allowed = hours.isin(c.tod_allowed_hours)
+            suppressed = (df["signal"] != 0) & ~allowed
+            df.loc[suppressed, "signal"] = 0
 
         return df
 

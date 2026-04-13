@@ -141,13 +141,21 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
 
     def _compute_verdict(self, pf: float, trades: int,
                           sharpe: float = 0.0, max_dd: float = 0.0) -> str:
+        engine_meta = get_strategy(self.engine_name)
+        if engine_meta.dd_gate_relaxed:
+            dd_allow = -0.50
+            dd_watch = -0.70
+        else:
+            dd_allow = MAX_DD_ALLOW
+            dd_watch = MAX_DD_WATCH
+
         if trades < MIN_TRADES:
             return "BLOCK"
         if (pf >= PF_ALLOW and sharpe >= SHARPE_ALLOW
-                and max_dd >= MAX_DD_ALLOW):
+                and max_dd >= dd_allow):
             return "ALLOW"
         if (pf >= PF_WATCH and sharpe >= SHARPE_WATCH
-                and max_dd >= MAX_DD_WATCH):
+                and max_dd >= dd_watch):
             return "WATCH"
         return "BLOCK"
 
@@ -231,6 +239,18 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
         shared_candles = _cache._bt_engine.backtesting_data_provider.candles_feeds.copy()
         del _cache
         gc.collect()
+
+        # Merge derivatives data if engine needs it (funding_rate, btc_return_4h, etc.)
+        engine_meta = get_strategy(self.engine_name)
+        if "derivatives" in engine_meta.required_features:
+            from app.tasks.backtesting.bulk_backtest_task import BulkBacktestTask
+            # Borrow the merge methods from BulkBacktestTask
+            _merger = object.__new__(BulkBacktestTask)
+            _merger.connector_name = self.connector_name
+            _merger.engine_name = self.engine_name
+            _merger.mongodb_client = self.mongodb_client
+            n_enriched = await _merger._merge_derivatives_into_candles(shared_candles, pairs)
+            logger.info(f"Merged derivatives data into {n_enriched}/{len(pairs)} pairs")
 
         logger.info(
             f"WalkForward {self.engine_name}: {len(pairs)} pairs, "

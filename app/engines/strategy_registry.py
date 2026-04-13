@@ -79,6 +79,11 @@ class StrategyMetadata:
     pair_source: str = "pair_historical"
     pair_allowlist: List[str] = field(default_factory=list)
 
+    # Verdict overrides
+    # Carry strategies run unlimited concurrent positions in backtest, inflating DD.
+    # Production uses max 3 concurrent at $300 each — real DD is ~5x lower.
+    dd_gate_relaxed: bool = False      # if True, use -50% DD gate instead of -15%/-20%
+
     # Bot deployment
     bot_image: str = "quants-lab/hummingbot:demo"  # Docker image (with patches baked in)
     total_amount_quote: float = 300.0   # per pair position size in quote
@@ -272,17 +277,52 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         blocked_pairs=[],
         required_features=["derivatives"],
         max_concurrent=20,
+        dd_gate_relaxed=True,  # carry strategy: backtest DD inflated by unlimited concurrency
         controller_file="e3_funding_carry.py",
         hb_connector="bybit_perpetual_testnet",
         deployment_mode="hb_native",
         default_config={
             "funding_streak_min": 3,
-            "funding_rate_threshold": 0.0001,
+            "funding_rate_threshold": 0.00005,
             "funding_zscore_boost": 2.0,
+            "btc_regime_enabled": True,
+            "btc_regime_threshold": 0.0,
         },
         pair_source="pair_historical",
         total_amount_quote=300.0,
         cooldown_time=3600,
+    ),
+    "H2": StrategyMetadata(
+        name="H2",
+        display_name="Funding Divergence",
+        controller_module="app.controllers.directional_trading.h2_funding_divergence",
+        config_class_name="H2FundingDivergenceConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "stop_loss": Decimal("0.03"),
+            "take_profit": Decimal("0.02"),
+            "time_limit": 28800,  # 8 hours
+        },
+        trailing_stop={
+            "activation_price": Decimal("0.01"),
+            "trailing_delta": Decimal("0.005"),
+        },
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],
+        max_concurrent=20,
+        controller_file="h2_funding_divergence.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "zscore_window": 30,
+            "zscore_entry": 2.0,
+            "min_spread_abs": 0.00005,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=1800,  # 30min cooldown (arb signals are fast)
     ),
     "E4": StrategyMetadata(
         name="E4",
@@ -315,6 +355,37 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         pair_source="pair_historical",
         total_amount_quote=300.0,
         cooldown_time=3600,
+    ),
+    "M1": StrategyMetadata(
+        name="M1",
+        display_name="ML Ensemble Signal",
+        controller_module="app.controllers.directional_trading.m1_ml_ensemble",
+        config_class_name="M1MLEnsembleConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "stop_loss": Decimal("0.05"),
+            "take_profit": Decimal("0.05"),
+            "time_limit": 345600,  # 4 days
+        },
+        trailing_stop=None,
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives", "microstructure"],
+        max_concurrent=5,
+        controller_file="m1_ml_ensemble.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "entry_threshold": 0.45,
+            "exit_threshold": 0.40,
+            "sl_atr_multiplier": 2.0,
+            "tp_atr_multiplier": 2.0,
+            "hard_sl_pct": 0.05,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=7200,  # 2h cooldown (fewer, higher-quality trades)
     ),
 }
 
@@ -385,6 +456,8 @@ def build_backtest_config(
         # candles_config deliberately omitted — controller computes correct lookbacks
     }
 
+    # Apply strategy-specific defaults first (signal params, filters, etc.)
+    config_kwargs.update(meta.default_config)
     config_kwargs.update(meta.exit_params)
 
     if meta.trailing_stop:

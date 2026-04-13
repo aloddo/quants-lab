@@ -37,6 +37,70 @@ tasks:
       ls_limit: 10
     tags: [data, derivatives, bybit]
 
+  binance_funding:
+    enabled: true
+    task_class: app.tasks.data_collection.binance_funding_task.BinanceFundingTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 600
+    config:
+      pairs: "auto"
+      funding_limit: 5
+    tags: [data, funding, binance]
+
+  # ═══════ Layer 1b: Exotic Data Collection ═══════════════
+  deribit_options:
+    enabled: true
+    task_class: app.tasks.data_collection.deribit_options_task.DeribitOptionsSurfaceTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+    config:
+      currencies: ["BTC", "ETH"]
+      collection_name: "deribit_options_surface"
+    tags: [data, options, deribit, exotic]
+
+  coinglass:
+    enabled: true
+    task_class: app.tasks.data_collection.coinglass_task.CoinglassTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+    config:
+      pairs: "auto"
+      liquidation_interval: "1h"
+      oi_interval: "1h"
+      liquidation_limit: 24
+      oi_limit: 24
+    tags: [data, liquidations, oi, coinglass, exotic]
+
+  fear_greed:
+    enabled: true
+    task_class: app.tasks.data_collection.fear_greed_task.FearGreedTask
+    schedule:
+      type: cron
+      cron: "0 0 * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 120
+    timeout_seconds: 60
+    config:
+      limit: 7
+      collection_name: "fear_greed_index"
+    tags: [data, sentiment, exotic]
+
   # ═══════ Layer 2: Feature Computation ═══════════════════
   feature_computation:
     enabled: true
@@ -49,6 +113,12 @@ tasks:
         on_success: true
         delay_seconds: 10
       - task_name: "bybit_derivatives"
+        on_success: true
+        delay_seconds: 5
+      - task_name: "deribit_options"
+        on_success: true
+        delay_seconds: 5
+      - task_name: "coinglass"
         on_success: true
         delay_seconds: 5
     max_retries: 2
@@ -136,6 +206,19 @@ tasks:
     config:
       poll_timeout: 5
     tags: [infra, telegram]
+
+  # ═══════ Infrastructure: Trade Recorder ═════════════════
+  trade_recorder:
+    enabled: true
+    task_class: app.tasks.trade_recorder_task.TradeRecorderTask
+    schedule:
+      type: cron
+      cron: "*/5 * * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 30
+    config: {}
+    tags: [infra, trades, recording]
 
   # ═══════ Infrastructure: Watchdog ══════════════════════
   watchdog:
@@ -338,6 +421,41 @@ tasks:
       trade_cost: 0.000375
     tags: [backtesting, e3, walk-forward, weekly]
 
+  h2_bulk_backtest:
+    enabled: false
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "H2"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, h2, weekly]
+
+  h2_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "H2"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, h2, walk-forward, weekly]
+
   e4_bulk_backtest:
     enabled: false
     task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
@@ -427,3 +545,38 @@ tasks:
       step_days: 30
       trade_cost: 0.000375
     tags: [backtesting, e2, walk-forward, weekly]
+
+  m1_bulk_backtest:
+    enabled: false
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "M1"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, m1, ml, weekly]
+
+  m1_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "M1"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, m1, ml, walk-forward, weekly]

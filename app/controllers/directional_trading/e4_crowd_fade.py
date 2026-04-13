@@ -159,8 +159,6 @@ class E4CrowdFadeController(DirectionalTradingControllerBase):
 
         return df
 
-        return signal
-
     def _signal_from_api(self, trading_pair: str) -> int:
         """Compute signal from Bybit REST API data (live mode)."""
         c = self.config
