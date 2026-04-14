@@ -294,16 +294,115 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                      f"(resolution={resolution})")
         return int(min_end)
 
+    def _compute_trade_quality(self, executors_df) -> dict:
+        """Compute trade-level quality metrics from backtest executors DataFrame.
+
+        Returns dict with monthly_wr, max_loss_streak, side balance PFs,
+        and composite sub-scores for the verdict function.
+        """
+        if executors_df is None or len(executors_df) == 0:
+            return {
+                "monthly_wr": 0.0, "max_loss_streak": 0,
+                "long_pf": 0.0, "short_pf": 0.0,
+                "composite_quality": 0.0,
+            }
+
+        df = executors_df.copy()
+
+        # --- Monthly consistency ---
+        if "timestamp" in df.columns:
+            df["_month"] = pd.to_datetime(df["timestamp"], unit="s").dt.to_period("M")
+        elif "datetime" in df.columns:
+            df["_month"] = pd.to_datetime(df["datetime"]).dt.to_period("M")
+        else:
+            df["_month"] = 0
+
+        pnl_col = "net_pnl_quote"
+        if pnl_col not in df.columns:
+            pnl_col = "net_pnl_pct"  # fallback
+
+        monthly_pnl = df.groupby("_month")[pnl_col].sum()
+        win_months = (monthly_pnl > 0).sum()
+        total_months = max(len(monthly_pnl), 1)
+        monthly_wr = win_months / total_months
+
+        # --- Max consecutive losses ---
+        is_loss = (df[pnl_col] < 0).astype(int)
+        if len(is_loss) > 0:
+            streaks = is_loss.groupby((is_loss != is_loss.shift()).cumsum()).sum()
+            max_loss_streak = int(streaks.max()) if len(streaks) > 0 else 0
+        else:
+            max_loss_streak = 0
+
+        # --- Side-specific profit factors ---
+        def _side_pf(subset):
+            if len(subset) == 0:
+                return 0.0
+            wins = subset[subset[pnl_col] > 0][pnl_col].sum()
+            losses = abs(subset[subset[pnl_col] <= 0][pnl_col].sum())
+            return float(wins / losses) if losses > 0 else 0.0
+
+        side_col = "side" if "side" in df.columns else None
+        if side_col:
+            long_mask = df[side_col].astype(str).str.contains("BUY", na=False)
+            short_mask = df[side_col].astype(str).str.contains("SELL", na=False)
+            long_pf = _side_pf(df[long_mask])
+            short_pf = _side_pf(df[short_mask])
+        else:
+            long_pf = 0.0
+            short_pf = 0.0
+
+        # --- Composite quality sub-score (0-1) ---
+        # Mirrors governance weights but uses only bulk-available data
+        monthly_score = monthly_wr  # already 0-1
+        streak_score = float(np.clip(1.0 - (max_loss_streak - 3) / 15, 0, 1))
+        trade_vol_score = float(np.clip(len(df) / 100, 0, 1))
+
+        # Side balance: both sides profitable = bonus, one side dead = penalty
+        dominant_pf = max(short_pf, long_pf)
+        weak_pf = min(short_pf, long_pf)
+        if weak_pf >= 1.0:
+            side_score = float(np.clip((dominant_pf - 1.0) / 0.5, 0, 1))
+        elif weak_pf >= 0.9:
+            side_score = float(np.clip((dominant_pf - 1.0) / 0.5, 0, 1)) * 0.7
+        else:
+            side_score = float(np.clip((dominant_pf - 1.0) / 0.5, 0, 1)) * 0.4
+
+        composite_quality = (
+            0.35 * monthly_score +
+            0.25 * streak_score +
+            0.20 * trade_vol_score +
+            0.20 * side_score
+        )
+
+        return {
+            "monthly_wr": monthly_wr,
+            "max_loss_streak": max_loss_streak,
+            "long_pf": long_pf,
+            "short_pf": short_pf,
+            "composite_quality": composite_quality,
+        }
+
     def _compute_verdict(self, pf: float, trades: int,
-                          sharpe: float = 0.0, max_dd: float = 0.0) -> str:
+                          sharpe: float = 0.0, max_dd: float = 0.0,
+                          trade_quality: dict = None) -> tuple:
         """Determine ALLOW/WATCH/BLOCK from backtest results.
 
-        Multi-criteria: a pair must pass ALL thresholds for a given tier.
-        PF alone is not enough — Sharpe and max drawdown are hard gates.
+        Multi-gate verdict aligned with quant governance framework:
 
-        Carry strategies (dd_gate_relaxed=True) use relaxed DD thresholds
-        because backtests run unlimited concurrent positions, inflating DD.
-        Production uses max 3 concurrent at $300 each.
+        Gate 1: Hard floors (instant BLOCK)
+          - trades < 30
+          - PF < 1.05 (not even marginally positive)
+
+        Gate 2: Core metrics (PF, Sharpe, drawdown)
+          - Carry strategies use relaxed DD thresholds (dd_gate_relaxed)
+
+        Gate 3: Trade quality (monthly consistency, loss streaks, side balance)
+          - composite_quality < 0.20 → demote ALLOW→WATCH
+          - monthly_wr < 0.40 → demote ALLOW→WATCH (inconsistent)
+          - max_loss_streak > 12 → demote ALLOW→WATCH (fragile)
+
+        Returns (verdict: str, quality_detail: dict).
         """
         from app.engines.strategy_registry import get_strategy
         engine_meta = get_strategy(self.engine_name)
@@ -314,18 +413,121 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
             dd_allow = MAX_DD_ALLOW
             dd_watch = MAX_DD_WATCH
 
+        quality = trade_quality or {}
+        detail = {
+            "monthly_wr": quality.get("monthly_wr", 0),
+            "max_loss_streak": quality.get("max_loss_streak", 0),
+            "long_pf": quality.get("long_pf", 0),
+            "short_pf": quality.get("short_pf", 0),
+            "composite_quality": quality.get("composite_quality", 0),
+            "gate_failures": [],
+        }
+
+        # Gate 1: Hard floors
         if trades < MIN_TRADES:
-            return "BLOCK"
+            detail["gate_failures"].append(f"trades={trades} < {MIN_TRADES}")
+            return "BLOCK", detail
+        if pf < 1.05:
+            detail["gate_failures"].append(f"PF={pf:.2f} < 1.05")
+            return "BLOCK", detail
+
+        # Gate 2: Core metrics tier
         if (pf >= PF_ALLOW and sharpe >= SHARPE_ALLOW
                 and max_dd >= dd_allow):
-            return "ALLOW"
-        if (pf >= PF_WATCH and sharpe >= SHARPE_WATCH
+            verdict = "ALLOW"
+        elif (pf >= PF_WATCH and sharpe >= SHARPE_WATCH
                 and max_dd >= dd_watch):
-            return "WATCH"
-        return "BLOCK"
+            verdict = "WATCH"
+        else:
+            # Identify which gate failed for diagnostics
+            if pf < PF_WATCH:
+                detail["gate_failures"].append(f"PF={pf:.2f} < {PF_WATCH}")
+            if sharpe < SHARPE_WATCH:
+                detail["gate_failures"].append(f"Sharpe={sharpe:.2f} < {SHARPE_WATCH}")
+            if max_dd < dd_watch:
+                detail["gate_failures"].append(f"DD={max_dd:.2f} < {dd_watch}")
+            return "BLOCK", detail
 
-    async def _store_trades(self, db, bt_result, pair: str, period_label: str, run_id: str):
-        """Store individual trade records from a backtest result."""
+        # Gate 3: Trade quality (only applies if we have trade data)
+        if verdict == "ALLOW" and quality:
+            demote_reasons = []
+            if quality.get("composite_quality", 1) < 0.20:
+                demote_reasons.append(
+                    f"quality={quality['composite_quality']:.2f} < 0.20")
+            if quality.get("monthly_wr", 1) < 0.40:
+                demote_reasons.append(
+                    f"monthly_wr={quality['monthly_wr']:.0%} < 40%")
+            if quality.get("max_loss_streak", 0) > 12:
+                demote_reasons.append(
+                    f"loss_streak={quality['max_loss_streak']} > 12")
+            if demote_reasons:
+                detail["gate_failures"] = demote_reasons
+                verdict = "WATCH"
+                logger.info(
+                    f"  Demoted ALLOW→WATCH: {', '.join(demote_reasons)}")
+
+        return verdict, detail
+
+    def _compute_funding_pnl(
+        self, shared_candles: dict, pair: str, entry_ts: float,
+        exit_ts: float, side: str, position_value: float,
+    ) -> dict:
+        """Compute funding PnL accumulated during a trade's hold period.
+
+        Bybit funding settles every 8h (00:00, 08:00, 16:00 UTC).
+        - Positive funding_rate: longs PAY shorts
+        - Negative funding_rate: shorts PAY longs
+        - Payment = position_value * funding_rate
+
+        If you're SHORT and rate is positive → you RECEIVE funding (positive PnL).
+        If you're LONG and rate is positive → you PAY funding (negative PnL).
+
+        Returns dict with funding_pnl, funding_payments (count), avg_rate.
+        """
+        feed_key = f"{self.connector_name}_{pair}_1h"
+        df = shared_candles.get(feed_key)
+        if df is None or "funding_rate" not in df.columns:
+            return {"funding_pnl": 0.0, "funding_payments": 0, "avg_rate": 0.0}
+
+        # Filter candles within the hold period
+        mask = (df["timestamp"] >= entry_ts) & (df["timestamp"] <= exit_ts)
+        hold_df = df[mask]
+
+        if len(hold_df) == 0:
+            return {"funding_pnl": 0.0, "funding_payments": 0, "avg_rate": 0.0}
+
+        # Funding settles every 8h. With 1h candles, find settlement bars.
+        # Settlement hours: 0, 8, 16 UTC
+        settlement_mask = hold_df["timestamp"].apply(
+            lambda ts: pd.Timestamp(ts, unit="s", tz="UTC").hour in (0, 8, 16)
+        )
+        settlement_bars = hold_df[settlement_mask]
+
+        if len(settlement_bars) == 0:
+            return {"funding_pnl": 0.0, "funding_payments": 0, "avg_rate": 0.0}
+
+        # Side multiplier: short receives when rate positive, long pays
+        # funding_payment = position_value * rate * (-1 if long, +1 if short)
+        side_mult = -1.0 if side.upper() in ("BUY", "TRADEYPE.BUY") else 1.0
+
+        rates = settlement_bars["funding_rate"].values
+        total_funding = float(np.sum(rates)) * position_value * side_mult
+        avg_rate = float(np.mean(rates)) if len(rates) > 0 else 0.0
+
+        return {
+            "funding_pnl": total_funding,
+            "funding_payments": len(settlement_bars),
+            "avg_rate": avg_rate,
+        }
+
+    async def _store_trades(self, db, bt_result, pair: str, period_label: str,
+                            run_id: str, shared_candles: dict = None):
+        """Store individual trade records from a backtest result.
+
+        If shared_candles is provided and contains funding_rate data,
+        computes and includes funding PnL for each trade (critical for
+        carry strategy backtesting).
+        """
         if not hasattr(bt_result, "executors") or not bt_result.executors:
             return 0
         try:
@@ -338,20 +540,43 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         trades_coll = db["backtest_trades"]
 
         docs = []
+        total_funding_pnl = 0.0
         for _, row in edf.iterrows():
+            entry_ts = float(row.get("timestamp", 0))
+            exit_ts = float(row.get("close_timestamp", 0))
+            side = str(row.get("side", ""))
+            position_value = float(row["filled_amount_quote"]) if "filled_amount_quote" in row and row["filled_amount_quote"] is not None else 0.0
+            net_pnl_quote = float(row["net_pnl_quote"]) if "net_pnl_quote" in row and row["net_pnl_quote"] is not None else 0.0
+
+            # Compute funding PnL during hold period
+            funding_info = {"funding_pnl": 0.0, "funding_payments": 0, "avg_rate": 0.0}
+            if shared_candles is not None and position_value > 0:
+                funding_info = self._compute_funding_pnl(
+                    shared_candles, pair, entry_ts, exit_ts, side, position_value
+                )
+                total_funding_pnl += funding_info["funding_pnl"]
+
+            # Adjusted PnL = price PnL + funding PnL
+            adjusted_pnl = net_pnl_quote + funding_info["funding_pnl"]
+
             doc = {
                 "engine": self.engine_name,
                 "pair": pair,
                 "period": period_label,
                 "run_id": run_id,
-                "timestamp": float(row.get("timestamp", 0)),
-                "close_timestamp": float(row.get("close_timestamp", 0)),
-                "side": str(row.get("side", "")),
+                "timestamp": entry_ts,
+                "close_timestamp": exit_ts,
+                "side": side,
                 "close_type": str(row.get("close_type", "")),
-                "net_pnl_quote": float(row["net_pnl_quote"]) if "net_pnl_quote" in row and row["net_pnl_quote"] is not None else None,
+                "net_pnl_quote": net_pnl_quote,
                 "net_pnl_pct": float(row["net_pnl_pct"]) if "net_pnl_pct" in row and row["net_pnl_pct"] is not None else None,
                 "cum_fees_quote": float(row["cum_fees_quote"]) if "cum_fees_quote" in row and row["cum_fees_quote"] is not None else None,
-                "filled_amount_quote": float(row["filled_amount_quote"]) if "filled_amount_quote" in row and row["filled_amount_quote"] is not None else None,
+                "filled_amount_quote": position_value if position_value else None,
+                # Funding PnL fields
+                "funding_pnl": funding_info["funding_pnl"],
+                "funding_payments": funding_info["funding_payments"],
+                "avg_funding_rate": funding_info["avg_rate"],
+                "adjusted_pnl_quote": adjusted_pnl,  # price PnL + funding PnL
             }
             # Convert any remaining Decimal values
             for k, v in doc.items():
@@ -365,6 +590,9 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                 "engine": self.engine_name, "pair": pair, "run_id": run_id,
             })
             await trades_coll.insert_many(docs)
+
+        if total_funding_pnl != 0.0:
+            logger.info(f"  {pair}: funding PnL = {total_funding_pnl:+.2f} across {len(docs)} trades")
 
         return len(docs)
 
@@ -421,10 +649,17 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
         for pair in pairs:
             try:
-                # Fresh engine per pair (HB bug: state corrupts on reuse)
-                # but inject shared cache to avoid reloading parquet
+                # Fresh engine per pair + deep-copy ALL candles.
+                # HB's prepare_market_data() mutates DataFrames in-place:
+                #   - dropna(inplace=True) deletes rows with NaN derivatives
+                #   - ensure_epoch_index() calls set_index() modifying structure
+                # Without deep copy, pair N's backtest corrupts shared data
+                # for pairs N+1..end (previously only pair-specific feeds were
+                # copied, but reference feeds like BTC-USDT were shared refs).
+                pair_candles = {k: v.copy() for k, v in shared_candles.items()}
+
                 bt_engine = BacktestingEngine(load_cached_data=False)
-                bt_engine._bt_engine.backtesting_data_provider.candles_feeds = shared_candles
+                bt_engine._bt_engine.backtesting_data_provider.candles_feeds = pair_candles
 
                 # Build config via registry — handles candles, exit params, trailing stop
                 config_instance = build_backtest_config(
@@ -454,8 +689,20 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                 pnl = r.get("net_pnl_quote", 0) or 0
                 close_types = r.get("close_types", {})
 
-                verdict = self._compute_verdict(pf, trades,
-                    sharpe=sharpe or 0.0, max_dd=max_dd or 0.0)
+                # Compute trade-level quality metrics from executors
+                trade_quality = {}
+                try:
+                    edf = bt_result.executors_df
+                    if edf is not None and len(edf) > 0:
+                        trade_quality = self._compute_trade_quality(edf)
+                except (KeyError, AttributeError):
+                    pass
+
+                verdict, quality_detail = self._compute_verdict(
+                    pf, trades,
+                    sharpe=sharpe or 0.0, max_dd=max_dd or 0.0,
+                    trade_quality=trade_quality,
+                )
 
                 doc = {
                     "engine": self.engine_name,
@@ -472,7 +719,15 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                     "n_short": r.get("total_short", 0),
                     "close_types": {str(k): v for k, v in close_types.items()},
                     "verdict": verdict,
+                    "funding_pnl_included": "derivatives" in engine_meta.required_features,
                     "created_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+                    # Quality metrics (new governance gates)
+                    "monthly_wr": quality_detail.get("monthly_wr", 0),
+                    "max_loss_streak": quality_detail.get("max_loss_streak", 0),
+                    "long_pf": quality_detail.get("long_pf", 0),
+                    "short_pf": quality_detail.get("short_pf", 0),
+                    "composite_quality": quality_detail.get("composite_quality", 0),
+                    "gate_failures": quality_detail.get("gate_failures", []),
                 }
 
                 await db["pair_historical"].update_one(
@@ -481,15 +736,33 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                     upsert=True,
                 )
 
-                # Store individual trades for post-hoc analysis
-                n_stored = await self._store_trades(db, bt_result, pair, period_label, run_id)
+                # Store individual trades for post-hoc analysis (with funding PnL)
+                n_stored = await self._store_trades(
+                    db, bt_result, pair, period_label, run_id,
+                    shared_candles=shared_candles,
+                )
                 total_trades_stored += n_stored
 
                 stats["pairs_tested"] += 1
                 stats[verdict.lower()] = stats.get(verdict.lower(), 0) + 1
-                results.append({"pair": pair, "pf": pf, "wr": wr, "trades": trades, "verdict": verdict})
+                results.append({
+                    "pair": pair, "pf": pf, "wr": wr, "trades": trades,
+                    "verdict": verdict,
+                    "monthly_wr": quality_detail.get("monthly_wr", 0),
+                    "max_loss_streak": quality_detail.get("max_loss_streak", 0),
+                    "composite_quality": quality_detail.get("composite_quality", 0),
+                    "gate_failures": quality_detail.get("gate_failures", []),
+                })
 
-                logger.info(f"  {pair}: PF={pf:.2f} WR={wr:.1f}% trades={trades} -> {verdict}")
+                gate_str = ""
+                if quality_detail.get("gate_failures"):
+                    gate_str = f" [{', '.join(quality_detail['gate_failures'])}]"
+                logger.info(
+                    f"  {pair}: PF={pf:.2f} WR={wr:.1f}% trades={trades} "
+                    f"MoWR={quality_detail.get('monthly_wr', 0):.0%} "
+                    f"streak={quality_detail.get('max_loss_streak', 0)} "
+                    f"-> {verdict}{gate_str}"
+                )
 
                 del bt_engine, bt_result
                 gc.collect()

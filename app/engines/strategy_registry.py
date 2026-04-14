@@ -356,6 +356,40 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         total_amount_quote=300.0,
         cooldown_time=3600,
     ),
+    "X1": StrategyMetadata(
+        name="X1",
+        display_name="Funding Divergence v2",
+        controller_module="app.controllers.directional_trading.x1_funding_divergence",
+        config_class_name="X1FundingDivergenceConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "stop_loss": Decimal("0.04"),
+            "take_profit": Decimal("0.025"),
+            "time_limit": 172800,  # 48 hours
+        },
+        trailing_stop=None,  # Mean reversion — no trailing
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],
+        max_concurrent=20,
+        controller_file="x1_funding_divergence.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "zscore_window": 30,
+            "zscore_entry": 2.0,
+            "zscore_exit": 0.5,
+            "min_spread_abs": 0.00005,
+            "oi_filter_enabled": True,
+            "oi_filter_min_pct": 0.30,
+            "btc_regime_enabled": False,
+            "fg_filter_enabled": False,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=1800,  # 30min (arb signals are fast)
+    ),
     "M1": StrategyMetadata(
         name="M1",
         display_name="ML Ensemble Signal",
