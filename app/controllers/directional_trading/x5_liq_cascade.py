@@ -94,7 +94,8 @@ class X5LiqCascadeConfig(DirectionalTradingControllerConfigBase):
 
     # Coinalyze REST API (live mode)
     coinalyze_api_url: str = Field(default="https://api.coinalyze.net/v1", description="Coinalyze base URL")
-    coinalyze_api_key_env: str = Field(default="COINALYZE_API_KEY", description="Env var for API key")
+    coinalyze_api_key: str = Field(default="", description="Coinalyze API key (passed via config for Docker)")
+    coinalyze_api_key_env: str = Field(default="COINALYZE_API_KEY", description="Env var fallback for API key")
 
     candles_config: List[CandlesConfig] = Field(default_factory=list)
 
@@ -290,9 +291,9 @@ class X5LiqCascadeController(DirectionalTradingControllerBase):
         if now - self._last_liq_fetch < 300 and self._cached_liq:
             return self._cached_liq
 
-        api_key = os.environ.get(self.config.coinalyze_api_key_env, "")
+        api_key = self.config.coinalyze_api_key or os.environ.get(self.config.coinalyze_api_key_env, "")
         if not api_key:
-            logger.warning("X5: No COINALYZE_API_KEY set, cannot fetch live liq data")
+            logger.warning("X5: No COINALYZE_API_KEY set (config or env), cannot fetch live liq data")
             return []
 
         base = trading_pair.replace("-", "")  # "BTC-USDT" -> "BTCUSDT"

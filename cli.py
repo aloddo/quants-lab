@@ -701,6 +701,7 @@ TRADEABLE_PAIRS: set = {
     "SEI-USDT", "WLD-USDT", "LTC-USDT", "BCH-USDT", "BNB-USDT",
     "CRV-USDT", "1000PEPE-USDT", "ALGO-USDT", "GALA-USDT",
     "ONT-USDT", "TAO-USDT", "ZEC-USDT",
+    "AAVE-USDT", "DRIFT-USDT", "FARTCOIN-USDT", "PAXG-USDT", "WIF-USDT",
 }
 
 
@@ -815,6 +816,12 @@ async def deploy_engine(engine_name: str, single_pair: str = None,
 
         # Merge strategy-specific defaults
         config.update(meta.default_config)
+
+        # Inject API keys from env for controllers that need them in Docker
+        coinalyze_key = os.getenv("COINALYZE_API_KEY", "")
+        if coinalyze_key and "derivatives" in (meta.required_features or []):
+            config["coinalyze_api_key"] = coinalyze_key
+
         configs[config_name] = config
 
     if dry_run:

@@ -85,7 +85,7 @@ class StrategyMetadata:
     dd_gate_relaxed: bool = False      # if True, use -50% DD gate instead of -15%/-20%
 
     # Bot deployment
-    bot_image: str = "quants-lab/hummingbot:demo"  # Docker image (with patches baked in)
+    bot_image: str = "quants-lab/hummingbot:demo-client"  # Docker image (HB client with Bybit demo patches)
     total_amount_quote: float = 300.0   # per pair position size in quote
     cooldown_time: int = 3600           # seconds between signals on same pair
     max_drawdown_quote: Optional[float] = None  # per-controller drawdown limit
