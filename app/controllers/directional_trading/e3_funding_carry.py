@@ -1,27 +1,36 @@
 """
-E3 — Funding Rate Carry (HB V2 Controller)
-V1 — April 2026
+E3 — Funding Rate Directional (HB V2 Controller)
+V2 — April 2026
 
 Self-contained: no quants-lab imports. Same code runs in backtest and live.
 
-Thesis: When funding rate is persistently positive (longs paying shorts),
-enter SHORT to collect carry. Retail is long-biased; we collect their premium.
-When funding is persistently negative (shorts paying longs), enter LONG.
+Thesis: Persistent funding rate direction reveals retail positioning bias.
+When funding is persistently positive (longs paying shorts), retail is
+overleveraged long — fade them by entering SHORT. When persistently negative,
+retail is short-biased — enter LONG. The edge is in the directional move,
+NOT in collecting funding fees (which are incidental).
 
 Signal (1h candle with funding_rate column):
   - Funding same sign for N consecutive periods (default: 3)
-  - |funding_rate| >= threshold (default: 0.0001 = 0.01%)
-  - Direction: opposite to payers (positive funding → SHORT, negative → LONG)
+  - |funding_rate| >= threshold (default: 0.00005 = 0.005%)
+  - Direction: opposite to payers (positive funding -> SHORT, negative -> LONG)
 
 Context:
   - funding_zscore_30: if |z| > 2, extra confidence (extreme vs history)
-  - funding_cumulative_8: if abs > threshold, 24h carry is significant
+  - BTC regime filter: suppress signals opposing BTC 4h trend
 
-Exits:
-  - Funding inverts (sign changes) → signal flips to 0
-  - SL: 5% (wide — carry is slow and steady)
+Exits (V2 — ATR-based dynamic):
+  - SL: 2.0x ATR(14) — adapts to per-pair volatility
+  - TP: 3.0x ATR(14) — R:R of 1.5 (was 0.6 with static 3%/5%)
+  - Trailing stop: activate at 1.5x ATR, delta 0.7x ATR — let funding-driven moves run
   - Time limit: 5 days (rebalance weekly)
-  - No trailing stop (not momentum)
+  - Safety clamps: 0.3% floor, 12% ceiling on all exit percentages
+
+Changes from V1:
+  - Static 3% TP / 5% SL replaced with ATR-based dynamic exits
+  - Trailing stop added to let winners run in persistent funding regimes
+  - ATR(14) computed in vectorized signal path (backtest) and live path
+  - Consistent with exit patterns in E1, E2, E4, S6, S7, S9 controllers
 
 Data:
   - Backtest: funding_rate column pre-merged into candle DataFrame
@@ -36,6 +45,7 @@ import urllib.request
 
 import numpy as np
 import pandas as pd
+import pandas_ta as ta
 from pydantic import Field
 
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -46,6 +56,7 @@ from hummingbot.strategy_v2.controllers.directional_trading_controller_base impo
 )
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
+    TrailingStop,
     TripleBarrierConfig,
 )
 
@@ -53,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 class E3FundingCarryConfig(DirectionalTradingControllerConfigBase):
-    """V1 config — Funding Rate Carry."""
+    """V2 config — Funding Rate Carry with ATR-based dynamic exits."""
     controller_name: str = "e3_funding_carry"
 
     # Funding parameters
@@ -61,10 +72,21 @@ class E3FundingCarryConfig(DirectionalTradingControllerConfigBase):
     funding_rate_threshold: float = Field(default=0.00005, description="Min |funding_rate| to enter")
     funding_zscore_boost: float = Field(default=2.0, description="Z-score threshold for extra confidence")
 
-    # Exit
-    sl_pct: float = Field(default=0.05, description="Stop loss as decimal (5%)")
-    tp_pct: float = Field(default=0.03, description="Take profit as decimal (3%)")
+    # ATR-based dynamic exits (V2)
+    atr_period: int = Field(default=14, description="ATR lookback period")
+    tp_atr_mult: float = Field(default=3.0, description="Take profit in ATR multiples")
+    sl_atr_mult: float = Field(default=2.0, description="Stop loss in ATR multiples")
+    trailing_act_atr_mult: float = Field(default=1.5, description="Trailing stop activation in ATR multiples")
+    trailing_delta_atr_mult: float = Field(default=0.7, description="Trailing stop delta in ATR multiples")
     time_limit_seconds: int = Field(default=432000, description="5 days")
+
+    # Safety clamps for ATR-derived percentages
+    exit_pct_floor: float = Field(default=0.003, description="Min exit pct (0.3%)")
+    exit_pct_ceiling: float = Field(default=0.12, description="Max exit pct (12%)")
+
+    # Static fallbacks (used when ATR unavailable)
+    fallback_sl_pct: float = Field(default=0.04, description="Fallback SL when ATR unavailable")
+    fallback_tp_pct: float = Field(default=0.03, description="Fallback TP when ATR unavailable")
 
     # OI filter (skip trades when OI is in bottom percentile — SHAP analysis shows
     # low-OI environments have worst WR across most pairs)
@@ -109,7 +131,7 @@ class E3FundingCarryConfig(DirectionalTradingControllerConfigBase):
 
 
 class E3FundingCarryController(DirectionalTradingControllerBase):
-    """E3 Funding Carry — collect carry by being on the paid side of funding."""
+    """E3 Funding Directional — fade retail positioning bias revealed by persistent funding."""
 
     def __init__(self, config: E3FundingCarryConfig, *args, **kwargs):
         self.config = config
@@ -117,6 +139,47 @@ class E3FundingCarryController(DirectionalTradingControllerBase):
         self._last_funding_fetch = 0.0
         self._cached_funding: list = []
         super().__init__(config, *args, **kwargs)
+
+    def can_create_executor(self, signal: int) -> bool:
+        """Override to enforce cooldown after SL/TL exits, not just active executors.
+
+        The base class only checks cooldown against the last ACTIVE executor's
+        timestamp. After a SL closes the executor, active count drops to 0 and
+        cooldown is bypassed — causing immediate re-entry into the same losing
+        signal. This is a money pit for carry strategies where the funding signal
+        persists long after price has moved against us.
+
+        Fix: also check the most recent CLOSED executor on the same side.
+        Cooldown applies to whichever timestamp is newer (last open or last close).
+        """
+        from hummingbot.core.data_type.common import TradeType as TT
+
+        target_side = TT.BUY if signal > 0 else TT.SELL
+
+        # Active executors on this side (same as base class)
+        active_same_side = self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda x: x.is_active and x.side == target_side,
+        )
+        if len(active_same_side) >= self.config.max_executors_per_side:
+            return False
+
+        # Find most recent timestamp across BOTH active and closed executors
+        # on the same side — this prevents re-entry right after SL
+        all_same_side = self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda x: x.side == target_side,
+        )
+        # Use close_timestamp if available (closed executors), else timestamp (open)
+        timestamps = []
+        for ex in all_same_side:
+            close_ts = getattr(ex, "close_timestamp", None) or 0
+            open_ts = getattr(ex, "timestamp", None) or 0
+            timestamps.append(max(close_ts, open_ts))
+
+        max_ts = max(timestamps, default=0)
+        elapsed = self.market_data_provider.time() - max_ts
+        return elapsed > self.config.cooldown_time
 
     def get_candles_config(self) -> List[CandlesConfig]:
         return self.config.candles_config
@@ -143,6 +206,7 @@ class E3FundingCarryController(DirectionalTradingControllerBase):
             funding_rates = self._fetch_funding_live(c.trading_pair)
             signal = self._signal_from_funding_list(funding_rates)
             df = df.copy()
+            df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=c.atr_period)
             df["signal"] = 0
             if len(df) > 0:
                 df.iloc[-1, df.columns.get_loc("signal")] = signal
@@ -151,11 +215,23 @@ class E3FundingCarryController(DirectionalTradingControllerBase):
         self.processed_data["signal"] = signal
         self.processed_data["features"] = df
 
+        # Store ATR and entry price for dynamic exits in get_executor_config()
+        if signal != 0 and len(df) > 0:
+            last = df.iloc[-1]
+            atr_val = float(last.get("atr", 0) or 0)
+            price_val = float(last["close"])
+            if atr_val > 0 and price_val > 0:
+                self.processed_data["entry_atr"] = atr_val
+                self.processed_data["entry_price"] = price_val
+
     def _compute_signals_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """Compute signal column for every bar (required for BacktestingEngine)."""
         c = self.config
         df = df.copy()
         df["signal"] = 0
+
+        # Compute ATR for dynamic exits
+        df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=c.atr_period)
 
         fr = df["funding_rate"]
 
@@ -265,8 +341,67 @@ class E3FundingCarryController(DirectionalTradingControllerBase):
             logger.warning(f"E3 funding fetch failed for {trading_pair}: {e}")
             return self._cached_funding
 
+    def _compute_dynamic_exits(self, price: Decimal) -> dict:
+        """Compute ATR-based exit percentages from stored signal data.
+
+        Returns dict with tp_pct, sl_pct, trailing_stop (or None), all as Decimal.
+        Falls back to static values if ATR is unavailable.
+
+        ATR sources (checked in order):
+        - processed_data["atr"]: set per-bar by BacktestingEngine via row.to_dict()
+        - processed_data["entry_atr"]: set in update_processed_data() for live mode
+        """
+        c = self.config
+        # Backtest: "atr" column auto-populated per-bar. Live: "entry_atr" set on signal.
+        atr = self.processed_data.get("atr", 0)
+        if not atr or (isinstance(atr, float) and np.isnan(atr)):
+            atr = self.processed_data.get("entry_atr", 0)
+        atr = float(atr) if atr else 0
+        entry_price = float(price) if float(price) > 0 else self.processed_data.get("entry_price", 0)
+
+        if atr <= 0 or entry_price <= 0:
+            logger.warning("E3: ATR unavailable, using static fallback exits")
+            return {
+                "tp_pct": Decimal(str(c.fallback_tp_pct)),
+                "sl_pct": Decimal(str(c.fallback_sl_pct)),
+                "trailing_stop": None,
+            }
+
+        # Convert ATR multiples to percentages of entry price
+        tp_pct = Decimal(str(c.tp_atr_mult * atr / entry_price))
+        sl_pct = Decimal(str(c.sl_atr_mult * atr / entry_price))
+        trail_act_pct = Decimal(str(c.trailing_act_atr_mult * atr / entry_price))
+        trail_delta_pct = Decimal(str(c.trailing_delta_atr_mult * atr / entry_price))
+
+        # Safety clamps
+        floor = Decimal(str(c.exit_pct_floor))
+        ceiling = Decimal(str(c.exit_pct_ceiling))
+        tp_pct = max(floor, min(tp_pct, ceiling))
+        sl_pct = max(floor, min(sl_pct, ceiling))
+        trail_act_pct = max(Decimal("0.001"), min(trail_act_pct, Decimal("0.05")))
+        trail_delta_pct = max(Decimal("0.001"), min(trail_delta_pct, Decimal("0.03")))
+
+        trailing_stop = TrailingStop(
+            activation_price=trail_act_pct,
+            trailing_delta=trail_delta_pct,
+        )
+
+        logger.info(
+            f"E3 dynamic exits: TP={float(tp_pct):.4f} SL={float(sl_pct):.4f} "
+            f"trail_act={float(trail_act_pct):.4f} trail_delta={float(trail_delta_pct):.4f} "
+            f"(ATR={atr:.4f}, price={entry_price:.2f})"
+        )
+
+        return {
+            "tp_pct": tp_pct,
+            "sl_pct": sl_pct,
+            "trailing_stop": trailing_stop,
+        }
+
     def get_executor_config(self, trade_type: TradeType, price: Decimal, amount: Decimal):
         c = self.config
+        exits = self._compute_dynamic_exits(price)
+
         return PositionExecutorConfig(
             timestamp=self.market_data_provider.time(),
             connector_name=c.connector_name,
@@ -275,10 +410,10 @@ class E3FundingCarryController(DirectionalTradingControllerBase):
             entry_price=price,
             amount=amount,
             triple_barrier_config=TripleBarrierConfig(
-                stop_loss=Decimal(str(c.sl_pct)),
-                take_profit=Decimal(str(c.tp_pct)),
+                stop_loss=exits["sl_pct"],
+                take_profit=exits["tp_pct"],
                 time_limit=c.time_limit_seconds,
-                trailing_stop=None,
+                trailing_stop=exits["trailing_stop"],
                 open_order_type=OrderType.LIMIT,
                 take_profit_order_type=OrderType.LIMIT,
                 stop_loss_order_type=OrderType.MARKET,

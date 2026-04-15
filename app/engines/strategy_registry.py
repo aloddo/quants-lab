@@ -267,12 +267,19 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         config_class_name="E3FundingCarryConfig",
         intervals=["1h"],
         backtesting_resolution="1m",
+        # V2: exit_params are placeholders — controller computes ATR-based dynamic
+        # exits in get_executor_config() via _compute_dynamic_exits().
+        # Base class stop_loss/take_profit fields are set but never read by the
+        # controller. The actual exits are:
+        #   TP: tp_atr_mult * ATR(14) / price  (default 3.0x)
+        #   SL: sl_atr_mult * ATR(14) / price  (default 2.0x)
+        #   Trailing: activate at 1.5x ATR, delta 0.7x ATR
+        #   Time limit: 5 days
+        #   Safety clamps: 0.3% floor, 12% ceiling
         exit_params={
-            "stop_loss": Decimal("0.05"),
-            "take_profit": Decimal("0.03"),
-            "time_limit": 432000,  # 5 days
+            "time_limit": 432000,  # 5 days — only param used by base class
         },
-        trailing_stop=None,
+        trailing_stop=None,  # computed dynamically per-trade by controller
         direction="BOTH",
         blocked_pairs=[],
         required_features=["derivatives"],
@@ -282,11 +289,18 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         hb_connector="bybit_perpetual_testnet",
         deployment_mode="hb_native",
         default_config={
+            # Signal params
             "funding_streak_min": 3,
             "funding_rate_threshold": 0.00005,
             "funding_zscore_boost": 2.0,
             "btc_regime_enabled": True,
             "btc_regime_threshold": 0.0,
+            # V2 ATR exit params (controller defaults, listed here for visibility)
+            "atr_period": 14,
+            "tp_atr_mult": 3.0,
+            "sl_atr_mult": 2.0,
+            "trailing_act_atr_mult": 1.5,
+            "trailing_delta_atr_mult": 0.7,
         },
         pair_source="pair_historical",
         total_amount_quote=300.0,
@@ -389,6 +403,109 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         pair_source="pair_historical",
         total_amount_quote=300.0,
         cooldown_time=1800,  # 30min (arb signals are fast)
+    ),
+    "X2": StrategyMetadata(
+        name="X2",
+        display_name="True Carry",
+        controller_module="app.controllers.directional_trading.x2_true_carry",
+        config_class_name="X2TrueCarryConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "stop_loss": Decimal("0.06"),
+            "take_profit": Decimal("0.10"),
+            "time_limit": 604800,  # 7 days
+        },
+        trailing_stop=None,  # Carry — never cut winners
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],
+        max_concurrent=20,
+        controller_file="x2_true_carry.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "funding_lookback": 6,
+            "funding_min_rate": 0.00005,
+            "funding_min_streak": 3,
+            "vol_filter_enabled": True,
+            "vol_max_atr_pct": 0.04,
+            "oi_filter_enabled": True,
+            "oi_filter_min_pct": 0.25,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=3600,
+    ),
+    "X4": StrategyMetadata(
+        name="X4",
+        display_name="OI Conviction Momentum",
+        controller_module="app.controllers.directional_trading.x4_oi_conviction",
+        config_class_name="X4OIConvictionConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "stop_loss": Decimal("0.05"),
+            "take_profit": Decimal("0.06"),
+            "time_limit": 259200,  # 3 days
+        },
+        trailing_stop=None,
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],
+        max_concurrent=20,
+        controller_file="x4_oi_conviction.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "momentum_period": 12,
+            "momentum_threshold": 0.01,
+            "oi_change_period": 12,
+            "oi_change_min_pct": 0.02,
+            "volume_filter_enabled": True,
+            "volume_min_ratio": 1.2,
+            "funding_alignment_enabled": True,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=3600,
+    ),
+    "X5": StrategyMetadata(
+        name="X5",
+        display_name="Liquidation Cascade",
+        controller_module="app.controllers.directional_trading.x5_liq_cascade",
+        config_class_name="X5LiqCascadeConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 28800,  # 8 hours — controller computes ATR-based TP/SL
+        },
+        trailing_stop=None,
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],  # triggers liq merge in BulkBacktestTask
+        max_concurrent=20,
+        dd_gate_relaxed=False,
+        controller_file="x5_liq_cascade.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "z_threshold": 2.0,
+            "z_window": 720,
+            "asym_long_threshold": 0.7,
+            "asym_short_threshold": 0.3,
+            "z_base": 2.0,
+            "max_z_mult": 2.0,
+            "atr_period": 14,
+            "tp_atr_mult": 2.0,
+            "sl_atr_mult": 1.5,
+            "time_limit_seconds": 28800,
+            "btc_regime_enabled": True,
+            "btc_regime_threshold": 0.0,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=3600,
     ),
     "M1": StrategyMetadata(
         name="M1",

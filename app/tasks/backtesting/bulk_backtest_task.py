@@ -8,12 +8,25 @@ engine-specific logic here.
 Records PF, WR, Sharpe, max_dd per pair per engine.
 Writes verdicts (ALLOW/WATCH/BLOCK) to MongoDB pair_historical collection.
 Stores individual trades to backtest_trades collection for post-hoc analysis.
+
+Memory safety: each pair's BacktestingEngine runs in a subprocess via
+_run_pair_subprocess(). The OS reclaims all memory (3-5 GB per pair at 1m)
+when the subprocess exits. The parent stays lightweight and handles all
+MongoDB writes, trade storage, and verdict computation.
+
 Schedule: manual trigger or weekly cron.
 """
 import gc
+import json
 import logging
+import os
+import pickle
+import subprocess
+import sys
+import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
@@ -26,6 +39,10 @@ from core.tasks import BaseTask, TaskContext
 from app.engines.strategy_registry import build_backtest_config
 
 logger = logging.getLogger(__name__)
+
+# Python interpreter for subprocess isolation
+_PYTHON = sys.executable
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent.parent)
 
 # Verdict thresholds (multi-criteria — PF alone is not enough)
 PF_ALLOW = 1.3
@@ -159,6 +176,34 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                 else:
                     df["binance_funding_rate"] = 0.0
 
+                # Coinalyze liquidations (daily resolution — cross-exchange aggregated)
+                # Provides: liq_long_usd, liq_short_usd, liq_total_usd
+                # Neutral fill: 0.0 (no liquidation = no signal)
+                liq_cursor = db["coinalyze_liquidations"].find(
+                    {"pair": pair, "resolution": "daily"}
+                ).sort("timestamp_utc", 1)
+                liq_docs = await liq_cursor.to_list(length=100000)
+                if liq_docs:
+                    liqdf = pd.DataFrame(liq_docs)
+                    if "timestamp_utc" in liqdf.columns:
+                        liqdf["ts"] = pd.to_datetime(liqdf["timestamp_utc"], unit="ms", utc=True)
+                        liqdf = liqdf.set_index("ts").sort_index()
+                        liqdf = liqdf[~liqdf.index.duplicated(keep="last")]
+                        for col, default in [
+                            ("long_liquidations_usd", 0.0),
+                            ("short_liquidations_usd", 0.0),
+                            ("total_liquidations_usd", 0.0),
+                        ]:
+                            if col in liqdf.columns:
+                                col_reindexed = liqdf[[col]].reindex(candle_idx, method="ffill")
+                                df[col] = col_reindexed[col].fillna(default).values
+                            else:
+                                df[col] = default
+                else:
+                    df["long_liquidations_usd"] = 0.0
+                    df["short_liquidations_usd"] = 0.0
+                    df["total_liquidations_usd"] = 0.0
+
                 shared_candles[feed_key] = df
                 enriched += 1
 
@@ -269,30 +314,87 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
     def _get_data_end_time(self, pairs: List[str]) -> int:
         """Find the earliest end time across all resolution parquet files.
 
-        Uses the backtesting resolution (e.g. 1m) as the binding constraint
-        since that's what the BacktestingEngine iterates over. Falls back to
-        now() if no parquet files exist.
+        Checks BOTH the backtesting resolution (e.g. 1m) AND the 1h feed.
+        Uses the minimum of both as the binding constraint. This prevents
+        initialize_candles_feed from refetching 1h data (which would overwrite
+        derivatives columns merged by _merge_derivatives_into_candles).
+
+        Without this, a 1m feed ending at 11:16 but 1h feed ending at 11:00
+        would cause the engine to refetch 1h data from parquet, losing the
+        merged funding_rate/oi_value/buy_ratio columns and producing 0 signals.
         """
         import pandas as pd
         candles_dir = data_paths.candles_dir
         min_end = float("inf")
-        resolution = self.backtesting_resolution
 
-        for pair in pairs[:5]:  # sample first 5 pairs (all downloaded together)
-            f = candles_dir / f"{self.connector_name}|{pair}|{resolution}.parquet"
-            if f.exists():
-                df = pd.read_parquet(f, columns=["timestamp"])
-                end = df["timestamp"].max()
-                if end < min_end:
-                    min_end = end
+        # Check both resolutions: backtesting (1m) and signal (1h)
+        resolutions_to_check = {self.backtesting_resolution}
+        # Always include 1h since that's where derivatives are merged
+        resolutions_to_check.add("1h")
+
+        for resolution in resolutions_to_check:
+            for pair in pairs[:5]:  # sample first 5 pairs (all downloaded together)
+                f = candles_dir / f"{self.connector_name}|{pair}|{resolution}.parquet"
+                if f.exists():
+                    df = pd.read_parquet(f, columns=["timestamp"])
+                    end = df["timestamp"].max()
+                    if end < min_end:
+                        min_end = end
 
         if min_end == float("inf"):
             logger.warning("No parquet data found for end time — using now()")
             return int(datetime.now(timezone.utc).timestamp())
 
         logger.info(f"Data end time: {datetime.fromtimestamp(min_end, tz=timezone.utc)} "
-                     f"(resolution={resolution})")
+                     f"(resolution={self.backtesting_resolution})")
         return int(min_end)
+
+    @staticmethod
+    def _compute_max_dd(edf, trade_cost: float = 0.000375) -> float:
+        """Compute real peak-to-trough max drawdown from executor DataFrame.
+
+        Builds an equity curve from sequential trade PnLs, tracks the peak,
+        and returns the worst drawdown as a negative ratio (e.g. -0.15 = -15%).
+
+        HB's built-in max_drawdown_pct is broken: it computes cumulative PnL
+        drawdown, not peak-to-trough equity drawdown, and can exceed -100%
+        which is impossible at 1x leverage.
+
+        Returns 0.0 if no trade data available.
+        """
+        if edf is None or len(edf) == 0:
+            return 0.0
+
+        pnl_col = "net_pnl_quote"
+        if pnl_col not in edf.columns:
+            return 0.0
+
+        # Sort by close time to build chronological equity curve
+        df = edf.sort_values("close_timestamp") if "close_timestamp" in edf.columns else edf
+
+        # Starting capital = typical position size (from filled_amount_quote)
+        if "filled_amount_quote" in df.columns:
+            capital = float(df["filled_amount_quote"].median())
+            if capital <= 0:
+                capital = 300.0
+        else:
+            capital = 300.0
+
+        equity = capital
+        peak = equity
+        max_dd = 0.0
+
+        for pnl in df[pnl_col]:
+            pnl_f = float(pnl) if pnl is not None else 0.0
+            equity += pnl_f
+            if equity > peak:
+                peak = equity
+            if peak > 0:
+                dd = (equity - peak) / peak
+                if dd < max_dd:
+                    max_dd = dd
+
+        return max_dd
 
     def _compute_trade_quality(self, executors_df) -> dict:
         """Compute trade-level quality metrics from backtest executors DataFrame.
@@ -308,6 +410,13 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
             }
 
         df = executors_df.copy()
+
+        # Ensure numeric columns are float — subprocess pickle can produce
+        # StringDtype (PyArrow) that breaks comparisons like `> 0`.
+        for col in ["net_pnl_quote", "net_pnl_pct", "cum_fees_quote",
+                     "filled_amount_quote", "timestamp", "close_timestamp"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
         # --- Monthly consistency ---
         if "timestamp" in df.columns:
@@ -407,8 +516,8 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         from app.engines.strategy_registry import get_strategy
         engine_meta = get_strategy(self.engine_name)
         if engine_meta.dd_gate_relaxed:
-            dd_allow = -0.50   # -50% (carry backtest concurrency)
-            dd_watch = -0.70   # -70%
+            dd_allow = -0.25   # -25% (carry strategies have wider stops)
+            dd_watch = -0.35   # -35%
         else:
             dd_allow = MAX_DD_ALLOW
             dd_watch = MAX_DD_WATCH
@@ -435,13 +544,13 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         if (pf >= PF_ALLOW and sharpe >= SHARPE_ALLOW
                 and max_dd >= dd_allow):
             verdict = "ALLOW"
-        elif (pf >= PF_WATCH and sharpe >= SHARPE_WATCH
+        elif (pf >= 1.05 and sharpe >= SHARPE_WATCH
                 and max_dd >= dd_watch):
             verdict = "WATCH"
         else:
             # Identify which gate failed for diagnostics
-            if pf < PF_WATCH:
-                detail["gate_failures"].append(f"PF={pf:.2f} < {PF_WATCH}")
+            if pf < 1.05:
+                detail["gate_failures"].append(f"PF={pf:.2f} < 1.05")
             if sharpe < SHARPE_WATCH:
                 detail["gate_failures"].append(f"Sharpe={sharpe:.2f} < {SHARPE_WATCH}")
             if max_dd < dd_watch:
@@ -596,6 +705,130 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
         return len(docs)
 
+    async def _run_pair_subprocess(
+        self, pair: str, start_ts: int, end_ts: int,
+    ) -> tuple:
+        """Run one pair's backtest in a subprocess for memory isolation.
+
+        Returns (results_dict, executors_df) or (None, None) on error.
+        The subprocess loads parquet, merges derivatives, runs BacktestingEngine,
+        and writes results to a temp pickle file. When the subprocess exits,
+        the OS reclaims all memory (3-5 GB per pair at 1m).
+        """
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+            output_path = tmp.name
+
+        try:
+            cmd = [
+                _PYTHON, "-m", "app.tasks.backtesting._backtest_worker",
+                "--engine", self.engine_name,
+                "--connector", self.connector_name,
+                "--pair", pair,
+                "--start", str(start_ts),
+                "--end", str(end_ts),
+                "--resolution", self.backtesting_resolution,
+                "--trade-cost", str(self.trade_cost),
+                "--output", output_path,
+            ]
+
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=600, cwd=_PROJECT_ROOT,
+                env={**os.environ},
+            )
+
+            if proc.returncode != 0:
+                logger.error(f"  {pair}: subprocess failed (exit {proc.returncode}): {proc.stderr[-500:]}")
+                return None, None
+
+            with open(output_path, "rb") as f:
+                payload = pickle.load(f)
+
+            if payload.get("status") == "error":
+                logger.error(f"  {pair}: backtest error: {payload.get('error')}")
+                return None, None
+
+            return payload.get("results"), payload.get("executors_df")
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"  {pair}: subprocess timed out (600s)")
+            return None, None
+        except Exception as e:
+            logger.error(f"  {pair}: subprocess exception: {e}")
+            return None, None
+        finally:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
+    async def _store_trades_from_df(
+        self, db, edf, pair: str, period_label: str,
+        run_id: str, shared_candles: dict = None,
+    ) -> int:
+        """Store individual trades from an executor DataFrame returned by subprocess.
+
+        Same logic as _store_trades but works with a raw DataFrame instead of
+        a BacktestingResult object.
+        """
+        if edf is None or len(edf) == 0:
+            return 0
+
+        trades_coll = db["backtest_trades"]
+        docs = []
+        total_funding_pnl = 0.0
+
+        for _, row in edf.iterrows():
+            entry_ts = float(row.get("timestamp", 0))
+            exit_ts = float(row.get("close_timestamp", 0))
+            side = str(row.get("side", ""))
+            position_value = float(row["filled_amount_quote"]) if "filled_amount_quote" in row and row["filled_amount_quote"] is not None else 0.0
+            net_pnl_quote = float(row["net_pnl_quote"]) if "net_pnl_quote" in row and row["net_pnl_quote"] is not None else 0.0
+
+            # Compute funding PnL during hold period
+            funding_info = {"funding_pnl": 0.0, "funding_payments": 0, "avg_rate": 0.0}
+            if shared_candles is not None and position_value > 0:
+                funding_info = self._compute_funding_pnl(
+                    shared_candles, pair, entry_ts, exit_ts, side, position_value
+                )
+                total_funding_pnl += funding_info["funding_pnl"]
+
+            adjusted_pnl = net_pnl_quote + funding_info["funding_pnl"]
+
+            doc = {
+                "engine": self.engine_name,
+                "pair": pair,
+                "period": period_label,
+                "run_id": run_id,
+                "timestamp": entry_ts,
+                "close_timestamp": exit_ts,
+                "side": side,
+                "close_type": str(row.get("close_type", "")),
+                "net_pnl_quote": net_pnl_quote,
+                "net_pnl_pct": float(row["net_pnl_pct"]) if "net_pnl_pct" in row and row["net_pnl_pct"] is not None else None,
+                "cum_fees_quote": float(row["cum_fees_quote"]) if "cum_fees_quote" in row and row["cum_fees_quote"] is not None else None,
+                "filled_amount_quote": position_value if position_value else None,
+                "funding_pnl": funding_info["funding_pnl"],
+                "funding_payments": funding_info["funding_payments"],
+                "avg_funding_rate": funding_info["avg_rate"],
+                "adjusted_pnl_quote": adjusted_pnl,
+            }
+            for k, v in doc.items():
+                if isinstance(v, Decimal):
+                    doc[k] = float(v)
+            docs.append(doc)
+
+        if docs:
+            await trades_coll.delete_many({
+                "engine": self.engine_name, "pair": pair, "run_id": run_id,
+            })
+            await trades_coll.insert_many(docs)
+
+        if total_funding_pnl != 0.0:
+            logger.info(f"  {pair}: funding PnL = {total_funding_pnl:+.2f} across {len(docs)} trades")
+
+        return len(docs)
+
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
         # Pre-compute time window so we can filter pairs by data coverage
@@ -634,69 +867,58 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
 
         total_trades_stored = 0
 
-        # Pre-load parquet cache ONCE — reused across all pairs (saves ~2GB)
+        # Load shared candles once for funding PnL computation (used by _store_trades).
+        # The actual backtest runs in a subprocess — this is only for post-hoc analysis.
         _shared_cache = BacktestingEngine(load_cached_data=True)
         shared_candles = _shared_cache._bt_engine.backtesting_data_provider.candles_feeds.copy()
         del _shared_cache
         gc.collect()
 
-        # Merge derivatives data into candle DataFrames if engine needs it
+        # Merge derivatives into shared_candles for funding PnL computation in _store_trades
         from app.engines.strategy_registry import get_strategy
         engine_meta = get_strategy(self.engine_name)
         if "derivatives" in engine_meta.required_features:
             n_enriched = await self._merge_derivatives_into_candles(shared_candles, pairs)
-            logger.info(f"Merged derivatives data into {n_enriched}/{len(pairs)} pairs")
+            logger.info(f"Merged derivatives data into {n_enriched}/{len(pairs)} pairs (for funding PnL)")
 
         for pair in pairs:
             try:
-                # Fresh engine per pair + deep-copy ALL candles.
-                # HB's prepare_market_data() mutates DataFrames in-place:
-                #   - dropna(inplace=True) deletes rows with NaN derivatives
-                #   - ensure_epoch_index() calls set_index() modifying structure
-                # Without deep copy, pair N's backtest corrupts shared data
-                # for pairs N+1..end (previously only pair-specific feeds were
-                # copied, but reference feeds like BTC-USDT were shared refs).
-                pair_candles = {k: v.copy() for k, v in shared_candles.items()}
-
-                bt_engine = BacktestingEngine(load_cached_data=False)
-                bt_engine._bt_engine.backtesting_data_provider.candles_feeds = pair_candles
-
-                # Build config via registry — handles candles, exit params, trailing stop
-                config_instance = build_backtest_config(
-                    engine_name=self.engine_name,
-                    connector=self.connector_name,
-                    pair=pair,
+                # Run BacktestingEngine in a subprocess for full memory isolation.
+                # Each pair uses 3-5 GB at 1m resolution. The subprocess loads parquet,
+                # merges derivatives, runs the engine, and writes results to a temp file.
+                # When it exits, the OS reclaims ALL memory.
+                r, edf = await self._run_pair_subprocess(
+                    pair, start_ts, end_ts,
                 )
 
-                bt_result = await bt_engine.run_backtesting(
-                    config=config_instance,
-                    start=start_ts,
-                    end=end_ts,
-                    backtesting_resolution=self.backtesting_resolution,
-                    trade_cost=self.trade_cost,
-                )
+                if r is None:
+                    stats["errors"] += 1
+                    continue
 
-                # Workaround: close_types returns int(0) when no trades
-                if not isinstance(bt_result.results.get("close_types"), dict):
-                    bt_result.results["close_types"] = {}
-
-                r = bt_result.results
                 trades = r.get("total_executors", 0)
                 pf = r.get("profit_factor", 0) or 0
                 wr = (r.get("accuracy_long", 0) or 0) * 100
                 sharpe = r.get("sharpe_ratio", None)
-                max_dd = r.get("max_drawdown_pct", None)
                 pnl = r.get("net_pnl_quote", 0) or 0
                 close_types = r.get("close_types", {})
 
+                # Cast numeric columns — pickle from subprocess can produce
+                # string types (from Decimal serialization).
+                if edf is not None and len(edf) > 0:
+                    for col in ["net_pnl_quote", "net_pnl_pct", "cum_fees_quote",
+                                "filled_amount_quote", "timestamp", "close_timestamp"]:
+                        if col in edf.columns:
+                            edf[col] = pd.to_numeric(edf[col], errors="coerce")
+
+                # Compute REAL peak-to-trough MaxDD from equity curve.
+                # HB's max_drawdown_pct is broken (cumulative, not peak-to-trough,
+                # can exceed -100% which is impossible at 1x leverage).
+                max_dd = self._compute_max_dd(edf, self.trade_cost)
+
                 # Compute trade-level quality metrics from executors
                 trade_quality = {}
-                try:
-                    edf = bt_result.executors_df
-                    if edf is not None and len(edf) > 0:
-                        trade_quality = self._compute_trade_quality(edf)
-                except (KeyError, AttributeError):
-                    pass
+                if edf is not None and len(edf) > 0:
+                    trade_quality = self._compute_trade_quality(edf)
 
                 verdict, quality_detail = self._compute_verdict(
                     pf, trades,
@@ -736,9 +958,10 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                     upsert=True,
                 )
 
-                # Store individual trades for post-hoc analysis (with funding PnL)
-                n_stored = await self._store_trades(
-                    db, bt_result, pair, period_label, run_id,
+                # Store individual trades for post-hoc analysis (with funding PnL).
+                # We reconstruct a lightweight result object from the subprocess data.
+                n_stored = await self._store_trades_from_df(
+                    db, edf, pair, period_label, run_id,
                     shared_candles=shared_candles,
                 )
                 total_trades_stored += n_stored
@@ -759,13 +982,11 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                     gate_str = f" [{', '.join(quality_detail['gate_failures'])}]"
                 logger.info(
                     f"  {pair}: PF={pf:.2f} WR={wr:.1f}% trades={trades} "
+                    f"stored={n_stored} "
                     f"MoWR={quality_detail.get('monthly_wr', 0):.0%} "
                     f"streak={quality_detail.get('max_loss_streak', 0)} "
                     f"-> {verdict}{gate_str}"
                 )
-
-                del bt_engine, bt_result
-                gc.collect()
 
             except Exception as e:
                 stats["errors"] += 1

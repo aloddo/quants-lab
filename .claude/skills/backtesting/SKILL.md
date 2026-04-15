@@ -104,6 +104,24 @@ pdf = result.processed_data                  # features DataFrame from controlle
 
 ---
 
+## Memory Safety — Subprocess Isolation (Apr 2026)
+
+BulkBacktestTask runs each pair's BacktestingEngine in a **subprocess** via `_backtest_worker.py`.
+Each pair uses 3-5 GB at 1m resolution. Without subprocess isolation, sequential pairs accumulate
+memory until OOM crashes the server (happened Apr 15 — rebooted machine, lost Docker, orphaned 9 positions).
+
+### Architecture
+- **Parent** (BulkBacktestTask.execute): loads shared candles once for funding PnL, manages MongoDB writes
+- **Child** (`_backtest_worker.py`): loads parquet, merges derivatives, runs engine, returns results via pickle
+- When child exits, OS reclaims ALL memory. Parent stays at ~100MB.
+
+### Critical gotchas
+- **Pickle dtype issue**: HB's executor DataFrame uses Decimal/PyArrow StringDtype internally. After pickle round-trip, numeric columns like `net_pnl_quote` arrive as strings. MUST call `pd.to_numeric(edf[col], errors="coerce")` in the parent before any arithmetic.
+- **Never use standalone backtest scripts**: All backtests go through BulkBacktestTask. It handles trade storage, funding PnL, verdicts, quality metrics. Standalone scripts that skip this produce incomplete data.
+- **Parquet end time**: The worker reads parquet end time to cap the backtest window. Never use `now()` — it triggers live API fetches that fail under load.
+
+---
+
 ## Gotchas (all discovered through trial and error)
 
 1. **`id` is REQUIRED** -- no default. Every config needs a unique id string.

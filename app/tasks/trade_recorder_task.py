@@ -42,9 +42,11 @@ class TradeRecorderTask(BaseTask):
         stats = {
             "exchange_executions": 0, "exchange_closed_pnl": 0,
             "hb_trades": 0, "positions_snapshot": 0, "bots_polled": 0,
+            "funding_fees": 0, "funding_fee_total": 0.0,
         }
 
         exchange = BybitExchangeClient()
+        executions = []  # populated in step 1, used in step 1b
 
         # 1. Record exchange executions (source of truth for all fills)
         if exchange.is_configured():
@@ -71,6 +73,34 @@ class TradeRecorderTask(BaseTask):
 
             except Exception as e:
                 logger.warning(f"TradeRecorder: exchange executions failed: {e}")
+
+            # 1b. Aggregate funding fees from new executions into daily summary
+            try:
+                funding_execs = [
+                    ex for ex in executions
+                    if ex.get("exec_type") == "Funding"
+                ]
+                for fx in funding_execs:
+                    fee = float(fx.get("exec_fee", 0))
+                    pair = fx.get("pair", "")
+                    exec_time = fx.get("exec_time", 0)
+                    day_str = datetime.fromtimestamp(
+                        exec_time / 1000, tz=timezone.utc
+                    ).strftime("%Y-%m-%d") if exec_time else ""
+
+                    await db["funding_fees_collected"].update_one(
+                        {"pair": pair, "date": day_str},
+                        {
+                            "$inc": {"total_fee": fee, "settlement_count": 1},
+                            "$set": {"updated_at": datetime.now(timezone.utc)},
+                            "$setOnInsert": {"pair": pair, "date": day_str},
+                        },
+                        upsert=True,
+                    )
+                    stats["funding_fees"] += 1
+                    stats["funding_fee_total"] += fee
+            except Exception as e:
+                logger.warning(f"TradeRecorder: funding fee aggregation failed: {e}")
 
             # 2. Record closed PnL (complete round-trip position results)
             try:
@@ -184,11 +214,14 @@ class TradeRecorderTask(BaseTask):
 
         new_data = stats["exchange_executions"] + stats["exchange_closed_pnl"] + stats["hb_trades"]
         if new_data > 0:
+            funding_msg = ""
+            if stats["funding_fees"] > 0:
+                funding_msg = f", {stats['funding_fees']} funding settlements (${stats['funding_fee_total']:.4f})"
             logger.info(
                 f"TradeRecorder: {stats['exchange_executions']} exchange fills, "
                 f"{stats['exchange_closed_pnl']} closed PnL, "
                 f"{stats['hb_trades']} HB trades, "
-                f"{stats['positions_snapshot']} positions"
+                f"{stats['positions_snapshot']} positions{funding_msg}"
             )
 
         return {

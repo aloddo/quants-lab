@@ -68,8 +68,57 @@ tasks:
       collection_name: "deribit_options_surface"
     tags: [data, options, deribit, exotic]
 
-  coinglass:
+  deribit_dvol:
     enabled: true
+    task_class: app.tasks.data_collection.deribit_dvol_task.DeribitDvolTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+    config:
+      currencies: ["BTC", "ETH"]
+      resolution: 3600
+      collection_name: "deribit_dvol"
+    tags: [data, dvol, deribit, exotic]
+
+  hyperliquid_funding:
+    enabled: true
+    task_class: app.tasks.data_collection.hyperliquid_funding_task.HyperliquidFundingTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 600
+    config:
+      collection_name: "hyperliquid_funding_rates"
+      backfill_days: 365
+    tags: [data, funding, hyperliquid, exotic]
+
+  coinalyze:
+    enabled: true
+    task_class: app.tasks.data_collection.coinalyze_task.CoinalyzeTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 600
+    config:
+      api_key_env: "COINALYZE_API_KEY"
+      liq_collection: "coinalyze_liquidations"
+      oi_collection: "coinalyze_oi"
+      backfill_daily_days: 365
+      hourly_lookback_days: 90
+    tags: [data, liquidations, oi, coinalyze, exotic]
+
+  coinglass:
+    enabled: false  # Requires paid plan ($50-100/mo). Replaced by Coinalyze.
     task_class: app.tasks.data_collection.coinglass_task.CoinglassTask
     schedule:
       type: cron
@@ -581,6 +630,76 @@ tasks:
       step_days: 30
       trade_cost: 0.000375
     tags: [backtesting, x1, exotic, walk-forward, weekly]
+
+  x2_bulk_backtest:
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 4 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X2"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, x2, exotic, carry, weekly]
+
+  x2_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X2"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, x2, exotic, carry, walk-forward, weekly]
+
+  x4_bulk_backtest:
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 4 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X4"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, x4, exotic, momentum, weekly]
+
+  x4_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X4"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, x4, exotic, momentum, walk-forward, weekly]
 
   m1_bulk_backtest:
     enabled: false

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.quantslab.docker-stack</string>
+	<key>UserName</key>
+	<string>hermes</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/hermes/quants-lab/scripts/start_docker_stack.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>StandardOutPath</key>
+	<string>/tmp/ql-docker-stack-launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/ql-docker-stack-launchd.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/hermes</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>DOCKER_HOST</key>
+		<string>unix:///Users/hermes/.colima/docker.sock</string>
+	</dict>
+</dict>
+</plist>

@@ -224,6 +224,7 @@ class BybitExchangeClient:
                 "is_maker": e.get("isMaker", False),
                 "order_link_id": e.get("orderLinkId", ""),
                 "order_type": e.get("orderType", ""),
+                "exec_type": e.get("execType", ""),  # Trade, Funding, AdlTrade, BustTrade
                 "closed_size": float(e.get("closedSize", 0)),
                 "exec_time": int(e.get("execTime", 0)),
             })
