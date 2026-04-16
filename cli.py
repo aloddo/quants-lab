@@ -188,9 +188,11 @@ Examples:
     deploy_parser = subparsers.add_parser('deploy', help='Deploy engine as HB-native bot')
     deploy_parser.add_argument('--engine', '-e', required=True, help='Engine name (e.g. E1)')
     deploy_parser.add_argument('--pair', '-p', help='Single pair to deploy (testing)')
+    deploy_parser.add_argument('--pairs', help='Comma-separated pairs to deploy (e.g. BTC-USDT,ETH-USDT)')
     deploy_parser.add_argument('--dry-run', action='store_true', help='Show configs without deploying')
     deploy_parser.add_argument('--force', action='store_true', help='Deploy even if positions exist on exchange')
     deploy_parser.add_argument('--profile', default='master_account', help='HB credentials profile')
+    deploy_parser.add_argument('--instance-suffix', default='paper', help='Bot instance name suffix (default: paper)')
 
     bot_status_parser = subparsers.add_parser('bot-status', help='Check HB bot status')
     bot_status_parser.add_argument('--engine', '-e', help='Engine name (omit for all bots)')
@@ -707,7 +709,8 @@ TRADEABLE_PAIRS: set = {
 
 async def deploy_engine(engine_name: str, single_pair: str = None,
                         dry_run: bool = False, profile: str = "master_account",
-                        force: bool = False):
+                        force: bool = False, pairs_csv: str = None,
+                        instance_suffix: str = "paper"):
     """Deploy an engine as an HB-native bot."""
     from pymongo import MongoClient
     from app.engines.strategy_registry import get_strategy
@@ -726,6 +729,8 @@ async def deploy_engine(engine_name: str, single_pair: str = None,
     # 1. Get eligible pairs
     if single_pair:
         pairs = [single_pair]
+    elif pairs_csv:
+        pairs = [p.strip() for p in pairs_csv.split(",") if p.strip()]
     else:
         mongo_uri = os.getenv("MONGO_URI")
         if not mongo_uri:
@@ -869,20 +874,28 @@ async def deploy_engine(engine_name: str, single_pair: str = None,
         logger.info(f"Uploaded {len(configs)} controller configs")
 
         # Add demo credentials if needed
-        env_key = os.getenv("BYBIT_DEMO_API_KEY")
-        env_secret = os.getenv("BYBIT_DEMO_API_SECRET")
-        if env_key and meta.hb_connector == "bybit_perpetual_demo":
+        # Support multiple API keys: BYBIT_DEMO_API_KEY (default) and BYBIT_DEMO_API_KEY_2, etc.
+        # The profile name determines which key to use: master_account=key1, account_b=key2
+        if profile == "account_b":
+            env_key = os.getenv("BYBIT_DEMO_API_KEY_2")
+            env_secret = os.getenv("BYBIT_DEMO_API_SECRET_2")
+        else:
+            env_key = os.getenv("BYBIT_DEMO_API_KEY")
+            env_secret = os.getenv("BYBIT_DEMO_API_SECRET")
+
+        connector_name = meta.hb_connector
+        if env_key and "bybit_perpetual" in connector_name:
             try:
-                await hb.add_credential(profile, "bybit_perpetual_demo", {
-                    "bybit_perpetual_demo_api_key": env_key,
-                    "bybit_perpetual_demo_secret_key": env_secret,
+                await hb.add_credential(profile, connector_name, {
+                    f"{connector_name}_api_key": env_key,
+                    f"{connector_name}_secret_key": env_secret,
                 })
-                logger.info("Added bybit_perpetual_demo credentials")
+                logger.info(f"Added {connector_name} credentials for profile {profile}")
             except Exception as e:
                 logger.warning(f"Credential add: {e} (may already exist)")
 
         # Deploy bot
-        instance_name = f"{engine_name.lower()}_paper"
+        instance_name = f"{engine_name.lower()}_{instance_suffix}"
         result = await hb.deploy_v2_bot(
             instance_name=instance_name,
             credentials_profile=profile,
@@ -970,7 +983,10 @@ async def main():
     elif args.command == 'promote-shadow':
         promote_shadow(args.engine, getattr(args, 'to'))
     elif args.command == 'deploy':
-        await deploy_engine(args.engine, args.pair, args.dry_run, args.profile, getattr(args, 'force', False))
+        await deploy_engine(args.engine, args.pair, args.dry_run, args.profile,
+                            getattr(args, 'force', False),
+                            pairs_csv=getattr(args, 'pairs', None),
+                            instance_suffix=getattr(args, 'instance_suffix', 'paper'))
     elif args.command == 'bot-status':
         await bot_status(getattr(args, 'engine', None))
     elif args.command == 'bot-stop':
