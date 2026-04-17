@@ -8,9 +8,10 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import aiohttp
+from pymongo import UpdateOne
 
 from app.services.bybit_rest import (
     fetch_funding_rates,
@@ -46,6 +47,30 @@ class BybitDerivativesTask(NotifyingTaskMixin, BaseTask):
         if not self.mongodb_client:
             raise RuntimeError("MongoDB connection required for BybitDerivativesTask")
 
+    async def _upsert_docs(
+        self,
+        collection_name: str,
+        documents: List[Dict],
+        key_fields: Tuple[str, ...] = ("pair", "timestamp_utc"),
+    ) -> int:
+        """Upsert documents using bulk_write with UpdateOne(upsert=True).
+
+        Prevents BulkWriteError on duplicate keys while still inserting new docs.
+        Returns the number of upserted (new) documents.
+        """
+        db = self.mongodb_client.db
+        collection = db[collection_name]
+        ops = [
+            UpdateOne(
+                {k: doc[k] for k in key_fields},
+                {"$setOnInsert": doc},
+                upsert=True,
+            )
+            for doc in documents
+        ]
+        result = await collection.bulk_write(ops, ordered=False)
+        return result.upserted_count
+
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
         stats = {"pairs": 0, "funding": 0, "oi": 0, "ls": 0, "errors": 0}
@@ -65,47 +90,51 @@ class BybitDerivativesTask(NotifyingTaskMixin, BaseTask):
             else:
                 pairs = self.pairs_config
 
-            # Fetch data for each pair
+            # Fetch data for each pair — separate try/except per data type
+            # so a failure in one doesn't skip the others
             for pair in pairs:
+                pair_ok = True
+
+                # Funding rates
                 try:
-                    # Funding rates
                     funding = await fetch_funding_rates(session, pair, limit=self.funding_limit)
                     if funding:
-                        await self.mongodb_client.insert_documents(
-                            collection_name="bybit_funding_rates",
-                            documents=funding,
-                            index=[("pair", 1), ("timestamp_utc", 1)],
-                        )
-                        stats["funding"] += len(funding)
+                        n = await self._upsert_docs("bybit_funding_rates", funding)
+                        stats["funding"] += n
+                except Exception as e:
+                    pair_ok = False
+                    stats["errors"] += 1
+                    logger.error(f"Error fetching/upserting funding for {pair}: {e}")
 
-                    # Open interest
+                # Open interest
+                try:
                     oi = await fetch_open_interest(
                         session, pair, interval=self.oi_interval, limit=self.oi_limit
                     )
                     if oi:
-                        await self.mongodb_client.insert_documents(
-                            collection_name="bybit_open_interest",
-                            documents=oi,
-                            index=[("pair", 1), ("timestamp_utc", 1)],
-                        )
-                        stats["oi"] += len(oi)
+                        n = await self._upsert_docs("bybit_open_interest", oi)
+                        stats["oi"] += n
+                except Exception as e:
+                    pair_ok = False
+                    stats["errors"] += 1
+                    logger.error(f"Error fetching/upserting OI for {pair}: {e}")
 
-                    # L/S ratio
+                # L/S ratio
+                try:
                     ls = await fetch_ls_ratio(session, pair, limit=self.ls_limit)
                     if ls:
-                        await self.mongodb_client.insert_documents(
-                            collection_name="bybit_ls_ratio",
-                            documents=ls,
-                            index=[("pair", 1), ("timestamp_utc", 1)],
-                        )
-                        stats["ls"] += len(ls)
-
-                    stats["pairs"] += 1
-
+                        n = await self._upsert_docs("bybit_ls_ratio", ls,
+                                                     key_fields=("pair", "timestamp_utc", "period")
+                                                     if ls and "period" in ls[0]
+                                                     else ("pair", "timestamp_utc"))
+                        stats["ls"] += n
                 except Exception as e:
+                    pair_ok = False
                     stats["errors"] += 1
-                    logger.error(f"Error fetching derivatives for {pair}: {e}")
-                    continue
+                    logger.error(f"Error fetching/upserting LS ratio for {pair}: {e}")
+
+                if pair_ok:
+                    stats["pairs"] += 1
 
         duration = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info(f"BybitDerivativesTask completed in {duration:.1f}s: {stats}")

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import aiohttp
+from pymongo import UpdateOne
 
 from core.tasks import BaseTask, TaskContext
 
@@ -99,6 +100,21 @@ class BinanceFundingTask(NotifyingTaskMixin, BaseTask):
 
         return docs
 
+    async def _upsert_docs(self, collection_name: str, documents: List[Dict]) -> int:
+        """Upsert documents using bulk_write to handle duplicates gracefully."""
+        db = self.mongodb_client.db
+        collection = db[collection_name]
+        ops = [
+            UpdateOne(
+                {"pair": doc["pair"], "timestamp_utc": doc["timestamp_utc"]},
+                {"$setOnInsert": doc},
+                upsert=True,
+            )
+            for doc in documents
+        ]
+        result = await collection.bulk_write(ops, ordered=False)
+        return result.upserted_count
+
     async def execute(self, context: TaskContext) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
         stats = {"pairs": 0, "docs": 0, "errors": 0}
@@ -112,12 +128,8 @@ class BinanceFundingTask(NotifyingTaskMixin, BaseTask):
                 try:
                     docs = await self._fetch_funding_rates(session, pair)
                     if docs:
-                        await self.mongodb_client.insert_documents(
-                            collection_name="binance_funding_rates",
-                            documents=docs,
-                            index=[("pair", 1), ("timestamp_utc", 1)],
-                        )
-                        stats["docs"] += len(docs)
+                        n = await self._upsert_docs("binance_funding_rates", docs)
+                        stats["docs"] += n
                     stats["pairs"] += 1
 
                     # Binance rate limit: 2400 req/min — be polite

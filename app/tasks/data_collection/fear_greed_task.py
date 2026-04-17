@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import aiohttp
+from pymongo import UpdateOne
 
 from core.tasks import BaseTask, TaskContext
 from app.tasks.notifying_task import NotifyingTaskMixin
@@ -78,12 +79,18 @@ class FearGreedTask(NotifyingTaskMixin, BaseTask):
             try:
                 docs = await self._fetch_index(session)
                 if docs:
-                    await self.mongodb_client.insert_documents(
-                        collection_name=self.collection_name,
-                        documents=docs,
-                        index=[("timestamp_utc", 1)],
-                    )
-                    stats["docs"] = len(docs)
+                    db = self.mongodb_client.db
+                    collection = db[self.collection_name]
+                    ops = [
+                        UpdateOne(
+                            {"timestamp_utc": doc["timestamp_utc"]},
+                            {"$setOnInsert": doc},
+                            upsert=True,
+                        )
+                        for doc in docs
+                    ]
+                    result = await collection.bulk_write(ops, ordered=False)
+                    stats["docs"] = result.upserted_count
 
             except Exception as e:
                 stats["errors"] += 1
