@@ -15,12 +15,16 @@ Stores to:
 - paper_position_snapshots: periodic exchange position snapshots
 - paper_controller_stats: per-controller performance from HB orchestration
 
-Strategy-agnostic: records ALL exchange activity, regardless of which bot placed orders.
+Bot attribution: every exchange record is tagged with bot_name and engine
+(derived by joining exec_id with paper_trades.trade_id). This enables
+per-strategy performance analysis. Records without a matching paper_trade
+(e.g. manual trades, funding) get bot_name=None, engine=None.
 """
 import logging
 import os
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -29,6 +33,20 @@ from app.services.hb_api_client import HBApiClient
 from app.services.bybit_exchange_client import BybitExchangeClient
 
 logger = logging.getLogger(__name__)
+
+
+def _engine_from_bot_name(bot_name: str) -> Optional[str]:
+    """Extract engine tag from bot_name.
+
+    Examples:
+        'e3_paper-20260413-101702'  -> 'E3'
+        'x5_paper_a-20260416-044552' -> 'X5'
+        'x5_paper-20260415-215621'  -> 'X5'
+    """
+    if not bot_name:
+        return None
+    m = re.match(r"^([a-zA-Z]+\d+)_", bot_name)
+    return m.group(1).upper() if m else None
 
 
 class TradeRecorderTask(BaseTask):
@@ -212,16 +230,28 @@ class TradeRecorderTask(BaseTask):
         finally:
             await hb.close()
 
+        # 5. Enrich exchange records with bot attribution
+        try:
+            attributed = await self._enrich_bot_attribution(db)
+            stats["attributed_executions"] = attributed["executions"]
+            stats["attributed_closed_pnl"] = attributed["closed_pnl"]
+        except Exception as e:
+            logger.warning(f"TradeRecorder: bot attribution failed: {e}")
+
         new_data = stats["exchange_executions"] + stats["exchange_closed_pnl"] + stats["hb_trades"]
         if new_data > 0:
             funding_msg = ""
             if stats["funding_fees"] > 0:
                 funding_msg = f", {stats['funding_fees']} funding settlements (${stats['funding_fee_total']:.4f})"
+            attr_msg = ""
+            attr_count = stats.get("attributed_executions", 0) + stats.get("attributed_closed_pnl", 0)
+            if attr_count > 0:
+                attr_msg = f", {attr_count} records attributed"
             logger.info(
                 f"TradeRecorder: {stats['exchange_executions']} exchange fills, "
                 f"{stats['exchange_closed_pnl']} closed PnL, "
                 f"{stats['hb_trades']} HB trades, "
-                f"{stats['positions_snapshot']} positions{funding_msg}"
+                f"{stats['positions_snapshot']} positions{funding_msg}{attr_msg}"
             )
 
         return {
@@ -230,6 +260,94 @@ class TradeRecorderTask(BaseTask):
             "execution_id": context.execution_id,
             "stats": stats,
         }
+
+    async def _enrich_bot_attribution(self, db) -> Dict[str, int]:
+        """Tag exchange_executions and exchange_closed_pnl with bot_name/engine.
+
+        Joins exchange records with paper_trades (exec_id = trade_id) to find
+        which bot placed each order. Also propagates attribution to closed_pnl
+        via order_id matching.
+
+        Only processes un-attributed records (bot_name field missing or null).
+        Safe to run repeatedly — idempotent.
+        """
+        result = {"executions": 0, "closed_pnl": 0}
+
+        # Build lookup: exec_id -> (bot_name, engine) from paper_trades
+        cursor = db["paper_trades"].find(
+            {}, {"trade_id": 1, "bot_name": 1, "_id": 0},
+        )
+        trade_to_bot = {}
+        async for pt in cursor:
+            bot = pt.get("bot_name", "")
+            trade_to_bot[pt["trade_id"]] = {
+                "bot_name": bot,
+                "engine": _engine_from_bot_name(bot),
+            }
+
+        # Tag un-attributed exchange_executions
+        untagged_execs = db["exchange_executions"].find(
+            {"bot_name": {"$exists": False}},
+        )
+        order_to_bot = {}  # order_id -> bot info, for closed_pnl attribution
+        async for ex in untagged_execs:
+            exec_id = ex["exec_id"]
+            attribution = trade_to_bot.get(exec_id, {
+                "bot_name": None, "engine": None,
+            })
+            await db["exchange_executions"].update_one(
+                {"_id": ex["_id"]},
+                {"$set": {
+                    "bot_name": attribution["bot_name"],
+                    "engine": attribution["engine"],
+                }},
+            )
+            result["executions"] += 1
+
+            # Map order_id to bot for closed_pnl enrichment
+            oid = ex.get("order_id")
+            if oid and attribution["bot_name"]:
+                order_to_bot[oid] = attribution
+
+        # Also build order_to_bot from already-attributed executions
+        # (for closed_pnl records that reference orders from previous runs)
+        attributed_execs = db["exchange_executions"].find(
+            {"bot_name": {"$ne": None}, "order_id": {"$exists": True}},
+            {"order_id": 1, "bot_name": 1, "engine": 1, "_id": 0},
+        )
+        async for ex in attributed_execs:
+            oid = ex.get("order_id")
+            if oid and ex.get("bot_name"):
+                order_to_bot[oid] = {
+                    "bot_name": ex["bot_name"],
+                    "engine": ex["engine"],
+                }
+
+        # Tag un-attributed exchange_closed_pnl via order_id
+        untagged_pnl = db["exchange_closed_pnl"].find(
+            {"bot_name": {"$exists": False}},
+        )
+        async for cp in untagged_pnl:
+            oid = cp.get("order_id")
+            attribution = order_to_bot.get(oid, {
+                "bot_name": None, "engine": None,
+            })
+            await db["exchange_closed_pnl"].update_one(
+                {"_id": cp["_id"]},
+                {"$set": {
+                    "bot_name": attribution["bot_name"],
+                    "engine": attribution["engine"],
+                }},
+            )
+            result["closed_pnl"] += 1
+
+        if result["executions"] > 0 or result["closed_pnl"] > 0:
+            logger.info(
+                f"TradeRecorder: attributed {result['executions']} executions, "
+                f"{result['closed_pnl']} closed PnL records"
+            )
+
+        return result
 
     def _extract_trades(self, history_response: dict, bot_name: str) -> List[Dict]:
         """Parse trade fills from the HB API history response."""
