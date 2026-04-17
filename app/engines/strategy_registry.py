@@ -507,6 +507,39 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         total_amount_quote=300.0,
         cooldown_time=3600,
     ),
+    "X8": StrategyMetadata(
+        name="X8",
+        display_name="DeFi-CEX Funding Spread",
+        controller_module="app.controllers.directional_trading.x8_defi_cex_funding_spread",
+        config_class_name="X8DefiCexFundingSpreadConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 57600,  # 16h carry / 24h directional — controller computes ATR TP/SL
+        },
+        trailing_stop=None,
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["funding_spread"],  # triggers HL+Bybit+Binance merge in BulkBacktestTask
+        max_concurrent=20,
+        dd_gate_relaxed=False,
+        controller_file="x8_defi_cex_funding_spread.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "signal_mode": "carry",
+            "z_threshold": 1.5,
+            "z_window": 240,
+            "atr_period": 14,
+            "tp_atr_mult": 2.5,
+            "sl_atr_mult": 1.5,
+            "time_limit_seconds": 57600,
+            "funding_resample_hours": 8,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=3600,
+    ),
     "M1": StrategyMetadata(
         name="M1",
         display_name="ML Ensemble Signal",
@@ -663,8 +696,8 @@ def validate_registry() -> List[str]:
             from app.features import ALL_FEATURES
             available = {f.__name__.replace("Feature", "").lower() for f in ALL_FEATURES}
             for feat in meta.required_features:
-                if feat not in available and feat != "derivatives":
-                    # derivatives comes from MongoDB, not FeatureBase
+                if feat not in available and feat not in ("derivatives", "funding_spread"):
+                    # derivatives and funding_spread come from MongoDB, not FeatureBase
                     errors.append(f"{name}: required feature '{feat}' not in ALL_FEATURES")
         except ImportError:
             pass  # features module not available (e.g. in tests)
