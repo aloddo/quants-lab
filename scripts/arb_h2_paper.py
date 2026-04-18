@@ -25,6 +25,10 @@ from pathlib import Path
 import aiohttp
 from pymongo import MongoClient
 
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.services.arb_notifier import notify_open, notify_close, notify_stats, _send, _fire
+
 # Load .env
 _env_file = Path(__file__).resolve().parents[1] / ".env"
 if _env_file.exists():
@@ -220,6 +224,12 @@ class H2PaperTrader:
                     f"(P90={thresh['p90']:.1f}, base={thresh['median']:.1f}, "
                     f"exit@{thresh['p25']:.1f}) | {data['direction']}"
                 )
+                _fire(
+                    f"📝 <b>H2 OPEN</b> <code>{sym}</code>\n"
+                    f"Spread: <b>{data['abs_spread']:.0f}bp</b> (P90={thresh['p90']:.0f})\n"
+                    f"Base: {thresh['median']:.0f}bp | Exit@{thresh['p25']:.0f}bp\n"
+                    f"Excess: {data['abs_spread']-thresh['p25']:.0f}bp (fees=24bp)"
+                )
 
     def _check_exits(self, spreads: dict):
         """Check for exit signals on open positions."""
@@ -261,6 +271,13 @@ class H2PaperTrader:
                     f"CLOSE {pos.symbol} | {reason} | "
                     f"capture={pos.gross_capture:.1f}bp net={pos.net_pnl_bps:.1f}bp "
                     f"${pos.net_pnl_usd:.4f} | hold={hold:.0f}s"
+                )
+                emoji = "✅" if pos.net_pnl_bps > 0 else "❌"
+                _fire(
+                    f"📝 <b>H2 CLOSE</b> {emoji} <code>{pos.symbol}</code>\n"
+                    f"Entry: {pos.entry_spread:.0f}bp → Exit: {pos.exit_spread:.0f}bp\n"
+                    f"Capture: {pos.gross_capture:.0f}bp | Net: <b>{pos.net_pnl_bps:.0f}bp (${pos.net_pnl_usd:.3f})</b>\n"
+                    f"Hold: {hold/60:.0f}min | {pos.close_reason}"
                 )
 
     def _save_position(self, pos: H2Position):
@@ -310,6 +327,19 @@ class H2PaperTrader:
 
         self._load_history()
 
+        # Startup notification
+        viable = [s for s in PAIRS if (t := self.thresholds.get_thresholds(s)) and t["viable"]]
+        viable_info = []
+        for s in viable:
+            t = self.thresholds.get_thresholds(s)
+            viable_info.append(f"  {s}: P90={t['p90']:.0f} exit={t['p25']:.0f} excess={t['excess']:.0f}bp")
+        _fire(
+            f"🚀 <b>H2 Spike Fade STARTED</b>\n"
+            f"Pairs: {len(PAIRS)} monitored, {len(viable)} viable\n"
+            f"Entry: P90 | Exit: P25 | Fees: {FEE_RT_BPS}bp\n"
+            + "\n".join(viable_info)
+        )
+
         async with aiohttp.ClientSession() as session:
             try:
                 while self._running:
@@ -326,9 +356,13 @@ class H2PaperTrader:
                     self._check_exits(spreads)
                     self._check_entries(spreads)
 
-                    # Status every 60 polls (~5 min)
+                    # Console status every 60 polls (~5 min)
                     if self._poll_count % 60 == 0:
                         self._print_status()
+
+                    # Telegram stats every 360 polls (~30 min)
+                    if self._poll_count % 360 == 0:
+                        self._send_telegram_stats()
 
                     elapsed = time.time() - t0
                     await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
@@ -338,6 +372,29 @@ class H2PaperTrader:
 
         # Final summary
         self._print_summary()
+
+    def _send_telegram_stats(self):
+        """Send periodic stats to Telegram."""
+        open_pos = [p for p in self.positions if p.status == "OPEN"]
+        total_pnl = sum(p.net_pnl_usd for p in self.closed)
+        wins = sum(1 for p in self.closed if p.net_pnl_bps > 0)
+        wr = wins / len(self.closed) if self.closed else 0
+        uptime_h = (time.time() - self._start_time) / 3600
+
+        viable = sum(1 for s in PAIRS if (t := self.thresholds.get_thresholds(s)) and t["viable"])
+
+        lines = [
+            f"📊 <b>H2 Spike Fade</b> ({uptime_h:.1f}h)",
+            f"Open: {len(open_pos)} | Closed: {len(self.closed)} | Viable: {viable}/{len(PAIRS)}",
+            f"PnL: <b>${total_pnl:.2f}</b> | WR: {wr:.0%}",
+        ]
+        if open_pos:
+            lines.append("")
+            for p in open_pos:
+                hold_m = (time.time() - p.entry_time) / 60
+                lines.append(f"  {p.symbol} {p.entry_spread:.0f}bp exit@{p.exit_threshold:.0f}bp {hold_m:.0f}m")
+
+        _fire("\n".join(lines))
 
     def _print_summary(self):
         total_pnl = sum(p.net_pnl_usd for p in self.closed)
