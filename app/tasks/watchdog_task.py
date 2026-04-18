@@ -58,7 +58,7 @@ class WatchdogTask(BaseTask):
         mongo_uri = os.getenv("MONGO_URI")
         mongo_db = os.getenv("MONGO_DATABASE", "quants_lab")
         if not mongo_uri:
-            return self._result(context, TaskStatus.COMPLETED, "No MONGO_URI")
+            return {"status": "completed", "message": "No MONGO_URI"}
 
         client = MongoClient(mongo_uri)
         db = client[mongo_db]
@@ -176,10 +176,13 @@ class WatchdogTask(BaseTask):
         else:
             msg = "All clear"
 
-        return self._result(
-            context, TaskStatus.COMPLETED, msg,
-            result_data={"issues": issues, "reaped": reaped, "healed": healed},
-        )
+        return {
+            "status": "completed",
+            "message": msg,
+            "issues": issues,
+            "reaped": reaped,
+            "healed": healed,
+        }
 
     # ══════════════════════════════════════════════════════════
     # SELF-HEALING METHODS

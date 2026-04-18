@@ -14,7 +14,7 @@ tasks:
       connector_name: "bybit_perpetual"
       quote_asset: "USDT"
       intervals: ["1h", "5m", "1m"]
-      days_data_retention: 365
+      days_data_retention: 7
       min_notional_size: 10
     tags: [data, candles, bybit]
 
@@ -256,6 +256,37 @@ tasks:
       poll_timeout: 5
     tags: [infra, telegram]
 
+  # ═══════ Infrastructure: Portfolio Risk State ════════════
+  risk_state_update:
+    enabled: true
+    task_class: app.tasks.risk_state_task.RiskStateTask
+    schedule:
+      type: cron
+      cron: "* * * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 30
+    config:
+      fallback_capital: 50000
+      initial_capital: 50000
+    tags: [infra, risk]
+
+  # ═══════ Execution: Thin Wrapper ═════════════════════════
+  thin_executor:
+    enabled: true
+    task_class: app.tasks.execution.thin_executor_task.ThinExecutorTask
+    schedule:
+      type: cron
+      cron: "* * * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 55
+    config:
+      strategies: ["X5"]
+      signal_interval_s: 60
+      lifecycle_interval_s: 30
+    tags: [execution, x5]
+
   # ═══════ Infrastructure: Trade Recorder ═════════════════
   trade_recorder:
     enabled: true
@@ -278,7 +309,7 @@ tasks:
       cron: "*/5 * * * *"
       timezone: UTC
     max_retries: 1
-    timeout_seconds: 60
+    timeout_seconds: 300
     config: {}
     tags: [infra, watchdog]
 
@@ -700,6 +731,41 @@ tasks:
       step_days: 30
       trade_cost: 0.000375
     tags: [backtesting, x4, exotic, momentum, walk-forward, weekly]
+
+  x8_bulk_backtest:
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X8"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, x8, exotic, weekly]
+
+  x8_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X8"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, x8, exotic, walk-forward, weekly]
 
   m1_bulk_backtest:
     enabled: false
