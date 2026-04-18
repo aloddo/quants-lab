@@ -178,8 +178,11 @@ class ArbEngine:
             return (bn["bid"] - bb["ask"]) / bb["ask"] * 10000
 
     async def _check_unwinds(self, bn_tickers: dict, bb_tickers: dict):
-        """Check if any open positions should be unwound."""
-        open_positions = self.executor.get_open_positions()
+        """Check if any open or pending-unwind positions should be unwound."""
+        open_positions = [
+            p for p in self.executor.positions
+            if p.status in (PositionStatus.OPEN, PositionStatus.PENDING_UNWIND)
+        ]
         if not open_positions:
             return
 
@@ -203,14 +206,27 @@ class ArbEngine:
             hold_time = now - pos.entry_time
 
             if pos.symbol not in bn_tickers or pos.symbol not in bb_tickers:
-                # Can't check spread — force close if held too long
+                # Can't check spread — queue for unwind if held too long
+                # NEVER mark CLOSED without actually executing the unwind.
+                # PENDING_UNWIND positions stay visible to risk limits and
+                # are retried on next iteration when price data returns.
                 if hold_time > self.max_hold_seconds:
-                    logger.warning(f"Force closing {pos.symbol}: no price data + max hold exceeded")
-                    pos.status = PositionStatus.CLOSED
-                    pos.exit_time = now
-                    pos.error = "No price data for unwind"
-                    self.executor._save_position(pos)
-                    self._cooldowns[pos.symbol] = now
+                    if pos.status != PositionStatus.PENDING_UNWIND:
+                        logger.warning(
+                            f"⚠️ {pos.symbol}: no price data + max hold exceeded. "
+                            f"Queued as PENDING_UNWIND (will retry when data returns)"
+                        )
+                        pos.status = PositionStatus.PENDING_UNWIND
+                        pos.error = "No price data for unwind — awaiting retry"
+                        self.executor._save_position(pos)
+                    else:
+                        # Already PENDING_UNWIND — log staleness
+                        stale_minutes = (now - pos.entry_time - self.max_hold_seconds) / 60
+                        if stale_minutes > 30:
+                            logger.error(
+                                f"🚨 {pos.symbol}: PENDING_UNWIND for {stale_minutes:.0f}min. "
+                                f"Manual intervention may be needed."
+                            )
                 continue
 
             bn = bn_tickers[pos.symbol]
@@ -220,8 +236,13 @@ class ArbEngine:
             should_close = False
             reason = ""
 
+            # 0. PENDING_UNWIND retry — data is back, unwind immediately
+            if pos.status == PositionStatus.PENDING_UNWIND:
+                should_close = True
+                reason = f"PENDING_UNWIND_RETRY: data returned after {hold_time/3600:.1f}h"
+
             # 1. Spread converged
-            if current_spread <= self.min_exit_spread_bps:
+            elif current_spread <= self.min_exit_spread_bps:
                 should_close = True
                 reason = f"REVERTED: {current_spread:.1f}bp"
 

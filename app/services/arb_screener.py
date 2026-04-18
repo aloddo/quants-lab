@@ -29,11 +29,15 @@ BINANCE_SPOT_MAKER = 0.001
 BYBIT_PERP_TAKER = 0.00055
 BYBIT_PERP_MAKER = 0.0002
 
-# Strategy: MAKER on Bybit (limit), TAKER on Binance (market) — fastest execution
-# Realistic fee: Binance taker + Bybit maker = 0.12% = 12bp
-FEE_OPTIMISTIC = BINANCE_SPOT_MAKER + BYBIT_PERP_MAKER   # 12bp (both maker — rare)
-FEE_REALISTIC = BINANCE_SPOT_TAKER + BYBIT_PERP_MAKER     # 12bp
-FEE_PESSIMISTIC = BINANCE_SPOT_TAKER + BYBIT_PERP_TAKER   # 15.5bp
+# Fee model: use TAKER fees for conservative screening (what we actually pay).
+# Live execution may achieve maker on Bybit (saving 3.5bp/side) but we don't
+# assume that in research/screening to avoid overstating edge.
+# Round-trip: entry + exit = 2 * (Binance taker + Bybit taker) = 2 * 15.5bp = 31bp
+# Conservative RT for screening: 2 * (Binance taker + Bybit taker) = 31bp
+# Achievable RT with Bybit LIMIT: 2 * (Binance taker + Bybit maker) = 24bp
+FEE_OPTIMISTIC = BINANCE_SPOT_MAKER + BYBIT_PERP_MAKER   # 12bp (both maker, rare)
+FEE_REALISTIC = BINANCE_SPOT_TAKER + BYBIT_PERP_TAKER     # 15.5bp per side (conservative)
+FEE_PESSIMISTIC = BINANCE_SPOT_TAKER + BYBIT_PERP_TAKER   # 15.5bp per side
 
 # Minimum spread to consider (after realistic fees)
 MIN_NET_SPREAD_BPS = 5.0  # 5bp minimum profit per trade

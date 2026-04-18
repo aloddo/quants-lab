@@ -31,6 +31,7 @@ from pymongo import MongoClient
 
 from app.services.binance_client import BinanceClient
 from app.services.arb_notifier import notify_open, notify_close
+from app.services.arb_safety import OrphanDetector
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class PositionStatus(str, Enum):
     PENDING = "PENDING"
     OPEN = "OPEN"
     UNWINDING = "UNWINDING"
+    PENDING_UNWIND = "PENDING_UNWIND"  # unwind queued but not yet executed
     CLOSED = "CLOSED"
     FAILED = "FAILED"
 
@@ -160,6 +162,7 @@ class ArbExecutor:
         self.binance = binance
         self.risk = risk or RiskManager()
         self.paper_mode = paper_mode
+        self.orphan_detector = OrphanDetector()
 
         # Bybit real credentials
         self.bb_api_key = os.getenv("BYBIT_API_KEY", "")
@@ -182,8 +185,8 @@ class ArbExecutor:
         self._load_open_positions()
 
     def _load_open_positions(self):
-        """Load OPEN positions from MongoDB on startup."""
-        docs = self._positions_coll.find({"status": {"$in": ["OPEN", "PENDING"]}})
+        """Load OPEN and PENDING_UNWIND positions from MongoDB on startup."""
+        docs = self._positions_coll.find({"status": {"$in": ["OPEN", "PENDING", "PENDING_UNWIND"]}})
         for doc in docs:
             pos = self._doc_to_position(doc)
             self.positions.append(pos)
@@ -347,31 +350,59 @@ class ArbExecutor:
             )
             notify_open(symbol, direction.value, entry_spread_bps, usd_size, paper=True)
         else:
-            # LIVE execution: place orders on both exchanges simultaneously
+            # LIVE execution: sequential legs with orphan detection.
+            # Binance first (spot, no funding risk). If it fails, nothing to unwind.
+            # If Binance fills but Bybit fails, OrphanDetector triggers rollback.
             try:
-                # Round qty to appropriate precision
-                # TODO: fetch symbol info for proper precision
-                qty_str = f"{qty:.6f}".rstrip("0").rstrip(".")
-
-                bn_task = self._execute_binance_leg(pos, qty)
-                bb_task = self._execute_bybit_leg(pos, qty)
-
-                await asyncio.gather(bn_task, bb_task)
-                pos.total_fees = pos.bn_fee + pos.bb_fee
-                pos.status = PositionStatus.OPEN
-
-                logger.info(
-                    f"🔥 LIVE OPEN {symbol} | {direction.value} | "
-                    f"BN {pos.bn_side} @ {pos.bn_fill_price:.6f} | "
-                    f"BB {pos.bb_side} @ {pos.bb_fill_price:.6f} | "
-                    f"fees=${pos.total_fees:.4f}"
-                )
+                await self._execute_binance_leg(pos, qty)
             except Exception as e:
                 pos.status = PositionStatus.FAILED
-                pos.error = str(e)
-                logger.error(f"❌ OPEN FAILED {symbol}: {e}")
-                # TODO: handle partial fill (one leg filled, other failed)
-                # This is critical for live — need to unwind the filled leg
+                pos.error = f"Binance leg failed (no orphan): {e}"
+                logger.error(f"❌ BN LEG FAILED {symbol}: {e}")
+                self.positions.append(pos)
+                self._save_position(pos)
+                return pos
+
+            # Binance filled. Now try Bybit.
+            try:
+                await self._execute_bybit_leg(pos, qty)
+            except Exception as e:
+                # ORPHAN: Binance filled, Bybit failed. Detect and handle.
+                recovery = self.orphan_detector.check_fill_pair(
+                    pos.bn_status, pos.bb_status, symbol, direction.value
+                )
+                if recovery:
+                    logger.error(
+                        f"🚨 ORPHAN {symbol}: Bybit failed after Binance fill. "
+                        f"Recovery action: {recovery['type']} — unwinding Binance leg"
+                    )
+                    # Attempt immediate rollback of the Binance leg
+                    try:
+                        reverse_side = "SELL" if pos.bn_side == "BUY" else "BUY"
+                        await self.binance.place_market_order(
+                            symbol, reverse_side, quantity=pos.bn_fill_qty
+                        )
+                        logger.info(f"✅ Orphan rollback executed: {reverse_side} {pos.bn_fill_qty} {symbol}")
+                    except Exception as rb_err:
+                        logger.error(f"🚨🚨 ORPHAN ROLLBACK FAILED {symbol}: {rb_err}")
+
+                pos.status = PositionStatus.FAILED
+                pos.error = f"Bybit leg failed (orphan handled): {e}"
+                logger.error(f"❌ BB LEG FAILED {symbol}: {e}")
+                self.positions.append(pos)
+                self._save_position(pos)
+                return pos
+
+            # Both legs filled
+            pos.total_fees = pos.bn_fee + pos.bb_fee
+            pos.status = PositionStatus.OPEN
+
+            logger.info(
+                f"🔥 LIVE OPEN {symbol} | {direction.value} | "
+                f"BN {pos.bn_side} @ {pos.bn_fill_price:.6f} | "
+                f"BB {pos.bb_side} @ {pos.bb_fill_price:.6f} | "
+                f"fees=${pos.total_fees:.4f}"
+            )
 
         self.positions.append(pos)
         self._save_position(pos)
@@ -409,20 +440,75 @@ class ArbExecutor:
             raise
 
     async def _execute_bybit_leg(self, pos: ArbPosition, qty: float):
-        """Execute the Bybit perp leg."""
+        """Execute the Bybit perp leg and fetch actual fill data."""
         try:
             result = await self._bybit_order(pos.symbol, pos.bb_side, qty)
-            pos.bb_order_id = result.get("orderId")
+            order_id = result.get("orderId")
+            pos.bb_order_id = order_id
             pos.bb_status = "SUBMITTED"
-            # Bybit market orders fill immediately; get fill from order status
-            # For now, estimate fill at target price
-            pos.bb_fill_price = pos.target_usd / qty  # approximate
-            pos.bb_fill_qty = qty
-            pos.bb_fee = pos.target_usd * 0.00055  # taker fee estimate
+
+            # Fetch actual fill from Bybit order query (market orders fill instantly)
+            await asyncio.sleep(0.5)  # brief wait for fill to settle
+            fill_data = await self._bybit_get_order(pos.symbol, order_id)
+
+            if fill_data and float(fill_data.get("cumExecQty", 0)) > 0:
+                pos.bb_fill_price = float(fill_data["avgPrice"])
+                pos.bb_fill_qty = float(fill_data["cumExecQty"])
+                pos.bb_fee = float(fill_data.get("cumExecFee", 0))
+                pos.bb_status = fill_data.get("orderStatus", "FILLED")
+                logger.info(
+                    f"BB fill parsed: {pos.bb_fill_qty} @ {pos.bb_fill_price:.6f}, "
+                    f"fee=${pos.bb_fee:.6f}"
+                )
+            else:
+                # Fallback: estimate if query fails (log warning)
+                logger.warning(f"BB fill query returned no data for {order_id}, using estimate")
+                pos.bb_fill_price = pos.target_usd / qty
+                pos.bb_fill_qty = qty
+                pos.bb_fee = pos.target_usd * 0.00055  # taker fee estimate
 
         except Exception as e:
             pos.bb_status = f"FAILED: {e}"
             raise
+
+    async def _bybit_get_order(self, symbol: str, order_id: str) -> dict | None:
+        """Query Bybit for actual fill data of an order."""
+        await self._ensure_bb_session()
+
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "orderId": order_id,
+        }
+
+        import json
+        ts = str(int(time.time() * 1000))
+        recv_window = "5000"
+        query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        sign_str = ts + self.bb_api_key + recv_window + query_str
+        sig = hmac.new(
+            self.bb_api_secret.encode(), sign_str.encode(), hashlib.sha256
+        ).hexdigest()
+
+        headers = {
+            "X-BAPI-API-KEY": self.bb_api_key,
+            "X-BAPI-SIGN": sig,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv_window,
+        }
+
+        try:
+            async with self._bb_session.get(
+                f"{self.bb_base_url}/v5/order/realtime?{query_str}",
+                headers=headers,
+            ) as resp:
+                data = await resp.json()
+                if data["retCode"] == 0 and data["result"]["list"]:
+                    return data["result"]["list"][0]
+                return None
+        except Exception as e:
+            logger.warning(f"Failed to query Bybit order {order_id}: {e}")
+            return None
 
     # ── Position unwinding ───────────────────────────────────
 
