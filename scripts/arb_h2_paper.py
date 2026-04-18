@@ -343,9 +343,18 @@ class H2PaperTrader:
 
             should_exit = False
             reason = ""
+
+            # Track unrealized P&L on every tick
+            pos._current_spread = data["abs_spread"]
+            pos._unrealized_bps = pos.entry_spread - data["abs_spread"] - FEE_RT_BPS
+
             if data["abs_spread"] <= pos.exit_threshold:
                 should_exit = True
                 reason = f"REVERTED: {data['abs_spread']:.1f}bp < P25={pos.exit_threshold:.1f}bp"
+            # Stop loss: spread widened 2x beyond entry (spike got worse, not reverting)
+            elif data["abs_spread"] > pos.entry_spread * 2:
+                should_exit = True
+                reason = f"STOP_LOSS: {data['abs_spread']:.1f}bp > 2x entry ({pos.entry_spread*2:.0f}bp)"
             elif hold > 86400:
                 should_exit = True
                 reason = f"MAX_HOLD: {hold/3600:.1f}h"
@@ -409,16 +418,24 @@ class H2PaperTrader:
                 w = sum(1 for p in pp if p.net_pnl_bps > 0)
                 lines.append(f"  {sym}: {len(pp)} trades ${pnl:.3f} WR={w/len(pp):.0%}")
 
-        # Open positions
+        # Open positions with uPnL
         if open_pos:
             lines.append("")
             lines.append("<b>Open:</b>")
+            total_upnl = 0
             for p in open_pos:
                 hold_m = (time.time() - p.entry_time) / 60
+                current = getattr(p, '_current_spread', p.entry_spread)
+                upnl_bps = getattr(p, '_unrealized_bps', 0)
+                upnl_usd = upnl_bps / 10000 * POSITION_USD
+                total_upnl += upnl_usd
+                emoji = "🟢" if upnl_bps > 0 else "🔴"
                 lines.append(
-                    f"  {p.symbol} {p.entry_spread:.0f}bp "
-                    f"exit@{p.exit_threshold:.0f}bp {hold_m:.0f}m"
+                    f"  {emoji} {p.symbol} {p.entry_spread:.0f}bp now={current:.0f}bp "
+                    f"exit@{p.exit_threshold:.0f}bp "
+                    f"uPnL={upnl_bps:+.0f}bp (${upnl_usd:+.3f}) {hold_m:.0f}m"
                 )
+            lines.append(f"  Total uPnL: ${total_upnl:+.3f}")
 
         # Current thresholds
         lines.append("")
