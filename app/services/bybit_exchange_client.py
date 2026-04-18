@@ -11,6 +11,7 @@ Configuration via env vars:
 """
 import hashlib
 import hmac
+import json
 import logging
 import os
 import time
@@ -22,6 +23,16 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 CATEGORY = "linear"  # USDT perpetuals
+
+
+class BybitAPIError(Exception):
+    """Typed error with retCode for caller classification."""
+
+    def __init__(self, code: int, msg: str, path: str):
+        self.code = code
+        self.msg = msg
+        self.path = path
+        super().__init__(f"Bybit {path}: [{code}] {msg}")
 
 
 def _to_pair(symbol: str) -> str:
@@ -96,6 +107,159 @@ class BybitExchangeClient:
                 f"(code {data.get('retCode')}) path={path}"
             )
         return data.get("result", {})
+
+    async def _post(
+        self, session: aiohttp.ClientSession, path: str, body: dict
+    ) -> dict:
+        """Authenticated POST request with JSON body."""
+        ts = str(int(time.time() * 1000))
+        recv_window = "5000"
+        payload = json.dumps(body)
+        signature = self._sign(ts, recv_window, payload)
+        headers = self._headers(ts, recv_window, signature)
+        headers["Content-Type"] = "application/json"
+
+        url = f"{self.base_url}{path}"
+        async with session.post(
+            url, headers=headers, data=payload,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+
+        ret_code = data.get("retCode", -1)
+        if ret_code != 0:
+            # Classified error handling
+            if ret_code == 110043:  # leverage not modified — safe to ignore
+                logger.debug(f"Leverage already set (110043) for {path}")
+                return data.get("result", {})
+            raise BybitAPIError(ret_code, data.get("retMsg", ""), path)
+        return data.get("result", {})
+
+    # ── Order Management ─────────────────────────────────────
+
+    async def place_order(
+        self,
+        session: aiohttp.ClientSession,
+        pair: str,
+        side: str,
+        qty: float,
+        order_type: str = "Limit",
+        price: float = None,
+        take_profit: float = None,
+        stop_loss: float = None,
+        time_in_force: str = "GTC",
+        reduce_only: bool = False,
+    ) -> dict:
+        """Place order with optional TP/SL (exchange-managed).
+
+        Args:
+            pair: Trading pair (e.g., "BTC-USDT").
+            side: "Buy" or "Sell".
+            qty: Order quantity in base asset.
+            order_type: "Limit" or "Market".
+            price: Limit price (required for Limit orders).
+            take_profit: TP price (exchange-managed).
+            stop_loss: SL price (exchange-managed).
+        """
+        body = {
+            "category": CATEGORY,
+            "symbol": _to_symbol(pair),
+            "side": side,
+            "orderType": order_type,
+            "qty": str(qty),
+            "timeInForce": time_in_force,
+            "reduceOnly": reduce_only,
+        }
+        if price is not None:
+            body["price"] = str(price)
+        if take_profit is not None:
+            body["takeProfit"] = str(take_profit)
+        if stop_loss is not None:
+            body["stopLoss"] = str(stop_loss)
+        return await self._post(session, "/v5/order/create", body)
+
+    async def amend_order(
+        self,
+        session: aiohttp.ClientSession,
+        pair: str,
+        order_id: str = None,
+        stop_loss: float = None,
+        take_profit: float = None,
+    ) -> dict:
+        """Amend TP/SL or price on existing order."""
+        body = {"category": CATEGORY, "symbol": _to_symbol(pair)}
+        if order_id:
+            body["orderId"] = order_id
+        if stop_loss is not None:
+            body["stopLoss"] = str(stop_loss)
+        if take_profit is not None:
+            body["takeProfit"] = str(take_profit)
+        return await self._post(session, "/v5/order/amend", body)
+
+    async def cancel_order(
+        self, session: aiohttp.ClientSession, pair: str, order_id: str
+    ) -> dict:
+        """Cancel an open order."""
+        return await self._post(session, "/v5/order/cancel", {
+            "category": CATEGORY,
+            "symbol": _to_symbol(pair),
+            "orderId": order_id,
+        })
+
+    async def close_position(
+        self, session: aiohttp.ClientSession, pair: str, side: str
+    ) -> dict:
+        """Market close entire position. Side is the POSITION side (Buy/Sell).
+
+        Fetches current position size first, then sends a reduce-only market order.
+        """
+        # Fetch current position size
+        positions = await self.fetch_positions(session)
+        pos = next((p for p in positions if p["pair"] == pair), None)
+        if not pos or pos["qty"] <= 0:
+            logger.warning(f"close_position: no position found for {pair}")
+            return {}
+
+        close_side = "Sell" if side.upper() in ("BUY", "LONG") else "Buy"
+        return await self.place_order(
+            session, pair, side=close_side, qty=pos["qty"],
+            order_type="Market", reduce_only=True,
+        )
+
+    async def fetch_open_orders(
+        self, session: aiohttp.ClientSession
+    ) -> list[dict]:
+        """Fetch ALL open orders in one call (no per-pair loop)."""
+        result = await self._get(session, "/v5/order/realtime", {
+            "category": CATEGORY,
+        })
+        return result.get("list", [])
+
+    async def set_leverage(
+        self, session: aiohttp.ClientSession, pair: str, leverage: int
+    ) -> dict:
+        """Set leverage for a pair. Ignores 110043 (already set)."""
+        return await self._post(session, "/v5/position/set-leverage", {
+            "category": CATEGORY,
+            "symbol": _to_symbol(pair),
+            "buyLeverage": str(leverage),
+            "sellLeverage": str(leverage),
+        })
+
+    async def set_tp_sl(
+        self,
+        session: aiohttp.ClientSession,
+        pair: str,
+        take_profit: float = None,
+        stop_loss: float = None,
+    ) -> dict:
+        """Set/update TP/SL on an existing position (standalone conditional)."""
+        body = {"category": CATEGORY, "symbol": _to_symbol(pair)}
+        if take_profit is not None:
+            body["takeProfit"] = str(take_profit)
+        if stop_loss is not None:
+            body["stopLoss"] = str(stop_loss)
+        return await self._post(session, "/v5/position/trading-stop", body)
 
     # ── Positions ────────────────────────────────────────────
 
