@@ -73,23 +73,28 @@ async def tg_send(text: str, session: aiohttp.ClientSession | None = None):
     """Send Telegram message. Creates own session if needed."""
     global _tg_last_send
     if not TG_TOKEN or not TG_CHAT:
+        logger.warning("TG send skipped: no token or chat_id")
         return
     now = time.time()
-    if now - _tg_last_send < 3:
-        await asyncio.sleep(3 - (now - _tg_last_send))
+    wait = 3 - (now - _tg_last_send)
+    if wait > 0:
+        await asyncio.sleep(wait)
     try:
         own_session = session is None
         if own_session:
             session = aiohttp.ClientSession()
-        await session.post(f"{TG_URL}/sendMessage", json={
+        resp = await session.post(f"{TG_URL}/sendMessage", json={
             "chat_id": TG_CHAT, "text": text,
             "parse_mode": "HTML", "disable_web_page_preview": True,
         }, timeout=aiohttp.ClientTimeout(total=5))
+        result = await resp.json()
+        if not result.get("ok"):
+            logger.warning(f"TG send failed: {result}")
         _tg_last_send = time.time()
         if own_session:
             await session.close()
     except Exception as e:
-        logger.debug(f"TG send failed: {e}")
+        logger.warning(f"TG send error: {e}")
 
 
 async def tg_send_photo(path: str, caption: str, session: aiohttp.ClientSession):
