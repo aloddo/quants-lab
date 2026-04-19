@@ -98,19 +98,43 @@ class AdaptiveThresholds:
         }
 
     def load_from_mongodb(self, db_uri: str = "mongodb://localhost:27017/quants_lab"):
-        """Bootstrap thresholds from historical quote snapshots (same as paper trader)."""
+        """Bootstrap thresholds from historical quote snapshots.
+
+        Tries multiple collections in order:
+        1. arb_usdc_quote_snapshots (USDC paper trader — most relevant for USDC mode)
+        2. arb_bn_usdc_bb_perp_snapshots (dual collector — USDC cross-venue)
+        3. arb_quote_snapshots (original USDT paper trader — fallback, similar dynamics)
+        """
         client = MongoClient(db_uri)
         db_name = db_uri.rsplit("/", 1)[-1]
         db = client[db_name]
 
         for sym in list(self.history.keys()) or []:
-            docs = list(db.arb_quote_snapshots.find(
+            docs = []
+
+            # Try USDC paper trader first
+            docs = list(db.arb_usdc_quote_snapshots.find(
                 {"symbol": sym}, {"best_spread": 1, "_id": 0},
             ).sort("timestamp", -1).limit(self.window))
+
+            # Try dual collector (Binance USDC vs Bybit perp)
+            if len(docs) < self.window // 2:
+                dual_docs = list(db.arb_bn_usdc_bb_perp_snapshots.find(
+                    {"symbol_bb": sym}, {"best_spread": 1, "_id": 0},
+                ).sort("timestamp", -1).limit(self.window - len(docs)))
+                docs.extend(dual_docs)
+
+            # Fallback to original USDT collector
+            if len(docs) < self.window // 2:
+                orig_docs = list(db.arb_quote_snapshots.find(
+                    {"symbol": sym}, {"best_spread": 1, "_id": 0},
+                ).sort("timestamp", -1).limit(self.window - len(docs)))
+                docs.extend(orig_docs)
+
             for d in reversed(docs):
                 self.history[sym].append(abs(d["best_spread"]))
             if docs:
-                logger.info(f"  {sym}: loaded {len(docs)} historical quotes")
+                logger.info(f"  {sym}: loaded {len(docs)} quotes from multiple sources")
 
     def seed_symbols(self, symbols: list[str]):
         """Initialize history deques for symbols."""

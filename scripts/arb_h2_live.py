@@ -41,6 +41,7 @@ from app.services.arb.inventory_ledger import InventoryLedger
 from app.services.arb.risk_manager import RiskManager, RiskAction
 from app.services.arb.crash_recovery import CrashRecovery
 from app.services.arb.order_api import BybitOrderAPI, BinanceOrderAPI
+from app.services.arb.instrument_rules import InstrumentRules
 
 # Load .env
 _env_file = Path(__file__).resolve().parents[1] / ".env"
@@ -71,16 +72,14 @@ TRADING_MODE = "usdc"
 # USDC mode: Binance USDC symbol -> Bybit USDT perp symbol
 USDC_PAIR_MAP = {
     "NOMUSDT":  ("NOMUSDC",  "NOMUSDT"),   # internal key -> (bn_symbol, bb_symbol)
-    "ACTUSDT":  ("ACTUSDC",  "ACTUSDT"),
-    "DYMUSDT":  ("DYMUSDC",  "DYMUSDT"),
 }
 
 # USDT mode (original, for non-EU accounts)
 USDT_PAIRS = ["HIGHUSDT", "NOMUSDT"]
 
 PAIRS = list(USDC_PAIR_MAP.keys()) if TRADING_MODE == "usdc" else USDT_PAIRS
-POSITION_USD = 20.0               # $20 per side for micro-test
-MAX_CONCURRENT = 2
+POSITION_USD = 10.0               # $10 per side — first live test
+MAX_CONCURRENT = 1                # one position at a time for first test
 POLL_INTERVAL = 0.5                # check signals every 500ms (WS feeds are real-time)
 
 # Exchange credentials
@@ -218,6 +217,7 @@ class H2LiveTrader:
         self.inventory = InventoryLedger(MONGO_URI)
         self.risk_manager = RiskManager()
         self.crash_recovery = CrashRecovery(MONGO_URI, self.inventory)
+        self.instrument_rules = InstrumentRules()
 
         # MongoDB for trade logging
         client = MongoClient(MONGO_URI)
@@ -312,6 +312,11 @@ class H2LiveTrader:
                 f"Risk: 3-tier (alert/pause/kill)",
                 session,
             )
+
+            # Load instrument rules (qty step sizes, tick sizes, min notional)
+            bb_symbols = [USDC_PAIR_MAP[p][1] for p in PAIRS] if TRADING_MODE == "usdc" else PAIRS
+            bn_symbols = [USDC_PAIR_MAP[p][0] for p in PAIRS] if TRADING_MODE == "usdc" else PAIRS
+            await self.instrument_rules.load_all(session, bb_symbols, bn_symbols)
 
             logger.info("Waiting 3s for feeds to warm up...")
             await asyncio.sleep(3)
@@ -487,24 +492,50 @@ class H2LiveTrader:
 
             self.inventory.lock(sym, qty_bn)
 
-        # Execute
-        qty_bb = POSITION_USD / snap.bb_ask if snap.bb_ask > 0 else 0
-        qty_bn = POSITION_USD / snap.bn_bid if snap.bn_bid > 0 else 0
+        # Calculate and round quantities to exchange step sizes
+        bb_sym = USDC_PAIR_MAP[sym][1] if TRADING_MODE == "usdc" else sym
+        bn_sym = USDC_PAIR_MAP[sym][0] if TRADING_MODE == "usdc" else sym
+
+        bb_rules = self.instrument_rules.get("bybit", bb_sym)
+        bn_rules = self.instrument_rules.get("binance", bn_sym)
+
+        raw_qty_bb = POSITION_USD / snap.bb_ask if snap.bb_ask > 0 else 0
+        raw_qty_bn = POSITION_USD / snap.bn_bid if snap.bn_bid > 0 else 0
+
+        qty_bb = bb_rules.round_qty(raw_qty_bb) if bb_rules else raw_qty_bb
+        qty_bn = bn_rules.round_qty(raw_qty_bn) if bn_rules else raw_qty_bn
+
+        # Check min qty and min notional
+        if bb_rules and (not bb_rules.check_min_qty(qty_bb) or not bb_rules.check_notional(qty_bb, snap.bb_ask)):
+            logger.warning(f"Bybit qty/notional check failed: {sym} qty={qty_bb} price={snap.bb_ask}")
+            if direction == "BUY_BB_SELL_BN":
+                self.inventory.release(sym, raw_qty_bn)
+            return
+        if bn_rules and (not bn_rules.check_min_qty(qty_bn) or not bn_rules.check_notional(qty_bn, snap.bn_bid)):
+            logger.warning(f"Binance qty/notional check failed: {sym} qty={qty_bn} price={snap.bn_bid}")
+            if direction == "BUY_BB_SELL_BN":
+                self.inventory.release(sym, raw_qty_bn)
+            return
+
+        # Round prices to tick size
+        price_bb = bb_rules.round_price(snap.bb_ask if direction == "BUY_BB_SELL_BN" else snap.bb_bid) if bb_rules else snap.bb_ask
+        price_bn = bn_rules.round_price(snap.bn_bid if direction == "BUY_BB_SELL_BN" else snap.bn_ask) if bn_rules else snap.bn_bid
 
         bb_side = "Buy" if direction == "BUY_BB_SELL_BN" else "Sell"
         bn_side = "Sell" if direction == "BUY_BB_SELL_BN" else "Buy"
 
         logger.info(
             f"ENTRY SIGNAL: {sym} {direction} spread={snap.spread_bps:.1f}bp "
-            f"P90={signal.threshold_p90:.1f} P25={signal.threshold_p25:.1f}"
+            f"P90={signal.threshold_p90:.1f} P25={signal.threshold_p25:.1f} "
+            f"qty_bb={qty_bb} qty_bn={qty_bn}"
         )
 
         result = await self._coordinator.execute_entry(
             signal=snap,
             bb_side=bb_side, bn_side=bn_side,
             qty_bb=qty_bb, qty_bn=qty_bn,
-            price_bb=snap.bb_ask if bb_side == "Buy" else snap.bb_bid,
-            price_bn=snap.bn_bid if bn_side == "Sell" else snap.bn_ask,
+            price_bb=price_bb,
+            price_bn=price_bn,
         )
 
         if result.outcome == EntryOutcome.SUCCESS:
