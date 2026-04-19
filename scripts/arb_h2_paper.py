@@ -259,6 +259,30 @@ class H2PaperTrader:
         self._poll_count = 0
         self._start_time = time.time()
 
+    def _recover_open_positions(self):
+        """Reload OPEN positions from MongoDB so restarts don't orphan them."""
+        open_docs = list(self._coll.find({"status": "OPEN"}))
+        if not open_docs:
+            logger.info("No open positions to recover from MongoDB")
+            return
+        for doc in open_docs:
+            pos = H2Position(
+                position_id=doc["position_id"],
+                symbol=doc["symbol"],
+                direction=doc["direction"],
+                entry_time=doc["entry_time"],
+                entry_spread=doc["entry_spread"],
+                entry_baseline=doc["entry_baseline"],
+                entry_threshold=doc["entry_threshold"],
+                exit_threshold=doc["exit_threshold"],
+                bn_price=doc["bn_price"],
+                bb_price=doc["bb_price"],
+                status="OPEN",
+            )
+            self.positions.append(pos)
+        logger.info(f"Recovered {len(open_docs)} open positions from MongoDB: "
+                     f"{[d['symbol'] for d in open_docs]}")
+
     def _load_history(self):
         logger.info("Loading historical quotes from arb_quote_snapshots...")
         self.thresholds.load_from_mongodb(self._db)
@@ -461,6 +485,7 @@ class H2PaperTrader:
         logger.info("=" * 60)
 
         self._load_history()
+        self._recover_open_positions()
 
         async with aiohttp.ClientSession() as session:
             # Startup notification (fire and forget, don't block main loop)
@@ -505,12 +530,14 @@ class H2PaperTrader:
                     # Telegram: notify closes
                     for pos in closed_now:
                         emoji = "✅" if pos.net_pnl_bps > 0 else "❌"
+                        # Escape HTML entities in close_reason (< in "71bp < P25" breaks HTML parser)
+                        safe_reason = pos.close_reason.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                         await tg_send(
                             f"📝 <b>H2 CLOSE</b> {emoji} <code>{pos.symbol}</code>\n"
-                            f"Entry: {pos.entry_spread:.0f}bp -> Exit: {pos.exit_spread:.0f}bp\n"
+                            f"Entry: {pos.entry_spread:.0f}bp -&gt; Exit: {pos.exit_spread:.0f}bp\n"
                             f"Capture: {pos.gross_capture:.0f}bp | Net: <b>{pos.net_pnl_bps:.0f}bp "
                             f"(${pos.net_pnl_usd:.3f})</b>\n"
-                            f"Hold: {pos.hold_seconds/60:.0f}min | {pos.close_reason}",
+                            f"Hold: {pos.hold_seconds/60:.0f}min | {safe_reason}",
                             session,
                         )
 

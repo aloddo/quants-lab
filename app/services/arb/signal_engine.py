@@ -1,0 +1,272 @@
+"""
+H2 SignalEngine — Adaptive threshold logic extracted from the paper trader.
+
+Same P90/P25 entry/exit thresholds as arb_h2_paper.py.
+Uses WS prices instead of REST polling.
+
+Signal flow:
+1. PriceFeed provides fresh SpreadSnapshot
+2. SignalEngine checks thresholds -> emit SignalEvent
+3. LegCoordinator executes the trade
+
+The spread is RECALCULATED at order submission time using live WS prices.
+If spread has narrowed below threshold by then, we skip the trade.
+"""
+import logging
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+from pymongo import MongoClient
+
+from app.services.arb.price_feed import SpreadSnapshot
+
+logger = logging.getLogger(__name__)
+
+
+# ── Config (same as paper trader) ───────────────────────────────
+
+ENTRY_PERCENTILE = 0.90
+EXIT_PERCENTILE = 0.25
+MIN_EXCESS_BPS = 30.0
+FEE_RT_BPS = 31.0  # corrected: 4 fills at taker rates
+STOP_LOSS_MULTIPLE = 2.0  # spread > 2x entry = stop loss
+MAX_HOLD_S = 86400  # 24h max hold
+
+
+@dataclass
+class SignalEvent:
+    """Entry or exit signal from the adaptive threshold engine."""
+    symbol: str
+    signal_type: str           # "ENTRY" | "EXIT_REVERT" | "EXIT_STOP_LOSS" | "EXIT_MAX_HOLD"
+    spread_snapshot: SpreadSnapshot
+    threshold_p90: float
+    threshold_p25: float
+    threshold_median: float
+    excess_bps: float          # P90 - P25
+    timestamp: float
+
+
+@dataclass
+class OpenPosition:
+    """Tracks an open position for exit signal detection."""
+    symbol: str
+    direction: str
+    entry_spread: float
+    entry_time: float
+    entry_threshold_p90: float
+    exit_threshold_p25: float
+    position_id: str = ""
+
+
+class AdaptiveThresholds:
+    """
+    Per-pair P90/P25 thresholds from rolling spread history.
+    Same logic as paper trader's AdaptiveThresholds class.
+    """
+
+    def __init__(self, window: int = 720):  # 1h at 5s polling -> keep same for WS
+        self.window = window
+        self.history: dict[str, deque] = defaultdict(lambda: deque(maxlen=window))
+
+    def update(self, symbol: str, abs_spread: float):
+        """Add a new spread observation."""
+        self.history[symbol].append(abs_spread)
+
+    def ready(self, symbol: str) -> bool:
+        """Have enough data to compute thresholds?"""
+        return len(self.history[symbol]) >= self.window // 2
+
+    def get_thresholds(self, symbol: str) -> Optional[dict]:
+        """Compute current thresholds for a pair."""
+        h = self.history[symbol]
+        if len(h) < self.window // 2:
+            return None
+        arr = np.array(h)
+        p25 = float(np.percentile(arr, 25))
+        p50 = float(np.percentile(arr, 50))
+        p90 = float(np.percentile(arr, 90))
+        excess = p90 - p25
+        return {
+            "p25": p25,
+            "median": p50,
+            "p90": p90,
+            "excess": excess,
+            "viable": excess > MIN_EXCESS_BPS,
+        }
+
+    def load_from_mongodb(self, db_uri: str = "mongodb://localhost:27017/quants_lab"):
+        """Bootstrap thresholds from historical quote snapshots (same as paper trader)."""
+        client = MongoClient(db_uri)
+        db_name = db_uri.rsplit("/", 1)[-1]
+        db = client[db_name]
+
+        for sym in list(self.history.keys()) or []:
+            docs = list(db.arb_quote_snapshots.find(
+                {"symbol": sym}, {"best_spread": 1, "_id": 0},
+            ).sort("timestamp", -1).limit(self.window))
+            for d in reversed(docs):
+                self.history[sym].append(abs(d["best_spread"]))
+            if docs:
+                logger.info(f"  {sym}: loaded {len(docs)} historical quotes")
+
+    def seed_symbols(self, symbols: list[str]):
+        """Initialize history deques for symbols."""
+        for sym in symbols:
+            if sym not in self.history:
+                self.history[sym]  # triggers defaultdict creation
+
+
+class SignalEngine:
+    """
+    Generates entry and exit signals from price feed data.
+
+    Feed it spread snapshots, it emits signals based on adaptive thresholds.
+    """
+
+    def __init__(self, symbols: list[str], db_uri: str = "mongodb://localhost:27017/quants_lab"):
+        self.symbols = symbols
+        self.thresholds = AdaptiveThresholds()
+        self.thresholds.seed_symbols(symbols)
+        self.open_positions: dict[str, OpenPosition] = {}  # symbol -> position
+        self._update_count = 0
+        self._subsample_rate = 12  # update thresholds every 12th spread (~1/min at WS rate)
+
+    def load_history(self, db_uri: str):
+        """Bootstrap thresholds from MongoDB quote snapshots."""
+        self.thresholds.load_from_mongodb(db_uri)
+
+    def check_entry(self, snap: SpreadSnapshot) -> Optional[SignalEvent]:
+        """
+        Check if current spread triggers an entry signal.
+        Returns SignalEvent or None.
+        """
+        if not snap.fresh:
+            return None
+
+        sym = snap.symbol
+        if sym in self.open_positions:
+            return None  # already have a position
+
+        # Subsample threshold updates (don't need to update on every WS tick)
+        self._update_count += 1
+        if self._update_count % self._subsample_rate == 0:
+            self.thresholds.update(sym, abs(snap.spread_bps))
+
+        thresh = self.thresholds.get_thresholds(sym)
+        if not thresh or not thresh["viable"]:
+            return None
+
+        if abs(snap.spread_bps) >= thresh["p90"]:
+            return SignalEvent(
+                symbol=sym,
+                signal_type="ENTRY",
+                spread_snapshot=snap,
+                threshold_p90=thresh["p90"],
+                threshold_p25=thresh["p25"],
+                threshold_median=thresh["median"],
+                excess_bps=thresh["excess"],
+                timestamp=time.time(),
+            )
+
+        return None
+
+    def check_exit(self, snap: SpreadSnapshot) -> Optional[SignalEvent]:
+        """
+        Check if current spread triggers an exit signal for an open position.
+        Returns SignalEvent or None.
+        """
+        sym = snap.symbol
+        pos = self.open_positions.get(sym)
+        if not pos:
+            return None
+
+        if not snap.fresh:
+            return None
+
+        abs_spread = abs(snap.spread_bps)
+        now = time.time()
+        hold_s = now - pos.entry_time
+
+        # Reversion exit: spread reverted below P25
+        if abs_spread <= pos.exit_threshold_p25:
+            return SignalEvent(
+                symbol=sym,
+                signal_type="EXIT_REVERT",
+                spread_snapshot=snap,
+                threshold_p90=pos.entry_threshold_p90,
+                threshold_p25=pos.exit_threshold_p25,
+                threshold_median=0,
+                excess_bps=0,
+                timestamp=now,
+            )
+
+        # Stop loss: spread widened to 2x entry
+        if abs_spread > pos.entry_spread * STOP_LOSS_MULTIPLE:
+            return SignalEvent(
+                symbol=sym,
+                signal_type="EXIT_STOP_LOSS",
+                spread_snapshot=snap,
+                threshold_p90=pos.entry_threshold_p90,
+                threshold_p25=pos.exit_threshold_p25,
+                threshold_median=0,
+                excess_bps=0,
+                timestamp=now,
+            )
+
+        # Max hold
+        if hold_s > MAX_HOLD_S:
+            return SignalEvent(
+                symbol=sym,
+                signal_type="EXIT_MAX_HOLD",
+                spread_snapshot=snap,
+                threshold_p90=pos.entry_threshold_p90,
+                threshold_p25=pos.exit_threshold_p25,
+                threshold_median=0,
+                excess_bps=0,
+                timestamp=now,
+            )
+
+        return None
+
+    def register_position(self, pos: OpenPosition):
+        """Register a newly opened position for exit signal tracking."""
+        self.open_positions[pos.symbol] = pos
+        logger.info(f"Position registered: {pos.symbol} entry_spread={pos.entry_spread:.0f}bp")
+
+    def unregister_position(self, symbol: str):
+        """Remove a closed position."""
+        self.open_positions.pop(symbol, None)
+
+    def verify_spread_at_execution(self, snap: SpreadSnapshot, original_signal: SignalEvent) -> bool:
+        """
+        Re-check spread at the moment of order submission.
+        If spread has narrowed below threshold, skip the trade.
+
+        This is the defense against execution skew (100-800ms between signal and order).
+        """
+        if not snap.fresh:
+            return False
+
+        # Re-check: spread must still exceed P90
+        thresh = self.thresholds.get_thresholds(snap.symbol)
+        if not thresh:
+            return False
+
+        return abs(snap.spread_bps) >= thresh["p90"]
+
+    def status(self) -> dict:
+        """Return current signal engine state for monitoring."""
+        result = {"open_positions": len(self.open_positions), "pairs": {}}
+        for sym in self.symbols:
+            thresh = self.thresholds.get_thresholds(sym)
+            result["pairs"][sym] = {
+                "ready": self.thresholds.ready(sym),
+                "p90": thresh["p90"] if thresh else None,
+                "p25": thresh["p25"] if thresh else None,
+                "viable": thresh["viable"] if thresh else False,
+                "has_position": sym in self.open_positions,
+            }
+        return result
