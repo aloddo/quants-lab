@@ -71,7 +71,11 @@ TRADING_MODE = "usdc"
 
 # USDC mode: Binance USDC symbol -> Bybit USDT perp symbol
 USDC_PAIR_MAP = {
-    "NOMUSDT":  ("NOMUSDC",  "NOMUSDT"),   # internal key -> (bn_symbol, bb_symbol)
+    "NOMUSDT":    ("NOMUSDC",    "NOMUSDT"),
+    "ENJUSDT":    ("ENJUSDC",    "ENJUSDT"),
+    "MOVEUSDT":   ("MOVEUSDC",   "MOVEUSDT"),
+    "KERNELUSDT": ("KERNELUSDC", "KERNELUSDT"),
+    "ACXUSDT":    ("ACXUSDC",    "ACXUSDT"),
 }
 
 # USDT mode (original, for non-EU accounts)
@@ -79,7 +83,7 @@ USDT_PAIRS = ["HIGHUSDT", "NOMUSDT"]
 
 PAIRS = list(USDC_PAIR_MAP.keys()) if TRADING_MODE == "usdc" else USDT_PAIRS
 POSITION_USD = 10.0               # $10 per side — first live test
-MAX_CONCURRENT = 1                # one position at a time for first test
+MAX_CONCURRENT = 3                # up to 3 concurrent positions
 POLL_INTERVAL = 0.5                # check signals every 500ms (WS feeds are real-time)
 
 # Exchange credentials
@@ -187,6 +191,36 @@ class OrderSubmitter:
         else:
             raise ValueError(f"Unknown venue: {venue}")
 
+    async def check_order(self, venue: str, symbol: str, order_id: str) -> dict:
+        """REST fallback: query order status for fill confirmation when WS unavailable."""
+        if self._shadow:
+            return {"filled_qty": 0, "avg_price": 0, "status": "shadow"}
+
+        bn_symbol = symbol
+        if venue == "binance" and TRADING_MODE == "usdc" and symbol in USDC_PAIR_MAP:
+            bn_symbol = USDC_PAIR_MAP[symbol][0]
+
+        try:
+            if venue == "bybit":
+                orders = await self.bybit_api.get_open_orders(symbol)
+                # If order is NOT in open orders, it's filled or cancelled
+                for o in orders:
+                    if o.get("orderId") == order_id:
+                        return {"filled_qty": float(o.get("cumExecQty", 0)), "avg_price": float(o.get("avgPrice", 0)), "status": o.get("orderStatus", "")}
+                # Not in open orders — check executions
+                execs = await self.bybit_api.get_executions(limit=10)
+                for e in execs:
+                    if e.get("orderId") == order_id:
+                        return {"filled_qty": float(e.get("execQty", 0)), "avg_price": float(e.get("execPrice", 0)), "status": "Filled"}
+            elif venue == "binance":
+                trades = await self.binance_api.get_my_trades(bn_symbol, limit=5)
+                for t in trades:
+                    if str(t.get("orderId")) == order_id:
+                        return {"filled_qty": float(t.get("qty", 0)), "avg_price": float(t.get("price", 0)), "status": "Filled"}
+        except Exception as e:
+            logger.warning(f"check_order failed {venue} {order_id}: {e}")
+        return {"filled_qty": 0, "avg_price": 0, "status": "unknown"}
+
     async def cancel(self, venue: str, symbol: str, order_id: str) -> bool:
         """Cancel an order. Returns True if successful."""
         if self._shadow:
@@ -287,9 +321,10 @@ class H2LiveTrader:
                 on_disconnect=on_disconnect,
             )
 
-            # Wire real submit/cancel functions into coordinator
+            # Wire real submit/cancel/check functions into coordinator
             self._coordinator._submit = submitter.submit
             self._coordinator._cancel = submitter.cancel
+            self._coordinator._check_order = submitter.check_order
 
             # Crash recovery
             if not self.shadow:
@@ -356,7 +391,9 @@ class H2LiveTrader:
 
                     # Check for entry signals (only if we can trade)
                     # In shadow mode, skip the both_connected check (order feed not started)
-                    feeds_ready = self.shadow or self.order_feed.both_connected
+                    # If Binance WS is unavailable (EU/NL 410), allow trading with Bybit WS only
+                    # — Binance fills will be confirmed via REST polling in LegCoordinator
+                    feeds_ready = self.shadow or self.order_feed.bybit.is_connected
                     if self.risk_manager.can_trade and feeds_ready:
                         open_count = len(self.signal_engine.open_positions)
                         if open_count < MAX_CONCURRENT:

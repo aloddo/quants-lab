@@ -168,13 +168,15 @@ class LegCoordinator:
     UNWIND_LIMIT_TIMEOUT_S = 0.2  # aggressive limit unwind
     UNWIND_MARKET_TIMEOUT_S = 1.0  # market order last resort
 
-    def __init__(self, submit_order_fn, cancel_order_fn):
+    def __init__(self, submit_order_fn, cancel_order_fn, check_order_fn=None):
         """
-        submit_order_fn(venue, symbol, side, qty, price, order_type) -> order_id
+        submit_order_fn(venue, symbol, side, qty, price, order_type, client_order_id) -> order_id
         cancel_order_fn(venue, symbol, order_id) -> bool
+        check_order_fn(venue, symbol, order_id) -> dict with status/filled_qty/avg_price (REST fallback)
         """
         self._submit = submit_order_fn
         self._cancel = cancel_order_fn
+        self._check_order = check_order_fn  # REST fallback for fill confirmation
 
         # Fill events are signaled here by OrderFeed callbacks
         self._fill_events: dict[str, asyncio.Event] = {}  # order_id -> event
@@ -348,7 +350,19 @@ class LegCoordinator:
                 timeout=self.FILL_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            pass  # Handle below
+            # WS timeout — try REST fallback for any unfilled legs
+            if self._check_order:
+                for leg, oid in [(bb_leg, bb_oid), (bn_leg, bn_oid)]:
+                    if oid and not leg.is_filled:
+                        try:
+                            order_info = await self._check_order(leg.venue, signal.symbol, oid)
+                            if order_info and float(order_info.get("filled_qty", 0)) > 0:
+                                leg.filled_qty = float(order_info["filled_qty"])
+                                leg.avg_fill_price = float(order_info.get("avg_price", 0))
+                                leg.state = OrderState.FILLED if leg.filled_qty >= leg.target_qty * 0.99 else OrderState.PARTIAL
+                                logger.info(f"REST fill confirmed: {leg.venue} {oid} qty={leg.filled_qty}")
+                        except Exception as e:
+                            logger.warning(f"REST fill check failed for {leg.venue}: {e}")
 
         # Evaluate outcome — check has_any_fill (not just is_filled) for partial handling
         bb_fully = bb_leg.is_filled
