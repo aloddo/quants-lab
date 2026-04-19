@@ -42,21 +42,24 @@ class BybitOrderAPI:
         }
 
     async def submit_order(
-        self, symbol: str, side: str, qty: float, price: float, order_type: str = "limit"
+        self, symbol: str, side: str, qty: float, price: float, order_type: str = "limit",
+        client_order_id: str = "",
     ) -> str:
         """
         Submit a linear perp order.
-        Returns order_id.
+        Returns order_id. If client_order_id provided, Bybit tracks it as orderLinkId.
         """
         ts = str(int(time.time() * 1000))
         params = {
             "category": "linear",
             "symbol": symbol,
-            "side": side.capitalize(),  # "Buy" or "Sell"
+            "side": side.capitalize(),
             "orderType": "Market" if order_type == "market" else "Limit",
             "qty": str(qty),
-            "timeInForce": "IOC",  # IOC for all orders: fill immediately or cancel
+            "timeInForce": "IOC",
         }
+        if client_order_id:
+            params["orderLinkId"] = client_order_id
         if order_type != "market" and price > 0:
             params["price"] = str(price)
 
@@ -185,20 +188,23 @@ class BinanceOrderAPI:
         return {"X-MBX-APIKEY": self._key}
 
     async def submit_order(
-        self, symbol: str, side: str, qty: float, price: float, order_type: str = "limit"
+        self, symbol: str, side: str, qty: float, price: float, order_type: str = "limit",
+        client_order_id: str = "",
     ) -> str:
         """
         Submit a spot order.
-        Returns order_id (as string).
+        Returns order_id (as string). If client_order_id provided, Binance tracks it as newClientOrderId.
         """
         params = {
             "symbol": symbol,
-            "side": side.upper(),  # "BUY" or "SELL"
+            "side": side.upper(),
             "type": "MARKET" if order_type == "market" else "LIMIT",
             "quantity": f"{qty:.8f}".rstrip("0").rstrip("."),
             "timestamp": str(int(time.time() * 1000)),
             "recvWindow": "5000",
         }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         if order_type != "market" and price > 0:
             params["price"] = f"{price:.8f}".rstrip("0").rstrip(".")
             params["timeInForce"] = "IOC"  # IOC: fill immediately or cancel

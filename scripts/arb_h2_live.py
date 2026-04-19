@@ -130,7 +130,8 @@ class OrderSubmitter:
         self.binance_api = BinanceOrderAPI(BINANCE_KEY, BINANCE_SECRET, session)
 
     async def submit(
-        self, venue: str, symbol: str, side: str, qty: float, price: float, order_type: str
+        self, venue: str, symbol: str, side: str, qty: float, price: float, order_type: str,
+        client_order_id: str = "",
     ) -> str:
         """Submit an order. Returns order_id. Maps symbols for USDC mode."""
         self._order_counter += 1
@@ -180,9 +181,9 @@ class OrderSubmitter:
             return oid
 
         if venue == "bybit":
-            return await self.bybit_api.submit_order(symbol, side, qty, price, order_type)
+            return await self.bybit_api.submit_order(symbol, side, qty, price, order_type, client_order_id)
         elif venue == "binance":
-            return await self.binance_api.submit_order(bn_symbol, side, qty, price, order_type)
+            return await self.binance_api.submit_order(bn_symbol, side, qty, price, order_type, client_order_id)
         else:
             raise ValueError(f"Unknown venue: {venue}")
 

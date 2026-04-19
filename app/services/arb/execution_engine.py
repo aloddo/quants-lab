@@ -227,23 +227,29 @@ class LegCoordinator:
         """
         t0 = time.time()
 
-        # Create leg states with placeholder order IDs
-        # We use placeholder IDs for pre-registration, then update after submit
-        bb_placeholder = f"pending_bb_{int(time.time()*1000)}"
-        bn_placeholder = f"pending_bn_{int(time.time()*1000)}"
+        # BUG FIX #1: Generate client order IDs and PRE-REGISTER before submitting
+        # This ensures WS fill events can be matched even if they arrive before
+        # the REST response returns the exchange order ID
+        import uuid
+        bb_client_id = f"h2_bb_{uuid.uuid4().hex[:12]}"
+        bn_client_id = f"h2_bn_{uuid.uuid4().hex[:12]}"
 
         bb_leg = LegState(
             venue="bybit", symbol=signal.symbol, side=bb_side,
             target_qty=qty_bb, target_price=price_bb,
-            order_id=bb_placeholder,
+            order_id=bb_client_id,  # use client ID as initial tracking key
         )
         bn_leg = LegState(
             venue="binance", symbol=signal.symbol, side=bn_side,
             target_qty=qty_bn, target_price=price_bn,
-            order_id=bn_placeholder,
+            order_id=bn_client_id,
         )
 
-        # Submit both legs with individual error handling (NOT asyncio.gather with raise)
+        # Pre-register BEFORE submitting so WS fills are never lost
+        self.register_leg(bb_leg)
+        self.register_leg(bn_leg)
+
+        # Submit both legs with client order IDs
         bb_oid = None
         bn_oid = None
         bb_err = None
@@ -252,14 +258,14 @@ class LegCoordinator:
         async def submit_bb():
             nonlocal bb_oid, bb_err
             try:
-                bb_oid = await self._submit("bybit", signal.symbol, bb_side, qty_bb, price_bb, "limit")
+                bb_oid = await self._submit("bybit", signal.symbol, bb_side, qty_bb, price_bb, "limit", bb_client_id)
             except Exception as e:
                 bb_err = e
 
         async def submit_bn():
             nonlocal bn_oid, bn_err
             try:
-                bn_oid = await self._submit("binance", signal.symbol, bn_side, qty_bn, price_bn, "limit")
+                bn_oid = await self._submit("binance", signal.symbol, bn_side, qty_bn, price_bn, "limit", bn_client_id)
             except Exception as e:
                 bn_err = e
 
@@ -317,20 +323,24 @@ class LegCoordinator:
                 leg_failure_venue="binance", entry_latency_ms=(time.time() - t0) * 1000,
             )
 
-        # Both submits succeeded — register with real order IDs
-        bb_leg.order_id = bb_oid
+        # Both submits succeeded — update legs with exchange order IDs
+        # Also register the exchange IDs so WS events using either ID are matched
+        if bb_oid and bb_oid != bb_client_id:
+            self._fill_events[bb_oid] = self._fill_events[bb_client_id]
+            self._leg_states[bb_oid] = bb_leg
+        bb_leg.order_id = bb_oid or bb_client_id
         bb_leg.state = OrderState.SUBMITTED
         bb_leg.submitted_at = time.time()
-        bn_leg.order_id = bn_oid
+        if bn_oid and bn_oid != bn_client_id:
+            self._fill_events[bn_oid] = self._fill_events[bn_client_id]
+            self._leg_states[bn_oid] = bn_leg
+        bn_leg.order_id = bn_oid or bn_client_id
         bn_leg.state = OrderState.SUBMITTED
         bn_leg.submitted_at = time.time()
 
-        self.register_leg(bb_leg)
-        self.register_leg(bn_leg)
-
-        # Wait for both fills via WS events
-        bb_event = self._fill_events[bb_oid]
-        bn_event = self._fill_events[bn_oid]
+        # Wait for both fills via WS events (check both client and exchange IDs)
+        bb_event = self._fill_events.get(bb_oid) or self._fill_events.get(bb_client_id)
+        bn_event = self._fill_events.get(bn_oid) or self._fill_events.get(bn_client_id)
 
         try:
             await asyncio.wait_for(
