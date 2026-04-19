@@ -164,10 +164,9 @@ class LegCoordinator:
     to detect fills. NO REST polling during execution.
     """
 
-    FILL_TIMEOUT_S = 0.5        # 500ms max wait for both fills
-    CANCEL_TIMEOUT_S = 0.2      # 200ms to confirm cancel
-    UNWIND_LIMIT_TIMEOUT_S = 0.2  # aggressive limit unwind
-    UNWIND_MARKET_TIMEOUT_S = 1.0  # market order last resort
+    FILL_TIMEOUT_S = 3.0        # 3s max wait for both fills (GTC on thin Binance USDC books)
+    CANCEL_TIMEOUT_S = 0.5      # 500ms to confirm cancel
+    UNWIND_MARKET_TIMEOUT_S = 2.0  # market order last resort
 
     def __init__(self, submit_order_fn, cancel_order_fn, check_order_fn=None,
                  check_position_fn=None):

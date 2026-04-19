@@ -312,7 +312,10 @@ class SignalEngine:
         if not thresh:
             return False
 
-        return snap.spread_bps >= thresh["p90"]
+        # Accept 80% of P90 at verify time — spread naturally narrows 10-30bp
+        # between signal and execution on thin USDC books. If we require full P90,
+        # most trades are rejected at verify despite being profitable.
+        return snap.spread_bps >= thresh["p90"] * 0.8
 
     def status(self) -> dict:
         """Return current signal engine state for monitoring."""

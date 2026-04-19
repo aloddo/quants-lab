@@ -207,7 +207,10 @@ class BinanceOrderAPI:
             params["newClientOrderId"] = client_order_id
         if order_type != "market" and price > 0:
             params["price"] = f"{price:.8f}".rstrip("0").rstrip(".")
-            params["timeInForce"] = "IOC"  # IOC: fill immediately or cancel
+            params["timeInForce"] = "GTC"  # GTC: rest on book until filled or cancelled
+            # On thin USDC books, IOC expires instantly with no fill.
+            # GTC rests for a moment and catches the next trade.
+            # The coordinator cancels unfilled GTC orders after 2-3 seconds.
 
         params["signature"] = self._sign(params)
 
