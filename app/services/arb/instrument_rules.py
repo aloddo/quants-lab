@@ -121,9 +121,25 @@ class InstrumentRules:
         except Exception as e:
             logger.error(f"Failed to load Binance instrument rules: {e}")
 
+    def missing_pairs(self, bb_symbols: list[str], bn_symbols: list[str]) -> list[str]:
+        """Return pairs missing rules on either venue. These must be excluded from trading."""
+        missing = []
+        for sym in bb_symbols:
+            if f"bybit:{sym}" not in self.rules:
+                missing.append(f"bybit:{sym}")
+        for sym in bn_symbols:
+            if f"binance:{sym}" not in self.rules:
+                missing.append(f"binance:{sym}")
+        return missing
+
     async def load_all(self, session: aiohttp.ClientSession, bb_symbols: list[str], bn_symbols: list[str]):
         """Load rules for all active pairs on both venues."""
         logger.info("Loading instrument rules...")
         await self.load_bybit(session, bb_symbols)
         await self.load_binance(session, bn_symbols)
         logger.info(f"Loaded rules for {len(self.rules)} symbol-venues")
+
+        # Check for missing rules — these pairs must be excluded from trading
+        missing = self.missing_pairs(bb_symbols, bn_symbols)
+        if missing:
+            logger.critical(f"MISSING instrument rules for: {missing} — these pairs will be BLOCKED from trading")

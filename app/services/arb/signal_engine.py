@@ -155,17 +155,34 @@ class SignalEngine:
         self.thresholds = AdaptiveThresholds()
         self.thresholds.seed_symbols(symbols)
         self.open_positions: dict[str, OpenPosition] = {}  # symbol -> position
-        self._update_count = 0
+        self._update_counts: dict[str, int] = defaultdict(int)  # per-symbol counter
         self._subsample_rate = 12  # update thresholds every 12th spread (~1/min at WS rate)
 
     def load_history(self, db_uri: str):
         """Bootstrap thresholds from MongoDB quote snapshots."""
         self.thresholds.load_from_mongodb(db_uri)
 
+    def update_thresholds(self, snap: 'SpreadSnapshot'):
+        """Update adaptive thresholds from a spread snapshot.
+
+        Call from the main loop on every tick regardless of entry/exit state,
+        so thresholds stay current even while holding positions.
+        """
+        sym = snap.symbol
+        if not snap.fresh:
+            return
+        self._update_counts[sym] += 1
+        if self._update_counts[sym] % self._subsample_rate == 0:
+            self.thresholds.update(sym, abs(snap.spread_bps))
+
     def check_entry(self, snap: SpreadSnapshot) -> Optional[SignalEvent]:
         """
         Check if current spread triggers an entry signal.
         Returns SignalEvent or None.
+
+        CRITICAL: spread_bps must be POSITIVE for the chosen direction.
+        A positive spread means the arb is profitable (buy low, sell high).
+        A negative spread means you'd PAY to enter -- never trade this.
         """
         if not snap.fresh:
             return None
@@ -174,16 +191,15 @@ class SignalEngine:
         if sym in self.open_positions:
             return None  # already have a position
 
-        # Subsample threshold updates (don't need to update on every WS tick)
-        self._update_count += 1
-        if self._update_count % self._subsample_rate == 0:
-            self.thresholds.update(sym, abs(snap.spread_bps))
+        # SAFETY: spread must be positive (profitable direction)
+        if snap.spread_bps <= 0:
+            return None
 
         thresh = self.thresholds.get_thresholds(sym)
         if not thresh or not thresh["viable"]:
             return None
 
-        if abs(snap.spread_bps) >= thresh["p90"]:
+        if snap.spread_bps >= thresh["p90"]:
             logger.info(
                 f"ENTRY SIGNAL: {sym} spread={snap.spread_bps:.1f}bp >= P90={thresh['p90']:.1f}bp "
                 f"(P25={thresh['p25']:.1f} excess={thresh['excess']:.1f} direction={snap.direction})"
@@ -205,14 +221,17 @@ class SignalEngine:
         """
         Check if current spread triggers an exit signal for an open position.
         Returns SignalEvent or None.
+
+        Note: snap.fresh may be False if using get_spread_for_exit() with
+        relaxed freshness. We still allow exits with slightly stale data
+        to prevent positions from being trapped.
         """
         sym = snap.symbol
         pos = self.open_positions.get(sym)
         if not pos:
             return None
 
-        if not snap.fresh:
-            return None
+        # Don't require snap.fresh for exits -- stale exit is better than trapped position
 
         abs_spread = abs(snap.spread_bps)
         now = time.time()
@@ -232,9 +251,13 @@ class SignalEngine:
                 timestamp=now,
             )
 
-        # Stop loss: spread widened to 2x entry
-        if abs_spread > pos.entry_spread * STOP_LOSS_MULTIPLE:
-            logger.warning(f"EXIT STOP LOSS: {sym} spread={abs_spread:.1f}bp > 2x entry={pos.entry_spread*2:.1f}bp (hold={hold_s:.0f}s)")
+        # Stop loss: spread widened FURTHER in same direction (reversion hasn't happened)
+        # For spike fade: entry at high spread, exit at low spread. If spread doubles
+        # from entry, the spike is getting worse, not reverting. That's a stop loss.
+        # If spread goes negative (crossed zero), that means FULL REVERSION = profitable.
+        # Use actual spread value (not abs) to detect same-direction widening.
+        if pos.entry_spread > 0 and snap.spread_bps > pos.entry_spread * STOP_LOSS_MULTIPLE:
+            logger.warning(f"EXIT STOP LOSS: {sym} spread={snap.spread_bps:.1f}bp > {STOP_LOSS_MULTIPLE}x entry={pos.entry_spread:.1f}bp (hold={hold_s:.0f}s)")
             return SignalEvent(
                 symbol=sym,
                 signal_type="EXIT_STOP_LOSS",
@@ -280,12 +303,16 @@ class SignalEngine:
         if not snap.fresh:
             return False
 
-        # Re-check: spread must still exceed P90
+        # Re-check: spread must still be positive AND exceed P90
+        # Must match check_entry's sign check: positive = profitable direction
+        if snap.spread_bps <= 0:
+            return False
+
         thresh = self.thresholds.get_thresholds(snap.symbol)
         if not thresh:
             return False
 
-        return abs(snap.spread_bps) >= thresh["p90"]
+        return snap.spread_bps >= thresh["p90"]
 
     def status(self) -> dict:
         """Return current signal engine state for monitoring."""

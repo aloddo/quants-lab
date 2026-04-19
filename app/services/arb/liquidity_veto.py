@@ -47,8 +47,12 @@ class LiquidityVeto:
                 return True, "unknown_venue"
         except Exception as e:
             logger.warning(f"Liquidity check failed {key}: {e}")
-            # On error, allow trading (don't block on transient API issues)
-            return True, f"check_failed:{e}"
+            # On error: if we have a cached result, use it; otherwise BLOCK (fail-closed)
+            cached = self._cache.get(key)
+            if cached:
+                logger.info(f"Using cached liquidity result for {key}: liquid={cached['liquid']}")
+                return cached["liquid"], f"cached_after_error:{e}"
+            return False, f"check_failed_no_cache:{e}"
 
     async def _check_bybit(self, session, symbol, key) -> tuple[bool, str]:
         async with session.get(

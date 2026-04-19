@@ -29,13 +29,22 @@ FUNDING_BLACKOUT_MINUTES = 5
 
 
 def is_in_funding_blackout() -> bool:
-    """Refuse new entries within 5min of Bybit funding settlement."""
+    """Refuse new entries within 5min of Bybit funding settlement.
+
+    Also checks tomorrow's 00:00 settlement when near midnight (23:55-00:00).
+    """
     now = datetime.now(timezone.utc)
+    from datetime import timedelta
+    blackout_s = FUNDING_BLACKOUT_MINUTES * 60
     for hour in FUNDING_SETTLEMENT_HOURS_UTC:
         settlement = now.replace(hour=hour, minute=0, second=0, microsecond=0)
         diff = abs((now - settlement).total_seconds())
-        if diff < FUNDING_BLACKOUT_MINUTES * 60:
+        if diff < blackout_s:
             return True
+    # Check tomorrow's 00:00 for the 23:55-00:00 window
+    tomorrow_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if abs((now - tomorrow_midnight).total_seconds()) < blackout_s:
+        return True
     return False
 
 

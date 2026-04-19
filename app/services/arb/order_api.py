@@ -55,13 +55,13 @@ class BybitOrderAPI:
             "symbol": symbol,
             "side": side.capitalize(),
             "orderType": "Market" if order_type == "market" else "Limit",
-            "qty": str(qty),
+            "qty": f"{qty:.8f}".rstrip("0").rstrip("."),
             "timeInForce": "IOC",
         }
         if client_order_id:
             params["orderLinkId"] = client_order_id
         if order_type != "market" and price > 0:
-            params["price"] = str(price)
+            params["price"] = f"{price:.8f}".rstrip("0").rstrip(".")
 
         import json
         body = json.dumps(params)

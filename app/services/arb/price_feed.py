@@ -380,6 +380,60 @@ class PriceFeed:
 
         return snap
 
+    def get_spread_for_exit(self, symbol: str, max_age_s: float = 30.0) -> SpreadSnapshot | None:
+        """
+        Like get_spread but with relaxed freshness for exit decisions.
+
+        Entries need tight freshness (5s) to avoid phantom spreads.
+        Exits need to work even with slightly stale data -- it's better
+        to exit with a 20-second-old price than be stuck in a position.
+
+        Still rejects: no data, phantom spikes, extreme skew.
+        """
+        bb = self.bybit.prices.get(symbol)
+        bn_symbol = self._bn_map.get(symbol, symbol)
+        bn = self.binance.prices.get(bn_symbol)
+
+        if not bb or not bn:
+            return None
+        if bb.last_update_ts == 0 or bn.last_update_ts == 0:
+            return None
+        if bb.best_ask <= 0 or bn.best_bid <= 0:
+            return None
+
+        now = time.monotonic()
+        bb_age = now - bb.last_update_ts
+        bn_age = now - bn.last_update_ts
+
+        # Relaxed age check for exits
+        if bb_age > max_age_s or bn_age > max_age_s:
+            return None
+
+        spread_buy_bb = (bn.best_bid - bb.best_ask) / bb.best_ask * 10000
+        spread_buy_bn = (bb.best_bid - bn.best_ask) / bn.best_ask * 10000
+        best_spread = max(spread_buy_bb, spread_buy_bn)
+        direction = "BUY_BB_SELL_BN" if spread_buy_bb >= spread_buy_bn else "BUY_BN_SELL_BB"
+
+        # Still reject phantom spikes
+        median = self.guard._median_spreads.get(symbol, abs(best_spread))
+        if median > 0 and abs(best_spread) > median * self.guard.MAX_SPREAD_MULTIPLE:
+            return None
+
+        return SpreadSnapshot(
+            symbol=symbol,
+            spread_bps=best_spread,
+            bb_ask=bb.best_ask,
+            bn_bid=bn.best_bid,
+            bb_bid=bb.best_bid,
+            bn_ask=bn.best_ask,
+            reverse_spread_bps=min(spread_buy_bb, spread_buy_bn),
+            direction=direction,
+            bb_age_ms=bb_age * 1000,
+            bn_age_ms=bn_age * 1000,
+            timestamp=time.time(),
+            fresh=(bb_age < self.guard.MAX_AGE_S and bn_age < self.guard.MAX_AGE_S),
+        )
+
     def status(self) -> dict:
         """Return status of all feeds for monitoring."""
         result = {}

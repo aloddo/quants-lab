@@ -55,6 +55,7 @@ class FillEvent:
     is_maker: bool = False
     order_status: str = ""  # "Filled", "PartiallyFilled", "Cancelled", etc.
     leaves_qty: float = 0   # remaining unfilled quantity
+    client_order_id: str = ""  # client-assigned order ID (orderLinkId on Bybit, newClientOrderId on Binance)
 
 
 @dataclass
@@ -184,6 +185,9 @@ class BybitOrderFeed:
                     order_status=item.get("orderStatus", ""),
                     leaves_qty=float(item.get("leavesQty", 0)),
                 )
+                # Set client order ID for matching during submit race window
+                fill.client_order_id = item.get("orderLinkId", "")
+                # (now a proper dataclass field, no longer monkey-patched)
                 self.last_exec_id = fill.exec_id
                 if self._on_fill:
                     self._on_fill(fill)
@@ -370,6 +374,8 @@ class BinanceOrderFeed:
                     order_status=self._normalize_bn_status(status),
                     leaves_qty=float(data.get("q", 0)) - float(data.get("z", 0)),
                 )
+                # Extract client order ID (Binance field "c" = newClientOrderId)
+                fill.client_order_id = data.get("c", "")
                 self.last_exec_id = fill.exec_id
                 if self._on_fill:
                     self._on_fill(fill)

@@ -65,6 +65,7 @@ class CrashRecovery:
         self._db = client[db_name]
         self._positions = self._db[self.POSITIONS_COLLECTION]
         self._inventory = inventory
+        self._orphan_buybacks: list = []
 
     async def recover(
         self,
@@ -73,6 +74,7 @@ class CrashRecovery:
         bybit_secret: str,
         binance_key: str,
         symbols: list[str],
+        binance_secret: str = "",
     ) -> RecoveryReport:
         """
         Full recovery sequence. Call on startup.
@@ -90,14 +92,14 @@ class CrashRecovery:
 
         # ── Step 2: Binance inventory ──
         try:
-            await self._recover_binance(session, binance_key, symbols, report)
+            await self._recover_binance(session, binance_key, binance_secret, symbols, report)
         except Exception as e:
             logger.error(f"Binance recovery failed: {e}")
             report.errors.append(f"binance: {e}")
 
         # ── Step 3: Cancel stranded orders ──
         try:
-            await self._cancel_stranded_orders(session, bybit_key, bybit_secret, binance_key, symbols, report)
+            await self._cancel_stranded_orders(session, bybit_key, bybit_secret, binance_key, binance_secret, symbols, report)
         except Exception as e:
             logger.error(f"Order cleanup failed: {e}")
             report.errors.append(f"orders: {e}")
@@ -121,9 +123,10 @@ class CrashRecovery:
         - In both = resume tracking
         """
         # Load our tracked positions
-        mongo_open = list(self._positions.find({"status": "OPEN", "bybit_order_id": {"$exists": True}}))
-        mongo_symbols = {doc["symbol"] for doc in mongo_open}
-        logger.info(f"MongoDB has {len(mongo_open)} open positions")
+        # Note: position docs use 'bb_order_id' not 'bybit_order_id'
+        mongo_open = list(self._positions.find({"status": "OPEN"}))
+        mongo_symbols = {doc["symbol"] for doc in mongo_open if doc.get("symbol")}
+        logger.info(f"MongoDB has {len(mongo_open)} open positions: {list(mongo_symbols)}")
 
         # Query Bybit for actual positions using BybitOrderAPI
         exchange_positions = {}
@@ -141,12 +144,14 @@ class CrashRecovery:
             logger.error(f"Bybit position query failed: {e}")
             report.errors.append(f"bybit_positions: {e}")
 
-        # Compare
+        # Compare and build resume list
+        self.resumed_positions = []  # caller reads this to re-register with signal engine
         for doc in mongo_open:
             sym = doc["symbol"]
             if sym in exchange_positions:
                 report.bybit_positions_resumed += 1
-                logger.info(f"Resuming tracked position: {sym}")
+                self.resumed_positions.append(doc)
+                logger.info(f"Resuming tracked position: {sym} (entry_spread={doc.get('actual_spread_bps', doc.get('entry_spread', 0)):.0f}bp)")
             else:
                 # Position in MongoDB but not on exchange — already closed
                 self._positions.update_one(
@@ -157,21 +162,42 @@ class CrashRecovery:
                 logger.warning(f"Stale position removed: {sym} (not on exchange)")
 
         # Check for exchange positions NOT in MongoDB (orphans) — CLOSE THEM
+        # and replenish Binance inventory if this was a BUY position (we sold spot on entry)
         for sym, pos_data in exchange_positions.items():
             if sym not in mongo_symbols:
                 logger.warning(f"ORPHAN detected on Bybit: {sym} — closing immediately")
                 try:
                     size = float(pos_data.get("size", 0))
-                    side = "Sell" if pos_data.get("side") == "Buy" else "Buy"
-                    await bb_api.submit_order(sym, side, size, 0, "market")
+                    bb_side = pos_data.get("side", "")
+                    close_side = "Sell" if bb_side == "Buy" else "Buy"
+                    await bb_api.submit_order(sym, close_side, size, 0, "market")
                     report.bybit_orphans_closed += 1
-                    logger.info(f"Orphan closed: {sym} {side} {size}")
+                    logger.info(f"Orphan closed: {sym} {close_side} {size}")
+
+                    # Replenish Binance inventory: if orphan was long Bybit,
+                    # we must have sold on Binance to enter. Buy it back.
+                    if bb_side == "Buy" and self._inventory:
+                        inv = self._inventory.inventories.get(sym)
+                        if inv:
+                            logger.info(
+                                f"Orphan replenish: {sym} needs buy-back of ~{size} "
+                                f"on Binance to restore inventory"
+                            )
+                            # Record that inventory was depleted by orphan close
+                            # The auto-heal reconcile will snap to actual exchange balance,
+                            # but we need to explicitly buy back on Binance
+                            self._orphan_buybacks.append({
+                                "symbol": sym,
+                                "qty": size,
+                                "side": "Buy",  # buy back what was sold
+                                "reason": "orphan_replenish",
+                            })
                 except Exception as e:
                     logger.critical(f"FAILED to close orphan {sym}: {e}")
                     report.errors.append(f"orphan_close_{sym}: {e}")
 
     async def _recover_binance(
-        self, session, api_key, symbols, report: RecoveryReport
+        self, session, api_key, api_secret, symbols, report: RecoveryReport
     ):
         """
         Reconcile Binance spot balances against inventory ledger.
@@ -182,21 +208,32 @@ class CrashRecovery:
             logger.warning("No inventory ledger — skipping Binance recovery")
             return
 
+        # Build Binance API client with proper credentials
+        bn_api = None
+        if api_key and api_secret:
+            try:
+                from app.services.arb.order_api import BinanceOrderAPI
+                bn_api = BinanceOrderAPI(api_key, api_secret, session)
+            except Exception as e:
+                logger.warning(f"Binance API client init failed: {e}")
+
         for sym in symbols:
             inv = self._inventory.inventories.get(sym)
             if not inv:
                 continue
 
             # Query actual balance via Binance REST
-            actual_qty = inv.expected_qty  # default
-            try:
-                from app.services.arb.order_api import BinanceOrderAPI
-                bn_api = BinanceOrderAPI(api_key, "", session)  # secret not needed for balance
-                # Actually we need the secret. Pass it from the caller.
-                # For now, use the inventory's reconcile which has the right signing
-                actual_qty = inv.expected_qty  # will be corrected by periodic reconcile
-            except Exception as e:
-                logger.warning(f"Binance balance query skipped: {e}")
+            actual_qty = inv.expected_qty  # default fallback
+            if bn_api:
+                try:
+                    base = sym.replace("USDT", "").replace("USDC", "")
+                    actual_qty = await bn_api.get_balance(base)
+                    logger.info(f"Binance balance for {sym}: {actual_qty}")
+                except Exception as e:
+                    logger.warning(f"Binance balance query failed for {sym}: {e}")
+                    actual_qty = inv.expected_qty  # fallback on error
+            else:
+                logger.warning(f"Binance balance query skipped for {sym}: no credentials")
 
             expected = inv.expected_qty - inv.locked_qty
 
@@ -222,7 +259,7 @@ class CrashRecovery:
                 self._inventory._save(sym)
 
     async def _cancel_stranded_orders(
-        self, session, bybit_key, bybit_secret, binance_key, symbols, report: RecoveryReport
+        self, session, bybit_key, bybit_secret, binance_key, binance_secret, symbols, report: RecoveryReport
     ):
         """Cancel any open orders on both exchanges."""
         from app.services.arb.order_api import BybitOrderAPI, BinanceOrderAPI
@@ -245,7 +282,7 @@ class CrashRecovery:
         # Binance: cancel all open spot orders
         if binance_key:
             try:
-                bn_api = BinanceOrderAPI(binance_key, "", session)  # need secret too
+                bn_api = BinanceOrderAPI(binance_key, binance_secret, session)
                 for sym in symbols:
                     # Map to Binance symbol if needed
                     orders = await bn_api.get_open_orders(sym)

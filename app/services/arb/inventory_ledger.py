@@ -36,6 +36,11 @@ class PairInventory:
     last_reconciled: float = 0.0
     last_exchange_qty: float = 0.0
     discrepancy: float = 0.0     # expected - actual (positive = we're short)
+    # USD cost tracking
+    cost_basis_usd: float = 0.0  # total USD spent to acquire current inventory
+    avg_cost_per_unit: float = 0.0  # cost_basis / qty
+    realized_pnl_usd: float = 0.0  # cumulative PnL from round-trips (spread capture - fees)
+    unrealized_pnl_usd: float = 0.0  # mark-to-market vs cost basis
 
     @property
     def available_qty(self) -> float:
@@ -100,6 +105,10 @@ class InventoryLedger:
                     last_reconciled=doc.get("last_reconciled", 0),
                     last_exchange_qty=doc.get("last_exchange_qty", 0),
                     discrepancy=doc.get("discrepancy", 0),
+                    cost_basis_usd=doc.get("cost_basis_usd", 0),
+                    avg_cost_per_unit=doc.get("avg_cost_per_unit", 0),
+                    realized_pnl_usd=doc.get("realized_pnl_usd", 0),
+                    unrealized_pnl_usd=doc.get("unrealized_pnl_usd", 0),
                 )
             else:
                 # New pair — target will be set when inventory is pre-bought
@@ -125,6 +134,10 @@ class InventoryLedger:
                 "last_reconciled": inv.last_reconciled,
                 "last_exchange_qty": inv.last_exchange_qty,
                 "discrepancy": inv.discrepancy,
+                "cost_basis_usd": inv.cost_basis_usd,
+                "avg_cost_per_unit": inv.avg_cost_per_unit,
+                "realized_pnl_usd": inv.realized_pnl_usd,
+                "unrealized_pnl_usd": inv.unrealized_pnl_usd,
                 "updated_at": time.time(),
             }},
             upsert=True,
@@ -164,10 +177,12 @@ class InventoryLedger:
             self._save(symbol)
             logger.debug(f"Released {qty} {inv.base_asset} (total locked: {inv.locked_qty})")
 
-    def sold(self, symbol: str, qty: float, fee_qty: float = 0, fee_in_base: bool = False):
+    def sold(self, symbol: str, qty: float, fee_qty: float = 0, fee_in_base: bool = False,
+             fill_price: float = 0.0):
         """
-        Record a completed sell.
+        Record a completed sell (entry leg on Binance spot).
         If fee_in_base=True, the fee was deducted from the token balance (not USDT).
+        fill_price: actual fill price for USD cost tracking.
         """
         inv = self.inventories.get(symbol)
         if inv:
@@ -176,18 +191,29 @@ class InventoryLedger:
                 inv.expected_qty -= fee_qty  # fee ate into our balance
             inv.locked_qty = max(0, inv.locked_qty - qty)
             inv.dust_qty += fee_qty
+            # USD tracking: reduce cost basis proportionally
+            if inv.expected_qty > 0 and inv.cost_basis_usd > 0:
+                sold_fraction = qty / (inv.expected_qty + qty)
+                inv.cost_basis_usd *= (1 - sold_fraction)
             self._save(symbol)
-            logger.info(f"SOLD {qty} {inv.base_asset} (fee={fee_qty} base={fee_in_base}) (expected: {inv.expected_qty})")
+            logger.info(f"SOLD {qty} {inv.base_asset} @{fill_price:.6f} (fee={fee_qty} base={fee_in_base}) (expected: {inv.expected_qty:.2f})")
 
-    def bought(self, symbol: str, qty: float, fee_qty: float = 0):
+    def bought(self, symbol: str, qty: float, fee_qty: float = 0, fill_price: float = 0.0):
         """
-        Record a completed buy (exit restoring inventory).
+        Record a completed buy (exit restoring inventory, or initial purchase).
+        fill_price: actual fill price for USD cost tracking.
         """
         inv = self.inventories.get(symbol)
         if inv:
-            inv.expected_qty += qty - fee_qty  # fee may be deducted from received qty
+            net_qty = qty - fee_qty  # fee may be deducted from received qty
+            inv.expected_qty += net_qty
+            # USD tracking: add cost of this purchase
+            if fill_price > 0:
+                inv.cost_basis_usd += net_qty * fill_price
+                if inv.expected_qty > 0:
+                    inv.avg_cost_per_unit = inv.cost_basis_usd / inv.expected_qty
             self._save(symbol)
-            logger.info(f"BOUGHT {qty} {inv.base_asset} (expected: {inv.expected_qty})")
+            logger.info(f"BOUGHT {qty} {inv.base_asset} @{fill_price:.6f} (expected: {inv.expected_qty:.2f}, cost_basis: ${inv.cost_basis_usd:.2f})")
 
     async def reconcile(
         self, symbol: str, session: aiohttp.ClientSession, api_key: str,
@@ -243,6 +269,14 @@ class InventoryLedger:
             inv.last_reconciled = time.time()
             inv.last_exchange_qty = actual_qty
             inv.discrepancy = disc
+
+            # Mark-to-market: compute unrealized PnL vs cost basis
+            # We need a current price — use the spread midpoint if available
+            if inv.cost_basis_usd > 0 and actual_qty > 0 and inv.avg_cost_per_unit > 0:
+                # Approximate current value from last exchange qty * avg cost
+                # (real mark-to-market needs a live price feed — this is just cost-basis tracking)
+                inv.unrealized_pnl_usd = 0  # Will be computed with live prices in reporting
+
             self._save(symbol)
 
             if abs(disc) > 0.001:
@@ -258,21 +292,46 @@ class InventoryLedger:
             return None
 
     async def periodic_reconcile(
-        self, session: aiohttp.ClientSession, api_key: str, api_secret: str = ""
+        self, session: aiohttp.ClientSession, api_key: str, api_secret: str = "",
+        open_positions: set[str] | None = None,
     ):
         """
         Reconcile all pairs. Run every 5 minutes.
+
+        Key behavior: if a pair has NO open position, snap expected_qty to
+        the actual exchange balance. The exchange IS the source of truth.
+        This handles fee erosion, rounding dust, and failed unwind residuals
+        automatically.
         """
+        if open_positions is None:
+            open_positions = set()
+
         for sym in self.inventories:
             disc = await self.reconcile(sym, session, api_key, api_secret)
-            if disc is not None and abs(disc) > 0:
-                inv = self.inventories[sym]
-                pct = abs(disc) / max(inv.target_qty, 1e-10)
+            if disc is None:
+                continue
+
+            inv = self.inventories[sym]
+
+            # AUTO-HEAL: If no position is open for this pair, snap to exchange balance.
+            # This is the core fix: the ledger tracks the exchange, not the other way around.
+            if sym not in open_positions and inv.locked_qty == 0 and abs(disc) > 0.001:
+                old_expected = inv.expected_qty
+                inv.expected_qty = inv.last_exchange_qty
+                inv.discrepancy = 0
+                self._save(sym)
+                if abs(old_expected - inv.expected_qty) > 0.01:
+                    logger.info(
+                        f"Inventory auto-healed {sym}: {old_expected:.4f} -> "
+                        f"{inv.expected_qty:.4f} (exchange={inv.last_exchange_qty:.4f})"
+                    )
+            elif abs(disc) > 0:
+                pct = abs(disc) / max(inv.expected_qty, 1e-10)
                 if pct > self.DISCREPANCY_ALERT_PCT:
                     logger.warning(
-                        f"Inventory discrepancy {sym}: "
-                        f"expected={inv.expected_qty} actual={inv.last_exchange_qty} "
-                        f"disc={disc} ({pct*100:.1f}%)"
+                        f"Inventory discrepancy {sym} (position open): "
+                        f"expected={inv.expected_qty:.4f} actual={inv.last_exchange_qty:.4f} "
+                        f"disc={disc:.4f} ({pct*100:.1f}%)"
                     )
 
     def release_stale_locks(self, active_order_ids: set[str]):
@@ -288,6 +347,34 @@ class InventoryLedger:
                 inv.locked_qty = 0
                 self._save(sym)
 
+    def record_round_trip_pnl(self, symbol: str, pnl_usd: float):
+        """Record realized PnL from a completed arb round-trip."""
+        inv = self.inventories.get(symbol)
+        if inv:
+            inv.realized_pnl_usd += pnl_usd
+            self._save(symbol)
+            logger.info(f"Round-trip PnL {inv.base_asset}: ${pnl_usd:.4f} (cumulative: ${inv.realized_pnl_usd:.4f})")
+
+    def mark_to_market(self, symbol: str, current_price: float):
+        """Update unrealized PnL based on current market price."""
+        inv = self.inventories.get(symbol)
+        if inv and inv.cost_basis_usd > 0 and inv.expected_qty > 0:
+            current_value = inv.expected_qty * current_price
+            inv.unrealized_pnl_usd = current_value - inv.cost_basis_usd
+            self._save(symbol)
+
+    def total_pnl_summary(self) -> dict:
+        """Return total realized + unrealized PnL across all pairs."""
+        total_realized = sum(inv.realized_pnl_usd for inv in self.inventories.values())
+        total_unrealized = sum(inv.unrealized_pnl_usd for inv in self.inventories.values())
+        total_cost_basis = sum(inv.cost_basis_usd for inv in self.inventories.values())
+        return {
+            "realized_pnl_usd": round(total_realized, 4),
+            "unrealized_pnl_usd": round(total_unrealized, 4),
+            "total_pnl_usd": round(total_realized + total_unrealized, 4),
+            "total_cost_basis_usd": round(total_cost_basis, 2),
+        }
+
     def status(self) -> dict:
         """Return status of all inventories for monitoring."""
         return {
@@ -299,6 +386,10 @@ class InventoryLedger:
                 "available": inv.available_qty,
                 "healthy": inv.is_healthy,
                 "discrepancy": inv.discrepancy,
+                "cost_basis_usd": round(inv.cost_basis_usd, 2),
+                "avg_cost": round(inv.avg_cost_per_unit, 6),
+                "realized_pnl": round(inv.realized_pnl_usd, 4),
+                "unrealized_pnl": round(inv.unrealized_pnl_usd, 4),
             }
             for sym, inv in self.inventories.items()
         }
