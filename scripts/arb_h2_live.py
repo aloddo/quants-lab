@@ -63,7 +63,22 @@ logger = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────
 
-PAIRS = ["HIGHUSDT", "NOMUSDT"]  # Phase 1 test pairs
+# ── Pair configuration ───────────────────────────────────────
+# Mode: "usdc" uses Binance USDC pairs (MiCA-compliant for EU/NL)
+#        "usdt" uses Binance USDT pairs (original H2, blocked for EU)
+TRADING_MODE = "usdc"
+
+# USDC mode: Binance USDC symbol -> Bybit USDT perp symbol
+USDC_PAIR_MAP = {
+    "NOMUSDT":  ("NOMUSDC",  "NOMUSDT"),   # internal key -> (bn_symbol, bb_symbol)
+    "ACTUSDT":  ("ACTUSDC",  "ACTUSDT"),
+    "DYMUSDT":  ("DYMUSDC",  "DYMUSDT"),
+}
+
+# USDT mode (original, for non-EU accounts)
+USDT_PAIRS = ["HIGHUSDT", "NOMUSDT"]
+
+PAIRS = list(USDC_PAIR_MAP.keys()) if TRADING_MODE == "usdc" else USDT_PAIRS
 POSITION_USD = 20.0               # $20 per side for micro-test
 MAX_CONCURRENT = 2
 POLL_INTERVAL = 0.5                # check signals every 500ms (WS feeds are real-time)
@@ -117,18 +132,24 @@ class OrderSubmitter:
     async def submit(
         self, venue: str, symbol: str, side: str, qty: float, price: float, order_type: str
     ) -> str:
-        """Submit an order. Returns order_id."""
+        """Submit an order. Returns order_id. Maps symbols for USDC mode."""
         self._order_counter += 1
 
+        # Map symbol for Binance in USDC mode
+        bn_symbol = symbol
+        if venue == "binance" and TRADING_MODE == "usdc" and symbol in USDC_PAIR_MAP:
+            bn_symbol = USDC_PAIR_MAP[symbol][0]  # e.g., "NOMUSDC"
+
         if self._shadow:
+            actual_sym = bn_symbol if venue == "binance" else symbol
             oid = f"shadow_{venue}_{self._order_counter}"
-            logger.info(f"[SHADOW] Would submit: {venue} {symbol} {side} {qty:.6f} @ {price:.6f} ({order_type}) -> {oid}")
+            logger.info(f"[SHADOW] Would submit: {venue} {actual_sym} {side} {qty:.6f} @ {price:.6f} ({order_type}) -> {oid}")
             return oid
 
         if venue == "bybit":
             return await self.bybit_api.submit_order(symbol, side, qty, price, order_type)
         elif venue == "binance":
-            return await self.binance_api.submit_order(symbol, side, qty, price, order_type)
+            return await self.binance_api.submit_order(bn_symbol, side, qty, price, order_type)
         else:
             raise ValueError(f"Unknown venue: {venue}")
 
@@ -154,8 +175,11 @@ class H2LiveTrader:
         self.shadow = shadow
         self.running = True
 
-        # Components
-        self.price_feed = PriceFeed(PAIRS)
+        # Components — build symbol map for USDC mode
+        bn_symbol_map = None
+        if TRADING_MODE == "usdc":
+            bn_symbol_map = {k: v[0] for k, v in USDC_PAIR_MAP.items()}  # {"NOMUSDT": "NOMUSDC", ...}
+        self.price_feed = PriceFeed(PAIRS, bn_symbol_map=bn_symbol_map)
         self.signal_engine = SignalEngine(PAIRS, MONGO_URI)
         self.inventory = InventoryLedger(MONGO_URI)
         self.risk_manager = RiskManager()

@@ -287,10 +287,25 @@ class PriceFeed:
     with freshness checking.
     """
 
-    def __init__(self, symbols: list[str]):
+    def __init__(self, symbols: list[str], bn_symbol_map: dict[str, str] | None = None):
+        """
+        Args:
+            symbols: internal symbol keys (e.g., ["NOMUSDT", "ACTUSDT"])
+            bn_symbol_map: optional mapping from internal key to Binance symbol.
+                          e.g., {"NOMUSDT": "NOMUSDC", "ACTUSDT": "ACTUSDC"}
+                          If None, assumes Binance uses same symbol as internal key.
+        """
         self.symbols = symbols
+        self._bn_map = bn_symbol_map or {}  # internal -> Binance WS symbol
+        self._bn_reverse = {v: k for k, v in self._bn_map.items()}  # Binance -> internal
+
+        # Bybit always uses USDT symbols (the internal keys)
         self.bybit = BybitPriceFeed(symbols)
-        self.binance = BinancePriceFeed(symbols)
+
+        # Binance may use different symbols (e.g., USDC)
+        bn_symbols = [self._bn_map.get(s, s) for s in symbols]
+        self.binance = BinancePriceFeed(bn_symbols)
+
         self.guard = FreshnessGuard()
         self._tasks: list[asyncio.Task] = []
 
@@ -318,7 +333,9 @@ class PriceFeed:
         - BUY_BN_SELL_BB: buy Binance ask, sell Bybit bid
         """
         bb = self.bybit.prices.get(symbol)
-        bn = self.binance.prices.get(symbol)
+        # Look up Binance price using mapped symbol (e.g., NOMUSDC for NOMUSDT)
+        bn_symbol = self._bn_map.get(symbol, symbol)
+        bn = self.binance.prices.get(bn_symbol)
 
         if not bb or not bn:
             return None
@@ -368,7 +385,8 @@ class PriceFeed:
         result = {}
         for sym in self.symbols:
             bb = self.bybit.prices[sym]
-            bn = self.binance.prices[sym]
+            bn_sym = self._bn_map.get(sym, sym)
+            bn = self.binance.prices.get(bn_sym, VenuePrice(symbol=bn_sym))
             now = time.monotonic()
             result[sym] = {
                 "bb_bid": bb.best_bid,
