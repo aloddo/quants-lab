@@ -120,12 +120,13 @@ class OrderSubmitter:
     In shadow mode, returns fake order IDs without hitting exchanges.
     """
 
-    def __init__(self, session: aiohttp.ClientSession, shadow: bool = False):
+    def __init__(self, session: aiohttp.ClientSession, shadow: bool = False, on_shadow_fill=None):
         self._session = session
         self._shadow = shadow
         self._order_counter = 0
+        self._on_shadow_fill = on_shadow_fill  # callback for simulated fills in shadow mode
 
-        # Real API clients
+        # Real API clients (only used in live mode)
         self.bybit_api = BybitOrderAPI(BYBIT_KEY, BYBIT_SECRET, session)
         self.binance_api = BinanceOrderAPI(BINANCE_KEY, BINANCE_SECRET, session)
 
@@ -143,7 +144,40 @@ class OrderSubmitter:
         if self._shadow:
             actual_sym = bn_symbol if venue == "binance" else symbol
             oid = f"shadow_{venue}_{self._order_counter}"
-            logger.info(f"[SHADOW] Would submit: {venue} {actual_sym} {side} {qty:.6f} @ {price:.6f} ({order_type}) -> {oid}")
+            logger.info(f"[SHADOW] Simulated: {venue} {actual_sym} {side} {qty:.6f} @ {price:.6f} ({order_type}) -> {oid}")
+
+            # Simulate realistic fill with small random slippage (1-5bp)
+            import random
+            slippage_bps = random.uniform(1, 5)
+            slippage_mult = 1 + (slippage_bps / 10000) if side in ("Buy", "BUY") else 1 - (slippage_bps / 10000)
+            sim_price = price * slippage_mult if price > 0 else 0
+
+            # Simulate execution latency (50-200ms)
+            latency_ms = random.uniform(50, 200)
+            await asyncio.sleep(latency_ms / 1000)
+
+            # Emit simulated fill event through the coordinator
+            if self._on_shadow_fill:
+                from app.services.arb.order_feed import FillEvent, FillSource
+                fill = FillEvent(
+                    venue=venue,
+                    symbol=symbol,
+                    order_id=oid,
+                    exec_id=f"sim_{oid}",
+                    side=side,
+                    price=sim_price if sim_price > 0 else price,
+                    qty=qty,
+                    fee=qty * sim_price * 0.00055 if venue == "bybit" else qty * sim_price * 0.001,
+                    fee_asset="USDT" if venue == "bybit" else "USDC",
+                    timestamp_ms=int(time.time() * 1000),
+                    local_ts=time.time(),
+                    source=FillSource.WS,
+                    is_maker=False,
+                    order_status="Filled",
+                    leaves_qty=0,
+                )
+                self._on_shadow_fill(fill)
+
             return oid
 
         if venue == "bybit":
@@ -212,8 +246,21 @@ class H2LiveTrader:
         self.inventory.load(PAIRS)
 
         async with aiohttp.ClientSession() as session:
+            # Setup leg coordinator first (needed for shadow fill callback)
+            self._coordinator = LegCoordinator(
+                submit_order_fn=lambda *a, **kw: None,  # placeholder, replaced below
+                cancel_order_fn=lambda *a, **kw: None,
+            )
+
+            # Shadow fill callback — routes simulated fills to the coordinator
+            def shadow_fill_cb(fill):
+                self._coordinator.on_fill(fill)
+
             # Setup order submission
-            submitter = OrderSubmitter(session, shadow=self.shadow)
+            submitter = OrderSubmitter(
+                session, shadow=self.shadow,
+                on_shadow_fill=shadow_fill_cb if self.shadow else None,
+            )
 
             # Setup order feed with callbacks
             def on_fill(fill: FillEvent):
@@ -239,11 +286,9 @@ class H2LiveTrader:
                 on_disconnect=on_disconnect,
             )
 
-            # Setup leg coordinator
-            self._coordinator = LegCoordinator(
-                submit_order_fn=submitter.submit,
-                cancel_order_fn=submitter.cancel,
-            )
+            # Wire real submit/cancel functions into coordinator
+            self._coordinator._submit = submitter.submit
+            self._coordinator._cancel = submitter.cancel
 
             # Crash recovery
             if not self.shadow:
