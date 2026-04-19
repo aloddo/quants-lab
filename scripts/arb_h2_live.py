@@ -408,6 +408,10 @@ class H2LiveTrader:
                                         fresh_snap = self.price_feed.get_spread(sym)
                                         if fresh_snap and self.signal_engine.verify_spread_at_execution(fresh_snap, entry_signal):
                                             await self._handle_entry(entry_signal, fresh_snap, session, submitter)
+                                        elif fresh_snap:
+                                            logger.info(f"Entry rejected at verify: {sym} spread dropped to {fresh_snap.spread_bps:.1f}bp")
+                                        else:
+                                            logger.info(f"Entry rejected: {sym} fresh_snap=None (stale at verify time)")
 
                     # Status logging every 5 min
                     if self._poll_count % 600 == 0:
