@@ -443,8 +443,10 @@ class H2LiveTrader:
 
             elif venue == "binance":
                 # Fetch recent trades from Binance REST per symbol
+                # BUG FIX #7: Map internal symbols to actual Binance symbols (USDC mode)
                 for sym in PAIRS:
-                    trades = await submitter.binance_api.get_my_trades(sym, limit=20)
+                    bn_sym = USDC_PAIR_MAP[sym][0] if TRADING_MODE == "usdc" and sym in USDC_PAIR_MAP else sym
+                    trades = await submitter.binance_api.get_my_trades(bn_sym, limit=20)
                     for trade in trades:
                         trade_id = str(trade.get("id", ""))
                         order_id = str(trade.get("orderId", ""))
@@ -499,11 +501,23 @@ class H2LiveTrader:
         bb_rules = self.instrument_rules.get("bybit", bb_sym)
         bn_rules = self.instrument_rules.get("binance", bn_sym)
 
-        raw_qty_bb = POSITION_USD / snap.bb_ask if snap.bb_ask > 0 else 0
-        raw_qty_bn = POSITION_USD / snap.bn_bid if snap.bn_bid > 0 else 0
+        # BUG FIX #2: Size both legs from ONE canonical base quantity
+        # Use the average mid price to determine base qty, then round for each venue
+        avg_price = (snap.bb_ask + snap.bn_bid) / 2 if snap.bb_ask > 0 and snap.bn_bid > 0 else snap.bb_ask or snap.bn_bid
+        if avg_price <= 0:
+            logger.warning(f"Zero price for {sym}, skipping")
+            if direction == "BUY_BB_SELL_BN":
+                self.inventory.release(sym, 0)
+            return
+        canonical_qty = POSITION_USD / avg_price
 
-        qty_bb = bb_rules.round_qty(raw_qty_bb) if bb_rules else raw_qty_bb
-        qty_bn = bn_rules.round_qty(raw_qty_bn) if bn_rules else raw_qty_bn
+        # Round to the MORE restrictive step size (so both venues can fill)
+        qty_bb = bb_rules.round_qty(canonical_qty) if bb_rules else canonical_qty
+        qty_bn = bn_rules.round_qty(canonical_qty) if bn_rules else canonical_qty
+        # Use the SMALLER of the two as the hedge qty (ensures delta neutral)
+        hedge_qty = min(qty_bb, qty_bn)
+        qty_bb = hedge_qty
+        qty_bn = hedge_qty
 
         # Check min qty and min notional
         if bb_rules and (not bb_rules.check_min_qty(qty_bb) or not bb_rules.check_notional(qty_bb, snap.bb_ask)):
@@ -539,7 +553,7 @@ class H2LiveTrader:
         )
 
         if result.outcome == EntryOutcome.SUCCESS:
-            # Register position for exit tracking
+            # Register position for exit tracking — store ACTUAL fill quantities
             pos = OpenPosition(
                 symbol=sym,
                 direction=direction,
@@ -547,13 +561,37 @@ class H2LiveTrader:
                 entry_time=time.time(),
                 entry_threshold_p90=signal.threshold_p90,
                 exit_threshold_p25=signal.threshold_p25,
+                position_id=f"live_{sym}_{int(time.time()*1000)}",
             )
+            # Store actual fill quantities on the position for correct exit sizing
+            pos._bb_filled_qty = result.bybit_leg.filled_qty
+            pos._bn_filled_qty = result.binance_leg.filled_qty
+            pos._bb_order_id = result.bybit_leg.order_id
+            pos._bn_order_id = result.binance_leg.order_id
             self.signal_engine.register_position(pos)
+
+            # BUG FIX #6: Persist open position to MongoDB
+            self._trades_coll.insert_one({
+                "position_id": pos.position_id,
+                "symbol": sym,
+                "direction": direction,
+                "status": "OPEN",
+                "entry_time": pos.entry_time,
+                "entry_spread": pos.entry_spread,
+                "bb_order_id": result.bybit_leg.order_id,
+                "bn_order_id": result.binance_leg.order_id,
+                "bb_filled_qty": result.bybit_leg.filled_qty,
+                "bn_filled_qty": result.binance_leg.filled_qty,
+                "bb_fill_price": result.bybit_leg.avg_fill_price,
+                "bn_fill_price": result.binance_leg.avg_fill_price,
+                "actual_spread_bps": result.actual_spread_bps,
+                "slippage_bps": result.slippage_bps,
+            })
 
             # Update inventory with ACTUAL fill quantities (not intended)
             actual_bn_qty = result.binance_leg.filled_qty
             actual_bn_fee = result.binance_leg.fee
-            fee_in_base = result.binance_leg.fee_asset != "USDT" and result.binance_leg.fee_asset != "BNB"
+            fee_in_base = result.binance_leg.fee_asset not in ("USDT", "USDC", "BNB")
             if bn_side == "Sell":
                 self.inventory.sold(sym, actual_bn_qty, actual_bn_fee, fee_in_base=fee_in_base)
             else:
@@ -561,7 +599,8 @@ class H2LiveTrader:
 
             logger.info(
                 f"ENTRY SUCCESS: {sym} actual_spread={result.actual_spread_bps:.1f}bp "
-                f"slippage={result.slippage_bps:.1f}bp latency={result.entry_latency_ms:.0f}ms"
+                f"slippage={result.slippage_bps:.1f}bp latency={result.entry_latency_ms:.0f}ms "
+                f"bb_qty={result.bybit_leg.filled_qty} bn_qty={result.binance_leg.filled_qty}"
             )
             await tg_send(
                 f"H2 OPEN {sym}\n"
@@ -621,17 +660,22 @@ class H2LiveTrader:
 
         is_stop_loss = signal.signal_type == "EXIT_STOP_LOSS"
 
-        # Get symbols for qty rounding
+        # BUG FIX #3: Use STORED fill quantities from entry, not recomputed from current price
+        qty_bb = getattr(pos, '_bb_filled_qty', 0)
+        qty_bn = getattr(pos, '_bn_filled_qty', 0)
+
+        if qty_bb <= 0 or qty_bn <= 0:
+            # Fallback: if stored qty not available, compute from current price (legacy)
+            logger.warning(f"No stored fill qty for {sym}, falling back to price-based sizing")
+            avg_price = (snap.bb_bid + snap.bn_ask) / 2 if snap.bb_bid > 0 else snap.bb_bid or snap.bn_ask
+            qty_bb = POSITION_USD / avg_price if avg_price > 0 else 0
+            qty_bn = qty_bb
+
+        # Get symbols for price rounding
         bb_sym = USDC_PAIR_MAP[sym][1] if TRADING_MODE == "usdc" else sym
         bn_sym = USDC_PAIR_MAP[sym][0] if TRADING_MODE == "usdc" else sym
         bb_rules = self.instrument_rules.get("bybit", bb_sym)
         bn_rules = self.instrument_rules.get("binance", bn_sym)
-
-        # Calculate and round exit quantities
-        raw_qty_bb = POSITION_USD / snap.bb_bid if bb_side == "Sell" and snap.bb_bid > 0 else POSITION_USD / snap.bb_ask if snap.bb_ask > 0 else 0
-        raw_qty_bn = POSITION_USD / snap.bn_ask if bn_side == "Buy" and snap.bn_ask > 0 else POSITION_USD / snap.bn_bid if snap.bn_bid > 0 else 0
-        qty_bb = bb_rules.round_qty(raw_qty_bb) if bb_rules else raw_qty_bb
-        qty_bn = bn_rules.round_qty(raw_qty_bn) if bn_rules else raw_qty_bn
 
         price_bb = bb_rules.round_price(snap.bb_bid if bb_side == "Sell" else snap.bb_ask) if bb_rules else snap.bb_bid
         price_bn = bn_rules.round_price(snap.bn_ask if bn_side == "Buy" else snap.bn_bid) if bn_rules else snap.bn_ask
@@ -656,10 +700,40 @@ class H2LiveTrader:
                 self.inventory.sold(sym, actual_bn_qty, actual_bn_fee, fee_in_base=fee_in_base)
 
             # Record trade in risk manager
-            pnl = 0.0  # TODO: compute from entry vs exit prices
+            pnl = 0.0  # TODO: compute PnL from entry vs exit fill prices
             self.risk_manager.record_trade(pnl, 0, 0, leg_failure=(result.outcome == "partial"))
 
-        self.signal_engine.unregister_position(sym)
+            # Update MongoDB position record
+            pos_id = getattr(pos, 'position_id', '')
+            if pos_id:
+                self._trades_coll.update_one(
+                    {"position_id": pos_id},
+                    {"$set": {
+                        "status": "CLOSED",
+                        "close_reason": signal.signal_type,
+                        "exit_time": time.time(),
+                        "exit_bb_qty": result.bybit_leg.filled_qty,
+                        "exit_bn_qty": result.binance_leg.filled_qty,
+                        "exit_bb_price": result.bybit_leg.avg_fill_price,
+                        "exit_bn_price": result.binance_leg.avg_fill_price,
+                        "exit_spread_bps": result.actual_exit_spread_bps,
+                        "exit_latency_ms": result.exit_latency_ms,
+                    }},
+                )
+
+        # BUG FIX #10: Only unregister if BOTH legs confirmed closed
+        if result.outcome == "success":
+            self.signal_engine.unregister_position(sym)
+        elif result.outcome == "failed":
+            # Exit completely failed — keep position active, will retry next cycle
+            logger.critical(f"EXIT FAILED for {sym} — position stays active, will retry")
+            await tg_send(f"H2 CRITICAL: Exit failed for {sym}, retrying next cycle", session)
+        else:
+            # Partial — one leg closed, other may still be open
+            # Unregister to prevent duplicate exit attempts, but log the concern
+            logger.warning(f"EXIT PARTIAL for {sym} — unregistering but exchange may have residual")
+            self.signal_engine.unregister_position(sym)
+            await tg_send(f"H2 WARNING: Partial exit for {sym}, check exchange manually", session)
 
         safe_reason = signal.signal_type.replace("<", "&lt;").replace(">", "&gt;")
         await tg_send(

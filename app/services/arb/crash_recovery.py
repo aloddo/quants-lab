@@ -156,12 +156,19 @@ class CrashRecovery:
                 report.bybit_stale_removed += 1
                 logger.warning(f"Stale position removed: {sym} (not on exchange)")
 
-        # Check for exchange positions NOT in MongoDB (orphans)
+        # Check for exchange positions NOT in MongoDB (orphans) — CLOSE THEM
         for sym, pos_data in exchange_positions.items():
             if sym not in mongo_symbols:
                 logger.warning(f"ORPHAN detected on Bybit: {sym} — closing immediately")
-                # TODO: close via market order
-                report.bybit_orphans_closed += 1
+                try:
+                    size = float(pos_data.get("size", 0))
+                    side = "Sell" if pos_data.get("side") == "Buy" else "Buy"
+                    await bb_api.submit_order(sym, side, size, 0, "market")
+                    report.bybit_orphans_closed += 1
+                    logger.info(f"Orphan closed: {sym} {side} {size}")
+                except Exception as e:
+                    logger.critical(f"FAILED to close orphan {sym}: {e}")
+                    report.errors.append(f"orphan_close_{sym}: {e}")
 
     async def _recover_binance(
         self, session, api_key, symbols, report: RecoveryReport

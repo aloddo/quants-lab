@@ -601,13 +601,14 @@ class LegCoordinator:
             except asyncio.TimeoutError:
                 logger.warning(f"Exit timeout after {timeout}s — checking fill status")
 
-        # For any unfilled exit legs, escalate to market
+        # BUG FIX #9: Escalate ANY unfilled or partially filled exit legs to market
         for leg, oid in [(bb_leg, bb_oid), (bn_leg, bn_oid)]:
-            if oid and not leg.is_filled and not leg.has_any_fill:
-                logger.warning(f"Exit leg {leg.venue} unfilled — escalating to market")
+            remaining = leg.target_qty - leg.filled_qty if leg.target_qty > 0 else 0
+            if oid and remaining > 0:
+                logger.warning(f"Exit leg {leg.venue} has {remaining:.4f} unfilled — escalating to market")
                 await self._safe_cancel(leg.venue, symbol, oid)
                 try:
-                    market_oid = await self._submit(leg.venue, symbol, leg.side, leg.target_qty, 0, "market")
+                    market_oid = await self._submit(leg.venue, symbol, leg.side, remaining, 0, "market")
                     mkt_leg = LegState(venue=leg.venue, symbol=symbol, side=leg.side,
                                        order_id=market_oid, target_qty=leg.target_qty,
                                        state=OrderState.SUBMITTED, submitted_at=time.time())
