@@ -190,45 +190,81 @@ class InventoryLedger:
             logger.info(f"BOUGHT {qty} {inv.base_asset} (expected: {inv.expected_qty})")
 
     async def reconcile(
-        self, symbol: str, session: aiohttp.ClientSession, api_key: str
+        self, symbol: str, session: aiohttp.ClientSession, api_key: str,
+        api_secret: str = "",
     ) -> Optional[float]:
         """
-        Query actual Binance balance and compare to expected.
-        Returns discrepancy (positive = we're short).
+        Query actual Binance balance via signed REST and compare to expected.
+        Returns discrepancy (positive = we're short, negative = surplus).
         """
         inv = self.inventories.get(symbol)
         if not inv:
             return None
 
-        try:
-            # Binance account info requires signature — simplified here
-            # In production, use proper HMAC signing
-            headers = {"X-MBX-APIKEY": api_key}
-            # Note: /api/v3/account requires signature. For now, log the intent.
-            # The actual implementation will use the signed request helper.
-            logger.debug(f"Reconciling {symbol} ({inv.base_asset})...")
-
-            # Placeholder — actual balance query goes here
-            # actual_qty = <query Binance /api/v3/account, find base_asset balance>
-
-            # For now, trust expected_qty (real reconciliation added when Binance keys are configured)
+        if not api_key or not api_secret:
+            logger.debug(f"Reconcile {symbol}: no Binance credentials, skipping")
             inv.last_reconciled = time.time()
-            inv.discrepancy = 0  # will be actual - expected once we have real balances
             self._save(symbol)
             return 0.0
+
+        try:
+            import hashlib, hmac, time as _time
+            from urllib.parse import urlencode
+
+            ts = str(int(_time.time() * 1000))
+            params = {"timestamp": ts, "recvWindow": "5000"}
+            qs = urlencode(params)
+            sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+            params["signature"] = sig
+
+            headers = {"X-MBX-APIKEY": api_key}
+            async with session.get(
+                "https://api.binance.com/api/v3/account",
+                headers=headers,
+                params=params,
+            ) as resp:
+                data = await resp.json()
+
+            if "balances" not in data:
+                logger.error(f"Binance account query failed: {data.get('msg', data)}")
+                return None
+
+            # Find our base asset balance
+            actual_qty = 0.0
+            for bal in data["balances"]:
+                if bal["asset"] == inv.base_asset:
+                    actual_qty = float(bal["free"]) + float(bal["locked"])
+                    break
+
+            # Compare to expected
+            expected = inv.expected_qty
+            disc = expected - actual_qty  # positive = we're short
+
+            inv.last_reconciled = time.time()
+            inv.last_exchange_qty = actual_qty
+            inv.discrepancy = disc
+            self._save(symbol)
+
+            if abs(disc) > 0.001:
+                logger.info(
+                    f"Reconcile {symbol}: expected={expected:.6f} actual={actual_qty:.6f} "
+                    f"disc={disc:.6f} ({abs(disc)/max(inv.target_qty, 1e-10)*100:.1f}%)"
+                )
+
+            return disc
 
         except Exception as e:
             logger.error(f"Reconciliation failed for {symbol}: {e}")
             return None
 
     async def periodic_reconcile(
-        self, session: aiohttp.ClientSession, api_key: str
+        self, session: aiohttp.ClientSession, api_key: str, api_secret: str = ""
     ):
         """
         Reconcile all pairs. Run every 5 minutes.
         """
         for sym in self.inventories:
-            disc = await self.reconcile(sym, session, api_key)
+            disc = await self.reconcile(sym, session, api_key, api_secret)
             if disc is not None and abs(disc) > 0:
                 inv = self.inventories[sym]
                 pct = abs(disc) / max(inv.target_qty, 1e-10)

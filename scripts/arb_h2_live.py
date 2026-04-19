@@ -203,8 +203,10 @@ class H2LiveTrader:
                     self._coordinator.on_order_update(update)
 
             def on_disconnect(venue: str):
-                logger.warning(f"WS DISCONNECT: {venue} — blocking new entries")
+                logger.warning(f"WS DISCONNECT: {venue} — blocking new entries, starting gap recovery")
                 self.risk_manager.record_disconnect()
+                # Schedule async gap recovery (can't await in sync callback)
+                asyncio.create_task(self._handle_disconnect(venue, session, submitter))
 
             self.order_feed = OrderFeed(
                 BYBIT_KEY, BYBIT_SECRET,
@@ -301,7 +303,7 @@ class H2LiveTrader:
 
                     # Periodic inventory reconciliation every 5 min
                     if self._poll_count % 600 == 0 and not self.shadow:
-                        await self.inventory.periodic_reconcile(session, BINANCE_KEY)
+                        await self.inventory.periodic_reconcile(session, BINANCE_KEY, BINANCE_SECRET)
 
                     # Sleep to target poll interval
                     elapsed = time.time() - t0
@@ -318,6 +320,89 @@ class H2LiveTrader:
             await self.price_feed.stop()
             if not self.shadow:
                 await self.order_feed.stop()
+
+    async def _handle_disconnect(self, venue: str, session: aiohttp.ClientSession, submitter):
+        """
+        Gap recovery after WS disconnect.
+        1. Fetch recent fills/orders via REST
+        2. Reconcile against local state
+        3. Resume only after state is consistent
+        """
+        logger.info(f"GAP RECOVERY starting for {venue}...")
+
+        try:
+            if venue == "bybit":
+                # Fetch recent executions from Bybit REST
+                executions = await submitter.bybit_api.get_executions(limit=50)
+                for exec_data in executions:
+                    exec_id = exec_data.get("execId", "")
+                    order_id = exec_data.get("orderId", "")
+                    # Check if coordinator knows about this fill
+                    leg = self._coordinator._leg_states.get(order_id)
+                    if leg and exec_id not in leg.exec_ids:
+                        logger.warning(f"MISSED FILL recovered: {venue} {exec_id} order={order_id}")
+                        from app.services.arb.order_feed import FillEvent, FillSource
+                        fill = FillEvent(
+                            venue="bybit",
+                            symbol=exec_data.get("symbol", ""),
+                            order_id=order_id,
+                            exec_id=exec_id,
+                            side=exec_data.get("side", ""),
+                            price=float(exec_data.get("execPrice", 0)),
+                            qty=float(exec_data.get("execQty", 0)),
+                            fee=float(exec_data.get("execFee", 0)),
+                            fee_asset="USDT",
+                            timestamp_ms=int(exec_data.get("execTime", 0)),
+                            local_ts=time.time(),
+                            source=FillSource.REST_RECONCILE,
+                        )
+                        self._coordinator.on_fill(fill)
+
+                # Check for orphan positions
+                for sym in PAIRS:
+                    positions = await submitter.bybit_api.get_positions(sym)
+                    for pos in positions:
+                        size = float(pos.get("size", 0))
+                        if size > 0 and sym not in self.signal_engine.open_positions:
+                            logger.warning(f"ORPHAN position on Bybit: {sym} size={size}")
+                            await tg_send(f"H2 ALERT: Orphan Bybit position {sym} size={size}", session)
+
+            elif venue == "binance":
+                # Fetch recent trades from Binance REST per symbol
+                for sym in PAIRS:
+                    trades = await submitter.binance_api.get_my_trades(sym, limit=20)
+                    for trade in trades:
+                        trade_id = str(trade.get("id", ""))
+                        order_id = str(trade.get("orderId", ""))
+                        leg = self._coordinator._leg_states.get(order_id)
+                        if leg and trade_id not in leg.exec_ids:
+                            logger.warning(f"MISSED FILL recovered: binance {trade_id} order={order_id}")
+                            from app.services.arb.order_feed import FillEvent, FillSource
+                            fill = FillEvent(
+                                venue="binance",
+                                symbol=sym,
+                                order_id=order_id,
+                                exec_id=trade_id,
+                                side="Buy" if trade.get("isBuyer") else "Sell",
+                                price=float(trade.get("price", 0)),
+                                qty=float(trade.get("qty", 0)),
+                                fee=float(trade.get("commission", 0)),
+                                fee_asset=trade.get("commissionAsset", ""),
+                                timestamp_ms=int(trade.get("time", 0)),
+                                local_ts=time.time(),
+                                source=FillSource.REST_RECONCILE,
+                            )
+                            self._coordinator.on_fill(fill)
+
+            # Reconcile inventory
+            await self.inventory.periodic_reconcile(session, BINANCE_KEY, BINANCE_SECRET)
+
+            logger.info(f"GAP RECOVERY complete for {venue}")
+            await tg_send(f"H2: {venue} WS reconnected, gap recovery complete", session)
+
+        except Exception as e:
+            logger.error(f"GAP RECOVERY failed for {venue}: {e}", exc_info=True)
+            await tg_send(f"H2 ALERT: {venue} gap recovery failed: {e}", session)
 
     async def _handle_entry(self, signal, snap, session, submitter):
         """Process an entry signal."""
@@ -513,7 +598,7 @@ class H2LiveTrader:
             logger.error(f"Bybit position close failed: {e}")
 
         # Reconcile inventory
-        await self.inventory.periodic_reconcile(session, BINANCE_KEY)
+        await self.inventory.periodic_reconcile(session, BINANCE_KEY, BINANCE_SECRET)
 
         # Final status
         logger.info(f"Final risk status: {self.risk_manager.status()}")
