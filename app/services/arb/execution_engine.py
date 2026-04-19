@@ -523,3 +523,131 @@ class LegCoordinator:
         """Remove a leg from tracking."""
         self._fill_events.pop(order_id, None)
         self._leg_states.pop(order_id, None)
+
+    async def execute_exit(
+        self,
+        symbol: str,
+        bb_side: str,
+        bn_side: str,
+        qty_bb: float,
+        qty_bn: float,
+        price_bb: float,
+        price_bn: float,
+        is_stop_loss: bool = False,
+    ) -> ExitResult:
+        """
+        Close both legs of an open position.
+
+        For stop loss: uses market orders (accept slippage, prevent further loss).
+        For reversion exits: uses IOC limit orders.
+
+        Unlike entry, exit is more forgiving:
+        - If one leg fails, we still close the other (don't leave exposure)
+        - We log the failure but don't try to "unwind" — we're already closing
+        """
+        t0 = time.time()
+        order_type = "market" if is_stop_loss else "limit"
+
+        logger.info(f"EXIT {'SL' if is_stop_loss else 'REVERT'}: {symbol} bb={bb_side} bn={bn_side} type={order_type}")
+
+        # Create leg states
+        bb_leg = LegState(venue="bybit", symbol=symbol, side=bb_side, target_qty=qty_bb, target_price=price_bb)
+        bn_leg = LegState(venue="binance", symbol=symbol, side=bn_side, target_qty=qty_bn, target_price=price_bn)
+
+        # Submit both close orders
+        bb_oid = None
+        bn_oid = None
+
+        async def close_bb():
+            nonlocal bb_oid
+            try:
+                bb_oid = await self._submit("bybit", symbol, bb_side, qty_bb, price_bb, order_type)
+            except Exception as e:
+                logger.error(f"Exit Bybit submit failed: {e}")
+
+        async def close_bn():
+            nonlocal bn_oid
+            try:
+                bn_oid = await self._submit("binance", symbol, bn_side, qty_bn, price_bn, order_type)
+            except Exception as e:
+                logger.error(f"Exit Binance submit failed: {e}")
+
+        await asyncio.gather(close_bb(), close_bn())
+
+        # Track fills
+        if bb_oid:
+            bb_leg.order_id = bb_oid
+            bb_leg.state = OrderState.SUBMITTED
+            bb_leg.submitted_at = time.time()
+            self.register_leg(bb_leg)
+
+        if bn_oid:
+            bn_leg.order_id = bn_oid
+            bn_leg.state = OrderState.SUBMITTED
+            bn_leg.submitted_at = time.time()
+            self.register_leg(bn_leg)
+
+        # Wait for fills (longer timeout for exits, especially stop loss)
+        timeout = 2.0 if is_stop_loss else self.FILL_TIMEOUT_S
+        events_to_wait = []
+        if bb_oid:
+            events_to_wait.append(self._fill_events[bb_oid].wait())
+        if bn_oid:
+            events_to_wait.append(self._fill_events[bn_oid].wait())
+
+        if events_to_wait:
+            try:
+                await asyncio.wait_for(asyncio.gather(*events_to_wait), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Exit timeout after {timeout}s — checking fill status")
+
+        # For any unfilled exit legs, escalate to market
+        for leg, oid in [(bb_leg, bb_oid), (bn_leg, bn_oid)]:
+            if oid and not leg.is_filled and not leg.has_any_fill:
+                logger.warning(f"Exit leg {leg.venue} unfilled — escalating to market")
+                await self._safe_cancel(leg.venue, symbol, oid)
+                try:
+                    market_oid = await self._submit(leg.venue, symbol, leg.side, leg.target_qty, 0, "market")
+                    mkt_leg = LegState(venue=leg.venue, symbol=symbol, side=leg.side,
+                                       order_id=market_oid, target_qty=leg.target_qty,
+                                       state=OrderState.SUBMITTED, submitted_at=time.time())
+                    self.register_leg(mkt_leg)
+                    event = self._fill_events[market_oid]
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        logger.critical(f"EXIT MARKET TIMEOUT {leg.venue} {symbol} — MANUAL INTERVENTION")
+                    if mkt_leg.is_filled:
+                        leg.filled_qty = mkt_leg.filled_qty
+                        leg.avg_fill_price = mkt_leg.avg_fill_price
+                        leg.fee = mkt_leg.fee
+                        leg.state = OrderState.FILLED
+                    self._cleanup_leg(market_oid)
+                except Exception as e:
+                    logger.critical(f"EXIT MARKET FAILED {leg.venue} {symbol}: {e}")
+
+        # Compute result
+        actual_spread = 0.0
+        if bb_leg.is_filled and bn_leg.is_filled:
+            actual_spread = self._compute_actual_spread(bb_leg, bn_leg, bb_side)
+
+        outcome = "success"
+        if not bb_leg.is_filled or not bn_leg.is_filled:
+            outcome = "partial"
+            if not bb_leg.is_filled and not bn_leg.is_filled:
+                outcome = "failed"
+
+        if bb_oid:
+            self._cleanup_leg(bb_oid)
+        if bn_oid:
+            self._cleanup_leg(bn_oid)
+
+        logger.info(f"EXIT {outcome}: {symbol} spread={actual_spread:.1f}bp latency={((time.time()-t0)*1000):.0f}ms")
+
+        return ExitResult(
+            outcome=outcome,
+            bybit_leg=bb_leg,
+            binance_leg=bn_leg,
+            actual_exit_spread_bps=actual_spread,
+            exit_latency_ms=(time.time() - t0) * 1000,
+        )

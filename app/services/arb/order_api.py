@@ -55,7 +55,7 @@ class BybitOrderAPI:
             "side": side.capitalize(),  # "Buy" or "Sell"
             "orderType": "Market" if order_type == "market" else "Limit",
             "qty": str(qty),
-            "timeInForce": "IOC" if order_type == "market" else "GTC",
+            "timeInForce": "IOC",  # IOC for all orders: fill immediately or cancel
         }
         if order_type != "market" and price > 0:
             params["price"] = str(price)
@@ -201,7 +201,7 @@ class BinanceOrderAPI:
         }
         if order_type != "market" and price > 0:
             params["price"] = f"{price:.8f}".rstrip("0").rstrip(".")
-            params["timeInForce"] = "GTC"
+            params["timeInForce"] = "IOC"  # IOC: fill immediately or cancel
 
         params["signature"] = self._sign(params)
 

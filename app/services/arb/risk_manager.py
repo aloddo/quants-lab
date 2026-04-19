@@ -136,6 +136,12 @@ class RiskManager:
         self.stats.slippage_sum_bps += abs(slippage_bps)
         self.stats.daily_pnl_usd += pnl_usd
 
+        logger.info(
+            f"TRADE #{self.stats.total_trades}: pnl=${pnl_usd:.4f} fees=${fees_usd:.4f} "
+            f"slippage={slippage_bps:.1f}bp leg_fail={leg_failure} "
+            f"total_pnl=${self.stats.total_pnl_usd:.2f} daily=${self.stats.daily_pnl_usd:.2f}"
+        )
+
         if leg_failure:
             self.stats.leg_failures += 1
             self.stats.consecutive_leg_failures += 1
@@ -143,6 +149,7 @@ class RiskManager:
                 self.stats.max_consecutive_leg_failures,
                 self.stats.consecutive_leg_failures,
             )
+            logger.warning(f"LEG FAILURE #{self.stats.leg_failures} (consecutive: {self.stats.consecutive_leg_failures})")
         else:
             self.stats.consecutive_leg_failures = 0
 
@@ -151,16 +158,19 @@ class RiskManager:
         self.stats.ghost_positions += 1
         if auto_resolved:
             self.stats.ghost_auto_resolved += 1
+        logger.warning(f"GHOST POSITION detected (auto_resolved={auto_resolved}, total={self.stats.ghost_positions})")
 
     def record_inventory_issue(self, auto_resolved: bool):
         """Record an inventory discrepancy."""
         self.stats.inventory_discrepancies += 1
         if auto_resolved:
             self.stats.inventory_auto_resolved += 1
+        logger.warning(f"INVENTORY ISSUE (auto_resolved={auto_resolved}, total={self.stats.inventory_discrepancies})")
 
     def record_disconnect(self):
         """Record a WS disconnect event."""
         self.stats.ws_disconnects += 1
+        logger.warning(f"WS DISCONNECT #{self.stats.ws_disconnects}")
 
     def evaluate(self) -> tuple[RiskAction, str]:
         """

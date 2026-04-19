@@ -184,6 +184,10 @@ class SignalEngine:
             return None
 
         if abs(snap.spread_bps) >= thresh["p90"]:
+            logger.info(
+                f"ENTRY SIGNAL: {sym} spread={snap.spread_bps:.1f}bp >= P90={thresh['p90']:.1f}bp "
+                f"(P25={thresh['p25']:.1f} excess={thresh['excess']:.1f} direction={snap.direction})"
+            )
             return SignalEvent(
                 symbol=sym,
                 signal_type="ENTRY",
@@ -216,6 +220,7 @@ class SignalEngine:
 
         # Reversion exit: spread reverted below P25
         if abs_spread <= pos.exit_threshold_p25:
+            logger.info(f"EXIT REVERT: {sym} spread={abs_spread:.1f}bp <= P25={pos.exit_threshold_p25:.1f}bp (hold={hold_s:.0f}s)")
             return SignalEvent(
                 symbol=sym,
                 signal_type="EXIT_REVERT",
@@ -229,6 +234,7 @@ class SignalEngine:
 
         # Stop loss: spread widened to 2x entry
         if abs_spread > pos.entry_spread * STOP_LOSS_MULTIPLE:
+            logger.warning(f"EXIT STOP LOSS: {sym} spread={abs_spread:.1f}bp > 2x entry={pos.entry_spread*2:.1f}bp (hold={hold_s:.0f}s)")
             return SignalEvent(
                 symbol=sym,
                 signal_type="EXIT_STOP_LOSS",

@@ -619,38 +619,52 @@ class H2LiveTrader:
             bb_side = "Buy"
             bn_side = "Sell"
 
-        # Use market orders for stop loss, limit for reverts
-        order_type = "market" if signal.signal_type == "EXIT_STOP_LOSS" else "limit"
+        is_stop_loss = signal.signal_type == "EXIT_STOP_LOSS"
 
-        qty_bb = pos.entry_spread  # TODO: track actual position qty from entry
-        qty_bn = qty_bb  # same size
+        # Get symbols for qty rounding
+        bb_sym = USDC_PAIR_MAP[sym][1] if TRADING_MODE == "usdc" else sym
+        bn_sym = USDC_PAIR_MAP[sym][0] if TRADING_MODE == "usdc" else sym
+        bb_rules = self.instrument_rules.get("bybit", bb_sym)
+        bn_rules = self.instrument_rules.get("binance", bn_sym)
 
-        # Execute exit via coordinator
-        result = await self._coordinator.execute_entry(
-            signal=snap,
+        # Calculate and round exit quantities
+        raw_qty_bb = POSITION_USD / snap.bb_bid if bb_side == "Sell" and snap.bb_bid > 0 else POSITION_USD / snap.bb_ask if snap.bb_ask > 0 else 0
+        raw_qty_bn = POSITION_USD / snap.bn_ask if bn_side == "Buy" and snap.bn_ask > 0 else POSITION_USD / snap.bn_bid if snap.bn_bid > 0 else 0
+        qty_bb = bb_rules.round_qty(raw_qty_bb) if bb_rules else raw_qty_bb
+        qty_bn = bn_rules.round_qty(raw_qty_bn) if bn_rules else raw_qty_bn
+
+        price_bb = bb_rules.round_price(snap.bb_bid if bb_side == "Sell" else snap.bb_ask) if bb_rules else snap.bb_bid
+        price_bn = bn_rules.round_price(snap.bn_ask if bn_side == "Buy" else snap.bn_bid) if bn_rules else snap.bn_ask
+
+        # Execute exit via dedicated exit method
+        result = await self._coordinator.execute_exit(
+            symbol=sym,
             bb_side=bb_side, bn_side=bn_side,
-            qty_bb=POSITION_USD / snap.bb_bid if bb_side == "Sell" else POSITION_USD / snap.bb_ask,
-            qty_bn=POSITION_USD / snap.bn_ask if bn_side == "Buy" else POSITION_USD / snap.bn_bid,
-            price_bb=snap.bb_bid if bb_side == "Sell" else snap.bb_ask,
-            price_bn=snap.bn_ask if bn_side == "Buy" else snap.bn_bid,
+            qty_bb=qty_bb, qty_bn=qty_bn,
+            price_bb=price_bb, price_bn=price_bn,
+            is_stop_loss=is_stop_loss,
         )
 
         # Update inventory (buy-back restores inventory)
-        if result.outcome == EntryOutcome.SUCCESS:
+        if result.outcome in ("success", "partial"):
             actual_bn_qty = result.binance_leg.filled_qty
             actual_bn_fee = result.binance_leg.fee
-            if bn_side == "Buy":
+            if bn_side == "Buy" and actual_bn_qty > 0:
                 self.inventory.bought(sym, actual_bn_qty, actual_bn_fee)
-            else:
-                fee_in_base = result.binance_leg.fee_asset not in ("USDT", "BNB")
+            elif bn_side == "Sell" and actual_bn_qty > 0:
+                fee_in_base = result.binance_leg.fee_asset not in ("USDT", "USDC", "BNB")
                 self.inventory.sold(sym, actual_bn_qty, actual_bn_fee, fee_in_base=fee_in_base)
+
+            # Record trade in risk manager
+            pnl = 0.0  # TODO: compute from entry vs exit prices
+            self.risk_manager.record_trade(pnl, 0, 0, leg_failure=(result.outcome == "partial"))
 
         self.signal_engine.unregister_position(sym)
 
         safe_reason = signal.signal_type.replace("<", "&lt;").replace(">", "&gt;")
         await tg_send(
             f"H2 CLOSE {sym}: {safe_reason}\n"
-            f"Outcome: {result.outcome.value} | Latency: {result.entry_latency_ms:.0f}ms",
+            f"Outcome: {result.outcome} | Latency: {result.exit_latency_ms:.0f}ms",
             session,
         )
 
