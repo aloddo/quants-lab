@@ -289,10 +289,14 @@ class BinanceOrderFeed:
             except Exception as e:
                 self._connected = False
                 self._reconnect_count += 1
-                wait = min(2 ** self._reconnect_count, 30)
-                logger.warning(f"Binance private WS error: {e}. Reconnect #{self._reconnect_count} in {wait}s")
-                if self._on_disconnect:
-                    self._on_disconnect("binance")
+                wait = min(2 ** self._reconnect_count, 300)  # max 5min between retries
+                if self._reconnect_count <= 3:
+                    logger.warning(f"Binance private WS error: {e}. Reconnect #{self._reconnect_count} in {wait}s")
+                    if self._on_disconnect:
+                        self._on_disconnect("binance")
+                elif self._reconnect_count == 4:
+                    logger.warning(f"Binance private WS permanently unavailable (410 Gone, likely EU/NL restriction). Using REST fill fallback.")
+                # After 3 failures, retry silently every 5min in case it comes back
                 await asyncio.sleep(wait)
 
     async def _connect_and_listen(self):
