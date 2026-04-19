@@ -75,7 +75,7 @@ USDC_PAIR_MAP = {
     "ENJUSDT":    ("ENJUSDC",    "ENJUSDT"),
     "MOVEUSDT":   ("MOVEUSDC",   "MOVEUSDT"),
     "KERNELUSDT": ("KERNELUSDC", "KERNELUSDT"),
-    "ACXUSDT":    ("ACXUSDC",    "ACXUSDT"),
+    # ACX removed: 190 trades/24h, $4K volume = dead pair
 }
 
 # USDT mode (original, for non-EU accounts)
