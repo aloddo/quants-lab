@@ -855,6 +855,13 @@ class H2LiveTrader:
             fs = feed_status.get(sym, {})
             ss = sig_status["pairs"].get(sym, {})
 
+            # Display name: show base asset + venues, not internal USDT key
+            base = sym.replace("USDT", "")
+            if TRADING_MODE == "usdc" and sym in USDC_PAIR_MAP:
+                display = f"{base} (BB perp + BN USDC)"
+            else:
+                display = f"{base} (BB perp + BN USDT)"
+
             # Feed health label
             bb_age = fs.get("bb_age_ms", -1)
             bn_age = fs.get("bn_age_ms", -1)
@@ -889,10 +896,10 @@ class H2LiveTrader:
                     icon = "QUIET"
 
                 status_lines.append(
-                    f"  {sym}: [{icon}] spread={spread_str} P90={p90:.0f} P25={p25:.0f} feed={health}"
+                    f"  {display}: [{icon}] spread={spread_str} P90={p90:.0f} P25={p25:.0f} feed={health}"
                 )
             else:
-                status_lines.append(f"  {sym}: [WARMING] feed={health} ({fs.get('bb_updates', 0)}+{fs.get('bn_updates', 0)} updates)")
+                status_lines.append(f"  {display}: [WARMING] feed={health} ({fs.get('bb_updates', 0)}+{fs.get('bn_updates', 0)} updates)")
 
         # Inventory summary
         inv = self.inventory.status()
