@@ -527,16 +527,8 @@ class H2LiveTrader:
         sym = signal.symbol
         direction = snap.direction
 
-        # Check inventory (for BUY_BB_SELL_BN: we need inventory to sell on Binance)
-        if direction == "BUY_BB_SELL_BN":
-            qty_bn = POSITION_USD / snap.bn_bid if snap.bn_bid > 0 else 0
-            if not self.inventory.can_sell(sym, qty_bn):
-                logger.warning(f"Insufficient inventory for {sym}: need {qty_bn}, have {self.inventory.inventories.get(sym, {})}")
-                return
-
-            self.inventory.lock(sym, qty_bn)
-
-        # Calculate and round quantities to exchange step sizes
+        # Calculate canonical hedge qty FIRST (before inventory check)
+        # so lock and release use the same amount
         bb_sym = USDC_PAIR_MAP[sym][1] if TRADING_MODE == "usdc" else sym
         bn_sym = USDC_PAIR_MAP[sym][0] if TRADING_MODE == "usdc" else sym
 
@@ -561,16 +553,23 @@ class H2LiveTrader:
         qty_bb = hedge_qty
         qty_bn = hedge_qty
 
+        # Check inventory AFTER computing hedge_qty (so lock amount is correct)
+        if direction == "BUY_BB_SELL_BN":
+            if not self.inventory.can_sell(sym, hedge_qty):
+                logger.warning(f"Insufficient inventory for {sym}: need {hedge_qty}, have {self.inventory.inventories.get(sym)}")
+                return
+            self.inventory.lock(sym, hedge_qty)
+
         # Check min qty and min notional
         if bb_rules and (not bb_rules.check_min_qty(qty_bb) or not bb_rules.check_notional(qty_bb, snap.bb_ask)):
             logger.warning(f"Bybit qty/notional check failed: {sym} qty={qty_bb} price={snap.bb_ask}")
             if direction == "BUY_BB_SELL_BN":
-                self.inventory.release(sym, raw_qty_bn)
+                self.inventory.release(sym, hedge_qty)
             return
         if bn_rules and (not bn_rules.check_min_qty(qty_bn) or not bn_rules.check_notional(qty_bn, snap.bn_bid)):
             logger.warning(f"Binance qty/notional check failed: {sym} qty={qty_bn} price={snap.bn_bid}")
             if direction == "BUY_BB_SELL_BN":
-                self.inventory.release(sym, raw_qty_bn)
+                self.inventory.release(sym, hedge_qty)
             return
 
         # Round prices to tick size
@@ -653,14 +652,10 @@ class H2LiveTrader:
 
         elif result.outcome == EntryOutcome.LEG_FAILURE:
             self.risk_manager.record_trade(result.unwind_pnl_usd, 0, 0, leg_failure=True)
-            # Only release inventory if Binance leg did NOT fill
-            # If Binance sold successfully but Bybit failed, inventory is reduced
-            if not result.binance_leg.has_any_fill:
-                self.inventory.release(sym, qty_bn)
-            else:
-                # Binance leg filled (sold our inventory). The unwind bought it back on Binance.
-                # Inventory should be back to normal after unwind — reconcile to be sure.
-                logger.info(f"Binance leg filled during failure — inventory auto-reconciled via unwind")
+            # ALWAYS release the lock on leg failure — the unwind closes everything
+            # Whether Binance filled or not, the position is unwound and lock must clear
+            self.inventory.release(sym, hedge_qty)
+            logger.info(f"Inventory lock released after leg failure (was locked {hedge_qty})")
             self._leg_failures_coll.insert_one({
                 "symbol": sym, "direction": direction,
                 "venue_failed": result.leg_failure_venue,
@@ -671,8 +666,9 @@ class H2LiveTrader:
             await tg_send(f"H2 LEG FAILURE {sym}: {result.leg_failure_venue} unwind=${result.unwind_pnl_usd:.4f}", session)
 
         else:
-            # Both missed or rejected
-            self.inventory.release(sym, qty_bn)
+            # Both missed or rejected — release lock
+            if direction == "BUY_BB_SELL_BN":
+                self.inventory.release(sym, hedge_qty)
             logger.info(f"Entry {result.outcome}: {sym}")
 
     async def _handle_exit(self, signal, session, submitter):
