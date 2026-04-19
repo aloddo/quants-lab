@@ -833,33 +833,72 @@ class H2LiveTrader:
         await tg_send("H2 SHUTDOWN complete. All orders cancelled, positions closed.", session)
 
     async def _log_status(self, session):
-        """Periodic status logging."""
+        """Periodic status logging with clear, actionable format."""
         uptime_h = (time.time() - self._start_time) / 3600
         risk = self.risk_manager.status()
         mode = "SHADOW" if self.shadow else "LIVE"
 
+        # Header
         status_lines = [
             f"H2 {mode} ({uptime_h:.1f}h)",
-            f"Trades: {risk['total_trades']} | PnL: ${risk['total_pnl_usd']:.2f}",
-            f"Slippage: {risk['avg_slippage_bps']:.1f}bp | Leg fails: {risk['leg_failures']}",
+            f"Trades: {risk['total_trades']} | PnL: ${risk['total_pnl_usd']:.2f} | Daily: ${risk['daily_pnl_usd']:.2f}",
         ]
+        if risk['total_trades'] > 0:
+            status_lines.append(f"Slippage: {risk['avg_slippage_bps']:.1f}bp | Leg fails: {risk['leg_failures']}")
 
-        # Feed health
+        # Per-pair status: feed health + signal + current spread
         feed_status = self.price_feed.status()
-        for sym, fs in feed_status.items():
-            status_lines.append(
-                f"  {sym}: bb={fs['bb_updates']}u/{fs['bb_age_ms']:.0f}ms "
-                f"bn={fs['bn_updates']}u/{fs['bn_age_ms']:.0f}ms"
-            )
-
-        # Signal engine
         sig_status = self.signal_engine.status()
-        for sym, ss in sig_status["pairs"].items():
-            if ss["ready"]:
+
+        status_lines.append("")
+        for sym in PAIRS:
+            fs = feed_status.get(sym, {})
+            ss = sig_status["pairs"].get(sym, {})
+
+            # Feed health label
+            bb_age = fs.get("bb_age_ms", -1)
+            bn_age = fs.get("bn_age_ms", -1)
+            if bb_age < 0 or bn_age < 0:
+                health = "NO DATA"
+            elif bb_age > 5000 or bn_age > 5000:
+                health = "STALE"
+            elif bb_age > 2000 or bn_age > 2000:
+                health = "SLOW"
+            else:
+                health = "OK"
+
+            # Current spread
+            snap = self.price_feed.get_spread(sym)
+            spread_str = f"{snap.spread_bps:.0f}bp" if snap else "n/a"
+
+            # Threshold info
+            if ss.get("ready"):
+                p90 = ss.get("p90", 0)
+                p25 = ss.get("p25", 0)
+                viable = ss.get("viable", False)
+                has_pos = ss.get("has_position", False)
+
+                # Status emoji
+                if has_pos:
+                    icon = "OPEN"
+                elif viable and health == "OK":
+                    icon = "READY"
+                elif viable:
+                    icon = "VIABLE"
+                else:
+                    icon = "QUIET"
+
                 status_lines.append(
-                    f"  {sym}: P90={ss['p90']:.0f} P25={ss['p25']:.0f} "
-                    f"viable={ss['viable']} pos={ss['has_position']}"
+                    f"  {sym}: [{icon}] spread={spread_str} P90={p90:.0f} P25={p25:.0f} feed={health}"
                 )
+            else:
+                status_lines.append(f"  {sym}: [WARMING] feed={health} ({fs.get('bb_updates', 0)}+{fs.get('bn_updates', 0)} updates)")
+
+        # Inventory summary
+        inv = self.inventory.status()
+        low_inv = [s for s, v in inv.items() if not v["healthy"]]
+        if low_inv:
+            status_lines.append(f"\nInventory warning: {', '.join(low_inv)}")
 
         status = "\n".join(status_lines)
         logger.info(status)
