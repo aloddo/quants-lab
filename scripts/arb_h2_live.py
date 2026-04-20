@@ -468,19 +468,20 @@ class H2LiveTrader:
             self._coordinator._check_order = submitter.check_order
 
             # Position verification function — queries actual exchange state
+            # CRITICAL: Only works for Bybit perps (position = directional exposure).
+            # For Binance spot, balance != order fill. A balance of 1000 ENJ doesn't
+            # mean your 100 ENJ sell order filled — it's pre-existing inventory.
+            # Binance fills must be verified via check_order (REST trade query), NOT balance.
             async def check_position(venue: str, symbol: str) -> float:
-                """Returns net position size on exchange. Used to catch phantom leg failures."""
+                """Returns net position size on exchange (Bybit only)."""
                 try:
                     if venue == "bybit":
                         positions = await submitter.bybit_api.get_positions(symbol)
                         for p in positions:
                             if float(p.get("size", 0)) != 0:
                                 return float(p["size"])
-                    elif venue == "binance":
-                        # For spot, check balance of base asset
-                        base = symbol.replace("USDT", "").replace("USDC", "")
-                        bal = await submitter.binance_api.get_balance(base)
-                        return bal
+                    # Binance spot: DO NOT check balance — it's inventory, not a position.
+                    # Return 0 to let the coordinator fall through to check_order instead.
                 except Exception as e:
                     logger.warning(f"check_position failed {venue} {symbol}: {e}")
                 return 0.0
