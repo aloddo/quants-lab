@@ -466,12 +466,24 @@ class H2LiveTraderV2:
                         continue
                     bn_sym = USDC_PAIR_MAP[sym][0]
                     bn_rules = self.instrument_rules.get("binance", bn_sym)
-                    snap = self.price_feed.get_spread_for_exit(sym)
-                    if not snap or not bn_rules:
+                    if not bn_rules:
                         continue
 
-                    # How much do we need for one $10 trade?
-                    mid_price = (snap.bn_bid + snap.bn_ask) / 2
+                    # Get price — try WS spread first, fall back to REST ticker
+                    snap = self.price_feed.get_spread_for_exit(sym)
+                    if snap:
+                        mid_price = (snap.bn_bid + snap.bn_ask) / 2
+                    else:
+                        # WS has no data for this pair (too illiquid). Use REST price.
+                        try:
+                            async with session.get(
+                                f"https://api.binance.com/api/v3/ticker/price?symbol={bn_sym}"
+                            ) as resp:
+                                ticker = await resp.json()
+                                mid_price = float(ticker.get("price", 0))
+                                logger.info(f"AUTO-SEED {sym}: using REST price {mid_price} (WS has no data)")
+                        except Exception:
+                            mid_price = 0
                     if mid_price <= 0:
                         continue
                     min_qty = POSITION_USD / mid_price
@@ -498,7 +510,8 @@ class H2LiveTraderV2:
                         continue
 
                     # Buy at ask + 0.1% (aggressive limit to ensure fill)
-                    buy_price = bn_rules.round_price_for_side(snap.bn_ask * 1.001, "Buy")
+                    ask_price = snap.bn_ask if snap else mid_price
+                    buy_price = bn_rules.round_price_for_side(ask_price * 1.001, "Buy")
                     rounded_qty = bn_rules.round_qty(buy_qty)
 
                     if rounded_qty <= 0 or not bn_rules.check_notional(rounded_qty, buy_price):
