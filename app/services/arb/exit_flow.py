@@ -337,25 +337,55 @@ class ExitFlow:
 
         if bb_filled and bn_filled:
             # SUCCESS -- both legs closed
-            # For PnL, combine current in-memory leg data with any prior partial exit data
-            # (if bb_leg is None, the bb exit happened in a prior partial — use stored data)
+            # PnL: compute from ACTUAL fill prices per leg, not spread bps approximation.
+            # The spread-bps formula was wrong (5-10x overstatement) because it doesn't
+            # account for actual quantities, price differences between venues, or fees.
+            entry = pos.get("entry", {})
             exit_stored = pos.get("exit", {})
+
+            # Get all fill prices and quantities
+            bb_entry_price = float(entry.get("bb", {}).get("avg_fill_price", 0))
+            bb_entry_qty = float(entry.get("bb", {}).get("filled_qty", 0))
+            bn_entry_price = float(entry.get("bn", {}).get("avg_fill_price", 0))
+            bn_entry_qty = float(entry.get("bn", {}).get("filled_qty", 0))
+
             bb_exit_price = bb_leg.avg_fill_price if bb_leg else float(exit_stored.get("bb", {}).get("avg_fill_price", 0))
+            bb_exit_qty = bb_leg.filled_qty if bb_leg else float(exit_stored.get("bb", {}).get("filled_qty", 0))
             bn_exit_price = bn_leg.avg_fill_price if bn_leg else float(exit_stored.get("bn", {}).get("avg_fill_price", 0))
-            bb_exit_fee = (bb_leg.fee if bb_leg else 0) + float(exit_stored.get("bb", {}).get("fee", 0)) if not bb_leg else bb_leg.fee
-            bn_exit_fee = (bn_leg.fee if bn_leg else 0) + float(exit_stored.get("bn", {}).get("fee", 0)) if not bn_leg else bn_leg.fee
+            bn_exit_qty = bn_leg.filled_qty if bn_leg else float(exit_stored.get("bn", {}).get("filled_qty", 0))
+
+            # Fees
+            bb_entry_fee = float(entry.get("bb", {}).get("fee", 0))
+            bb_exit_fee = bb_leg.fee if bb_leg else float(exit_stored.get("bb", {}).get("fee", 0))
+            bn_entry_fee = float(entry.get("bn", {}).get("fee", 0))
+            bn_exit_fee = bn_leg.fee if bn_leg else float(exit_stored.get("bn", {}).get("fee", 0))
+            total_fees_usd = bb_entry_fee + bb_exit_fee + bn_entry_fee + bn_exit_fee
+
+            # Bybit perp PnL: (exit - entry) * qty for longs, (entry - exit) * qty for shorts
+            bb_entry_side = entry.get("bb", {}).get("side", "Buy")
+            if bb_entry_side == "Buy":
+                bb_pnl = (bb_exit_price - bb_entry_price) * bb_entry_qty
+            else:
+                bb_pnl = (bb_entry_price - bb_exit_price) * bb_entry_qty
+
+            # Binance spot PnL: sold high bought low (or vice versa)
+            bn_entry_side = entry.get("bn", {}).get("side", "Sell")
+            if bn_entry_side == "Sell":
+                bn_pnl = (bn_entry_price - bn_exit_price) * bn_entry_qty
+            else:
+                bn_pnl = (bn_exit_price - bn_entry_price) * bn_entry_qty
+
+            # Combined PnL
+            gross_usd = bb_pnl + bn_pnl
+            net_usd = gross_usd - total_fees_usd
+
+            # Convert to bps for reporting (using average notional)
+            avg_notional = (bb_entry_price * bb_entry_qty + bn_entry_price * bn_entry_qty) / 2
+            gross_bps = (gross_usd / avg_notional * 10000) if avg_notional > 0 else 0
+            fees_bps = (total_fees_usd / avg_notional * 10000) if avg_notional > 0 else 0
+            net_bps = gross_bps - fees_bps
 
             actual_spread = self._compute_exit_spread(bb_leg, bn_leg, bb_side)
-            entry = pos.get("entry", {})
-            entry_spread = entry.get("actual_spread_bps", 0)
-            gross_bps = entry_spread - actual_spread
-            # Compute actual fees from ALL legs (entry + exit, current + prior partial)
-            entry_bb_fee = float(entry.get("bb", {}).get("fee", 0))
-            entry_bn_fee = float(entry.get("bn", {}).get("fee", 0))
-            total_fees_usd = entry_bb_fee + entry_bn_fee + bb_exit_fee + bn_exit_fee
-            fees_bps = total_fees_usd / (position_usd * 2) * 10000 if position_usd > 0 else 31.0
-            net_bps = gross_bps - fees_bps
-            net_usd = net_bps / 10000 * position_usd * 2
 
             close_updates = {
                 "exit_time": time.time(),
