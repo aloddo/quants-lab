@@ -452,9 +452,13 @@ class H2LiveTraderV2:
                         self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
                         logger.info(f"Post-reconcile inventory: {sym} qty={inv.expected_qty:.1f} (exchange={inv.last_exchange_qty:.1f})")
 
+            logger.info("Waiting 3s for feeds to warm up...")
+            await asyncio.sleep(3)
+
             # ── Auto-seed inventory for pairs with insufficient tokens ──
             # If a pair is in the allowlist, the system should ensure it CAN trade.
             # Buy tokens using available USDC if inventory < one trade size.
+            # Runs AFTER feed warmup so price data is available.
             if not self.shadow:
                 for sym in PAIRS:
                     inv = self.inventory.inventories.get(sym)
@@ -525,9 +529,6 @@ class H2LiveTraderV2:
                             logger.warning(f"AUTO-SEED {sym}: order not filled, cancelled")
                     except Exception as e:
                         logger.error(f"AUTO-SEED {sym} failed: {e}")
-
-            logger.info("Waiting 3s for feeds to warm up...")
-            await asyncio.sleep(3)
 
             # ── Main loop ──
             try:
