@@ -1006,12 +1006,26 @@ class H2LiveTrader:
 
         is_stop_loss = signal.signal_type == "EXIT_STOP_LOSS"
 
-        # BUG FIX #3: Use STORED fill quantities from entry, not recomputed from current price
-        qty_bb = getattr(pos, '_bb_filled_qty', 0)
-        qty_bn = getattr(pos, '_bn_filled_qty', 0)
+        # Use STORED fill quantities from entry, not recomputed from current price
+        # CRITICAL: If a prior partial exit already closed one leg, skip that leg
+        bb_already_closed = getattr(pos, '_bb_exit_closed', False)
+        bn_already_closed = getattr(pos, '_bn_exit_closed', False)
 
-        if qty_bb <= 0 or qty_bn <= 0:
-            # Fallback: if stored qty not available, compute from current price (legacy)
+        qty_bb = 0 if bb_already_closed else getattr(pos, '_bb_filled_qty', 0)
+        qty_bn = 0 if bn_already_closed else getattr(pos, '_bn_filled_qty', 0)
+
+        if qty_bb <= 0 and qty_bn <= 0:
+            # Both legs already closed by prior partials -- just unregister
+            logger.info(f"Both exit legs already closed for {sym}, unregistering")
+            self.signal_engine.unregister_position(sym)
+            self._trades_coll.update_one(
+                {"position_id": getattr(pos, 'position_id', '')},
+                {"$set": {"status": "CLOSED", "close_reason": "partial_complete"}},
+            )
+            return
+
+        if qty_bb <= 0 and not bb_already_closed and qty_bn <= 0 and not bn_already_closed:
+            # No stored qty at all -- fallback
             logger.warning(f"No stored fill qty for {sym}, falling back to price-based sizing")
             avg_price = (snap.bb_bid + snap.bn_ask) / 2 if snap.bb_bid > 0 else snap.bb_bid or snap.bn_ask
             qty_bb = POSITION_USD / avg_price if avg_price > 0 else 0
@@ -1023,10 +1037,16 @@ class H2LiveTrader:
         bb_rules = self.instrument_rules.get("bybit", bb_sym)
         bn_rules = self.instrument_rules.get("binance", bn_sym)
 
+        # Round exit quantities to exchange step sizes (prevents LOT_SIZE errors)
+        if bb_rules and qty_bb > 0:
+            qty_bb = bb_rules.round_qty(qty_bb)
+        if bn_rules and qty_bn > 0:
+            qty_bn = bn_rules.round_qty(qty_bn)
+
         price_bb = bb_rules.round_price(snap.bb_bid if bb_side == "Sell" else snap.bb_ask) if bb_rules else snap.bb_bid
         price_bn = bn_rules.round_price(snap.bn_ask if bn_side == "Buy" else snap.bn_bid) if bn_rules else snap.bn_ask
 
-        # Execute exit via dedicated exit method
+        # Execute exit -- skip legs that are already closed
         result = await self._coordinator.execute_exit(
             symbol=sym,
             bb_side=bb_side, bn_side=bn_side,
@@ -1076,7 +1096,7 @@ class H2LiveTrader:
                     }},
                 )
 
-        # BUG FIX #10: Only unregister if BOTH legs confirmed closed
+        # Only unregister if BOTH legs confirmed closed
         if result.outcome == "success":
             self.signal_engine.unregister_position(sym)
         elif result.outcome == "failed":
@@ -1084,10 +1104,26 @@ class H2LiveTrader:
             logger.critical(f"EXIT FAILED for {sym} — position stays active, will retry")
             await tg_send(f"H2 CRITICAL: Exit failed for {sym}, retrying next cycle", session)
         else:
-            # Partial — one leg closed, other may still be open
-            # Keep position registered in signal engine for retry on next cycle
-            logger.warning(f"EXIT PARTIAL for {sym} — keeping position registered for retry next cycle")
-            await tg_send(f"H2 WARNING: Partial exit for {sym}, will retry next cycle", session)
+            # Partial — record WHICH leg closed so retry only tries the other
+            bb_closed = result.bybit_leg.is_filled
+            bn_closed = result.binance_leg.is_filled
+            if bb_closed:
+                pos._bb_exit_closed = True
+                logger.warning(f"EXIT PARTIAL {sym}: Bybit CLOSED, Binance still open — will retry Binance only")
+            if bn_closed:
+                pos._bn_exit_closed = True
+                logger.warning(f"EXIT PARTIAL {sym}: Binance CLOSED, Bybit still open — will retry Bybit only")
+            if bb_closed and bn_closed:
+                # Actually both closed -- treat as success
+                self.signal_engine.unregister_position(sym)
+                logger.info(f"EXIT PARTIAL {sym}: both legs actually closed, unregistering")
+            else:
+                await tg_send(
+                    f"\u26a0\ufe0f H2 PARTIAL EXIT {sym.replace('USDT','')}: "
+                    f"BB={'closed' if bb_closed else 'OPEN'} BN={'closed' if bn_closed else 'OPEN'} "
+                    f"— retrying unfilled leg next cycle",
+                    session,
+                )
 
         safe_reason = signal.signal_type.replace("<", "&lt;").replace(">", "&gt;")
         base = sym.replace("USDT", "")

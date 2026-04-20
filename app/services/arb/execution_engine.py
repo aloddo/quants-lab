@@ -685,6 +685,10 @@ class LegCoordinator:
 
         async def close_bb():
             nonlocal bb_oid
+            if qty_bb <= 0:
+                bb_leg.state = OrderState.FILLED  # already closed from prior partial
+                bb_leg.filled_qty = 0
+                return
             try:
                 bb_oid = await self._submit("bybit", symbol, bb_side, qty_bb, price_bb, order_type, bb_client_id)
             except Exception as e:
@@ -692,6 +696,10 @@ class LegCoordinator:
 
         async def close_bn():
             nonlocal bn_oid
+            if qty_bn <= 0:
+                bn_leg.state = OrderState.FILLED  # already closed from prior partial
+                bn_leg.filled_qty = 0
+                return
             try:
                 bn_oid = await self._submit("binance", symbol, bn_side, qty_bn, price_bn, order_type, bn_client_id)
             except Exception as e:
