@@ -257,9 +257,9 @@ class BybitOrderAPI:
                     return {"fill_result": "NOT_FOUND", "filled_qty": 0, "avg_price": 0, "status": "not_found"}
 
                 item = items[0]
-                cum_qty = float(item.get("cumExecQty", 0))
-                avg_price = float(item.get("avgPrice", 0))
-                orig_qty = float(item.get("qty", 0))
+                cum_qty = float(item.get("cumExecQty", 0) or 0)
+                avg_price = float(item.get("avgPrice", 0) or 0)
+                orig_qty = float(item.get("qty", 0) or 0)
                 status = item.get("orderStatus", "")
 
                 # Determine fill result (4-state: FILLED, PARTIAL, NOT_FILLED, UNKNOWN)
@@ -283,7 +283,7 @@ class BybitOrderAPI:
                     "filled_qty": cum_qty,
                     "avg_price": avg_price,
                     "orig_qty": orig_qty,
-                    "leaves_qty": float(item.get("leavesQty", 0)),
+                    "leaves_qty": float(item.get("leavesQty", 0) or 0),
                     "fill_result": fill_result,
                 }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -568,10 +568,10 @@ class BinanceOrderAPI:
                     logger.warning(f"Binance get_order error: {msg}")
                     return {"fill_result": "UNKNOWN", "filled_qty": 0, "avg_price": 0, "status": "error"}
 
-                executed_qty = float(data.get("executedQty", 0))
-                cum_quote = float(data.get("cummulativeQuoteQty", 0))
+                executed_qty = float(data.get("executedQty", 0) or 0)
+                cum_quote = float(data.get("cummulativeQuoteQty", 0) or 0)
                 avg_price = cum_quote / executed_qty if executed_qty > 0 else 0
-                orig_qty = float(data.get("origQty", 0))
+                orig_qty = float(data.get("origQty", 0) or 0)
                 status = data.get("status", "")
 
                 # Determine fill result (4-state: FILLED, PARTIAL, NOT_FILLED, UNKNOWN)
