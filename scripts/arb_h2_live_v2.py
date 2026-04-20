@@ -436,6 +436,22 @@ class H2LiveTraderV2:
                     self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
                     logger.info(f"Inventory guard seeded: {sym} qty={inv.expected_qty:.1f} cost=${inv.cost_basis_usd:.2f}")
 
+            # ── Startup inventory reconciliation ──
+            # CRITICAL: reconcile ledger against actual Binance balances BEFORE trading.
+            # Fixes stale ledger from prior sessions (e.g., KERNEL 3.7 vs actual 149.67).
+            if not self.shadow:
+                logger.info("Reconciling inventory against Binance balances...")
+                await self.inventory.periodic_reconcile(
+                    session, BINANCE_KEY, BINANCE_SECRET,
+                    open_positions=set(self.signal_engine.open_positions.keys()),
+                )
+                # Re-seed inventory guard after reconciliation
+                for sym in PAIRS:
+                    inv = self.inventory.inventories.get(sym)
+                    if inv:
+                        self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
+                        logger.info(f"Post-reconcile inventory: {sym} qty={inv.expected_qty:.1f} (exchange={inv.last_exchange_qty:.1f})")
+
             logger.info("Waiting 3s for feeds to warm up...")
             await asyncio.sleep(3)
 
@@ -547,6 +563,13 @@ class H2LiveTraderV2:
                         cmd = await tg_poll_commands(session)
                         if cmd in ("/report", "/status", "/h2", "/h2live"):
                             await self._send_telegram_report(session)
+
+                    # Periodic inventory reconciliation every 5 min (600 polls)
+                    if self._poll_count % 600 == 0 and not self.shadow:
+                        await self.inventory.periodic_reconcile(
+                            session, BINANCE_KEY, BINANCE_SECRET,
+                            open_positions=set(self.signal_engine.open_positions.keys()),
+                        )
 
                     elapsed = time.time() - t0
                     await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
