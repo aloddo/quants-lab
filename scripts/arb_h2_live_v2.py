@@ -452,6 +452,80 @@ class H2LiveTraderV2:
                         self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
                         logger.info(f"Post-reconcile inventory: {sym} qty={inv.expected_qty:.1f} (exchange={inv.last_exchange_qty:.1f})")
 
+            # ── Auto-seed inventory for pairs with insufficient tokens ──
+            # If a pair is in the allowlist, the system should ensure it CAN trade.
+            # Buy tokens using available USDC if inventory < one trade size.
+            if not self.shadow:
+                for sym in PAIRS:
+                    inv = self.inventory.inventories.get(sym)
+                    if not inv:
+                        continue
+                    bn_sym = USDC_PAIR_MAP[sym][0]
+                    bn_rules = self.instrument_rules.get("binance", bn_sym)
+                    snap = self.price_feed.get_spread_for_exit(sym)
+                    if not snap or not bn_rules:
+                        continue
+
+                    # How much do we need for one $10 trade?
+                    mid_price = (snap.bn_bid + snap.bn_ask) / 2
+                    if mid_price <= 0:
+                        continue
+                    min_qty = POSITION_USD / mid_price
+                    available = inv.expected_qty - inv.locked_qty
+
+                    if available >= min_qty:
+                        continue  # Already have enough
+
+                    # How much to buy? Enough for 2 trades (buffer)
+                    buy_qty = min_qty * 2 - available
+                    buy_cost = buy_qty * mid_price * 1.002  # 0.2% fee buffer
+
+                    # Check USDC balance
+                    try:
+                        usdc_balance = await gateway.binance_api.get_balance("USDC")
+                    except Exception:
+                        usdc_balance = 0
+
+                    if usdc_balance < buy_cost:
+                        logger.warning(
+                            f"Cannot auto-seed {sym}: need ${buy_cost:.2f} USDC, have ${usdc_balance:.2f}. "
+                            f"Pair will be blocked until inventory is replenished."
+                        )
+                        continue
+
+                    # Buy at ask + 0.1% (aggressive limit to ensure fill)
+                    buy_price = bn_rules.round_price_for_side(snap.bn_ask * 1.001, "Buy")
+                    rounded_qty = bn_rules.round_qty(buy_qty)
+
+                    if rounded_qty <= 0 or not bn_rules.check_notional(rounded_qty, buy_price):
+                        continue
+
+                    logger.info(
+                        f"AUTO-SEED: {sym} buying {rounded_qty} {sym.replace('USDT','')} "
+                        f"@ {buy_price} on Binance (${rounded_qty * buy_price:.2f})"
+                    )
+                    try:
+                        oid = await gateway.submit("binance", sym, "Buy", rounded_qty, buy_price, "limit")
+                        # Wait for fill confirmation
+                        result = await gateway.get_order_with_retry("binance", sym, order_id=oid)
+                        if result.get("fill_result") in ("FILLED", "PARTIAL"):
+                            filled = float(result.get("filled_qty", 0))
+                            fill_price = float(result.get("avg_price", buy_price))
+                            self.inventory.bought(sym, filled, fill_price=fill_price)
+                            self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
+                            logger.info(f"AUTO-SEED SUCCESS: {sym} bought {filled} @ {fill_price}")
+                            await tg_send(
+                                f"\U0001f331 <b>Auto-seeded</b> {sym.replace('USDT','')}\n"
+                                f"Bought {filled:.0f} @ {fill_price:.6f} (${filled*fill_price:.2f})",
+                                session,
+                            )
+                        else:
+                            # Cancel unfilled order
+                            await gateway.cancel("binance", sym, oid)
+                            logger.warning(f"AUTO-SEED {sym}: order not filled, cancelled")
+                    except Exception as e:
+                        logger.error(f"AUTO-SEED {sym} failed: {e}")
+
             logger.info("Waiting 3s for feeds to warm up...")
             await asyncio.sleep(3)
 
