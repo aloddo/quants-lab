@@ -17,9 +17,12 @@ import os
 import signal
 import sys
 import time
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -84,17 +87,126 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Telegram ────────────────────────────────────────────────────
 
+TG_URL = f"https://api.telegram.org/bot{TG_TOKEN}"
+_tg_last_update_id = 0
+
+
 async def tg_send(text: str, session: aiohttp.ClientSession):
+    """Send Telegram notification with HTML formatting."""
     if not TG_TOKEN or not TG_CHAT:
         return
     try:
         await session.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            f"{TG_URL}/sendMessage",
             json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=aiohttp.ClientTimeout(total=5),
         )
     except Exception as e:
         logger.warning(f"TG send failed: {e}")
+
+
+async def tg_send_photo(path: str, caption: str, session: aiohttp.ClientSession):
+    """Send image to Telegram."""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    try:
+        with open(path, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", TG_CHAT)
+            data.add_field("caption", caption, content_type="text/plain")
+            data.add_field("parse_mode", "HTML")
+            data.add_field("photo", f, filename="equity_v2.png")
+            await session.post(f"{TG_URL}/sendPhoto", data=data,
+                               timeout=aiohttp.ClientTimeout(total=10))
+    except Exception as e:
+        logger.debug(f"TG photo failed: {e}")
+
+
+async def tg_poll_commands(session: aiohttp.ClientSession) -> str | None:
+    """Check for /report, /status, /h2, /h2live commands."""
+    global _tg_last_update_id
+    if not TG_TOKEN:
+        return None
+    try:
+        async with session.get(
+            f"{TG_URL}/getUpdates",
+            params={"offset": _tg_last_update_id + 1, "timeout": 0, "limit": 5},
+            timeout=aiohttp.ClientTimeout(total=3),
+        ) as resp:
+            data = await resp.json()
+        if not data.get("ok"):
+            return None
+        for update in data.get("result", []):
+            _tg_last_update_id = update["update_id"]
+            msg = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            if text in ("/report", "/status", "/h2", "/h2live"):
+                return text
+        return None
+    except Exception:
+        return None
+
+
+def render_equity_curve_live(closed_positions: list, path: str = "/tmp/h2_equity_v2.png"):
+    """Render equity curve as PNG for V2 live trades."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        if not closed_positions:
+            return None
+
+        # Sort by close_time
+        sorted_pos = sorted(closed_positions, key=lambda p: p.get("close_time", p.get("exit_time", 0)))
+        times = []
+        pnls = []
+        for p in sorted_pos:
+            ct = p.get("close_time", p.get("exit_time"))
+            if not ct:
+                continue
+            if isinstance(ct, (int, float)):
+                times.append(datetime.fromtimestamp(ct, tz=timezone.utc))
+            else:
+                times.append(ct.replace(tzinfo=timezone.utc) if ct.tzinfo is None else ct)
+            # PnL from exit data or spread capture
+            exit_data = p.get("exit", {})
+            pnl_net = exit_data.get("pnl_net_usd", 0)
+            if pnl_net == 0:
+                # Fallback: compute from spread capture
+                entry_s = p.get("entry", {}).get("actual_spread_bps", p.get("signal_spread_bps", 0)) or 0
+                exit_s = exit_data.get("actual_spread_bps", 0) or 0
+                capture_bps = entry_s - exit_s
+                pnl_net = (capture_bps - 31) / 10000 * POSITION_USD * 2
+            pnls.append(pnl_net)
+
+        if not times or not pnls:
+            return None
+
+        cum_pnl = np.cumsum(pnls)
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.step(times, cum_pnl, where="post", color="#2196F3", linewidth=1.5)
+        ax.fill_between(times, cum_pnl, step="post", alpha=0.15, color="#2196F3")
+        ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")
+
+        for i, (t, p) in enumerate(zip(times, pnls)):
+            c = "#4CAF50" if p > 0 else "#F44336"
+            ax.scatter([t], [cum_pnl[i]], color=c, s=20, zorder=5)
+
+        ax.set_title("H2 Spike Fade V2 -- LIVE Trading Equity", fontsize=12)
+        ax.set_ylabel("Cumulative PnL ($)")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+        fig.autofmt_xdate()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        return path
+    except Exception as e:
+        logger.warning(f"Equity chart failed: {e}")
+        return None
 
 
 # ── Main Trader ─────────────────────────────────────────────────
@@ -107,6 +219,7 @@ class H2LiveTraderV2:
         self.running = True
         self._poll_count = 0
         self._start_time = time.time()
+        self._entry_reject_cooldown: dict[str, float] = {}  # sym -> next_allowed_log_time
 
         # Config
         bn_symbol_map = {k: v[0] for k, v in USDC_PAIR_MAP.items()}
@@ -119,6 +232,13 @@ class H2LiveTraderV2:
         self.instrument_rules = InstrumentRules()
         self.position_store = PositionStore(MONGO_URI)
         self.inventory_guard = InventoryImpairmentGuard(impairment_threshold=3.0)
+
+        # MongoDB for V2 positions (used by report/equity chart)
+        from pymongo import MongoClient
+        client = MongoClient(MONGO_URI)
+        db_name = MONGO_URI.rsplit("/", 1)[-1]
+        self._db = client[db_name]
+        self._positions_coll = self._db["arb_h2_positions_v2"]
 
     async def run(self):
         mode = "SHADOW" if self.shadow else "LIVE"
@@ -285,10 +405,24 @@ class H2LiveTraderV2:
                             session,
                         )
 
+            # Startup notification with threshold info (like V1)
+            sig_status = self.signal_engine.status()
+            viable_lines = []
+            for sym in PAIRS:
+                ss = sig_status["pairs"].get(sym, {})
+                if ss.get("ready"):
+                    base = sym.replace("USDT", "")
+                    v = "\u2705" if ss.get("viable") else "\u274c"
+                    viable_lines.append(
+                        f"  {v} {base}: P90={ss.get('p90',0):.0f} exit={ss.get('p25',0):.0f} "
+                        f"ex={ss.get('p90',0)-ss.get('p25',0):.0f}bp"
+                    )
             await tg_send(
-                f"H2 V2 {mode} STARTED\n"
-                f"Pairs: {len(PAIRS)} | Size: ${POSITION_USD}/side | Max: {MAX_CONCURRENT}\n"
-                f"Components: PositionStore + FillDetector + EntryFlow/ExitFlow",
+                f"\U0001f680 <b>H2 V2 Spike Fade {mode} STARTED</b>\n"
+                f"Pairs: {len(PAIRS)} monitored\n"
+                f"Entry: P90 | Exit: P25 | Fees: ~31bp RT\n"
+                f"Size: ${POSITION_USD}/side | Max: {MAX_CONCURRENT}\n"
+                + ("\n".join(viable_lines) if viable_lines else "(warming up thresholds...)"),
                 session,
             )
 
@@ -378,6 +512,9 @@ class H2LiveTraderV2:
                             for sym in PAIRS:
                                 if sym in self.signal_engine.open_positions:
                                     continue
+                                # Skip pairs on entry rejection cooldown (avoid log spam)
+                                if time.time() < self._entry_reject_cooldown.get(sym, 0):
+                                    continue
                                 # Also check PositionStore (more authoritative)
                                 # Block on ALL non-terminal states (including UNWINDING)
                                 if await self.position_store.get_by_symbol(sym, [
@@ -400,6 +537,16 @@ class H2LiveTraderV2:
                     # Periodic status
                     if self._poll_count % 600 == 0:
                         await self._log_status(session)
+
+                    # Telegram report every 30 min (3600 polls at 0.5s)
+                    if self._poll_count % 3600 == 0:
+                        await self._send_telegram_report(session)
+
+                    # Poll for /report command every 30s (60 polls at 0.5s)
+                    if self._poll_count % 60 == 0:
+                        cmd = await tg_poll_commands(session)
+                        if cmd in ("/report", "/status", "/h2", "/h2live"):
+                            await self._send_telegram_report(session)
 
                     elapsed = time.time() - t0
                     await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
@@ -424,6 +571,10 @@ class H2LiveTraderV2:
         bn_rules = self.instrument_rules.get("binance", bn_sym)
 
         if not bb_rules or not bn_rules:
+            now = time.time()
+            if now >= self._entry_reject_cooldown.get(sym, 0):
+                logger.critical(f"Missing instrument rules for {sym} (bb={bb_rules is not None}, bn={bn_rules is not None}) -- BLOCKED")
+                self._entry_reject_cooldown[sym] = now + 600
             return
 
         avg_price = (snap.bb_ask + snap.bn_bid) / 2
@@ -438,6 +589,10 @@ class H2LiveTraderV2:
         # Inventory check for sell-side
         if direction == "BUY_BB_SELL_BN":
             if not self.inventory.can_sell(sym, hedge_qty):
+                now = time.time()
+                if now >= self._entry_reject_cooldown.get(sym, 0):
+                    logger.warning(f"Insufficient inventory for {sym}: need {hedge_qty}")
+                    self._entry_reject_cooldown[sym] = now + 300
                 return
             self.inventory.lock(sym, hedge_qty)
         elif direction == "BUY_BN_SELL_BB":
@@ -499,10 +654,15 @@ class H2LiveTraderV2:
             else:
                 self.inventory.bought(sym, result.bn_filled_qty, fill_price=result.bn_fill_price)
 
+            open_count = len(self.signal_engine.open_positions)
+            base = sym.replace("USDT", "")
+            excess = signal.threshold_p90 - signal.threshold_p25
             await tg_send(
-                f"H2 V2 OPEN {sym.replace('USDT', '')}\n"
-                f"Spread: {result.actual_spread_bps:.0f}bp | Slip: {result.slippage_bps:.1f}bp\n"
-                f"Lat: {result.latency_ms:.0f}ms",
+                f"\U0001f4dd <b>H2 V2 OPEN</b> <code>{base}</code> [{open_count}/{MAX_CONCURRENT}]\n"
+                f"Spread: <b>{result.actual_spread_bps:.0f}bp</b> (P90={signal.threshold_p90:.0f})\n"
+                f"Exit@{signal.threshold_p25:.0f}bp | Excess: {excess:.0f}bp (fees~31bp)\n"
+                f"Slip: {result.slippage_bps:.1f}bp | Lat: {result.latency_ms:.0f}ms\n"
+                f"Size: ${POSITION_USD:.0f}/side | Dir: {direction}",
                 session,
             )
         else:
@@ -512,6 +672,14 @@ class H2LiveTraderV2:
 
             if result.outcome == "LEG_FAILURE":
                 self.risk_manager.record_trade(result.unwind_pnl_usd, 0, 0, leg_failure=True)
+                base = sym.replace("USDT", "")
+                consec = self.risk_manager.status().get('consecutive_leg_failures', '?')
+                await tg_send(
+                    f"\u26a0\ufe0f <b>H2 V2 LEG FAIL</b> <code>{base}</code>\n"
+                    f"Unwind: ${result.unwind_pnl_usd:.4f}\n"
+                    f"Consecutive: {consec}/3 (circuit breaker at 3)",
+                    session,
+                )
 
     async def _handle_exit(self, signal, pos_doc, session, gateway, exit_flow: ExitFlow):
         """Process exit signal through ExitFlow."""
@@ -587,11 +755,19 @@ class H2LiveTraderV2:
             self.risk_manager.record_trade(result.pnl_net_usd, 0, 0)
             self.inventory_guard.record_trade_capture(sym, result.pnl_net_usd)
 
-            emoji = "+" if result.pnl_net_bps > 0 else ""
+            base = sym.replace("USDT", "")
+            emoji = "\u2705" if result.pnl_net_bps > 0 else "\u274c"
+            # Get entry spread from pos_doc
+            entry_spread = entry.get("actual_spread_bps", pos_doc.get("signal_spread_bps", 0)) or 0
+            exit_spread = result.actual_exit_spread_bps if hasattr(result, 'actual_exit_spread_bps') else 0
+            hold_s = time.time() - pos_doc.get("entry_time", time.time())
+            safe_reason = signal.signal_type.replace("<", "&lt;").replace(">", "&gt;")
             await tg_send(
-                f"H2 V2 CLOSE {sym.replace('USDT', '')}\n"
-                f"Net: {emoji}{result.pnl_net_bps:.0f}bp (${result.pnl_net_usd:.3f})\n"
-                f"{signal.signal_type} | Lat: {result.latency_ms:.0f}ms",
+                f"\U0001f4dd <b>H2 V2 CLOSE</b> {emoji} <code>{base}</code>\n"
+                f"Entry: {entry_spread:.0f}bp \u2192 Exit: {exit_spread:.0f}bp\n"
+                f"Net: <b>{result.pnl_net_bps:+.0f}bp (${result.pnl_net_usd:.3f})</b>\n"
+                f"Hold: {hold_s/60:.0f}min | {safe_reason}\n"
+                f"Lat: {result.latency_ms:.0f}ms",
                 session,
             )
 
@@ -602,7 +778,10 @@ class H2LiveTraderV2:
                     self.inventory.bought(sym, result.bn_filled_qty, fill_price=result.bn_fill_price)
                 elif bn_side == "Sell":
                     self.inventory.sold(sym, result.bn_filled_qty, fill_price=result.bn_fill_price)
-            await tg_send(f"H2 V2 PARTIAL EXIT {sym.replace('USDT', '')} — retrying next cycle", session)
+            await tg_send(
+                f"\u26a0\ufe0f <b>H2 V2 PARTIAL EXIT</b> <code>{sym.replace('USDT', '')}</code> -- retrying next cycle",
+                session,
+            )
 
         elif result.outcome == "FAILED":
             logger.warning(f"Exit failed for {sym}, will retry next cycle")
@@ -622,6 +801,19 @@ class H2LiveTraderV2:
             await tg_send(f"H2 V2 INVENTORY GUARD: {reason}", session)
             # Don't auto-pause yet -- just alert. Alberto decides.
 
+    def _get_feed_health(self, sym: str) -> str:
+        """Get feed health label for a symbol."""
+        fs = self.price_feed.status().get(sym, {})
+        bb_age = fs.get("bb_age_ms", -1)
+        bn_age = fs.get("bn_age_ms", -1)
+        if bb_age < 0 or bn_age < 0:
+            return "NO DATA"
+        elif bb_age > 5000 or bn_age > 5000:
+            return "STALE"
+        elif bb_age > 2000 or bn_age > 2000:
+            return "SLOW"
+        return "OK"
+
     async def _log_status(self, session):
         """Periodic status log."""
         uptime_h = (time.time() - self._start_time) / 3600
@@ -635,6 +827,178 @@ class H2LiveTraderV2:
             f"Inv impairment: ${guard['total_impairment_usd']:.2f} | "
             f"Capture: ${guard['total_capture_usd']:.2f}"
         )
+
+    def _build_report_text(self) -> str:
+        """Build full Telegram report text with V2 data sources."""
+        uptime_h = (time.time() - self._start_time) / 3600
+        risk = self.risk_manager.status()
+        mode = "SHADOW" if self.shadow else "LIVE"
+        sig_status = self.signal_engine.status()
+        guard = self.inventory_guard.status()
+
+        # Load closed trades from arb_h2_positions_v2
+        closed = list(self._positions_coll.find({"state": "CLOSED"}).sort("close_time", -1))
+        open_pos = list(self.signal_engine.open_positions.values())
+
+        # Compute stats from closed trades
+        total_trades = len(closed)
+        wins = 0
+        total_pnl = 0.0
+        for t in closed:
+            exit_data = t.get("exit", {})
+            pnl_net = exit_data.get("pnl_net_usd", 0)
+            if pnl_net == 0:
+                # Fallback: compute from spread capture
+                entry_s = t.get("entry", {}).get("actual_spread_bps", t.get("signal_spread_bps", 0)) or 0
+                exit_s = exit_data.get("actual_spread_bps", 0) or 0
+                cap = entry_s - exit_s
+                net = cap - 31
+                pnl_net = net / 10000 * POSITION_USD * 2
+            total_pnl += pnl_net
+            if pnl_net > 0:
+                wins += 1
+        wr = wins / total_trades if total_trades else 0
+
+        can_trade = self.risk_manager.can_trade
+        state_emoji = "\U0001f7e2" if can_trade else "\U0001f534"
+
+        lines = [
+            f"<b>H2 V2 Spike Fade {mode}</b> ({uptime_h:.1f}h) {state_emoji}",
+            f"Closed: {total_trades} | WR: {wr:.0%} | PnL: <b>${total_pnl:.2f}</b>",
+            f"Leg fails: {risk['leg_failures']} | Trading: {'YES' if can_trade else 'PAUSED'}",
+        ]
+
+        if closed:
+            # Per-pair breakdown
+            by_pair: dict[str, list[float]] = defaultdict(list)
+            for t in closed:
+                sym = t.get("symbol", "?")
+                exit_data = t.get("exit", {})
+                pnl_net = exit_data.get("pnl_net_usd", 0)
+                if pnl_net == 0:
+                    entry_s = t.get("entry", {}).get("actual_spread_bps", t.get("signal_spread_bps", 0)) or 0
+                    exit_s = exit_data.get("actual_spread_bps", 0) or 0
+                    net_bps = (entry_s - exit_s) - 31
+                    pnl_net = net_bps / 10000 * POSITION_USD * 2
+                by_pair[sym].append(pnl_net)
+            lines.append("")
+            for sym in sorted(by_pair):
+                pp = by_pair[sym]
+                base = sym.replace("USDT", "")
+                w = sum(1 for x in pp if x > 0)
+                pnl = sum(pp)
+                lines.append(f"  {base}: {len(pp)} trades ${pnl:.3f} WR={w}/{len(pp)}")
+
+        # Open positions with uPnL estimate
+        if open_pos:
+            lines.append("")
+            lines.append("<b>Open:</b>")
+            for pos in open_pos:
+                sym = pos.symbol
+                base = sym.replace("USDT", "")
+                hold_m = (time.time() - pos.entry_time) / 60
+                snap = self.price_feed.get_spread(sym)
+                if not snap:
+                    snap = self.price_feed.get_spread_for_exit(sym)
+                if snap:
+                    current_spread = snap.spread_bps
+                    upnl_bps = pos.entry_spread - current_spread - 31
+                    upnl_usd = upnl_bps / 10000 * POSITION_USD * 2
+                    emoji = "\U0001f7e2" if upnl_bps > 0 else "\U0001f534"
+                    stale_tag = "" if snap.fresh else " \u23f3"
+                    bb_age_s = snap.bb_age_ms / 1000
+                    bn_age_s = snap.bn_age_ms / 1000
+                    age_str = f"age={max(bb_age_s, bn_age_s):.0f}s"
+                    lines.append(
+                        f"  {emoji} {base} {pos.entry_spread:.0f}bp now={current_spread:.0f}bp "
+                        f"exit@{pos.exit_threshold_p25:.0f}bp "
+                        f"uPnL={upnl_bps:+.0f}bp (${upnl_usd:+.3f}) {hold_m:.0f}m "
+                        f"{age_str}{stale_tag}"
+                    )
+                else:
+                    health = self._get_feed_health(sym)
+                    lines.append(
+                        f"  \u23f3 {base} {pos.entry_spread:.0f}bp now=? "
+                        f"exit@{pos.exit_threshold_p25:.0f}bp "
+                        f"feed={health} {hold_m:.0f}m (>30s stale)"
+                    )
+
+        # Current thresholds per pair
+        lines.append("")
+        lines.append("<b>Thresholds:</b>")
+        for sym in PAIRS:
+            ss = sig_status["pairs"].get(sym, {})
+            if ss.get("ready"):
+                base = sym.replace("USDT", "")
+                p90 = ss.get("p90", 0)
+                p25 = ss.get("p25", 0)
+                excess = p90 - p25
+                viable = ss.get("viable", False)
+                health = self._get_feed_health(sym)
+                v = "\u2705" if viable else "\u274c"
+                h = "\U0001f7e2" if health == "OK" else ("\U0001f7e1" if health == "SLOW" else "\U0001f534")
+                lines.append(
+                    f"  {base}: P90={p90:.0f} P25={p25:.0f} ex={excess:.0f}bp [{v}] {h}"
+                )
+
+        # Inventory + cost basis + mark-to-market
+        inv_status = self.inventory.status()
+        pnl_summary = self.inventory.total_pnl_summary()
+        lines.append("")
+        lines.append("<b>Inventory:</b>")
+        for sym in PAIRS:
+            iv = inv_status.get(sym, {})
+            base = sym.replace("USDT", "")
+            avail = iv.get("available", 0)
+            cost = iv.get("cost_basis_usd", 0)
+            rpnl = iv.get("realized_pnl", 0)
+            snap = self.price_feed.get_spread(sym)
+            if snap and avail > 0:
+                mid = (snap.bn_bid + snap.bn_ask) / 2
+                mkt_val = avail * mid
+                upnl = mkt_val - cost if cost > 0 else 0
+                lines.append(
+                    f"  {base}: {avail:.0f} (${mkt_val:.2f}) cost=${cost:.2f} "
+                    f"uPnL=${upnl:+.2f} rPnL=${rpnl:+.4f}"
+                )
+            else:
+                lines.append(f"  {base}: {avail:.0f} cost=${cost:.2f} rPnL=${rpnl:+.4f}")
+
+        if pnl_summary["realized_pnl_usd"] != 0:
+            lines.append(f"\nTotal realized PnL: <b>${pnl_summary['realized_pnl_usd']:+.4f}</b>")
+
+        low_inv = [s.replace("USDT", "") for s, v in inv_status.items() if not v["healthy"]]
+        if low_inv:
+            lines.append(f"\u26a0\ufe0f Low inventory: {', '.join(low_inv)}")
+
+        # Inventory guard status (impairment vs capture)
+        lines.append("")
+        lines.append("<b>Inventory Guard:</b>")
+        imp = guard.get("total_impairment_usd", 0)
+        cap = guard.get("total_capture_usd", 0)
+        net_guard = cap - abs(imp)
+        emoji_guard = "\U0001f7e2" if net_guard >= 0 else "\U0001f534"
+        lines.append(
+            f"  {emoji_guard} Impairment: ${imp:+.2f} | Capture: ${cap:+.2f} | Net: ${net_guard:+.2f}"
+        )
+        paused, pause_reason = self.inventory_guard.should_pause()
+        if paused:
+            lines.append(f"  \u26a0\ufe0f {pause_reason}")
+
+        return "\n".join(lines)
+
+    async def _send_telegram_report(self, session):
+        """Send full report + equity curve chart to Telegram."""
+        report = self._build_report_text()
+
+        # Generate equity curve from closed trades in V2 collection
+        closed = list(self._positions_coll.find({"state": "CLOSED"}).sort("close_time", 1))
+        chart_path = render_equity_curve_live(closed) if closed else None
+
+        if chart_path:
+            await tg_send_photo(chart_path, f"\U0001f4ca {report}", session)
+        else:
+            await tg_send(f"\U0001f4ca {report}", session)
 
 
 # ── Entry point ─────────────────────────────────────────────────
