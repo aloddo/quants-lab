@@ -445,12 +445,38 @@ class H2LiveTraderV2:
                     session, BINANCE_KEY, BINANCE_SECRET,
                     open_positions=set(self.signal_engine.open_positions.keys()),
                 )
-                # Re-seed inventory guard after reconciliation
+
+                # Backfill cost_basis for pre-existing inventory with $0 cost.
+                # We don't know the original purchase price, so use current market
+                # price as baseline. Impairment tracking starts from zero (honest).
                 for sym in PAIRS:
-                    inv = self.inventory.inventories.get(sym)
-                    if inv:
-                        self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
-                        logger.info(f"Post-reconcile inventory: {sym} qty={inv.expected_qty:.1f} (exchange={inv.last_exchange_qty:.1f})")
+                    inv_item = self.inventory.inventories.get(sym)
+                    if inv_item and inv_item.expected_qty > 0 and inv_item.cost_basis_usd <= 0:
+                        bn_sym = USDC_PAIR_MAP[sym][0]
+                        try:
+                            async with session.get(
+                                f"https://api.binance.com/api/v3/ticker/price?symbol={bn_sym}"
+                            ) as resp:
+                                ticker = await resp.json()
+                                current_price = float(ticker.get("price", 0))
+                            if current_price > 0:
+                                backfill_cost = inv_item.expected_qty * current_price
+                                inv_item.cost_basis_usd = backfill_cost
+                                inv_item.avg_cost_per_unit = current_price
+                                self.inventory._save(sym)
+                                logger.info(
+                                    f"Cost basis backfilled: {sym} {inv_item.expected_qty:.1f} "
+                                    f"@ ${current_price:.6f} = ${backfill_cost:.2f}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Cost basis backfill failed for {sym}: {e}")
+
+                # Re-seed inventory guard after reconciliation + backfill
+                for sym in PAIRS:
+                    inv_item = self.inventory.inventories.get(sym)
+                    if inv_item:
+                        self.inventory_guard.register_pair(sym, inv_item.expected_qty, inv_item.cost_basis_usd)
+                        logger.info(f"Post-reconcile inventory: {sym} qty={inv_item.expected_qty:.1f} cost=${inv_item.cost_basis_usd:.2f}")
 
             logger.info("Waiting 3s for feeds to warm up...")
             await asyncio.sleep(3)
