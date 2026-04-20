@@ -224,7 +224,10 @@ class H2LiveTraderV2:
         self.risk_manager = RiskManager()
         self.instrument_rules = InstrumentRules()
         self.position_store = PositionStore(MONGO_URI)
-        self.inventory_guard = InventoryImpairmentGuard(impairment_threshold=3.0)
+        self.inventory_guard = InventoryImpairmentGuard(
+            impairment_threshold=3.0,         # pause if impairment > 3x capture
+            absolute_impairment_limit=20.0,   # ~20% of ~$95 inventory (was $5, too tight)
+        )
 
         # MongoDB for V2 positions (used by report/equity chart)
         from pymongo import MongoClient
