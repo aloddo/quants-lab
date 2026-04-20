@@ -459,8 +459,31 @@ class H2LiveTraderV2:
             # If a pair is in the allowlist, the system should ensure it CAN trade.
             # Buy tokens using available USDC if inventory < one trade size.
             # Runs AFTER feed warmup so price data is available.
+            #
+            # RULES:
+            # 1. Skip pairs with any active position (tokens are "in use",
+            #    exit will buy back automatically)
+            # 2. Reserve USDC for pending exit buy-backs before spending on seeds
             if not self.shadow:
+                # Calculate USDC reserved for exit buy-backs on open positions
+                open_positions = await self.position_store.get_active()
+                active_symbols = {p["symbol"] for p in open_positions}
+                usdc_reserved = sum(
+                    POSITION_USD * 1.01  # position size + 1% buffer for slippage
+                    for p in open_positions
+                    if p.get("direction") == "BUY_BB_SELL_BN"  # exit buys back on Binance
+                    and p.get("state") in (PositionState.OPEN, PositionState.EXITING,
+                                           PositionState.PARTIAL_EXIT)
+                )
+                if usdc_reserved > 0:
+                    logger.info(f"USDC reserved for exit buy-backs: ${usdc_reserved:.2f}")
+
                 for sym in PAIRS:
+                    # Skip pairs with active positions — inventory is in use
+                    if sym in active_symbols:
+                        logger.debug(f"Auto-seed skip {sym}: has active position")
+                        continue
+
                     inv = self.inventory.inventories.get(sym)
                     if not inv:
                         continue
@@ -502,9 +525,12 @@ class H2LiveTraderV2:
                     except Exception:
                         usdc_balance = 0
 
-                    if usdc_balance < buy_cost:
+                    usdc_available = usdc_balance - usdc_reserved
+                    if usdc_available < buy_cost:
                         logger.warning(
-                            f"Cannot auto-seed {sym}: need ${buy_cost:.2f} USDC, have ${usdc_balance:.2f}. "
+                            f"Cannot auto-seed {sym}: need ${buy_cost:.2f} USDC, "
+                            f"have ${usdc_balance:.2f} (${usdc_reserved:.2f} reserved for exits, "
+                            f"${usdc_available:.2f} available). "
                             f"Pair will be blocked until inventory is replenished."
                         )
                         continue
