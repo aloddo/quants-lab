@@ -5,8 +5,8 @@ Queries instrument info on startup, caches rules, provides round_qty/round_price
 Without this, orders REJECT on both Bybit and Binance.
 """
 import logging
-import math
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 
 import aiohttp
 
@@ -25,18 +25,39 @@ class PairRules:
     min_notional: float = 5.0
 
     def round_qty(self, qty: float) -> float:
-        """Round qty DOWN to nearest step size."""
+        """Round qty DOWN to nearest step size. Uses Decimal for exact arithmetic."""
         if self.qty_step <= 0:
             return qty
-        precision = max(0, -int(math.log10(self.qty_step))) if self.qty_step < 1 else 0
-        return round(math.floor(qty / self.qty_step) * self.qty_step, precision)
+        d_qty = Decimal(str(qty))
+        d_step = Decimal(str(self.qty_step))
+        # Floor to step: (qty // step) * step
+        result = (d_qty / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
+        return float(result)
 
     def round_price(self, price: float) -> float:
-        """Round price to nearest tick size."""
+        """Round price to nearest tick size. Uses Decimal for exact arithmetic."""
         if self.price_tick <= 0:
             return price
-        precision = max(0, -int(math.log10(self.price_tick))) if self.price_tick < 1 else 0
-        return round(round(price / self.price_tick) * self.price_tick, precision)
+        d_price = Decimal(str(price))
+        d_tick = Decimal(str(self.price_tick))
+        # Round to nearest tick
+        result = (d_price / d_tick).to_integral_value(rounding=ROUND_HALF_UP) * d_tick
+        return float(result)
+
+    def round_price_for_side(self, price: float, side: str) -> float:
+        """Round price to tick size, direction-safe for order execution.
+        Buy orders: round UP (ceil) to ensure fill at or better than target.
+        Sell orders: round DOWN (floor) to ensure fill at or better than target.
+        """
+        if self.price_tick <= 0:
+            return price
+        d_price = Decimal(str(price))
+        d_tick = Decimal(str(self.price_tick))
+        if side.lower() in ("buy", "bid"):
+            result = (d_price / d_tick).to_integral_value(rounding=ROUND_UP) * d_tick
+        else:
+            result = (d_price / d_tick).to_integral_value(rounding=ROUND_DOWN) * d_tick
+        return float(result)
 
     def check_notional(self, qty: float, price: float) -> bool:
         """Check if qty * price >= min_notional."""
@@ -104,7 +125,7 @@ class InstrumentRules:
                 filters = {f["filterType"]: f for f in sym_info.get("filters", [])}
                 lot = filters.get("LOT_SIZE", {})
                 price = filters.get("PRICE_FILTER", {})
-                notional = filters.get("NOTIONAL", {})
+                notional = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
 
                 rules = PairRules(
                     symbol=sym,

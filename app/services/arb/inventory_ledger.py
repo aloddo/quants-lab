@@ -198,14 +198,17 @@ class InventoryLedger:
             self._save(symbol)
             logger.info(f"SOLD {qty} {inv.base_asset} @{fill_price:.6f} (fee={fee_qty} base={fee_in_base}) (expected: {inv.expected_qty:.2f})")
 
-    def bought(self, symbol: str, qty: float, fee_qty: float = 0, fill_price: float = 0.0):
+    def bought(self, symbol: str, qty: float, fee_qty: float = 0, fill_price: float = 0.0,
+               fee_in_base: bool = False):
         """
         Record a completed buy (exit restoring inventory, or initial purchase).
         fill_price: actual fill price for USD cost tracking.
+        fee_in_base: True if fee was deducted from received tokens (not USDC/BNB).
+                     Codex #8: only subtract fee from qty when fee IS in base asset.
         """
         inv = self.inventories.get(symbol)
         if inv:
-            net_qty = qty - fee_qty  # fee may be deducted from received qty
+            net_qty = qty - fee_qty if fee_in_base else qty  # Only subtract fee if in base
             inv.expected_qty += net_qty
             # USD tracking: add cost of this purchase
             if fill_price > 0:

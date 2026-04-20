@@ -371,12 +371,13 @@ class PriceFeed:
             fresh=fresh,
         )
 
-        # Update running median for phantom spike detection
-        self.guard.update_median(symbol, best_spread)
-
         if not fresh:
             logger.debug(f"{symbol} price rejected: {reason}")
             return None  # CRITICAL: do not return stale/skewed prices
+
+        # Update running median for phantom spike detection AFTER freshness check
+        # so stale/skewed prices don't poison the median baseline
+        self.guard.update_median(symbol, best_spread)
 
         return snap
 
@@ -409,6 +410,11 @@ class PriceFeed:
         if bb_age > max_age_s or bn_age > max_age_s:
             return None
 
+        # Skew check: even with relaxed freshness, reject if one venue is
+        # extremely stale relative to the other (e.g., 1s vs 20s)
+        if abs(bb_age - bn_age) > 15.0:
+            return None
+
         spread_buy_bb = (bn.best_bid - bb.best_ask) / bb.best_ask * 10000
         spread_buy_bn = (bb.best_bid - bn.best_ask) / bn.best_ask * 10000
         best_spread = max(spread_buy_bb, spread_buy_bn)
@@ -427,6 +433,83 @@ class PriceFeed:
             bb_bid=bb.best_bid,
             bn_ask=bn.best_ask,
             reverse_spread_bps=min(spread_buy_bb, spread_buy_bn),
+            direction=direction,
+            bb_age_ms=bb_age * 1000,
+            bn_age_ms=bn_age * 1000,
+            timestamp=time.time(),
+            fresh=(bb_age < self.guard.MAX_AGE_S and bn_age < self.guard.MAX_AGE_S),
+        )
+
+    def get_spread_for_direction(
+        self, symbol: str, direction: str, max_age_s: float = 30.0,
+        for_exit: bool = False,
+    ) -> SpreadSnapshot | None:
+        """
+        Get the executable spread for a SPECIFIC direction.
+
+        For exits: if the position was entered as BUY_BB_SELL_BN, the exit
+        is SELL_BB_BUY_BN, and the relevant spread is (bb_bid - bn_ask).
+        This is NOT the same as the "best" spread from get_spread().
+
+        When for_exit=True, the spread_bps returned is the EXIT spread
+        (the reverse of the entry direction), which is what matters for
+        exit P&L decisions.
+
+        Codex finding #6: exit was using best-direction spread instead of
+        position-specific reverse spread. This method fixes that.
+        """
+        bb = self.bybit.prices.get(symbol)
+        bn_symbol = self._bn_map.get(symbol, symbol)
+        bn = self.binance.prices.get(bn_symbol)
+
+        if not bb or not bn:
+            return None
+        if bb.last_update_ts == 0 or bn.last_update_ts == 0:
+            return None
+        if bb.best_ask <= 0 or bn.best_bid <= 0 or bb.best_bid <= 0 or bn.best_ask <= 0:
+            return None
+
+        now = time.monotonic()
+        bb_age = now - bb.last_update_ts
+        bn_age = now - bn.last_update_ts
+
+        if bb_age > max_age_s or bn_age > max_age_s:
+            return None
+
+        # Skew check: reject if one venue much staler than the other
+        # (same guard as get_spread_for_exit — applies to all exit paths)
+        if for_exit and abs(bb_age - bn_age) > 15.0:
+            return None
+
+        # Compute spread for the SPECIFIC direction
+        if direction == "BUY_BB_SELL_BN":
+            entry_spread = (bn.best_bid - bb.best_ask) / bb.best_ask * 10000
+            exit_spread = (bb.best_bid - bn.best_ask) / bn.best_ask * 10000
+        else:  # BUY_BN_SELL_BB
+            entry_spread = (bb.best_bid - bn.best_ask) / bn.best_ask * 10000
+            exit_spread = (bn.best_bid - bb.best_ask) / bb.best_ask * 10000
+
+        # When for_exit=True, return the exit spread as spread_bps
+        if for_exit:
+            spread_bps = exit_spread
+            reverse_spread = entry_spread
+        else:
+            spread_bps = entry_spread
+            reverse_spread = exit_spread
+
+        # Reject phantom spikes
+        median = self.guard._median_spreads.get(symbol, abs(spread_bps))
+        if median > 0 and abs(spread_bps) > median * self.guard.MAX_SPREAD_MULTIPLE:
+            return None
+
+        return SpreadSnapshot(
+            symbol=symbol,
+            spread_bps=spread_bps,
+            bb_ask=bb.best_ask,
+            bn_bid=bn.best_bid,
+            bb_bid=bb.best_bid,
+            bn_ask=bn.best_ask,
+            reverse_spread_bps=reverse_spread,
             direction=direction,
             bb_age_ms=bb_age * 1000,
             bn_age_ms=bn_age * 1000,
