@@ -990,7 +990,7 @@ class H2LiveTraderV2:
         logger.info(
             f"H2 V2 ({uptime_h:.1f}h) | Active: {active} | "
             f"Trades: {risk['total_trades']} | PnL: ${risk['total_pnl_usd']:.2f} | "
-            f"Inv impairment: ${guard['total_impairment_usd']:.2f} | "
+            f"Inv M2M: ${guard['total_impairment_usd']:+.2f} | "
             f"Capture: ${guard['total_capture_usd']:.2f}"
         )
 
@@ -1127,16 +1127,17 @@ class H2LiveTraderV2:
         if low_inv:
             lines.append(f"\u26a0\ufe0f Low inventory: {', '.join(low_inv)}")
 
-        # Inventory guard status (impairment vs capture)
+        # Inventory guard: mark-to-market + trade capture
         lines.append("")
-        lines.append("<b>Inventory Guard:</b>")
+        lines.append("<b>Performance:</b>")
         imp = guard.get("total_impairment_usd", 0)
         cap = guard.get("total_capture_usd", 0)
-        net_guard = cap - abs(imp)
-        emoji_guard = "\U0001f7e2" if net_guard >= 0 else "\U0001f534"
-        lines.append(
-            f"  {emoji_guard} Impairment: ${imp:+.2f} | Capture: ${cap:+.2f} | Net: ${net_guard:+.2f}"
-        )
+        total_return = cap + imp  # imp positive = tokens gained, negative = tokens lost
+        emoji_mtm = "\U0001f7e2" if imp >= 0 else "\U0001f534"
+        emoji_total = "\U0001f7e2" if total_return >= 0 else "\U0001f534"
+        lines.append(f"  Trades: ${cap:+.2f} ({guard.get('total_trades', 0)} round-trips)")
+        lines.append(f"  {emoji_mtm} Inventory M2M: ${imp:+.2f} ({'tokens up' if imp >= 0 else 'tokens down'})")
+        lines.append(f"  {emoji_total} Total return: ${total_return:+.2f}")
         paused, pause_reason = self.inventory_guard.should_pause()
         if paused:
             lines.append(f"  \u26a0\ufe0f {pause_reason}")
