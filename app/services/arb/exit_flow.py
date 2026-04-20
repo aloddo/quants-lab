@@ -444,7 +444,22 @@ class ExitFlow:
                 latency_ms=(time.time() - t0) * 1000,
             )
 
-        # Neither leg has ANY fills -- safe to go back to OPEN for retry
+        # Neither leg has ANY fills in THIS attempt.
+        # But if a prior exit already closed one leg, we must stay in PARTIAL_EXIT, not OPEN.
+        # Going back to OPEN when Bybit is already flat would cause the system to re-sell on Bybit.
+        prior_bb_filled = pos.get("exit", {}).get("bb", {}).get("state") in (LegStateEnum.FILLED, "FILLED")
+        prior_bn_filled = pos.get("exit", {}).get("bn", {}).get("state") in (LegStateEnum.FILLED, "FILLED")
+        if prior_bb_filled or prior_bn_filled:
+            # Prior exit already closed one leg -- stay in PARTIAL_EXIT
+            if not await self._store.transition(position_id, PositionState.EXITING, PositionState.PARTIAL_EXIT, partial_updates):
+                logger.critical(f"DB transition FAILED for {position_id} -> PARTIAL_EXIT (prior leg filled)")
+                self._cleanup_legs(bb_leg, bn_leg)
+                return ExitResult(outcome="RISK_PAUSE", latency_ms=(time.time() - t0) * 1000)
+            self._cleanup_legs(bb_leg, bn_leg)
+            logger.warning(f"Exit retry had no new fills but prior exit closed one leg. Staying in PARTIAL_EXIT.")
+            return ExitResult(outcome="PARTIAL", latency_ms=(time.time() - t0) * 1000)
+
+        # Truly no fills (no prior, no current) -- safe to go back to OPEN
         if not await self._store.transition(position_id, PositionState.EXITING, PositionState.OPEN, partial_updates):
             logger.critical(f"DB transition FAILED for {position_id} -> OPEN (exit failed, no fills). "
                             f"NOT unregistering position or updating inventory.")
