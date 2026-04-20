@@ -170,15 +170,8 @@ def render_equity_curve_live(closed_positions: list, path: str = "/tmp/h2_equity
                 times.append(datetime.fromtimestamp(ct, tz=timezone.utc))
             else:
                 times.append(ct.replace(tzinfo=timezone.utc) if ct.tzinfo is None else ct)
-            # PnL from exit data or spread capture
-            exit_data = p.get("exit", {})
-            pnl_net = exit_data.get("pnl_net_usd", 0)
-            if pnl_net == 0:
-                # Fallback: compute from spread capture
-                entry_s = p.get("entry", {}).get("actual_spread_bps", p.get("signal_spread_bps", 0)) or 0
-                exit_s = exit_data.get("actual_spread_bps", 0) or 0
-                capture_bps = entry_s - exit_s
-                pnl_net = (capture_bps - 31) / 10000 * POSITION_USD * 2
+            # Read PnL from canonical location: pnl.net_usd
+            pnl_net = p.get("pnl", {}).get("net_usd", 0)
             pnls.append(pnl_net)
 
         if not times or not pnls:
@@ -477,6 +470,16 @@ class H2LiveTraderV2:
                     if inv_item:
                         self.inventory_guard.register_pair(sym, inv_item.expected_qty, inv_item.cost_basis_usd)
                         logger.info(f"Post-reconcile inventory: {sym} qty={inv_item.expected_qty:.1f} cost=${inv_item.cost_basis_usd:.2f}")
+
+                # Bootstrap guard capture history from MongoDB closed trades
+                # so it doesn't reset to zero on every restart
+                for pos in self._positions_coll.find({"state": "CLOSED"}):
+                    sym = pos.get("symbol", "")
+                    pnl_usd = pos.get("pnl", {}).get("net_usd", 0)
+                    if pnl_usd != 0:
+                        self.inventory_guard.record_trade_capture(sym, pnl_usd)
+                total_capture = self.inventory_guard._total_capture_usd
+                logger.info(f"Guard bootstrapped: ${total_capture:.4f} capture from {self._positions_coll.count_documents({'state': 'CLOSED'})} closed trades")
 
             logger.info("Waiting 3s for feeds to warm up...")
             await asyncio.sleep(3)
@@ -1009,14 +1012,8 @@ class H2LiveTraderV2:
         total_pnl = 0.0
         for t in closed:
             exit_data = t.get("exit", {})
-            pnl_net = exit_data.get("pnl_net_usd", 0)
-            if pnl_net == 0:
-                # Fallback: compute from spread capture
-                entry_s = t.get("entry", {}).get("actual_spread_bps", t.get("signal_spread_bps", 0)) or 0
-                exit_s = exit_data.get("actual_spread_bps", 0) or 0
-                cap = entry_s - exit_s
-                net = cap - 31
-                pnl_net = net / 10000 * POSITION_USD * 2
+            # Read PnL from the canonical location: pnl.net_usd
+            pnl_net = t.get("pnl", {}).get("net_usd", 0)
             total_pnl += pnl_net
             if pnl_net > 0:
                 wins += 1
@@ -1037,12 +1034,8 @@ class H2LiveTraderV2:
             for t in closed:
                 sym = t.get("symbol", "?")
                 exit_data = t.get("exit", {})
-                pnl_net = exit_data.get("pnl_net_usd", 0)
-                if pnl_net == 0:
-                    entry_s = t.get("entry", {}).get("actual_spread_bps", t.get("signal_spread_bps", 0)) or 0
-                    exit_s = exit_data.get("actual_spread_bps", 0) or 0
-                    net_bps = (entry_s - exit_s) - 31
-                    pnl_net = net_bps / 10000 * POSITION_USD * 2
+                # Read PnL from canonical location: pnl.net_usd
+                pnl_net = t.get("pnl", {}).get("net_usd", 0)
                 by_pair[sym].append(pnl_net)
             lines.append("")
             for sym in sorted(by_pair):
