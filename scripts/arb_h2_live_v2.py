@@ -179,7 +179,7 @@ class H2LiveTraderV2:
             )
 
             # Build flows
-            entry_flow = EntryFlow(self.position_store, detector, gateway, ws_available)
+            entry_flow = EntryFlow(self.position_store, detector, gateway, ws_available, shadow=self.shadow)
             exit_flow = ExitFlow(self.position_store, detector, gateway, ws_available)
 
             # Crash recovery (V2: state-machine-aware)

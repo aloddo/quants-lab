@@ -60,11 +60,13 @@ class EntryFlow:
         detector: FillDetector,
         gateway: OrderGateway,
         ws_available: dict[str, bool] | None = None,
+        shadow: bool = False,
     ):
         self._store = store
         self._detector = detector
         self._gateway = gateway
         self._ws_available = ws_available or {"bybit": True, "binance": False}
+        self._shadow = shadow
 
     async def execute(
         self,
@@ -88,6 +90,11 @@ class EntryFlow:
         """
         t0 = time.time()
         position_id = f"h2v2_{symbol}_{int(t0 * 1000)}"
+
+        # Shadow mode: log the signal but do NOT create MongoDB positions or submit orders
+        if self._shadow:
+            logger.info(f"[SHADOW] Would enter {symbol} {direction} qty_bb={qty_bb} qty_bn={qty_bn}")
+            return EntryResult(success=False, position_id=position_id, outcome="SHADOW_SKIP")
 
         # 1. Create PENDING position in MongoDB
         doc = new_position_doc(
