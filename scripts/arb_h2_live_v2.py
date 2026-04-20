@@ -889,7 +889,7 @@ class H2LiveTraderV2:
             elif bn_side == "Sell" and result.bn_filled_qty > 0:
                 self.inventory.sold(sym, result.bn_filled_qty, fill_price=result.bn_fill_price)
 
-            self.risk_manager.record_trade(result.pnl_net_usd, 0, 0)
+            self.risk_manager.record_trade(result.pnl_net_usd, 0, 0, leg_failure=False)
             self.inventory_guard.record_trade_capture(sym, result.pnl_net_usd)
 
             base = sym.replace("USDT", "")
