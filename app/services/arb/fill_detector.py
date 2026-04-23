@@ -35,6 +35,7 @@ class TrackedLeg:
     avg_fill_price: float = 0.0
     fee: float = 0.0
     fee_asset: str = ""
+    is_maker: bool = False
     exec_ids: list = field(default_factory=list)
     state: LegStateEnum = LegStateEnum.IDLE
     fill_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -55,14 +56,45 @@ class TrackedLeg:
 
     def apply_fill(self, fill: FillEvent) -> bool:
         """Apply a fill event. Returns False if duplicate (already seen exec_id)."""
-        if fill.exec_id in self.exec_ids:
+        # MEDIUM FIX (Codex #10): Only dedupe if exec_id is non-empty
+        # Empty exec_ids from REST fallback are legitimate fills, not duplicates
+        if fill.exec_id and fill.exec_id in self.exec_ids:
             return False  # Duplicate
 
         # Weighted average price
         prev_value = self.avg_fill_price * self.filled_qty
         self.filled_qty += fill.qty
-        self.fee += fill.fee
-        self.fee_asset = fill.fee_asset
+
+        # Normalize fee to USD. Bybit returns fees in USDT (quote), but Binance
+        # returns fees in the received asset: base token for buys, USDC for sells.
+        # HIGH FIX (Codex #5): BNB discount fees use BNB as fee_asset, not the traded
+        # pair's base token. Using fill.price (traded pair) for BNB conversion is WRONG.
+        # We can only safely convert when fee_asset matches the traded pair's base.
+        _QUOTE_ASSETS = ("USDT", "USDC", "USD", "BUSD", "FDUSD")
+        if fill.fee_asset and fill.fee_asset.upper() not in _QUOTE_ASSETS:
+            # Derive traded pair's base from symbol (e.g., RAREUSDC -> RARE)
+            _base = self.symbol.replace("USDT", "").replace("USDC", "") if self.symbol else ""
+            if fill.fee_asset.upper() == _base.upper() and fill.price > 0:
+                # Fee is in the traded base token — safe to use fill price
+                self.fee += fill.fee * fill.price
+            elif fill.price > 0 and not _base:
+                # No symbol info, best effort with fill price
+                self.fee += fill.fee * fill.price
+            else:
+                # Fee is in a DIFFERENT asset (BNB discount, etc.) — can't convert accurately
+                # Estimate: assume fee is ~0.1% of notional as fallback
+                notional = fill.price * fill.qty if fill.price > 0 and fill.qty > 0 else 0
+                estimated_fee_usd = notional * 0.001 if notional > 0 else 0
+                if estimated_fee_usd > 0:
+                    self.fee += estimated_fee_usd
+                    logger.warning(f"Fee in {fill.fee_asset} (not base token), estimated ${estimated_fee_usd:.6f} from 0.1% notional")
+                else:
+                    logger.warning(f"Fee normalization: unknown asset {fill.fee_asset}, fee={fill.fee} — cannot convert")
+                    self.fee += fill.fee  # Store raw
+        else:
+            self.fee += fill.fee
+        self.fee_asset = "USD"  # Always normalized to USD
+        self.is_maker = fill.is_maker
         self.filled_at = fill.local_ts
         self.exec_ids.append(fill.exec_id)
 
@@ -112,6 +144,45 @@ class TrackedLeg:
                     self.state = LegStateEnum.CANCELLED
                     self.fill_event.set()  # Signal terminal state
 
+    def enrich_fee_from_trades(self, trades: list[dict]):
+        """
+        Enrich fee data from exchange trade records (e.g. Binance /myTrades).
+        Called after REST fill confirmation to capture commission data that
+        get_order() doesn't return.
+
+        Each trade dict should have: commission (float), commissionAsset (str), price (float).
+        """
+        _QUOTE_ASSETS = ("USDT", "USDC", "USD", "BUSD", "FDUSD")
+        # Derive base asset from symbol for fee asset matching
+        _base = self.symbol.replace("USDT", "").replace("USDC", "") if self.symbol else ""
+        total_fee_usd = 0.0
+        for t in trades:
+            commission = float(t.get("commission", 0))
+            asset = t.get("commissionAsset", "")
+            price = float(t.get("price", 0))
+            if asset.upper() in _QUOTE_ASSETS:
+                total_fee_usd += commission
+            elif asset.upper() == _base.upper() and price > 0:
+                # Fee in traded base token — safe to use fill price
+                total_fee_usd += commission * price
+            elif price > 0:
+                # MEDIUM FIX (Opus C1 #4): Fee in unknown asset (BNB discount etc.)
+                # Estimate from notional since we can't convert accurately
+                qty = float(t.get("qty", 0))
+                notional = price * qty
+                total_fee_usd += notional * 0.001  # ~0.1% estimate
+                logger.warning(f"Fee in {asset} (not {_base}), estimated from 0.1% notional")
+            # else: can't convert, skip (shouldn't happen)
+        # MEDIUM FIX (Opus C3 #5): Only overwrite fee if REST data is more authoritative
+        # than existing WS-accumulated fee. If WS fee is already set, use the higher of the two
+        # (REST is more complete since it captures all fills, WS may miss some)
+        if total_fee_usd > 0:
+            self.fee = max(self.fee, total_fee_usd)
+        self.fee_asset = "USD"
+        # Set is_maker from first trade (all fills in an arb order should be same type)
+        if trades:
+            self.is_maker = bool(trades[0].get("isMaker", False))
+
     def mark_cancelled(self):
         """Mark leg as cancelled (only if no fills received)."""
         if not self.has_any_fill:
@@ -136,11 +207,13 @@ class FillDetector:
     UNMATCHED_BUFFER_MAX = 50
     UNMATCHED_TTL_S = 60.0
 
-    def __init__(self, get_order_fn: Callable):
+    def __init__(self, get_order_fn: Callable, get_trades_fn: Callable = None):
         """
         get_order_fn(venue, symbol, order_id, client_order_id) -> dict with fill_result
+        get_trades_fn(venue, symbol, order_id) -> list[dict] with commission data
         """
         self._get_order = get_order_fn
+        self._get_trades = get_trades_fn
 
         # Tracked legs: keyed by order_id AND client_order_id
         self._legs: dict[str, TrackedLeg] = {}
@@ -291,6 +364,9 @@ class FillDetector:
                         f"REST poll {i + 1}/{len(delays)}: {leg.venue} "
                         f"{leg.order_id} -> {leg.state} qty={leg.filled_qty}"
                     )
+                    # Enrich fee data for Binance (REST get_order doesn't return fees)
+                    if leg.venue == "binance" and leg.has_any_fill and self._get_trades:
+                        await self._enrich_fee(leg)
                     return
             except Exception as e:
                 logger.warning(f"REST poll {i + 1} failed: {leg.venue} {e}")
@@ -315,6 +391,29 @@ class FillDetector:
             await asyncio.sleep(0.5 * (2 ** attempt))
 
         return result  # Last UNKNOWN result
+
+    async def enrich_leg_fee(self, leg: TrackedLeg):
+        """Public method to enrich fee data for a filled leg. Called by entry/exit flows."""
+        if leg.venue == "binance" and leg.has_any_fill and self._get_trades:
+            await self._enrich_fee(leg)
+
+    async def _enrich_fee(self, leg: TrackedLeg):
+        """
+        Fetch commission data from exchange trade records for a filled Binance leg.
+        REST get_order() doesn't return fees — we need /myTrades for that.
+        """
+        if not self._get_trades:
+            return
+        try:
+            trades = await self._get_trades(leg.venue, leg.symbol, order_id=leg.order_id)
+            if trades:
+                leg.enrich_fee_from_trades(trades)
+                logger.info(
+                    f"Fee enriched: {leg.venue} {leg.symbol} "
+                    f"fee=${leg.fee:.6f} from {len(trades)} trade(s)"
+                )
+        except Exception as e:
+            logger.warning(f"Fee enrichment failed for {leg.venue} {leg.symbol}: {e}")
 
     def cleanup_leg(self, leg: TrackedLeg):
         """Remove a leg from tracking. Call after position transition is complete."""

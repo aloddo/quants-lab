@@ -79,8 +79,13 @@ class AdaptiveThresholds:
         """Have enough data to compute thresholds?"""
         return len(self.history[symbol]) >= self.window // 2
 
-    def get_thresholds(self, symbol: str) -> Optional[dict]:
-        """Compute current thresholds for a pair."""
+    def get_thresholds(self, symbol: str, entry_quantile: float = 0.90) -> Optional[dict]:
+        """Compute current thresholds for a pair.
+
+        Args:
+            entry_quantile: percentile for entry gate (0.87 for Tier A, 0.90 for Tier B).
+                           The exit quantile (P25) and excess are always computed at standard levels.
+        """
         h = self.history[symbol]
         if len(h) < self.window // 2:
             return None
@@ -88,11 +93,13 @@ class AdaptiveThresholds:
         p25 = float(np.percentile(arr, 25))
         p50 = float(np.percentile(arr, 50))
         p90 = float(np.percentile(arr, 90))
+        entry_threshold = float(np.percentile(arr, entry_quantile * 100))
         excess = p90 - p25
         return {
             "p25": p25,
             "median": p50,
             "p90": p90,
+            "entry_gate": entry_threshold,  # per-tier quantile
             "excess": excess,
             "viable": excess > MIN_EXCESS_BPS,
         }
@@ -136,6 +143,41 @@ class AdaptiveThresholds:
             if docs:
                 logger.info(f"  {sym}: loaded {len(docs)} quotes from multiple sources")
 
+    def seed_pair_from_collector(
+        self, symbol_bb: str, db_uri: str = "mongodb://localhost:27017/quants_lab"
+    ):
+        """Seed a single pair's threshold history from collector MongoDB.
+
+        Used when a new pair is promoted to the WS universe.
+        If the pair already has history (re-promotion), skip seeding.
+        """
+        if len(self.history.get(symbol_bb, [])) >= self.window // 4:
+            logger.info(f"  {symbol_bb}: already has {len(self.history[symbol_bb])} history, skipping seed")
+            return
+
+        client = None
+        try:
+            client = MongoClient(db_uri, serverSelectionTimeoutMS=5000)
+            db_name = db_uri.rsplit("/", 1)[-1]
+            db = client[db_name]
+
+            docs = list(db.arb_bn_usdc_bb_perp_snapshots.find(
+                {"symbol_bb": symbol_bb},
+                {"best_spread": 1, "_id": 0},
+            ).sort("timestamp", -1).limit(self.window))
+
+            if docs:
+                for d in reversed(docs):
+                    self.history[symbol_bb].append(abs(d["best_spread"]))
+                logger.info(f"  {symbol_bb}: seeded {len(docs)} snapshots from collector")
+            else:
+                logger.warning(f"  {symbol_bb}: no collector data found")
+        except Exception as e:
+            logger.warning(f"  {symbol_bb}: seed failed: {e}")
+        finally:
+            if client:
+                client.close()
+
     def seed_symbols(self, symbols: list[str]):
         """Initialize history deques for symbols."""
         for sym in symbols:
@@ -150,17 +192,67 @@ class SignalEngine:
     Feed it spread snapshots, it emits signals based on adaptive thresholds.
     """
 
-    def __init__(self, symbols: list[str], db_uri: str = "mongodb://localhost:27017/quants_lab"):
+    WARMUP_TICKS = 15  # Fresh spread observations before a newly seeded pair can trade
+    # (~2-3 min for low-vol USDC pairs that tick every 5-15s)
+
+    def __init__(self, symbols: list[str], db_uri: str = "mongodb://localhost:27017/quants_lab",
+                 fee_rt_bps: float = 31.0, margin_min_bps: float = 10.0):
         self.symbols = symbols
         self.thresholds = AdaptiveThresholds()
         self.thresholds.seed_symbols(symbols)
         self.open_positions: dict[str, OpenPosition] = {}  # symbol -> position
         self._update_counts: dict[str, int] = defaultdict(int)  # per-symbol counter
         self._subsample_rate = 12  # update thresholds every 12th spread (~1/min at WS rate)
+        self._warming_up: dict[str, int] = {}  # symbol -> WS ticks received since seed
+        self.fee_rt_bps = fee_rt_bps  # Centralized fee constant (single source of truth)
+        self.margin_min_bps = margin_min_bps  # Minimum margin over fees for entry
 
     def load_history(self, db_uri: str):
         """Bootstrap thresholds from MongoDB quote snapshots."""
         self.thresholds.load_from_mongodb(db_uri)
+
+    def add_pair(self, symbol_bb: str, db_uri: str = "mongodb://localhost:27017/quants_lab"):
+        """Add a new pair to the signal engine.
+
+        Seeds from collector data and marks as warming up.
+        If the pair already has threshold history (re-promotion), no warm-up needed.
+        """
+        if symbol_bb not in self.symbols:
+            self.symbols.append(symbol_bb)
+        self.thresholds.seed_symbols([symbol_bb])
+
+        # Check if already has history (re-promotion)
+        if len(self.thresholds.history.get(symbol_bb, [])) >= self.thresholds.window // 4:
+            logger.info(f"SignalEngine: {symbol_bb} re-promoted (history warm)")
+            return
+
+        # Seed from collector and mark as warming
+        self.thresholds.seed_pair_from_collector(symbol_bb, db_uri)
+        self._warming_up[symbol_bb] = 0
+        logger.info(f"SignalEngine: {symbol_bb} added, warming up ({self.WARMUP_TICKS} ticks)")
+
+    def remove_pair(self, symbol_bb: str):
+        """Remove a pair from active trading.
+
+        Keeps threshold history in memory for potential re-promotion.
+        Does NOT clear thresholds.history — that data is tiny and valuable.
+        NEVER drops open_positions — exit monitoring must continue even after removal.
+        """
+        if symbol_bb in self.symbols:
+            self.symbols.remove(symbol_bb)
+        self._warming_up.pop(symbol_bb, None)
+        # CRITICAL: do NOT pop open_positions — exit/stop-loss monitoring must continue
+        has_position = symbol_bb in self.open_positions
+        if has_position:
+            logger.warning(
+                f"SignalEngine: {symbol_bb} removed but has OPEN POSITION — exit monitoring continues"
+            )
+        else:
+            logger.info(f"SignalEngine: {symbol_bb} removed (history preserved)")
+
+    def is_warming_up(self, symbol: str) -> bool:
+        """Check if a pair is still in warm-up phase."""
+        return symbol in self._warming_up
 
     def update_thresholds(self, snap: 'SpreadSnapshot'):
         """Update adaptive thresholds from a spread snapshot.
@@ -172,13 +264,27 @@ class SignalEngine:
         if not snap.fresh:
             return
         self._update_counts[sym] += 1
+
+        # Track warm-up progress
+        if sym in self._warming_up:
+            self._warming_up[sym] += 1
+            if self._warming_up[sym] >= self.WARMUP_TICKS:
+                del self._warming_up[sym]
+                logger.info(f"SignalEngine: {sym} warm-up complete, entries enabled")
+
         if self._update_counts[sym] % self._subsample_rate == 0:
             self.thresholds.update(sym, abs(snap.spread_bps))
 
-    def check_entry(self, snap: SpreadSnapshot) -> Optional[SignalEvent]:
+    def check_entry(
+        self, snap: SpreadSnapshot, entry_quantile: float = 0.90
+    ) -> Optional[SignalEvent]:
         """
         Check if current spread triggers an entry signal.
         Returns SignalEvent or None.
+
+        Args:
+            entry_quantile: per-tier quantile gate (0.87 for Tier A, 0.90 for Tier B).
+                           Pass 1.0 to block entries (Tier C).
 
         CRITICAL: spread_bps must be POSITIVE for the chosen direction.
         A positive spread means the arb is profitable (buy low, sell high).
@@ -191,18 +297,35 @@ class SignalEngine:
         if sym in self.open_positions:
             return None  # already have a position
 
+        # Guard: only trade symbols in active universe
+        if sym not in self.symbols:
+            return None
+
+        # Block entries for warming-up pairs
+        if sym in self._warming_up:
+            return None
+
         # SAFETY: spread must be positive (profitable direction)
         if snap.spread_bps <= 0:
             return None
 
-        thresh = self.thresholds.get_thresholds(sym)
-        if not thresh or not thresh["viable"]:
+        # Block entries for Tier C / untiered pairs
+        if entry_quantile >= 1.0:
             return None
 
-        if snap.spread_bps >= thresh["p90"]:
+        thresh = self.thresholds.get_thresholds(sym, entry_quantile=entry_quantile)
+        if not thresh:
+            return None
+        # M1: Explicit margin gate — excess must cover fees + minimum margin
+        if thresh["excess"] < self.fee_rt_bps + self.margin_min_bps:
+            return None
+
+        if snap.spread_bps >= thresh["entry_gate"]:
             logger.info(
-                f"ENTRY SIGNAL: {sym} spread={snap.spread_bps:.1f}bp >= P90={thresh['p90']:.1f}bp "
-                f"(P25={thresh['p25']:.1f} excess={thresh['excess']:.1f} direction={snap.direction})"
+                f"ENTRY SIGNAL: {sym} spread={snap.spread_bps:.1f}bp >= "
+                f"P{entry_quantile*100:.0f}={thresh['entry_gate']:.1f}bp "
+                f"(P25={thresh['p25']:.1f} excess={thresh['excess']:.1f} "
+                f"direction={snap.direction})"
             )
             return SignalEvent(
                 symbol=sym,
@@ -293,29 +416,38 @@ class SignalEngine:
         """Remove a closed position."""
         self.open_positions.pop(symbol, None)
 
-    def verify_spread_at_execution(self, snap: SpreadSnapshot, original_signal: SignalEvent) -> bool:
+    def verify_spread_at_execution(
+        self, snap: SpreadSnapshot, original_signal: SignalEvent,
+        entry_quantile: float = 0.90,
+    ) -> bool:
         """
         Re-check spread at the moment of order submission.
         If spread has narrowed below threshold, skip the trade.
 
         This is the defense against execution skew (100-800ms between signal and order).
+
+        Args:
+            entry_quantile: same per-tier quantile used in check_entry.
+                           Ensures verify uses the same bar as the original signal.
         """
         if not snap.fresh:
             return False
 
-        # Re-check: spread must still be positive AND exceed P90
-        # Must match check_entry's sign check: positive = profitable direction
+        # Re-check: spread must still be positive
         if snap.spread_bps <= 0:
             return False
 
-        thresh = self.thresholds.get_thresholds(snap.symbol)
+        thresh = self.thresholds.get_thresholds(snap.symbol, entry_quantile=entry_quantile)
         if not thresh:
             return False
 
-        # Accept 80% of P90 at verify time — spread naturally narrows 10-30bp
-        # between signal and execution on thin USDC books. If we require full P90,
-        # most trades are rejected at verify despite being profitable.
-        return snap.spread_bps >= thresh["p90"] * 0.8
+        # Re-check margin gate at execution time (may have eroded since signal)
+        if thresh["excess"] < self.fee_rt_bps + self.margin_min_bps:
+            return False
+
+        # Accept 80% of the TIER-SPECIFIC entry gate at verify time.
+        # Spread naturally narrows 10-30bp between signal and execution on thin USDC books.
+        return snap.spread_bps >= thresh["entry_gate"] * 0.8
 
     def status(self) -> dict:
         """Return current signal engine state for monitoring."""

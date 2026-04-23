@@ -73,12 +73,16 @@ class OrderGateway:
         price: float,
         order_type: str,
         client_order_id: str = "",
+        order_mode: str = "aggressive",
     ) -> str:
         """
         Submit an order. Returns exchange order_id.
 
         Symbol is the internal key (e.g., NOMUSDT). For Binance, it is
         automatically mapped to the actual symbol (e.g., NOMUSDC).
+
+        order_mode: "aggressive" (IOC/taker) or "passive" (PostOnly/maker).
+        Only affects Bybit. Binance maker=taker so mode is ignored.
         """
         self._order_counter += 1
 
@@ -86,7 +90,7 @@ class OrderGateway:
             return await self._shadow_submit(venue, symbol, side, qty, price, order_type, client_order_id)
 
         if venue == "bybit":
-            return await self.bybit_api.submit_order(symbol, side, qty, price, order_type, client_order_id)
+            return await self.bybit_api.submit_order(symbol, side, qty, price, order_type, client_order_id, order_mode=order_mode)
         elif venue == "binance":
             bn_symbol = self.map_bn_symbol(symbol)
             return await self.binance_api.submit_order(bn_symbol, side, qty, price, order_type, client_order_id)
@@ -173,6 +177,18 @@ class OrderGateway:
             f"{venue} {symbol} oid={order_id or client_order_id}"
         )
         return result  # Return last UNKNOWN result
+
+    async def get_trades_for_order(self, venue: str, symbol: str, order_id: str = "") -> list[dict]:
+        """
+        Query trades for a specific order — returns commission/fee data.
+        Only implemented for Binance (Bybit WS already provides fees).
+        """
+        if self._shadow:
+            return []
+        if venue == "binance":
+            bn_symbol = self.map_bn_symbol(symbol)
+            return await self.binance_api.get_trades_for_order(bn_symbol, order_id)
+        return []
 
     async def check_position(self, venue: str, symbol: str) -> float | None:
         """

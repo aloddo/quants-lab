@@ -49,20 +49,32 @@ class BybitOrderAPI:
 
     async def submit_order(
         self, symbol: str, side: str, qty: float, price: float, order_type: str = "limit",
-        client_order_id: str = "",
+        client_order_id: str = "", order_mode: str = "aggressive",
     ) -> str:
         """
         Submit a linear perp order.
         Returns order_id. If client_order_id provided, Bybit tracks it as orderLinkId.
+
+        order_mode: "aggressive" (IOC, taker 0.055%) or "passive" (PostOnly, maker 0.02%).
+        PostOnly is rejected immediately if price would cross the spread.
         """
         ts = str(int(time.time() * 1000))
+
+        # TimeInForce: IOC for aggressive (fill-or-kill), PostOnly for passive (maker-only)
+        if order_type == "market":
+            tif = "IOC"
+        elif order_mode == "passive":
+            tif = "PostOnly"
+        else:
+            tif = "IOC"
+
         params = {
             "category": "linear",
             "symbol": symbol,
             "side": side.capitalize(),
             "orderType": "Market" if order_type == "market" else "Limit",
             "qty": f"{qty:.8f}".rstrip("0").rstrip("."),
-            "timeInForce": "IOC",
+            "timeInForce": tif,
         }
         if client_order_id:
             params["orderLinkId"] = client_order_id
@@ -601,6 +613,42 @@ class BinanceOrderAPI:
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"Binance get_order transient error: {e}")
             return {"fill_result": "UNKNOWN", "filled_qty": 0, "avg_price": 0, "status": "transport_error"}
+
+    async def get_trades_for_order(self, symbol: str, order_id: str) -> list[dict]:
+        """
+        Query trades for a specific order — returns commission data.
+        REST get_order() doesn't include fees. This endpoint does.
+        Each trade has: commission (str), commissionAsset (str), price (str), qty (str), isMaker (bool).
+        """
+        params = {
+            "symbol": symbol,
+            "orderId": order_id,
+            "timestamp": str(int(time.time() * 1000)),
+            "recvWindow": "5000",
+        }
+        params["signature"] = self._sign(params)
+
+        try:
+            async with self._session.get(
+                f"{self.BASE_URL}/api/v3/myTrades",
+                headers=self._headers(),
+                params=params,
+                timeout=_REQ_TIMEOUT,
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(f"Binance myTrades HTTP {resp.status} order={order_id}")
+                    return []
+                try:
+                    data = await resp.json()
+                except (aiohttp.ContentTypeError, ValueError):
+                    return []
+                if isinstance(data, list):
+                    return data
+                logger.warning(f"Binance myTrades unexpected response: {data}")
+                return []
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"Binance myTrades error: {e}")
+            return []
 
     async def get_exchange_info(self, symbol: str) -> dict:
         """Query symbol info (min notional, lot size, price filter)."""

@@ -41,6 +41,7 @@ class PairInventory:
     avg_cost_per_unit: float = 0.0  # cost_basis / qty
     realized_pnl_usd: float = 0.0  # cumulative PnL from round-trips (spread capture - fees)
     unrealized_pnl_usd: float = 0.0  # mark-to-market vs cost basis
+    sell_proceeds_usd: float = 0.0  # I3: total USD received from sells (for true realized PnL)
 
     @property
     def available_qty(self) -> float:
@@ -55,17 +56,14 @@ class PairInventory:
         return abs(self.discrepancy) / self.target_qty < 0.05  # <5% drift
 
 
-# Symbol to base asset mapping
-SYMBOL_TO_BASE = {
-    "HIGHUSDT": "HIGH",
-    "NOMUSDT": "NOM",
-    "ALICEUSDT": "ALICE",
-    "AXLUSDT": "AXL",
-    "PORTALUSDT": "PORTAL",
-    "THETAUSDT": "THETA",
-    "ILVUSDT": "ILV",
-    "ARPAUSDT": "ARPA",
-}
+def _derive_base_asset(symbol: str) -> str:
+    """Auto-derive base asset from trading symbol. Handles USDT/USDC pairs."""
+    for suffix in ("USDT", "USDC"):
+        if symbol.endswith(suffix):
+            base = symbol[:-len(suffix)]
+            if len(base) >= 1:
+                return base
+    return symbol  # fallback: return as-is
 
 
 class InventoryLedger:
@@ -92,7 +90,7 @@ class InventoryLedger:
         """Load inventory state from MongoDB, create if missing."""
         for sym in symbols:
             doc = self._coll.find_one({"symbol": sym})
-            base = SYMBOL_TO_BASE.get(sym, sym.replace("USDT", ""))
+            base = _derive_base_asset(sym)
 
             if doc:
                 self.inventories[sym] = PairInventory(
@@ -109,6 +107,7 @@ class InventoryLedger:
                     avg_cost_per_unit=doc.get("avg_cost_per_unit", 0),
                     realized_pnl_usd=doc.get("realized_pnl_usd", 0),
                     unrealized_pnl_usd=doc.get("unrealized_pnl_usd", 0),
+                    sell_proceeds_usd=doc.get("sell_proceeds_usd", 0),
                 )
             else:
                 # New pair — target will be set when inventory is pre-bought
@@ -138,6 +137,7 @@ class InventoryLedger:
                 "avg_cost_per_unit": inv.avg_cost_per_unit,
                 "realized_pnl_usd": inv.realized_pnl_usd,
                 "unrealized_pnl_usd": inv.unrealized_pnl_usd,
+                "sell_proceeds_usd": inv.sell_proceeds_usd,
                 "updated_at": time.time(),
             }},
             upsert=True,
@@ -191,10 +191,12 @@ class InventoryLedger:
                 inv.expected_qty -= fee_qty  # fee ate into our balance
             inv.locked_qty = max(0, inv.locked_qty - qty)
             inv.dust_qty += fee_qty
-            # USD tracking: reduce cost basis proportionally
+            # USD tracking: reduce cost basis proportionally + track sell proceeds
             if inv.expected_qty > 0 and inv.cost_basis_usd > 0:
                 sold_fraction = qty / (inv.expected_qty + qty)
                 inv.cost_basis_usd *= (1 - sold_fraction)
+            if fill_price > 0:
+                inv.sell_proceeds_usd += qty * fill_price  # I3: track total sell proceeds
             self._save(symbol)
             logger.info(f"SOLD {qty} {inv.base_asset} @{fill_price:.6f} (fee={fee_qty} base={fee_in_base}) (expected: {inv.expected_qty:.2f})")
 
@@ -288,6 +290,21 @@ class InventoryLedger:
                     f"disc={disc:.6f} ({abs(disc)/max(inv.target_qty, 1e-10)*100:.1f}%)"
                 )
 
+            # I4: Log reconciliation to drift history collection
+            try:
+                drift_coll = self._coll.database["arb_h2_inventory_drift"]
+                drift_coll.insert_one({
+                    "symbol": symbol,
+                    "timestamp": time.time(),
+                    "expected_qty": expected,
+                    "actual_qty": actual_qty,
+                    "discrepancy": disc,
+                    "cost_basis_usd": inv.cost_basis_usd,
+                    "sell_proceeds_usd": inv.sell_proceeds_usd,
+                })
+            except Exception as drift_err:
+                logger.debug(f"Drift history insert failed: {drift_err}")
+
             return disc
 
         except Exception as e:
@@ -322,11 +339,18 @@ class InventoryLedger:
                 old_expected = inv.expected_qty
                 inv.expected_qty = inv.last_exchange_qty
                 inv.discrepancy = 0
+                # CRITICAL: keep cost_basis in sync with qty change.
+                # If qty decreased (tokens sold/lost), cost_basis must shrink proportionally.
+                # If qty increased (tokens received), cost_basis stays (new tokens are "free").
+                # avg_cost_per_unit stays the same — it tracks per-unit acquisition cost.
+                if inv.avg_cost_per_unit > 0:
+                    inv.cost_basis_usd = inv.expected_qty * inv.avg_cost_per_unit
                 self._save(sym)
                 if abs(old_expected - inv.expected_qty) > 0.01:
                     logger.info(
                         f"Inventory auto-healed {sym}: {old_expected:.4f} -> "
-                        f"{inv.expected_qty:.4f} (exchange={inv.last_exchange_qty:.4f})"
+                        f"{inv.expected_qty:.4f} (exchange={inv.last_exchange_qty:.4f}) "
+                        f"cost_basis=${inv.cost_basis_usd:.2f}"
                     )
             elif abs(disc) > 0:
                 pct = abs(disc) / max(inv.expected_qty, 1e-10)
