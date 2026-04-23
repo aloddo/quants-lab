@@ -1283,19 +1283,35 @@ class H2LiveTraderV2:
             # Check Bybit WS
             if not ws_available.get("bybit", False):
                 issues.append("BB_WS_DOWN")
-            # Check price feed staleness (any pair > 30s stale)
+            # Check price feed staleness — only alert if MAJORITY of feeds are truly dead (>30s)
+            # Low-vol USDC pairs naturally tick every 5-15s, so 5s threshold causes false alarms
             stale_count = 0
-            for sym in self._active_pairs[:5]:  # Sample first 5
-                health = self._get_feed_health(sym)
-                if health in ("STALE", "NO DATA"):
+            total_checked = len(self._active_pairs)
+            for sym in self._active_pairs:
+                fs = self.price_feed.status().get(sym, {})
+                bb_age = fs.get("bb_age_ms", -1)
+                bn_age = fs.get("bn_age_ms", -1)
+                # 30s = truly dead, not just slow-ticking
+                if bb_age > 30000 or bn_age > 30000 or (bb_age < 0 and bn_age < 0):
                     stale_count += 1
-            if stale_count >= 3:
-                issues.append(f"FEEDS_STALE({stale_count}/{min(5, len(self._active_pairs))})")
+            if total_checked > 0 and stale_count > total_checked * 0.5:
+                issues.append(f"FEEDS_STALE({stale_count}/{total_checked})")
             # Check MongoDB
             try:
                 self._positions_coll.find_one({}, {"_id": 1})
             except Exception:
                 issues.append("MONGO_DOWN")
+            # Check for idle system — no trades in last 6 hours
+            last_trade = self._positions_coll.find_one(
+                {"state": "CLOSED"}, sort=[("exit_time", -1)],
+                projection={"exit_time": 1},
+            )
+            if last_trade:
+                last_exit = last_trade.get("exit_time", 0)
+                if isinstance(last_exit, (int, float)) and time.time() - last_exit > 6 * 3600:
+                    hours_idle = (time.time() - last_exit) / 3600
+                    issues.append(f"IDLE({hours_idle:.0f}h)")
+
             # Check for stuck positions (ENTERING/EXITING for > 5 min)
             stuck = list(self._positions_coll.find({
                 "state": {"$in": ["ENTERING", "EXITING", "UNWINDING"]},
@@ -1553,6 +1569,16 @@ class H2LiveTraderV2:
                 lines.append(f"Leg failures: {fill_results['LEG_FAILURE']}")
             if fill_results.get("BOTH_MISSED", 0):
                 lines.append(f"Both missed: {fill_results['BOTH_MISSED']}")
+            # PostOnly-specific metrics
+            po_rejected = fill_results.get("POSTONLY_REJECTED", 0)
+            po_timeout = fill_results.get("POSTONLY_TIMEOUT", 0)
+            po_partial = fill_results.get("POSTONLY_PARTIAL", 0)
+            po_collapsed = fill_results.get("SPREAD_COLLAPSED", 0)
+            po_slo = fill_results.get("NAKED_LEG_SLO", 0)
+            po_total = po_rejected + po_timeout + po_partial + po_collapsed + po_slo
+            if po_total > 0 or successes > 0:
+                po_success_rate = (successes / (successes + po_total) * 100) if (successes + po_total) > 0 else 0
+                lines.append(f"PostOnly: {po_success_rate:.0f}% success | rej:{po_rejected} timeout:{po_timeout} partial:{po_partial} collapse:{po_collapsed} slo:{po_slo}")
         except Exception:
             pass  # Analytics collection may not exist yet
 
