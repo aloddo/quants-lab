@@ -79,6 +79,12 @@ BYBIT_ENTRY_MODE = "passive"  # "passive" = PostOnly (maker 0.02%), "aggressive"
 # Aggressive (IOC):   BB taker 0.055% * 2 sides + BN taker 0.095% * 2 sides = 11bp + 19bp = 30bp
 FEE_RT_BPS = 23.0 if BYBIT_ENTRY_MODE == "passive" else 31.0
 POSTONLY_SPREAD_VERIFY_THRESHOLD = 0.7  # After BB fill, abort if spread < signal * this
+
+# Naked-leg SLO — hard limits on unhedged exposure
+MAX_NAKED_MS = 3000           # Max time with one leg filled, other not submitted (ms)
+MAX_UNHEDGED_USD = 2000.0     # Max unhedged notional before forced market close
+NAKED_LEG_ALERT_MS = 1500     # Alert threshold (half of hard limit)
+
 POLL_INTERVAL = 0.5
 TIER_RECOMPUTE_INTERVAL = 300  # 5 minutes
 UNIVERSE_REFRESH_INTERVAL = 4 * 3600  # 4 hours
@@ -131,7 +137,7 @@ async def tg_send_photo(path: str, caption: str, session: aiohttp.ClientSession)
 
 
 async def tg_poll_commands(session: aiohttp.ClientSession) -> str | None:
-    """Check for /report, /status, /h2, /h2live, /h2stats commands."""
+    """Check for /report, /status, /h2, /h2live, /h2stats, /h2pause, /h2resume, /h2mode, /h2size commands."""
     global _tg_last_update_id
     if not TG_TOKEN:
         return None
@@ -148,7 +154,7 @@ async def tg_poll_commands(session: aiohttp.ClientSession) -> str | None:
             _tg_last_update_id = update["update_id"]
             msg = update.get("message", {})
             text = msg.get("text", "").strip().lower().split("@")[0]
-            if text in ("/report", "/status", "/h2", "/h2live", "/h2stats"):
+            if text.startswith(("/report", "/status", "/h2")):
                 return text
         return None
     except Exception:
@@ -236,6 +242,9 @@ class H2LiveTraderV2:
         self._start_time = time.time()
         self._entry_reject_cooldown: dict[str, float] = {}  # sym -> next_allowed_log_time
         self._last_tier_recompute: float = 0.0
+        # Real-time effective cost tracker (Item #2)
+        self._realized_costs: list[float] = []  # last N trades' effective RT cost in bps
+        self._realized_cost_window = 20  # rolling window
 
         # V3: TierEngine drives pair selection
         self.tier_engine = TierEngine(mongo_uri=MONGO_URI)
@@ -261,6 +270,7 @@ class H2LiveTraderV2:
         self._positions_coll = self._db["arb_h2_positions_v2"]
 
     async def run(self):
+        global BYBIT_ENTRY_MODE, FEE_RT_BPS, POSITION_USD  # Runtime-modifiable via Telegram
         mode = "SHADOW" if self.shadow else "LIVE"
         logger.info("=" * 60)
         logger.info(f"H2 V3 SPIKE FADE — {mode} TRADER (dynamic screener)")
@@ -344,7 +354,7 @@ class H2LiveTraderV2:
             )
 
             # Build flows
-            entry_flow = EntryFlow(self.position_store, detector, gateway, ws_available, shadow=self.shadow, mongo_uri=MONGO_URI)
+            entry_flow = EntryFlow(self.position_store, detector, gateway, ws_available, shadow=self.shadow, mongo_uri=MONGO_URI, max_naked_ms=MAX_NAKED_MS)
             exit_flow = ExitFlow(self.position_store, detector, gateway, ws_available, mongo_uri=MONGO_URI)
 
             # V3: Start feeds via UniverseManager FIRST (before crash recovery needs price_feed)
@@ -708,10 +718,11 @@ class H2LiveTraderV2:
                         await tg_send(f"H2 V2 KILLED: {reason}", session)
                         break
 
-                    # Inventory impairment check + slippage monitoring every 5 minutes
+                    # Inventory impairment + slippage + degraded-mode checks every 5 minutes
                     if self._poll_count % 600 == 0:
                         await self._check_inventory_guard(session)
                         await self._check_slippage_alerts(session)
+                        await self._check_degraded_mode(session, ws_available)
 
                     # V3: Periodic tier recompute (every 5min)
                     if time.time() - self._last_tier_recompute >= TIER_RECOMPUTE_INTERVAL:
@@ -848,6 +859,35 @@ class H2LiveTraderV2:
                             await self._send_telegram_report(session)
                         elif cmd == "/h2stats":
                             await self._send_stats_report(session)
+                        elif cmd == "/h2pause":
+                            self.risk_manager._paused = True
+                            await tg_send("H2 V3 PAUSED. Send /h2resume to resume.", session)
+                        elif cmd == "/h2resume":
+                            self.risk_manager._paused = False
+                            await tg_send("H2 V3 RESUMED.", session)
+                        elif cmd and cmd.startswith("/h2mode"):
+                            parts = cmd.split()
+                            if len(parts) >= 2 and parts[1] in ("passive", "aggressive"):
+                                BYBIT_ENTRY_MODE = parts[1]
+                                FEE_RT_BPS = 23.0 if BYBIT_ENTRY_MODE == "passive" else 31.0
+                                self.signal_engine.fee_rt_bps = FEE_RT_BPS
+                                await tg_send(f"Mode: {BYBIT_ENTRY_MODE}, FEE_RT_BPS: {FEE_RT_BPS}", session)
+                            else:
+                                await tg_send(f"Current mode: {BYBIT_ENTRY_MODE}. Usage: /h2mode passive|aggressive", session)
+                        elif cmd and cmd.startswith("/h2size"):
+                            parts = cmd.split()
+                            if len(parts) >= 2:
+                                try:
+                                    new_size = float(parts[1])
+                                    if 1 <= new_size <= 10000:
+                                        POSITION_USD = new_size
+                                        await tg_send(f"Position size: ${POSITION_USD}/side", session)
+                                    else:
+                                        await tg_send("Size must be $1-$10000", session)
+                                except ValueError:
+                                    await tg_send(f"Current: ${POSITION_USD}/side. Usage: /h2size 100", session)
+                            else:
+                                await tg_send(f"Current: ${POSITION_USD}/side. Usage: /h2size 100", session)
 
                     # Periodic inventory reconciliation every 5 min (600 polls)
                     if self._poll_count % 600 == 0 and not self.shadow:
@@ -1143,6 +1183,14 @@ class H2LiveTraderV2:
 
             self.risk_manager.record_trade(result.pnl_net_usd, 0, 0, leg_failure=False)
             self.inventory_guard.record_trade_capture(sym, result.pnl_net_usd)
+            # Real-time effective cost tracking
+            if hasattr(result, 'pnl_net_bps'):
+                # Effective cost = gross - net (in bps)
+                gross_bps = result.pnl_net_bps + (FEE_RT_BPS if result.pnl_net_bps != 0 else 0)
+                effective_cost = gross_bps - result.pnl_net_bps if gross_bps != 0 else FEE_RT_BPS
+                self._realized_costs.append(effective_cost)
+                if len(self._realized_costs) > self._realized_cost_window:
+                    self._realized_costs = self._realized_costs[-self._realized_cost_window:]
 
             base = sym.replace("USDT", "")
             emoji = "\u2705" if result.pnl_net_bps > 0 else "\u274c"
@@ -1227,6 +1275,46 @@ class H2LiveTraderV2:
                     )
         except Exception as e:
             logger.debug(f"Slippage alert check failed: {e}")
+
+    async def _check_degraded_mode(self, session, ws_available):
+        """Degraded-mode playbook: deterministic actions for failure conditions."""
+        try:
+            issues = []
+            # Check Bybit WS
+            if not ws_available.get("bybit", False):
+                issues.append("BB_WS_DOWN")
+            # Check price feed staleness (any pair > 30s stale)
+            stale_count = 0
+            for sym in self._active_pairs[:5]:  # Sample first 5
+                health = self._get_feed_health(sym)
+                if health in ("STALE", "NO DATA"):
+                    stale_count += 1
+            if stale_count >= 3:
+                issues.append(f"FEEDS_STALE({stale_count}/{min(5, len(self._active_pairs))})")
+            # Check MongoDB
+            try:
+                self._positions_coll.find_one({}, {"_id": 1})
+            except Exception:
+                issues.append("MONGO_DOWN")
+            # Check for stuck positions (ENTERING/EXITING for > 5 min)
+            stuck = list(self._positions_coll.find({
+                "state": {"$in": ["ENTERING", "EXITING", "UNWINDING"]},
+                "entry_time": {"$lt": time.time() - 300},
+            }))
+            if stuck:
+                issues.append(f"STUCK_POSITIONS({len(stuck)})")
+
+            if issues:
+                severity = "CRITICAL" if "MONGO_DOWN" in issues or "STUCK_POSITIONS" in str(issues) else "WARNING"
+                msg = f"DEGRADED: {', '.join(issues)}"
+                logger.warning(msg)
+                if severity == "CRITICAL":
+                    self.risk_manager._paused = True
+                    await tg_send(f"\U0001f6d1 {msg}\nTrading PAUSED.", session)
+                else:
+                    await tg_send(f"\u26a0\ufe0f {msg}", session)
+        except Exception as e:
+            logger.debug(f"Degraded mode check failed: {e}")
 
     def _get_feed_health(self, sym: str) -> str:
         """Get feed health label for a symbol."""

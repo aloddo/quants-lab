@@ -63,12 +63,14 @@ class EntryFlow:
         ws_available: dict[str, bool] | None = None,
         shadow: bool = False,
         mongo_uri: str = "",
+        max_naked_ms: float = 3000.0,
     ):
         self._store = store
         self._detector = detector
         self._gateway = gateway
         self._ws_available = ws_available or {"bybit": True, "binance": False}
         self._shadow = shadow
+        self._max_naked_ms = max_naked_ms
         # Fill analytics collection
         self._analytics_coll = None
         if mongo_uri:
@@ -313,8 +315,25 @@ class EntryFlow:
                     "filled_at": bb_leg.filled_at,
                 })
 
-                # Verify spread is still alive before submitting BN
+                # Naked-leg SLO: check elapsed time since BB fill
                 bb_fill_ms = (time.time() - t_bb_submit) * 1000
+                if bb_fill_ms > self._max_naked_ms:
+                    logger.warning(f"Naked-leg SLO breached: {bb_fill_ms:.0f}ms > {self._max_naked_ms}ms, unwinding BB")
+                    if not await self._store.transition(position_id, PositionState.ENTERING, PositionState.UNWINDING, {
+                        "entry.bb.filled_qty": bb_leg.filled_qty,
+                        "entry.bb.state": LegStateEnum.FILLED,
+                    }):
+                        pass
+                    unwind_pnl, unwind_ok = await self._emergency_unwind(bb_leg, symbol, position_id)
+                    self._log_fill_analytics(symbol, "NAKED_LEG_SLO", bb_leg, bn_leg,
+                                             latency_ms=(time.time() - t0) * 1000, naked_ms=bb_fill_ms)
+                    self._cleanup_legs(bb_leg, bn_leg)
+                    outcome = "RISK_PAUSE" if not unwind_ok else "NAKED_LEG_SLO"
+                    return EntryResult(success=False, position_id=position_id, outcome=outcome,
+                                       failure_venue="naked_leg_timeout", unwind_pnl_usd=unwind_pnl,
+                                       latency_ms=(time.time() - t0) * 1000)
+
+                # Verify spread is still alive before submitting BN
                 if spread_verify_fn:
                     try:
                         spread_ok = spread_verify_fn(symbol, signal_spread_bps, threshold_p90)
