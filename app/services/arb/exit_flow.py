@@ -81,7 +81,7 @@ class ExitFlow:
 
     def _log_fill_analytics(self, symbol: str, outcome: str, bb_leg: TrackedLeg = None, bn_leg: TrackedLeg = None, **extra):
         """Log exit attempt outcome for fill rate analytics."""
-        if not self._analytics_coll:
+        if self._analytics_coll is None:
             return
         try:
             doc = {
