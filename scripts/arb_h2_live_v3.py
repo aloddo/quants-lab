@@ -73,7 +73,7 @@ USDC_PAIR_MAP: dict[str, tuple[str, str]] = {}  # populated at startup from Tier
 
 POSITION_USD = 10.0
 MAX_CONCURRENT = 6
-BYBIT_ENTRY_MODE = "passive"  # "passive" = PostOnly (maker 0.02%), "aggressive" = IOC (taker 0.055%)
+BYBIT_ENTRY_MODE = "aggressive"  # "aggressive" = IOC (taker 0.055%), "passive" = PostOnly (maker 0.02% but 90bp price slippage on spikes)
 # Dynamic fee estimate based on entry mode:
 # Passive (PostOnly): BB maker 0.02% * 2 sides + BN taker 0.095% * 2 sides = 4bp + 19bp = 23bp
 # Aggressive (IOC):   BB taker 0.055% * 2 sides + BN taker 0.095% * 2 sides = 11bp + 19bp = 30bp
