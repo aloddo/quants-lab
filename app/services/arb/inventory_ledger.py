@@ -42,6 +42,8 @@ class PairInventory:
     realized_pnl_usd: float = 0.0  # cumulative PnL from round-trips (spread capture - fees)
     unrealized_pnl_usd: float = 0.0  # mark-to-market vs cost basis
     sell_proceeds_usd: float = 0.0  # I3: total USD received from sells (for true realized PnL)
+    lifecycle_state: str = "ACTIVE"  # ACTIVE | RETIRING | INACTIVE
+    last_lifecycle_change: float = 0.0
 
     @property
     def available_qty(self) -> float:
@@ -108,6 +110,8 @@ class InventoryLedger:
                     realized_pnl_usd=doc.get("realized_pnl_usd", 0),
                     unrealized_pnl_usd=doc.get("unrealized_pnl_usd", 0),
                     sell_proceeds_usd=doc.get("sell_proceeds_usd", 0),
+                    lifecycle_state=doc.get("lifecycle_state", "ACTIVE"),
+                    last_lifecycle_change=doc.get("last_lifecycle_change", 0),
                 )
             else:
                 # New pair — target will be set when inventory is pre-bought
@@ -116,6 +120,7 @@ class InventoryLedger:
                     base_asset=base,
                     target_qty=0,  # set via initialize()
                     expected_qty=0,
+                    lifecycle_state="ACTIVE",
                 )
 
     def _save(self, sym: str):
@@ -138,10 +143,35 @@ class InventoryLedger:
                 "realized_pnl_usd": inv.realized_pnl_usd,
                 "unrealized_pnl_usd": inv.unrealized_pnl_usd,
                 "sell_proceeds_usd": inv.sell_proceeds_usd,
+                "lifecycle_state": inv.lifecycle_state,
+                "last_lifecycle_change": inv.last_lifecycle_change,
                 "updated_at": time.time(),
             }},
             upsert=True,
         )
+
+    def set_target(self, symbol: str, qty: float):
+        """Set inventory target for a symbol."""
+        inv = self.inventories.get(symbol)
+        if not inv:
+            return
+        new_qty = max(0.0, qty)
+        if abs(inv.target_qty - new_qty) > 1e-12:
+            inv.target_qty = new_qty
+            self._save(symbol)
+
+    def set_lifecycle_state(self, symbol: str, state: str):
+        """Update lifecycle marker for rotation-aware inventory management."""
+        inv = self.inventories.get(symbol)
+        if not inv:
+            return
+        state = (state or "").upper()
+        if state not in {"ACTIVE", "RETIRING", "INACTIVE"}:
+            return
+        if inv.lifecycle_state != state:
+            inv.lifecycle_state = state
+            inv.last_lifecycle_change = time.time()
+            self._save(symbol)
 
     def initialize(self, symbol: str, qty: float):
         """Set initial inventory target after pre-buying on Binance."""
@@ -151,6 +181,8 @@ class InventoryLedger:
             inv.expected_qty = qty
             inv.last_exchange_qty = qty
             inv.discrepancy = 0
+            inv.lifecycle_state = "ACTIVE"
+            inv.last_lifecycle_change = time.time()
             self._save(symbol)
             logger.info(f"Inventory initialized: {symbol} target={qty} {inv.base_asset}")
 
@@ -285,9 +317,10 @@ class InventoryLedger:
             self._save(symbol)
 
             if abs(disc) > 0.001:
+                base_qty = max(inv.target_qty, expected, actual_qty, 1e-10)
                 logger.info(
                     f"Reconcile {symbol}: expected={expected:.6f} actual={actual_qty:.6f} "
-                    f"disc={disc:.6f} ({abs(disc)/max(inv.target_qty, 1e-10)*100:.1f}%)"
+                    f"disc={disc:.6f} ({abs(disc)/base_qty*100:.1f}%)"
                 )
 
             # I4: Log reconciliation to drift history collection
@@ -339,12 +372,17 @@ class InventoryLedger:
                 old_expected = inv.expected_qty
                 inv.expected_qty = inv.last_exchange_qty
                 inv.discrepancy = 0
-                # CRITICAL: keep cost_basis in sync with qty change.
-                # If qty decreased (tokens sold/lost), cost_basis must shrink proportionally.
-                # If qty increased (tokens received), cost_basis stays (new tokens are "free").
-                # avg_cost_per_unit stays the same — it tracks per-unit acquisition cost.
-                if inv.avg_cost_per_unit > 0:
-                    inv.cost_basis_usd = inv.expected_qty * inv.avg_cost_per_unit
+                # Keep cost_basis coherent on auto-heal:
+                # - If qty decreases, shrink cost basis proportionally.
+                # - If qty increases, do NOT invent new cost basis.
+                # - Recompute avg_cost from resulting basis and qty.
+                if old_expected > 0 and inv.cost_basis_usd > 0 and inv.expected_qty < old_expected:
+                    keep_fraction = max(0.0, inv.expected_qty / old_expected)
+                    inv.cost_basis_usd *= keep_fraction
+                if inv.expected_qty > 0:
+                    inv.avg_cost_per_unit = inv.cost_basis_usd / inv.expected_qty
+                else:
+                    inv.avg_cost_per_unit = 0.0
                 self._save(sym)
                 if abs(old_expected - inv.expected_qty) > 0.01:
                     logger.info(
@@ -417,6 +455,7 @@ class InventoryLedger:
                 "avg_cost": round(inv.avg_cost_per_unit, 6),
                 "realized_pnl": round(inv.realized_pnl_usd, 4),
                 "unrealized_pnl": round(inv.unrealized_pnl_usd, 4),
+                "lifecycle_state": inv.lifecycle_state,
             }
             for sym, inv in self.inventories.items()
         }

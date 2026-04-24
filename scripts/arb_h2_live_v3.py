@@ -90,6 +90,13 @@ TIER_RECOMPUTE_INTERVAL = 300  # 5 minutes
 UNIVERSE_REFRESH_INTERVAL = 4 * 3600  # 4 hours
 V3_EPOCH = 1776940200.0  # Apr 23 2026 10:30 UTC — first V3 deploy. Used to filter V3-only trades.
 
+# Inventory lifecycle / rotation controls
+MIN_RETAIN_USD = 2.0  # below this, treat remaining balance as dust
+AUTOSEED_BUFFER_TRADES = 2.0  # keep enough token inventory for N entries
+LIQUIDATE_DISCOUNT = 0.0015  # sell at bid * (1-discount) for fast liquidation
+SEED_SURCHARGE = 0.0010  # buy at ask * (1+surcharge) for fast seeding
+REBALANCE_INTERVAL_POLL = 600  # every 5 minutes
+
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BINANCE_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -245,6 +252,7 @@ class H2LiveTraderV2:
         # Real-time effective cost tracker (Item #2)
         self._realized_costs: list[float] = []  # last N trades' effective RT cost in bps
         self._realized_cost_window = 20  # rolling window
+        self._retire_queue: set[str] = set()
 
         # V3: TierEngine drives pair selection
         self.tier_engine = TierEngine(mongo_uri=MONGO_URI)
@@ -268,6 +276,316 @@ class H2LiveTraderV2:
         db_name = MONGO_URI.rsplit("/", 1)[-1]
         self._db = client[db_name]
         self._positions_coll = self._db["arb_h2_positions_v2"]
+
+    async def _has_live_position(self, symbol: str) -> bool:
+        """True if symbol has any non-terminal position in PositionStore."""
+        live_states = [
+            PositionState.PENDING,
+            PositionState.ENTERING,
+            PositionState.OPEN,
+            PositionState.EXITING,
+            PositionState.PARTIAL_EXIT,
+            PositionState.UNWINDING,
+        ]
+        docs = await self.position_store.get_by_symbol(symbol, live_states)
+        return bool(docs)
+
+    async def _fetch_binance_mid_price(self, symbol: str, session: aiohttp.ClientSession) -> float:
+        """Best-effort mid price from WS, then Binance REST ticker."""
+        snap = self.price_feed.get_spread_for_exit(symbol) if self.price_feed else None
+        if snap:
+            mid = (snap.bn_bid + snap.bn_ask) / 2
+            if mid > 0:
+                return mid
+        bn_sym = self._pair_map.get(symbol, (symbol.replace("USDT", "USDC"),))[0]
+        try:
+            async with session.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": bn_sym},
+                timeout=aiohttp.ClientTimeout(total=4),
+            ) as resp:
+                data = await resp.json()
+            return float(data.get("price", 0))
+        except Exception:
+            return 0.0
+
+    def _sync_inventory_guard_pair(self, symbol: str):
+        inv = self.inventory.inventories.get(symbol)
+        if not inv:
+            return
+        derived_cost = (
+            inv.expected_qty * inv.avg_cost_per_unit
+            if inv.avg_cost_per_unit > 0
+            else inv.cost_basis_usd
+        )
+        self.inventory_guard.register_pair(symbol, inv.expected_qty, derived_cost)
+
+    async def _seed_inventory_for_symbols(
+        self,
+        symbols: list[str],
+        session: aiohttp.ClientSession,
+        gateway: OrderGateway,
+        reason: str = "autoseed",
+    ):
+        """Ensure active symbols can place SELL_BN entries (inventory preloaded)."""
+        if self.shadow:
+            return
+        targets = [s for s in dict.fromkeys(symbols) if s in self._pair_map]
+        if not targets:
+            return
+
+        open_positions = await self.position_store.get_active()
+        active_symbols = {p.get("symbol", "") for p in open_positions}
+        usdc_reserved = sum(
+            POSITION_USD * 1.01
+            for p in open_positions
+            if p.get("direction") == "BUY_BB_SELL_BN"
+            and p.get("state") in (
+                PositionState.OPEN.value,
+                PositionState.EXITING.value,
+                PositionState.PARTIAL_EXIT.value,
+            )
+        )
+        try:
+            usdc_balance = await gateway.binance_api.get_balance("USDC")
+        except Exception:
+            usdc_balance = 0.0
+        usdc_available = max(0.0, usdc_balance - usdc_reserved)
+
+        for sym in targets:
+            if sym in active_symbols:
+                continue
+            inv = self.inventory.inventories.get(sym)
+            if not inv:
+                continue
+
+            bn_sym = self._pair_map[sym][0]
+            bn_rules = self.instrument_rules.get("binance", bn_sym)
+            if not bn_rules:
+                continue
+
+            mid_price = await self._fetch_binance_mid_price(sym, session)
+            if mid_price <= 0:
+                continue
+
+            min_qty = POSITION_USD / mid_price
+            desired_qty = max(inv.target_qty, min_qty * AUTOSEED_BUFFER_TRADES)
+            available = max(0.0, inv.expected_qty - inv.locked_qty)
+            if available >= min_qty:
+                if inv.target_qty < desired_qty:
+                    self.inventory.set_target(sym, desired_qty)
+                self.inventory.set_lifecycle_state(sym, "ACTIVE")
+                self._sync_inventory_guard_pair(sym)
+                continue
+
+            buy_qty = max(0.0, desired_qty - available)
+            if buy_qty <= 0:
+                continue
+            buy_cost = buy_qty * mid_price * 1.002
+            if usdc_available < buy_cost:
+                logger.warning(
+                    f"AUTO-SEED blocked {sym}: need ${buy_cost:.2f}, "
+                    f"available ${usdc_available:.2f} (reserved ${usdc_reserved:.2f})"
+                )
+                continue
+
+            snap = self.price_feed.get_spread_for_exit(sym) if self.price_feed else None
+            ask_price = snap.bn_ask if snap and snap.bn_ask > 0 else mid_price
+            buy_price = bn_rules.round_price_for_side(ask_price * (1 + SEED_SURCHARGE), "Buy")
+            rounded_qty = bn_rules.round_qty(buy_qty)
+            if rounded_qty <= 0 or not bn_rules.check_notional(rounded_qty, buy_price):
+                continue
+
+            logger.info(
+                f"AUTO-SEED[{reason}] {sym}: buy {rounded_qty} @ {buy_price} "
+                f"(avail={available:.4f}, target={desired_qty:.4f})"
+            )
+            try:
+                oid = await gateway.submit("binance", sym, "Buy", rounded_qty, buy_price, "limit")
+                result = await gateway.get_order_with_retry("binance", sym, order_id=oid)
+                fill_state = result.get("fill_result")
+                if fill_state in ("FILLED", "PARTIAL"):
+                    filled = float(result.get("filled_qty", 0))
+                    fill_price = float(result.get("avg_price", buy_price))
+                    if filled > 0:
+                        self.inventory.bought(sym, filled, fill_price=fill_price)
+                        self.inventory.set_target(sym, desired_qty)
+                        self.inventory.set_lifecycle_state(sym, "ACTIVE")
+                        self._sync_inventory_guard_pair(sym)
+                        usdc_available = max(0.0, usdc_available - filled * fill_price * 1.002)
+                        logger.info(f"AUTO-SEED success {sym}: +{filled:.6f} @ {fill_price:.6f}")
+                else:
+                    await gateway.cancel("binance", sym, oid)
+            except Exception as e:
+                logger.error(f"AUTO-SEED failed {sym}: {e}")
+
+    async def _liquidate_inventory_for_symbol(
+        self,
+        symbol: str,
+        session: aiohttp.ClientSession,
+        gateway: OrderGateway,
+        reason: str = "rotation",
+    ) -> bool:
+        """Attempt to liquidate non-live symbol inventory on Binance.
+
+        Returns True when symbol can be removed from retire queue.
+        """
+        inv = self.inventory.inventories.get(symbol)
+        if not inv:
+            return True
+        if inv.locked_qty > 0:
+            return False
+
+        self.inventory.set_target(symbol, 0.0)
+        self.inventory.set_lifecycle_state(symbol, "RETIRING")
+
+        available = max(0.0, inv.expected_qty - inv.locked_qty)
+        if available <= 0:
+            self.inventory.set_lifecycle_state(symbol, "INACTIVE")
+            self._sync_inventory_guard_pair(symbol)
+            return True
+
+        bn_sym = self._pair_map.get(symbol, (symbol.replace("USDT", "USDC"),))[0]
+        bn_rules = self.instrument_rules.get("binance", bn_sym)
+        if not bn_rules:
+            await self.instrument_rules.load_binance(session, [bn_sym])
+            bn_rules = self.instrument_rules.get("binance", bn_sym)
+            if not bn_rules:
+                return False
+
+        mid_price = await self._fetch_binance_mid_price(symbol, session)
+        if mid_price <= 0:
+            return False
+
+        est_notional = available * mid_price
+        if est_notional < MIN_RETAIN_USD:
+            logger.info(f"Retire {symbol}: dust ${est_notional:.2f}, keeping residual")
+            self.inventory.set_lifecycle_state(symbol, "INACTIVE")
+            self._sync_inventory_guard_pair(symbol)
+            return True
+
+        sell_qty = bn_rules.round_qty(available)
+        if sell_qty <= 0:
+            return False
+
+        snap = self.price_feed.get_spread_for_exit(symbol) if self.price_feed else None
+        bid_price = snap.bn_bid if snap and snap.bn_bid > 0 else mid_price
+        sell_price = bn_rules.round_price_for_side(bid_price * (1 - LIQUIDATE_DISCOUNT), "Sell")
+        if not bn_rules.check_notional(sell_qty, sell_price):
+            if sell_qty * sell_price < MIN_RETAIN_USD:
+                self.inventory.set_lifecycle_state(symbol, "INACTIVE")
+                self._sync_inventory_guard_pair(symbol)
+                return True
+            return False
+
+        logger.info(f"RETIRE[{reason}] {symbol}: sell {sell_qty} @ {sell_price}")
+        try:
+            oid = await gateway.submit("binance", symbol, "Sell", sell_qty, sell_price, "limit")
+            result = await gateway.get_order_with_retry("binance", symbol, order_id=oid)
+            fill_state = result.get("fill_result")
+            if fill_state in ("FILLED", "PARTIAL"):
+                filled = float(result.get("filled_qty", 0))
+                fill_price = float(result.get("avg_price", sell_price))
+                if filled > 0:
+                    self.inventory.sold(symbol, filled, fill_price=fill_price, fee_in_base=False)
+                inv_now = self.inventory.inventories.get(symbol)
+                remaining = max(0.0, inv_now.expected_qty - inv_now.locked_qty) if inv_now else 0.0
+                self._sync_inventory_guard_pair(symbol)
+                if remaining * max(fill_price, mid_price) < MIN_RETAIN_USD:
+                    self.inventory.set_lifecycle_state(symbol, "INACTIVE")
+                    logger.info(f"RETIRE done {symbol}: residual ${remaining * max(fill_price, mid_price):.2f}")
+                    return True
+                logger.warning(f"RETIRE partial {symbol}: remaining={remaining:.6f}")
+                return False
+            await gateway.cancel("binance", symbol, oid)
+            return False
+        except Exception as e:
+            logger.error(f"RETIRE failed {symbol}: {e}")
+            return False
+
+    async def _process_retire_queue(self, session: aiohttp.ClientSession, gateway: OrderGateway):
+        """Drain pending retire queue for removed pairs with leftover inventory."""
+        if self.shadow or not self._retire_queue:
+            return
+        for sym in list(self._retire_queue):
+            if await self._has_live_position(sym):
+                continue
+            if await self._liquidate_inventory_for_symbol(sym, session, gateway, reason="queue"):
+                self._retire_queue.discard(sym)
+
+    async def _apply_universe_changes(
+        self,
+        changes: list[str],
+        session: aiohttp.ClientSession,
+        gateway: OrderGateway,
+    ):
+        """Apply universe add/remove changes and keep inventory lifecycle aligned."""
+        if not changes:
+            return
+
+        new_bb: list[str] = []
+        for change in changes:
+            if change.startswith("+"):
+                sym_bb = change[1:]
+                self.signal_engine.add_pair(sym_bb, MONGO_URI)
+                tier_info = self.tier_engine.get_tier_by_bb(sym_bb)
+                bn_sym = tier_info.symbol_bn if tier_info else sym_bb.replace("USDT", "USDC")
+                self._pair_map[sym_bb] = (bn_sym, sym_bb)
+                self._gateway_bn_map[sym_bb] = bn_sym
+                if sym_bb not in self._active_pairs:
+                    self._active_pairs.append(sym_bb)
+                self.inventory.load([sym_bb])
+                self.inventory.set_lifecycle_state(sym_bb, "ACTIVE")
+                self._retire_queue.discard(sym_bb)
+                self._sync_inventory_guard_pair(sym_bb)
+                new_bb.append(sym_bb)
+            elif change.startswith("-"):
+                sym_bb = change[1:]
+                self.signal_engine.remove_pair(sym_bb)
+                has_live_pos = await self._has_live_position(sym_bb)
+                if has_live_pos:
+                    logger.info(f"Universe remove deferred for {sym_bb}: live position still open")
+                    continue
+                if sym_bb in self._active_pairs:
+                    self._active_pairs.remove(sym_bb)
+                inv = self.inventory.inventories.get(sym_bb)
+                if inv and inv.expected_qty - inv.locked_qty > 0:
+                    self._retire_queue.add(sym_bb)
+                    self.inventory.set_lifecycle_state(sym_bb, "RETIRING")
+                    self.inventory.set_target(sym_bb, 0.0)
+                else:
+                    self.inventory.set_target(sym_bb, 0.0)
+                    self.inventory.set_lifecycle_state(sym_bb, "INACTIVE")
+
+        if new_bb:
+            new_bn = [self._pair_map[s][0] for s in new_bb]
+            await self.instrument_rules.load_all(session, new_bb, new_bn)
+            tradable_now = {info.symbol_bb for info in self.tier_engine.tradable_pairs()}
+            seed_now = [s for s in new_bb if s in tradable_now]
+            if seed_now:
+                await self._seed_inventory_for_symbols(seed_now, session, gateway, reason="rotation_add")
+
+        await self._process_retire_queue(session, gateway)
+
+    async def _sync_inventory_policy(self, session: aiohttp.ClientSession, gateway: OrderGateway):
+        """Inventory policy:
+        - Seed only tradable (Tier A/B) symbols.
+        - Retire inventory for non-tradable symbols with no live position.
+        """
+        tradable_symbols = {info.symbol_bb for info in self.tier_engine.tradable_pairs()}
+        for sym, inv in self.inventory.inventories.items():
+            if await self._has_live_position(sym):
+                continue
+            if sym in tradable_symbols:
+                self.inventory.set_lifecycle_state(sym, "ACTIVE")
+                continue
+            self.inventory.set_target(sym, 0.0)
+            if inv.expected_qty - inv.locked_qty > 0:
+                self.inventory.set_lifecycle_state(sym, "RETIRING")
+                self._retire_queue.add(sym)
+            else:
+                self.inventory.set_lifecycle_state(sym, "INACTIVE")
+        await self._process_retire_queue(session, gateway)
 
     async def run(self):
         global BYBIT_ENTRY_MODE, FEE_RT_BPS, POSITION_USD  # Runtime-modifiable via Telegram
@@ -298,6 +616,8 @@ class H2LiveTraderV2:
             self.signal_engine.add_pair(info.symbol_bb, MONGO_URI)
 
         self.inventory.load(self._active_pairs)
+        for sym in self._active_pairs:
+            self.inventory.set_lifecycle_state(sym, "ACTIVE")
 
         async with aiohttp.ClientSession() as session:
             # Build gateway (V3: bn_symbol_map is a reference to self._pair_map derived dict)
@@ -383,6 +703,7 @@ class H2LiveTraderV2:
                         if sym not in self._active_pairs:
                             self._active_pairs.append(sym)
                         self.signal_engine.add_pair(sym, MONGO_URI)
+                        self.inventory.set_lifecycle_state(sym, "ACTIVE")
                         # Dynamically subscribe on Bybit
                         if self.price_feed.bybit._ws and not self.price_feed.bybit._ws.closed:
                             await self.price_feed.bybit._ws.send_json(
@@ -497,7 +818,7 @@ class H2LiveTraderV2:
                         f"ex={ss.get('p90',0)-ss.get('p25',0):.0f}bp"
                     )
             await tg_send(
-                f"\U0001f680 <b>H2 V2 Spike Fade {mode} STARTED</b>\n"
+                f"\U0001f680 <b>H2 V3 Spike Fade {mode} STARTED</b>\n"
                 f"Pairs: {len(self._active_pairs)} monitored\n"
                 f"Entry: P90 | Exit: P25 | Fees: ~{FEE_RT_BPS:.0f}bp RT\n"
                 f"Size: ${POSITION_USD}/side | Max: {MAX_CONCURRENT}\n"
@@ -523,9 +844,10 @@ class H2LiveTraderV2:
             # Fixes stale ledger from prior sessions (e.g., KERNEL 3.7 vs actual 149.67).
             if not self.shadow:
                 logger.info("Reconciling inventory against Binance balances...")
+                startup_active = await self.position_store.get_active()
                 await self.inventory.periodic_reconcile(
                     session, BINANCE_KEY, BINANCE_SECRET,
-                    open_positions=set(self.signal_engine.open_positions.keys()),
+                    open_positions={p.get("symbol", "") for p in startup_active},
                 )
 
                 # Fix cost_basis consistency: ensure cost_basis = qty * avg_cost always.
@@ -589,120 +911,11 @@ class H2LiveTraderV2:
             logger.info("Waiting 3s for feeds to warm up...")
             await asyncio.sleep(3)
 
-            # ── Auto-seed inventory for pairs with insufficient tokens ──
-            # If a pair is in the allowlist, the system should ensure it CAN trade.
-            # Buy tokens using available USDC if inventory < one trade size.
-            # Runs AFTER feed warmup so price data is available.
-            #
-            # RULES:
-            # 1. Skip pairs with any active position (tokens are "in use",
-            #    exit will buy back automatically)
-            # 2. Reserve USDC for pending exit buy-backs before spending on seeds
+            # Startup auto-seed (and reconcile target quantities) for active pairs
             if not self.shadow:
-                # Calculate USDC reserved for exit buy-backs on open positions
-                open_positions = await self.position_store.get_active()
-                active_symbols = {p["symbol"] for p in open_positions}
-                usdc_reserved = sum(
-                    POSITION_USD * 1.01  # position size + 1% buffer for slippage
-                    for p in open_positions
-                    if p.get("direction") == "BUY_BB_SELL_BN"  # exit buys back on Binance
-                    and p.get("state") in (PositionState.OPEN, PositionState.EXITING,
-                                           PositionState.PARTIAL_EXIT)
-                )
-                if usdc_reserved > 0:
-                    logger.info(f"USDC reserved for exit buy-backs: ${usdc_reserved:.2f}")
-
-                for sym in self._active_pairs:
-                    # Skip pairs with active positions — inventory is in use
-                    if sym in active_symbols:
-                        logger.debug(f"Auto-seed skip {sym}: has active position")
-                        continue
-
-                    inv = self.inventory.inventories.get(sym)
-                    if not inv:
-                        continue
-                    bn_sym = self._pair_map[sym][0]
-                    bn_rules = self.instrument_rules.get("binance", bn_sym)
-                    if not bn_rules:
-                        continue
-
-                    # Get price — try WS spread first, fall back to REST ticker
-                    snap = self.price_feed.get_spread_for_exit(sym)
-                    if snap:
-                        mid_price = (snap.bn_bid + snap.bn_ask) / 2
-                    else:
-                        # WS has no data for this pair (too illiquid). Use REST price.
-                        try:
-                            async with session.get(
-                                f"https://api.binance.com/api/v3/ticker/price?symbol={bn_sym}"
-                            ) as resp:
-                                ticker = await resp.json()
-                                mid_price = float(ticker.get("price", 0))
-                                logger.info(f"AUTO-SEED {sym}: using REST price {mid_price} (WS has no data)")
-                        except Exception:
-                            mid_price = 0
-                    if mid_price <= 0:
-                        continue
-                    min_qty = POSITION_USD / mid_price
-                    available = inv.expected_qty - inv.locked_qty
-
-                    if available >= min_qty:
-                        continue  # Already have enough
-
-                    # How much to buy? Enough for 2 trades (buffer)
-                    buy_qty = min_qty * 2 - available
-                    buy_cost = buy_qty * mid_price * 1.002  # 0.2% fee buffer
-
-                    # Check USDC balance
-                    try:
-                        usdc_balance = await gateway.binance_api.get_balance("USDC")
-                    except Exception:
-                        usdc_balance = 0
-
-                    usdc_available = usdc_balance - usdc_reserved
-                    if usdc_available < buy_cost:
-                        logger.warning(
-                            f"Cannot auto-seed {sym}: need ${buy_cost:.2f} USDC, "
-                            f"have ${usdc_balance:.2f} (${usdc_reserved:.2f} reserved for exits, "
-                            f"${usdc_available:.2f} available). "
-                            f"Pair will be blocked until inventory is replenished."
-                        )
-                        continue
-
-                    # Buy at ask + 0.1% (aggressive limit to ensure fill)
-                    ask_price = snap.bn_ask if snap else mid_price
-                    buy_price = bn_rules.round_price_for_side(ask_price * 1.001, "Buy")
-                    rounded_qty = bn_rules.round_qty(buy_qty)
-
-                    if rounded_qty <= 0 or not bn_rules.check_notional(rounded_qty, buy_price):
-                        continue
-
-                    logger.info(
-                        f"AUTO-SEED: {sym} buying {rounded_qty} {sym.replace('USDT','')} "
-                        f"@ {buy_price} on Binance (${rounded_qty * buy_price:.2f})"
-                    )
-                    try:
-                        oid = await gateway.submit("binance", sym, "Buy", rounded_qty, buy_price, "limit")
-                        # Wait for fill confirmation
-                        result = await gateway.get_order_with_retry("binance", sym, order_id=oid)
-                        if result.get("fill_result") in ("FILLED", "PARTIAL"):
-                            filled = float(result.get("filled_qty", 0))
-                            fill_price = float(result.get("avg_price", buy_price))
-                            self.inventory.bought(sym, filled, fill_price=fill_price)
-                            derived_cost = inv.expected_qty * inv.avg_cost_per_unit if inv.avg_cost_per_unit > 0 else inv.cost_basis_usd
-                            self.inventory_guard.register_pair(sym, inv.expected_qty, derived_cost)
-                            logger.info(f"AUTO-SEED SUCCESS: {sym} bought {filled} @ {fill_price}")
-                            await tg_send(
-                                f"\U0001f331 <b>Auto-seeded</b> {sym.replace('USDT','')}\n"
-                                f"Bought {filled:.0f} @ {fill_price:.6f} (${filled*fill_price:.2f})",
-                                session,
-                            )
-                        else:
-                            # Cancel unfilled order
-                            await gateway.cancel("binance", sym, oid)
-                            logger.warning(f"AUTO-SEED {sym}: order not filled, cancelled")
-                    except Exception as e:
-                        logger.error(f"AUTO-SEED {sym} failed: {e}")
+                await self._sync_inventory_policy(session, gateway)
+                startup_seed = [info.symbol_bb for info in self.tier_engine.tradable_pairs()]
+                await self._seed_inventory_for_symbols(startup_seed, session, gateway, reason="startup")
 
             # ── Main loop ──
             try:
@@ -715,7 +928,7 @@ class H2LiveTraderV2:
 
                     if action == RiskAction.KILL:
                         logger.critical(f"KILL: {reason}")
-                        await tg_send(f"H2 V2 KILLED: {reason}", session)
+                        await tg_send(f"H2 V3 KILLED: {reason}", session)
                         break
 
                     # Inventory impairment + slippage + degraded-mode checks every 5 minutes
@@ -728,6 +941,8 @@ class H2LiveTraderV2:
                     if time.time() - self._last_tier_recompute >= TIER_RECOMPUTE_INTERVAL:
                         self.tier_engine.recompute()
                         self._last_tier_recompute = time.time()
+                        if not self.shadow:
+                            await self._sync_inventory_policy(session, gateway)
                         if self._poll_count % 600 == 0:
                             logger.info(f"Tiers:\n{self.tier_engine.summary()}")
 
@@ -735,29 +950,7 @@ class H2LiveTraderV2:
                     if self.universe_manager and self.universe_manager.needs_refresh():
                         changes = await self.universe_manager.refresh_universe()
                         if changes:
-                            # Update signal engine for new/removed pairs
-                            for change in changes:
-                                if change.startswith("+"):
-                                    sym_bb = change[1:]
-                                    self.signal_engine.add_pair(sym_bb, MONGO_URI)
-                                    # Update pair maps (C1 fix)
-                                    tier_info = self.tier_engine.get_tier_by_bb(sym_bb)
-                                    bn_sym = tier_info.symbol_bn if tier_info else sym_bb.replace("USDT", "USDC")
-                                    self._pair_map[sym_bb] = (bn_sym, sym_bb)
-                                    self._gateway_bn_map[sym_bb] = bn_sym
-                                    if sym_bb not in self._active_pairs:
-                                        self._active_pairs.append(sym_bb)
-                                    # Load inventory for new pair
-                                    self.inventory.load([sym_bb])
-                                elif change.startswith("-"):
-                                    sym_bb = change[1:]
-                                    self.signal_engine.remove_pair(sym_bb)
-                                    # Don't remove from _pair_map (may have open position)
-                            # Reload instrument rules for new pairs
-                            new_bb = [c[1:] for c in changes if c.startswith("+")]
-                            new_bn = [self._pair_map.get(c[1:], (c[1:].replace("USDT","USDC"),))[0] for c in changes if c.startswith("+")]
-                            if new_bb:
-                                await self.instrument_rules.load_all(session, new_bb, new_bn)
+                            await self._apply_universe_changes(changes, session, gateway)
 
                     # Update thresholds for all connected pairs
                     for sym in list(self.price_feed.symbols):
@@ -803,7 +996,7 @@ class H2LiveTraderV2:
                     # Check fill detector integrity (buffer overflow = RISK_PAUSE)
                     if detector.unmatched_buffer_overflow:
                         logger.critical("FILL DETECTOR BUFFER OVERFLOW — pausing all trading")
-                        await tg_send("H2 V2 CRITICAL: Fill detector buffer overflow. Trading paused.", session)
+                        await tg_send("H2 V3 CRITICAL: Fill detector buffer overflow. Trading paused.", session)
                         self.risk_manager._paused = True  # Force pause
 
                     # Check entries (V3: per-tier quantile + sizing)
@@ -890,11 +1083,15 @@ class H2LiveTraderV2:
                                 await tg_send(f"Current: ${POSITION_USD}/side. Usage: /h2size 100", session)
 
                     # Periodic inventory reconciliation every 5 min (600 polls)
-                    if self._poll_count % 600 == 0 and not self.shadow:
+                    if self._poll_count % REBALANCE_INTERVAL_POLL == 0 and not self.shadow:
+                        active_docs = await self.position_store.get_active()
                         await self.inventory.periodic_reconcile(
                             session, BINANCE_KEY, BINANCE_SECRET,
-                            open_positions=set(self.signal_engine.open_positions.keys()),
+                            open_positions={p.get("symbol", "") for p in active_docs},
                         )
+                        await self._sync_inventory_policy(session, gateway)
+                        periodic_seed = [info.symbol_bb for info in self.tier_engine.tradable_pairs()]
+                        await self._seed_inventory_for_symbols(periodic_seed, session, gateway, reason="periodic")
 
                     # V3: Mark position opens on universe manager (prevents WS disconnect)
                     if self.universe_manager:
@@ -1060,12 +1257,13 @@ class H2LiveTraderV2:
             else:
                 # BN buy: fee is in base token (deducted from received qty)
                 self.inventory.bought(sym, result.bn_filled_qty, fill_price=result.bn_fill_price, fee_in_base=True)
+            self.inventory.set_lifecycle_state(sym, "ACTIVE")
 
             open_count = len(self.signal_engine.open_positions)
             base = sym.replace("USDT", "")
             excess = signal.threshold_p90 - signal.threshold_p25
             await tg_send(
-                f"\U0001f4dd <b>H2 V2 OPEN</b> <code>{base}</code> [{open_count}/{MAX_CONCURRENT}]\n"
+                f"\U0001f4dd <b>H2 V3 OPEN</b> <code>{base}</code> [{open_count}/{MAX_CONCURRENT}]\n"
                 f"Spread: <b>{result.actual_spread_bps:.0f}bp</b> (P90={signal.threshold_p90:.0f})\n"
                 f"Exit@{signal.threshold_p25:.0f}bp | Excess: {excess:.0f}bp (fees~{FEE_RT_BPS:.0f}bp)\n"
                 f"Slip: {result.slippage_bps:.1f}bp | Lat: {result.latency_ms:.0f}ms\n"
@@ -1089,11 +1287,16 @@ class H2LiveTraderV2:
                     session,
                 )
             elif result.outcome == "LEG_FAILURE":
-                self.risk_manager.record_trade(result.unwind_pnl_usd, 0, 0, leg_failure=True)
+                self.risk_manager.record_trade(
+                    result.unwind_pnl_usd,
+                    0.0,
+                    abs(result.slippage_bps),
+                    leg_failure=True,
+                )
                 base = sym.replace("USDT", "")
                 consec = self.risk_manager.status().get('consecutive_leg_failures', '?')
                 await tg_send(
-                    f"\u26a0\ufe0f <b>H2 V2 LEG FAIL</b> <code>{base}</code>\n"
+                    f"\u26a0\ufe0f <b>H2 V3 LEG FAIL</b> <code>{base}</code>\n"
                     f"Unwind: ${result.unwind_pnl_usd:.4f}\n"
                     f"Consecutive: {consec}/3 (circuit breaker at 3)",
                     session,
@@ -1180,8 +1383,14 @@ class H2LiveTraderV2:
                 self.inventory.bought(sym, result.bn_filled_qty, fill_price=result.bn_fill_price)
             elif bn_side == "Sell" and result.bn_filled_qty > 0:
                 self.inventory.sold(sym, result.bn_filled_qty, fill_price=result.bn_fill_price)
+            self.inventory.set_lifecycle_state(sym, "ACTIVE")
 
-            self.risk_manager.record_trade(result.pnl_net_usd, 0, 0, leg_failure=False)
+            self.risk_manager.record_trade(
+                result.pnl_net_usd,
+                getattr(result, "fees_usd", 0.0),
+                abs(getattr(result, "slippage_bps", 0.0)),
+                leg_failure=False,
+            )
             self.inventory_guard.record_trade_capture(sym, result.pnl_net_usd)
             # Real-time effective cost tracking
             if hasattr(result, 'pnl_net_bps'):
@@ -1200,7 +1409,7 @@ class H2LiveTraderV2:
             hold_s = time.time() - pos_doc.get("entry_time", time.time())
             safe_reason = signal.signal_type.replace("<", "&lt;").replace(">", "&gt;")
             await tg_send(
-                f"\U0001f4dd <b>H2 V2 CLOSE</b> {emoji} <code>{base}</code>\n"
+                f"\U0001f4dd <b>H2 V3 CLOSE</b> {emoji} <code>{base}</code>\n"
                 f"Entry: {entry_spread:.0f}bp \u2192 Exit: {exit_spread:.0f}bp\n"
                 f"Net: <b>{result.pnl_net_bps:+.0f}bp (${result.pnl_net_usd:.3f})</b>\n"
                 f"Hold: {hold_s/60:.0f}min | {safe_reason}\n"
@@ -1216,8 +1425,9 @@ class H2LiveTraderV2:
                     self.inventory.bought(sym, result.bn_filled_qty, fill_price=result.bn_fill_price, fee_in_base=True)
                 elif bn_side == "Sell":
                     self.inventory.sold(sym, result.bn_filled_qty, fill_price=result.bn_fill_price, fee_in_base=True)
+            self.inventory.set_lifecycle_state(sym, "ACTIVE")
             await tg_send(
-                f"\u26a0\ufe0f <b>H2 V2 PARTIAL EXIT</b> <code>{sym.replace('USDT', '')}</code> -- retrying next cycle",
+                f"\u26a0\ufe0f <b>H2 V3 PARTIAL EXIT</b> <code>{sym.replace('USDT', '')}</code> -- retrying next cycle",
                 session,
             )
 
@@ -1237,17 +1447,39 @@ class H2LiveTraderV2:
 
     async def _check_inventory_guard(self, session):
         """Mark to market and check if inventory impairment exceeds alpha."""
-        prices = {}
-        for sym in self._active_pairs:
-            snap = self.price_feed.get_spread_for_exit(sym)
-            if snap:
+        prices: dict[str, float] = {}
+        missing_price_symbols: dict[str, str] = {}
+        for sym, inv in self.inventory.inventories.items():
+            self._sync_inventory_guard_pair(sym)
+            if inv.expected_qty <= 0:
+                continue
+            snap = self.price_feed.get_spread_for_exit(sym) if self.price_feed else None
+            if snap and snap.bn_bid > 0 and snap.bn_ask > 0:
                 prices[sym] = (snap.bn_bid + snap.bn_ask) / 2
+                continue
+            bn_sym = self._pair_map.get(sym, (sym.replace("USDT", "USDC"),))[0]
+            missing_price_symbols[sym] = bn_sym
+
+        if missing_price_symbols:
+            try:
+                async with session.get(
+                    "https://api.binance.com/api/v3/ticker/price",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    tickers = await resp.json()
+                px_map = {t.get("symbol"): float(t.get("price", 0)) for t in tickers if "symbol" in t}
+                for sym, bn_sym in missing_price_symbols.items():
+                    px = px_map.get(bn_sym, 0)
+                    if px > 0:
+                        prices[sym] = px
+            except Exception as e:
+                logger.debug(f"Inventory guard REST price fallback failed: {e}")
 
         self.inventory_guard.mark_to_market(prices)
         should_pause, reason = self.inventory_guard.should_pause()
         if should_pause:
             logger.warning(f"INVENTORY GUARD: {reason}")
-            await tg_send(f"H2 V2 INVENTORY GUARD: {reason}", session)
+            await tg_send(f"H2 V3 INVENTORY GUARD: {reason}", session)
             # Don't auto-pause yet -- just alert. Alberto decides.
 
     async def _check_slippage_alerts(self, session):
@@ -1353,10 +1585,11 @@ class H2LiveTraderV2:
         guard = self.inventory_guard.status()
 
         logger.info(
-            f"H2 V2 ({uptime_h:.1f}h) | Active: {active} | "
+            f"H2 V3 ({uptime_h:.1f}h) | Active: {active} | "
             f"Trades: {risk['total_trades']} | PnL: ${risk['total_pnl_usd']:.2f} | "
             f"Inv M2M: ${guard['total_impairment_usd']:+.2f} | "
-            f"Capture: ${guard['total_capture_usd']:.2f}"
+            f"Capture: ${guard['total_capture_usd']:.2f} | "
+            f"RetireQ: {len(self._retire_queue)}"
         )
 
     def _build_report_text(self) -> str:
@@ -1457,12 +1690,13 @@ class H2LiveTraderV2:
         lines.append("<b>Inventory M2M:</b>")
         # Use REST prices for M2M (WS single-venue fallback was returning wrong prices)
         m2m_prices = self._rest_prices_cache if hasattr(self, '_rest_prices_cache') else {}
-        for sym in self._active_pairs:
+        for sym in sorted(inv_status.keys()):
             iv = inv_status.get(sym, {})
             avail = iv.get("available", 0)
             cost = iv.get("cost_basis_usd", 0)
             if avail <= 0:
                 continue
+            lifecycle = self.inventory.inventories.get(sym).lifecycle_state if self.inventory.inventories.get(sym) else "ACTIVE"
             bn_sym = self._pair_map.get(sym, (sym.replace("USDT", "USDC"),))[0]
             mid = m2m_prices.get(bn_sym, 0)
             # Fallback to spread if REST cache empty
@@ -1477,12 +1711,12 @@ class H2LiveTraderV2:
                 total_mkt += mkt
                 base = sym.replace("USDT", "")
                 e = "\U0001f7e2" if upnl >= 0 else "\U0001f534"
-                lines.append(f"  {e} {base}: ${mkt:.2f} (cost ${cost:.2f}) uPnL ${upnl:+.2f}")
+                lines.append(f"  {e} {base} [{lifecycle}]: ${mkt:.2f} (cost ${cost:.2f}) uPnL ${upnl:+.2f}")
             else:
                 total_cost += cost
                 total_mkt += cost
                 base = sym.replace("USDT", "")
-                lines.append(f"  \u23f3 {base}: cost ${cost:.2f} (no price)")
+                lines.append(f"  \u23f3 {base} [{lifecycle}]: cost ${cost:.2f} (no price)")
 
         total_inv_upnl = total_mkt - total_cost
         e = "\U0001f7e2" if total_inv_upnl >= 0 else "\U0001f534"
@@ -1624,7 +1858,7 @@ class H2LiveTraderV2:
 # ── Entry point ─────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="H2 V2 Live Trader")
+    parser = argparse.ArgumentParser(description="H2 V3 Live Trader")
     parser.add_argument("--shadow", action="store_true", help="Shadow mode: no real orders")
     args = parser.parse_args()
 

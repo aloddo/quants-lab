@@ -42,6 +42,8 @@ class ExitResult:
     latency_ms: float = 0.0
     pnl_net_bps: float = 0.0
     pnl_net_usd: float = 0.0
+    fees_usd: float = 0.0
+    slippage_bps: float = 0.0
 
 
 class ExitFlow:
@@ -246,6 +248,7 @@ class ExitFlow:
             total_fee = sum(float(entry.get(v, {}).get("fee", 0)) + float(exit_stored.get(v, {}).get("fee", 0)) for v in ("bb", "bn"))
             net = gross - total_fee
             avg_notional = (bb_ep * bb_eq + bn_ep * bn_eq) / 2 if (bb_ep * bb_eq + bn_ep * bn_eq) > 0 else 1
+            trade_slippage_bps = abs(float(entry.get("slippage_bps", 0)))
             close_updates = {
                 "exit_time": time.time(),
                 "hold_seconds": time.time() - pos.get("entry_time", time.time()),
@@ -257,7 +260,13 @@ class ExitFlow:
             if not await self._store.transition(position_id, PositionState.EXITING, PositionState.CLOSED, close_updates):
                 logger.critical(f"DB transition FAILED for {position_id} -> CLOSED (no legs)")
                 return ExitResult(outcome="RISK_PAUSE")
-            return ExitResult(outcome="SUCCESS", pnl_net_usd=net, pnl_net_bps=(gross - total_fee) / avg_notional * 10000)
+            return ExitResult(
+                outcome="SUCCESS",
+                pnl_net_usd=net,
+                pnl_net_bps=(gross - total_fee) / avg_notional * 10000,
+                fees_usd=total_fee,
+                slippage_bps=trade_slippage_bps,
+            )
 
         # 3. Submit exit orders
         bb_oid = None
@@ -544,6 +553,17 @@ class ExitFlow:
             fees_bps = (total_fees_usd / avg_notional * 10000) if avg_notional > 0 else 0
             net_bps = gross_bps - fees_bps
 
+            entry_slippage_bps = abs(float(entry.get("slippage_bps", 0)))
+            bb_exit_slip_bps = (
+                abs((bb_leg.avg_fill_price - bb_leg.target_price) / bb_leg.target_price * 10000)
+                if bb_leg and bb_leg.target_price > 0 and bb_leg.avg_fill_price > 0 else 0.0
+            )
+            bn_exit_slip_bps = (
+                abs((bn_leg.avg_fill_price - bn_leg.target_price) / bn_leg.target_price * 10000)
+                if bn_leg and bn_leg.target_price > 0 and bn_leg.avg_fill_price > 0 else 0.0
+            )
+            trade_slippage_bps = entry_slippage_bps + bb_exit_slip_bps + bn_exit_slip_bps
+
             actual_spread = self._compute_exit_spread(bb_leg, bn_leg, bb_side)
 
             close_updates = {
@@ -605,6 +625,8 @@ class ExitFlow:
                 latency_ms=(time.time() - t0) * 1000,
                 pnl_net_bps=net_bps,
                 pnl_net_usd=net_usd,
+                fees_usd=total_fees_usd,
+                slippage_bps=trade_slippage_bps,
             )
 
         # PARTIAL -- one or both legs unfilled

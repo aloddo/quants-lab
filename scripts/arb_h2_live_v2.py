@@ -67,13 +67,20 @@ TRADING_MODE = "usdc"
 USDC_PAIR_MAP = {
     "NOMUSDT": ("NOMUSDC", "NOMUSDT"),
     "ENJUSDT": ("ENJUSDC", "ENJUSDT"),
-    "MOVEUSDT": ("MOVEUSDC", "MOVEUSDT"),
+    "BLURUSDT": ("BLURUSDC", "BLURUSDT"),
     "KERNELUSDT": ("KERNELUSDC", "KERNELUSDT"),
+    # New pairs from X7 volume-shock scan (2026-04-20)
+    # Validated: Bybit perp exists, depth > $500, spread < 10bps
+    "QNTUSDT": ("QNTUSDC", "QNTUSDT"),      # gross=3.8bp, BB spread=2.7bp, depth=$490+$1700
+    "ONTUSDT": ("ONTUSDC", "ONTUSDT"),       # gross=4.6bp, BB spread=1.3bp, depth=$618+$1703
+    "ILVUSDT": ("ILVUSDC", "ILVUSDT"),      # gross=5.0bp, BB spread=2.2bp, depth=$3572+$966
+    # TWT removed: no Bybit perpetual contract
+    # COMP removed: Bybit depth only $200 (too thin)
 }
 
 PAIRS = list(USDC_PAIR_MAP.keys())
 POSITION_USD = 10.0
-MAX_CONCURRENT = 3
+MAX_CONCURRENT = 6
 POLL_INTERVAL = 0.5
 
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
@@ -426,11 +433,14 @@ class H2LiveTraderV2:
             ws_monitor_task = asyncio.create_task(_ws_health_monitor())
 
             # Seed inventory guard from inventory ledger
+            # Use qty * avg_cost_per_unit as cost basis (not cost_basis_usd which can
+            # drift out of sync when reconciliation changes qty without updating cost).
             for sym in PAIRS:
                 inv = self.inventory.inventories.get(sym)
                 if inv:
-                    self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
-                    logger.info(f"Inventory guard seeded: {sym} qty={inv.expected_qty:.1f} cost=${inv.cost_basis_usd:.2f}")
+                    derived_cost = inv.expected_qty * inv.avg_cost_per_unit if inv.avg_cost_per_unit > 0 else inv.cost_basis_usd
+                    self.inventory_guard.register_pair(sym, inv.expected_qty, derived_cost)
+                    logger.info(f"Inventory guard seeded: {sym} qty={inv.expected_qty:.1f} cost=${derived_cost:.2f} (avg=${inv.avg_cost_per_unit:.6f})")
 
             # ── Startup inventory reconciliation ──
             # CRITICAL: reconcile ledger against actual Binance balances BEFORE trading.
@@ -441,6 +451,20 @@ class H2LiveTraderV2:
                     session, BINANCE_KEY, BINANCE_SECRET,
                     open_positions=set(self.signal_engine.open_positions.keys()),
                 )
+
+                # Fix cost_basis consistency: ensure cost_basis = qty * avg_cost always.
+                # This catches drift from reconciliation changing qty without updating cost.
+                for sym in PAIRS:
+                    inv_item = self.inventory.inventories.get(sym)
+                    if inv_item and inv_item.expected_qty > 0 and inv_item.avg_cost_per_unit > 0:
+                        derived = inv_item.expected_qty * inv_item.avg_cost_per_unit
+                        if abs(inv_item.cost_basis_usd - derived) > 0.10:
+                            logger.warning(
+                                f"Cost basis drift detected for {sym}: "
+                                f"cost_basis=${inv_item.cost_basis_usd:.2f} vs derived=${derived:.2f}. Fixing."
+                            )
+                            inv_item.cost_basis_usd = derived
+                            self.inventory._save(sym)
 
                 # Backfill cost_basis for pre-existing inventory with $0 cost.
                 # We don't know the original purchase price, so use current market
@@ -468,11 +492,13 @@ class H2LiveTraderV2:
                             logger.warning(f"Cost basis backfill failed for {sym}: {e}")
 
                 # Re-seed inventory guard after reconciliation + backfill
+                # Use derived cost (qty * avg_cost) for consistency
                 for sym in PAIRS:
                     inv_item = self.inventory.inventories.get(sym)
                     if inv_item:
-                        self.inventory_guard.register_pair(sym, inv_item.expected_qty, inv_item.cost_basis_usd)
-                        logger.info(f"Post-reconcile inventory: {sym} qty={inv_item.expected_qty:.1f} cost=${inv_item.cost_basis_usd:.2f}")
+                        derived_cost = inv_item.expected_qty * inv_item.avg_cost_per_unit if inv_item.avg_cost_per_unit > 0 else inv_item.cost_basis_usd
+                        self.inventory_guard.register_pair(sym, inv_item.expected_qty, derived_cost)
+                        logger.info(f"Post-reconcile inventory: {sym} qty={inv_item.expected_qty:.1f} cost=${derived_cost:.2f} (avg=${inv_item.avg_cost_per_unit:.6f})")
 
                 # Bootstrap guard capture history from MongoDB closed trades
                 # so it doesn't reset to zero on every restart
@@ -587,7 +613,8 @@ class H2LiveTraderV2:
                             filled = float(result.get("filled_qty", 0))
                             fill_price = float(result.get("avg_price", buy_price))
                             self.inventory.bought(sym, filled, fill_price=fill_price)
-                            self.inventory_guard.register_pair(sym, inv.expected_qty, inv.cost_basis_usd)
+                            derived_cost = inv.expected_qty * inv.avg_cost_per_unit if inv.avg_cost_per_unit > 0 else inv.cost_basis_usd
+                            self.inventory_guard.register_pair(sym, inv.expected_qty, derived_cost)
                             logger.info(f"AUTO-SEED SUCCESS: {sym} bought {filled} @ {fill_price}")
                             await tg_send(
                                 f"\U0001f331 <b>Auto-seeded</b> {sym.replace('USDT','')}\n"

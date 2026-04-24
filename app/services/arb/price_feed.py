@@ -61,8 +61,8 @@ class SpreadSnapshot:
 class FreshnessGuard:
     """Reject stale, skewed, or suspicious price data."""
 
-    MAX_AGE_S = 5.0              # max age for any single venue price (USDC pairs update slower)
-    MAX_SKEW_S = 3.0             # max age difference between venues
+    MAX_AGE_S = 15.0             # max age for any single venue price (V3: low-vol USDC pairs tick every 5-15s)
+    MAX_SKEW_S = 10.0            # max age difference between venues (V3: relaxed for USDC pairs)
     MAX_UNCHANGED_TICKS = 10     # unchanged price for 10 WS updates = suspicious
     MAX_SPREAD_MULTIPLE = 5.0    # reject spreads > 5x rolling median
 

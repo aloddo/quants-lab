@@ -84,13 +84,31 @@ class UniverseManager:
         if state:
             state.last_position_time = time.time()
 
+    @staticmethod
+    def _sorted_target_pairs(tiers: dict[str, TierInfo], max_symbols: int) -> list[TierInfo]:
+        """Deterministic top-N selection by tier quality and excess.
+
+        Tier A/B/C ordering is handled implicitly by excess in practice, but we
+        still apply explicit tier ranking to avoid edge-case inversions.
+        """
+        tier_rank = {"A": 0, "B": 1, "C": 2, None: 3}
+        ordered = sorted(
+            tiers.values(),
+            key=lambda info: (
+                tier_rank.get(info.tier, 3),
+                -float(info.excess),
+                info.symbol_bb,
+            ),
+        )
+        return ordered[:max_symbols]
+
     async def initialize(self, initial_tiers: dict[str, TierInfo]) -> PriceFeed:
         """Create initial PriceFeed from TierEngine output.
 
         Called once at startup. Subsequent changes use refresh_universe().
         """
-        # Select top pairs up to max
-        connected = list(initial_tiers.values())[:self._max_symbols]
+        # Select top pairs up to max (deterministic ranking)
+        connected = self._sorted_target_pairs(initial_tiers, self._max_symbols)
 
         symbols_bb = []
         bn_map = {}  # symbol_bb -> symbol_bn
@@ -127,8 +145,8 @@ class UniverseManager:
         tiers = self.tier_engine.tiers
         changes = []
 
-        # Target set: all Tier A+B+C pairs, up to max
-        target_pairs = list(tiers.values())[:self._max_symbols]
+        # Target set: all Tier A+B+C pairs, up to max, ordered by quality
+        target_pairs = self._sorted_target_pairs(tiers, self._max_symbols)
         target_bb = {info.symbol_bb for info in target_pairs}
         current_bb = set(self._price_feed.symbols)
 
