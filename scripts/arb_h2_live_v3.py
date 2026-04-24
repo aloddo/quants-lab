@@ -596,16 +596,23 @@ class H2LiveTraderV2:
                 self.inventory.set_lifecycle_state(sym, "ACTIVE")
                 continue
             self.inventory.set_target(sym, 0.0)
-            if inv.expected_qty - inv.locked_qty > 0:
-                self.inventory.set_lifecycle_state(sym, "RETIRING")
-                self._retire_queue.add(sym)
-                # Ensure gateway knows the BN symbol for liquidation
-                bn_sym = sym.replace("USDT", "USDC")
-                if sym not in self._pair_map:
-                    self._pair_map[sym] = (bn_sym, sym)
-                if sym not in self._gateway_bn_map:
-                    self._gateway_bn_map[sym] = bn_sym
-                    gateway._bn_symbol_map[sym] = bn_sym
+            available = inv.expected_qty - inv.locked_qty
+            if available > 0:
+                # Only queue for active liquidation if above dust threshold
+                mid = inv.avg_cost_per_unit if inv.avg_cost_per_unit > 0 else 1.0
+                est_value = available * mid
+                if est_value >= MIN_RETAIN_USD:
+                    self.inventory.set_lifecycle_state(sym, "RETIRING")
+                    self._retire_queue.add(sym)
+                    # Ensure gateway knows the BN symbol for liquidation
+                    bn_sym = sym.replace("USDT", "USDC")
+                    if sym not in self._pair_map:
+                        self._pair_map[sym] = (bn_sym, sym)
+                    if sym not in self._gateway_bn_map:
+                        self._gateway_bn_map[sym] = bn_sym
+                        gateway._bn_symbol_map[sym] = bn_sym
+                else:
+                    self.inventory.set_lifecycle_state(sym, "INACTIVE")
             else:
                 self.inventory.set_lifecycle_state(sym, "INACTIVE")
         await self._process_retire_queue(session, gateway)
