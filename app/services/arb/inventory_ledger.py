@@ -88,6 +88,36 @@ class InventoryLedger:
         self._coll.create_index("symbol", unique=True)
         self.inventories: dict[str, PairInventory] = {}
 
+    def load_all(self):
+        """Load ALL inventory records from MongoDB (including stale/retired pairs).
+
+        Used at startup to discover pairs with leftover inventory that need
+        liquidation, even if they aren't in the current tier set.
+        """
+        for doc in self._coll.find():
+            sym = doc.get("symbol", "")
+            if not sym or sym in self.inventories:
+                continue  # skip empty or already-loaded
+            base = _derive_base_asset(sym)
+            self.inventories[sym] = PairInventory(
+                symbol=sym,
+                base_asset=base,
+                target_qty=doc.get("target_qty", 0),
+                expected_qty=doc.get("expected_qty", 0),
+                locked_qty=doc.get("locked_qty", 0),
+                dust_qty=doc.get("dust_qty", 0),
+                last_reconciled=doc.get("last_reconciled", 0),
+                last_exchange_qty=doc.get("last_exchange_qty", 0),
+                discrepancy=doc.get("discrepancy", 0),
+                cost_basis_usd=doc.get("cost_basis_usd", 0),
+                avg_cost_per_unit=doc.get("avg_cost_per_unit", 0),
+                realized_pnl_usd=doc.get("realized_pnl_usd", 0),
+                unrealized_pnl_usd=doc.get("unrealized_pnl_usd", 0),
+                sell_proceeds_usd=doc.get("sell_proceeds_usd", 0),
+                lifecycle_state=doc.get("lifecycle_state", "ACTIVE"),
+                last_lifecycle_change=doc.get("last_lifecycle_change", 0),
+            )
+
     def load(self, symbols: list[str], target_qty_usd: float = 20.0):
         """Load inventory state from MongoDB, create if missing."""
         for sym in symbols:
@@ -223,14 +253,20 @@ class InventoryLedger:
                 inv.expected_qty -= fee_qty  # fee ate into our balance
             inv.locked_qty = max(0, inv.locked_qty - qty)
             inv.dust_qty += fee_qty
-            # USD tracking: reduce cost basis proportionally + track sell proceeds
+            # USD tracking: compute realized PnL before shrinking cost basis
+            if fill_price > 0:
+                proceeds = qty * fill_price
+                cost = qty * inv.avg_cost_per_unit if inv.avg_cost_per_unit > 0 else 0.0
+                inv.realized_pnl_usd += proceeds - cost
+                inv.sell_proceeds_usd += proceeds  # I3: track total sell proceeds
+            # Reduce cost basis proportionally
             if inv.expected_qty > 0 and inv.cost_basis_usd > 0:
                 sold_fraction = qty / (inv.expected_qty + qty)
                 inv.cost_basis_usd *= (1 - sold_fraction)
-            if fill_price > 0:
-                inv.sell_proceeds_usd += qty * fill_price  # I3: track total sell proceeds
+            elif inv.expected_qty <= 0:
+                inv.cost_basis_usd = 0.0
             self._save(symbol)
-            logger.info(f"SOLD {qty} {inv.base_asset} @{fill_price:.6f} (fee={fee_qty} base={fee_in_base}) (expected: {inv.expected_qty:.2f})")
+            logger.info(f"SOLD {qty} {inv.base_asset} @{fill_price:.6f} (fee={fee_qty} base={fee_in_base}) (expected: {inv.expected_qty:.2f}, rpnl: ${inv.realized_pnl_usd:.4f})")
 
     def bought(self, symbol: str, qty: float, fee_qty: float = 0, fill_price: float = 0.0,
                fee_in_base: bool = False):
