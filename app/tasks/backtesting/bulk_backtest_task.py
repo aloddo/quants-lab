@@ -176,13 +176,22 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
                 else:
                     df["binance_funding_rate"] = 0.0
 
-                # Coinalyze liquidations (daily resolution — cross-exchange aggregated)
-                # Provides: liq_long_usd, liq_short_usd, liq_total_usd
+                # Coinalyze liquidations (prefer hourly, fall back to daily)
+                # Provides: long_liquidations_usd, short_liquidations_usd, total_liquidations_usd
                 # Neutral fill: 0.0 (no liquidation = no signal)
+                # Hourly data is preferred for strategies like X10 that compute
+                # z-scores over hourly windows. Daily data forward-filled to 1h
+                # still works but loses intra-day variation.
                 liq_cursor = db["coinalyze_liquidations"].find(
-                    {"pair": pair, "resolution": "daily"}
+                    {"pair": pair, "resolution": "1hour"}
                 ).sort("timestamp_utc", 1)
-                liq_docs = await liq_cursor.to_list(length=100000)
+                liq_docs = await liq_cursor.to_list(length=500000)
+                if len(liq_docs) < 100:
+                    # Fall back to daily if hourly data is sparse
+                    liq_cursor = db["coinalyze_liquidations"].find(
+                        {"pair": pair, "resolution": "daily"}
+                    ).sort("timestamp_utc", 1)
+                    liq_docs = await liq_cursor.to_list(length=100000)
                 if liq_docs:
                     liqdf = pd.DataFrame(liq_docs)
                     if "timestamp_utc" in liqdf.columns:
@@ -344,6 +353,12 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         if min_end == float("inf"):
             logger.warning("No parquet data found for end time — using now()")
             return int(datetime.now(timezone.utc).timestamp())
+
+        # Round down to nearest hour to prevent feed-reuse race condition.
+        # The live pipeline may write newer candles between load_cached_data
+        # and the subprocess run. Rounding ensures the cached feed (loaded at
+        # subprocess start) always covers end_ts.
+        min_end = int(min_end) - (int(min_end) % 3600)
 
         logger.info(f"Data end time: {datetime.fromtimestamp(min_end, tz=timezone.utc)} "
                      f"(resolution={self.backtesting_resolution})")

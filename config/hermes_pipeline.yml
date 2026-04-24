@@ -99,6 +99,31 @@ tasks:
       backfill_days: 365
     tags: [data, funding, hyperliquid, exotic]
 
+  hyperliquid_microstructure_1s:
+    enabled: true
+    task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
+    schedule:
+      type: cron
+      cron: "* * * * *"
+      timezone: UTC
+    max_retries: 1
+    retry_delay_seconds: 10
+    timeout_seconds: 58
+    config:
+      pairs: "auto"
+      max_pairs: 4
+      restrict_to_bybit_pairs: true
+      bybit_collection: "bybit_funding_rates"
+      duration_seconds: 50
+      poll_seconds: 1.0
+      max_levels: 20
+      write_mongo: true
+      write_parquet: true
+      book_collection: "hyperliquid_l2_snapshots_1s"
+      trades_collection: "hyperliquid_recent_trades_1s"
+      out_dir: "app/data/cache/hyperliquid_micro_1s"
+    tags: [data, hyperliquid, microstructure, 1s, exotic]
+
   coinalyze:
     enabled: true
     task_class: app.tasks.data_collection.coinalyze_task.CoinalyzeTask
@@ -149,6 +174,21 @@ tasks:
       limit: 7
       collection_name: "fear_greed_index"
     tags: [data, sentiment, exotic]
+
+  storage_guard:
+    enabled: true
+    task_class: app.tasks.data_collection.storage_guard_task.StorageGuardTask
+    schedule:
+      type: cron
+      cron: "0 6 * * *"
+      timezone: UTC
+    max_retries: 1
+    retry_delay_seconds: 60
+    timeout_seconds: 120
+    config:
+      mongo_uri: "mongodb://localhost:27017/quants_lab"
+      mongo_database: "quants_lab"
+    tags: [ops, monitoring]
 
   # ═══════ Layer 2: Feature Computation ═══════════════════
   feature_computation:
@@ -766,6 +806,76 @@ tasks:
       step_days: 30
       trade_cost: 0.000375
     tags: [backtesting, x8, exotic, walk-forward, weekly]
+
+  x9_bulk_backtest:
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X9"
+      connector_name: "bybit_perpetual"
+      backtest_days: 1460
+      trade_cost: 0.000375
+    tags: [backtesting, x9, exotic, weekly]
+
+  x9_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X9"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, x9, exotic, walk-forward, weekly]
+
+  x10_bulk_backtest:
+    enabled: false  # DISABLED: run via scripts/run_backtest.sh — never in live trading process
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X10"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, x10, exotic, weekly]
+
+  x10_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X10"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 30
+      trade_cost: 0.000375
+    tags: [backtesting, x10, exotic, walk-forward, weekly]
 
   m1_bulk_backtest:
     enabled: false
