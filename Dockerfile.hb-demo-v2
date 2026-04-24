@@ -1,0 +1,8 @@
+FROM quants-lab/hummingbot:demo-client
+
+# Install pymongo for MongoDB liquidation data access
+SHELL ["/bin/bash", "-lc"]
+RUN conda activate hummingbot && pip install pymongo --no-cache-dir
+
+# Clear bytecode cache
+RUN find /home/hummingbot/hummingbot -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
