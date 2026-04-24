@@ -16,6 +16,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Callable, Awaitable
 
 import aiohttp
 
@@ -55,16 +56,23 @@ class UniverseManager:
         tier_engine: TierEngine,
         session: aiohttp.ClientSession,
         max_symbols: int = MAX_WS_SYMBOLS,
+        position_checker: Callable[[str], Awaitable[bool]] | None = None,
     ):
         self.tier_engine = tier_engine
         self._session = session
         self._max_symbols = max_symbols
+        self._position_checker = position_checker
 
         # Active WS state
         self._pair_states: dict[str, PairState] = {}  # symbol_bb -> PairState
         self._price_feed: PriceFeed | None = None
         self._last_refresh: float = 0.0
         self._refresh_count: int = 0
+
+    def set_position_checker(self, fn: Callable[[str], Awaitable[bool]]):
+        """Set callback to check if a symbol has live positions.
+        Prevents WS disconnection for pairs with open positions."""
+        self._position_checker = fn
 
     @property
     def price_feed(self) -> PriceFeed | None:
@@ -161,6 +169,20 @@ class UniverseManager:
             state = self._pair_states.get(sym_bb)
             if not state:
                 continue
+
+            # Never disconnect pair with live position (real-time check)
+            if self._position_checker:
+                try:
+                    has_position = await self._position_checker(sym_bb)
+                    if has_position:
+                        logger.info(f"UniverseManager: keeping {sym_bb} (has live position)")
+                        state.below_threshold_count = 0
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        f"UniverseManager: position check failed for {sym_bb}: {e}, keeping"
+                    )
+                    continue
 
             # Never disconnect pair with recent position
             if now - state.last_position_time < POSITION_COOLDOWN_HOURS * 3600:

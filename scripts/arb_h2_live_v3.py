@@ -571,9 +571,10 @@ class H2LiveTraderV2:
         """Inventory policy:
         - Seed only tradable (Tier A/B) symbols.
         - Retire inventory for non-tradable symbols with no live position.
+        - Ensure gateway has BN symbol mapping for all retiring pairs.
         """
         tradable_symbols = {info.symbol_bb for info in self.tier_engine.tradable_pairs()}
-        for sym, inv in self.inventory.inventories.items():
+        for sym, inv in list(self.inventory.inventories.items()):
             if await self._has_live_position(sym):
                 continue
             if sym in tradable_symbols:
@@ -583,6 +584,13 @@ class H2LiveTraderV2:
             if inv.expected_qty - inv.locked_qty > 0:
                 self.inventory.set_lifecycle_state(sym, "RETIRING")
                 self._retire_queue.add(sym)
+                # Ensure gateway knows the BN symbol for liquidation
+                bn_sym = sym.replace("USDT", "USDC")
+                if sym not in self._pair_map:
+                    self._pair_map[sym] = (bn_sym, sym)
+                if sym not in self._gateway_bn_map:
+                    self._gateway_bn_map[sym] = bn_sym
+                    gateway._bn_symbol_map[sym] = bn_sym
             else:
                 self.inventory.set_lifecycle_state(sym, "INACTIVE")
         await self._process_retire_queue(session, gateway)
@@ -616,6 +624,7 @@ class H2LiveTraderV2:
             self.signal_engine.add_pair(info.symbol_bb, MONGO_URI)
 
         self.inventory.load(self._active_pairs)
+        self.inventory.load_all()  # discover stale pairs for liquidation
         for sym in self._active_pairs:
             self.inventory.set_lifecycle_state(sym, "ACTIVE")
 
@@ -678,7 +687,10 @@ class H2LiveTraderV2:
             exit_flow = ExitFlow(self.position_store, detector, gateway, ws_available, mongo_uri=MONGO_URI)
 
             # V3: Start feeds via UniverseManager FIRST (before crash recovery needs price_feed)
-            self.universe_manager = UniverseManager(self.tier_engine, session)
+            self.universe_manager = UniverseManager(
+                self.tier_engine, session,
+                position_checker=self._has_live_position,
+            )
             self.price_feed = await self.universe_manager.initialize(tiers)
             if not self.shadow:
                 await order_feed.start(session)
@@ -713,7 +725,10 @@ class H2LiveTraderV2:
                             self.price_feed.bybit.symbols.append(sym)
                             self.price_feed.symbols.append(sym)
                             self.price_feed._bn_map[sym] = bn_sym
-                            self.price_feed.binance.prices[bn_sym] = VenuePrice(symbol=bn_sym)
+                            self.price_feed._bn_reverse[bn_sym] = sym
+                        # Dynamically subscribe on Binance (reconnects with new stream URL)
+                        if bn_sym not in self.price_feed.binance.prices:
+                            await self.price_feed.binance.add_symbol_and_reconnect(bn_sym)
                         self.universe_manager.mark_position_opened(sym)
 
                 # Resume OPEN positions into signal engine

@@ -271,6 +271,22 @@ class BinancePriceFeed:
             p.venue_ts_ms = int(d.get("u", 0))  # updateId, not timestamp
             p.update_count += 1
 
+    async def add_symbol_and_reconnect(self, symbol: str):
+        """Add a symbol and reconnect WS to include it in the combined stream URL.
+
+        Binance combined streams encode symbols in the connection URL, so adding
+        a new symbol requires closing the current WS and reconnecting with an
+        updated URL. The start() loop handles automatic reconnection.
+        """
+        if symbol in self.prices:
+            return  # already subscribed
+        self.symbols.append(symbol)
+        self.prices[symbol] = VenuePrice(symbol=symbol)
+        logger.info(f"Binance: added {symbol}, triggering reconnect for new stream URL")
+        # Force reconnect — the start() loop will auto-reconnect with the new URL
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+
     async def stop(self):
         self._running = False
         if self._ws and not self._ws.closed:
