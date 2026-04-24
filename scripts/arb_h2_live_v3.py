@@ -469,7 +469,22 @@ class H2LiveTraderV2:
             return False
 
         snap = self.price_feed.get_spread_for_exit(symbol) if self.price_feed else None
-        bid_price = snap.bn_bid if snap and snap.bn_bid > 0 else mid_price
+        if snap and snap.bn_bid > 0:
+            bid_price = snap.bn_bid
+        else:
+            # No WS feed — query actual bid from Binance REST
+            try:
+                async with session.get(
+                    "https://api.binance.com/api/v3/ticker/bookTicker",
+                    params={"symbol": bn_sym},
+                    timeout=aiohttp.ClientTimeout(total=4),
+                ) as resp:
+                    ticker = await resp.json()
+                bid_price = float(ticker.get("bidPrice", 0))
+            except Exception:
+                bid_price = mid_price * 0.995  # conservative fallback
+            if bid_price <= 0:
+                bid_price = mid_price * 0.995
         sell_price = bn_rules.round_price_for_side(bid_price * (1 - LIQUIDATE_DISCOUNT), "Sell")
         if not bn_rules.check_notional(sell_qty, sell_price):
             if sell_qty * sell_price < MIN_RETAIN_USD:
