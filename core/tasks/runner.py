@@ -28,10 +28,16 @@ class TaskRunner:
     Enhanced task runner with new task system.
     """
     
-    def __init__(self, config_path: str = "config/tasks.yml", enable_api: bool = None):
+    def __init__(
+        self,
+        config_path: str = "config/tasks.yml",
+        enable_api: bool = None,
+        start_scheduler: bool = True,
+    ):
         self.config_path = config_path
         self.orchestrator: Optional[TaskOrchestrator] = None
         self.api_server: Optional[uvicorn.Server] = None
+        self.start_scheduler = start_scheduler
         
         # API configuration with fallback to environment variables
         if enable_api is not None:
@@ -226,13 +232,23 @@ class TaskRunner:
             else:
                 api_task = None
             
-            # Start orchestrator
-            orchestrator_task = asyncio.create_task(self.orchestrator.start())
+            # Start orchestrator schedule loop unless explicitly disabled
+            if self.start_scheduler:
+                orchestrator_task = asyncio.create_task(self.orchestrator.start())
+            else:
+                logger.info("Task scheduler loop disabled for this runner instance")
+                orchestrator_task = None
             
             # Wait for tasks to complete
-            tasks_to_wait = [orchestrator_task]
+            tasks_to_wait = []
+            if orchestrator_task:
+                tasks_to_wait.append(orchestrator_task)
             if api_task:
                 tasks_to_wait.append(api_task)
+
+            if not tasks_to_wait:
+                logger.warning("No scheduler or API server enabled; nothing to run")
+                return
             
             await asyncio.gather(*tasks_to_wait)
             

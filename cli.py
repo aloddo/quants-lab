@@ -319,8 +319,9 @@ async def serve_api(config_path: str, host: str, port: int):
     await clear_stale_locks()
 
     try:
-        # Create runner with API enabled and configure host/port
-        runner = TaskRunner(config_path=config_path, enable_api=True)
+        # Create runner with API enabled (no periodic scheduler loop).
+        # Pipeline scheduling should be owned by `run-tasks` instance.
+        runner = TaskRunner(config_path=config_path, enable_api=True, start_scheduler=False)
         runner.api_host = host
         runner.api_port = port
 

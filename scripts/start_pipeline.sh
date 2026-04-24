@@ -21,6 +21,13 @@ PYTHON=/Users/hermes/miniforge3/envs/quants-lab/bin/python
 tmux kill-session -t ql-pipeline 2>/dev/null || true
 tmux kill-session -t ql-api 2>/dev/null || true
 
+# Kill detached/orphaned runner processes from previous restarts.
+# tmux session shutdown can leave child Python processes alive; ensure
+# we reclaim the API port and avoid duplicate schedulers.
+pkill -f "cli.py run-tasks --config config/hermes_pipeline.yml" 2>/dev/null || true
+pkill -f "cli.py serve --config config/hermes_pipeline.yml --port 8001" 2>/dev/null || true
+sleep 1
+
 # Start pipeline orchestrator — auto-restart loop
 tmux new-session -d -s ql-pipeline \
   "cd /Users/hermes/quants-lab && \
