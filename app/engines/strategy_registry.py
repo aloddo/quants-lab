@@ -540,6 +540,50 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         total_amount_quote=300.0,
         cooldown_time=3600,
     ),
+    "X9": StrategyMetadata(
+        name="X9",
+        display_name="Funding Crowding Reversion",
+        controller_module="app.controllers.directional_trading.x9_funding_crowding",
+        config_class_name="X9FundingCrowdingConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 172800,  # 48h — controller computes ATR-based TP/SL
+        },
+        trailing_stop=None,  # computed dynamically per-trade
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],  # triggers funding + OI merge in BulkBacktestTask
+        max_concurrent=20,
+        dd_gate_relaxed=True,  # carry-like strategy: backtest DD inflated by unlimited concurrency
+        controller_file="x9_funding_crowding.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            # Signal params (from Phase 0 discovery, Codex best config)
+            "funding_z_threshold": 1.0,
+            "streak_min": 2,
+            "oi_z_min": 0.0,
+            "z_window": 30,
+            "z_min_periods": 15,
+            # ATR exit params (sized from Phase 0 MAE/MFE analysis)
+            "atr_period": 14,
+            "tp_atr_mult": 2.0,
+            "sl_atr_mult": 2.5,
+            "trailing_act_atr_mult": 1.5,
+            "trailing_delta_atr_mult": 0.7,
+            "time_limit_seconds": 172800,
+            # BTC regime filter disabled (Phase 0 shows edge in both directions)
+            "btc_regime_enabled": False,
+        },
+        pair_source="explicit",
+        pair_allowlist=[
+            "ADA-USDT", "BNB-USDT", "DOGE-USDT", "DOT-USDT",
+            "LINK-USDT", "NEAR-USDT", "XRP-USDT",
+        ],
+        total_amount_quote=300.0,
+        cooldown_time=28800,  # 8h cooldown (1 funding interval — prevents re-entry churn)
+    ),
     "M1": StrategyMetadata(
         name="M1",
         display_name="ML Ensemble Signal",
@@ -570,6 +614,50 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         pair_source="pair_historical",
         total_amount_quote=300.0,
         cooldown_time=7200,  # 2h cooldown (fewer, higher-quality trades)
+    ),
+
+    "X10": StrategyMetadata(
+        name="X10",
+        display_name="Liquidation Exhaustion Reversion",
+        controller_module="app.controllers.directional_trading.x10_liq_exhaust_revert",
+        config_class_name="X10LiqExhaustRevertConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 43200,  # 12h — controller computes ATR-based TP/SL
+        },
+        trailing_stop=None,  # computed dynamically per-trade
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["derivatives"],  # triggers liq merge in BulkBacktestTask
+        max_concurrent=20,
+        controller_file="x10_liq_exhaust_revert.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        bot_image="quants-lab/hummingbot:demo-client-v2",
+        default_config={
+            "z_total_threshold": 2.0,
+            "z_imb_threshold": 0.5,
+            "z_window": 72,
+            "z_min_periods": 24,
+            "atr_period": 14,
+            "tp_atr_mult": 1.5,
+            "sl_atr_mult": 2.0,
+            "time_limit_seconds": 28800,
+            "trailing_enabled": True,
+            "trailing_activation_atr": 1.0,
+            "trailing_delta_atr": 0.5,
+            "mongo_uri": "mongodb://host.docker.internal:27017/quants_lab",
+            "mongo_database": "quants_lab",
+        },
+        pair_source="explicit",
+        pair_allowlist=[
+            "ADA-USDT", "APT-USDT", "AVAX-USDT", "BCH-USDT", "BNB-USDT", "BTC-USDT",
+            "DOGE-USDT", "DOT-USDT", "ETH-USDT", "LINK-USDT", "LTC-USDT", "NEAR-USDT",
+            "SEI-USDT", "SOL-USDT", "SUI-USDT", "TAO-USDT", "WLD-USDT", "XRP-USDT",
+        ],
+        total_amount_quote=300.0,
+        cooldown_time=3600,  # 1h cooldown (12h hold = no rapid re-entry needed)
     ),
 }
 
