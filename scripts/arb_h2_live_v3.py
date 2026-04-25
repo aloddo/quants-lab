@@ -102,6 +102,13 @@ INVENTORY_TP_PCT = 25.0   # take-profit: sell if inventory rises 25% from cost b
 INVENTORY_RISK_CHECK_INTERVAL = 30.0  # check every 30s
 REBALANCE_INTERVAL_POLL = 600  # every 5 minutes
 
+# Directional TP/SL on BB perp side — exploits 10x leverage asymmetry.
+# Since BN was sold at entry (flat spot), BB directional gain is free.
+# Normal arb capture ~28bp ($0.056). Directional TP at 3% = $0.30 (5x better).
+# SL prevents approaching liquidation (~10% at 10x leverage).
+DIRECTIONAL_TP_PCT = 3.0   # close BB only if BB price up 3%+ from entry
+DIRECTIONAL_SL_PCT = -5.0  # close BB only if BB price down 5%+ from entry
+
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BINANCE_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -1045,6 +1052,13 @@ class H2LiveTraderV2:
                                 await self._handle_exit(
                                     exit_signal, pos_doc[0], session, gateway, exit_flow,
                                 )
+                            elif DIRECTIONAL_TP_PCT > 0 or DIRECTIONAL_SL_PCT < 0:
+                                # Directional TP/SL on BB perp — check BB price vs entry
+                                dir_signal = self._check_directional_exit(pos_doc[0], snap)
+                                if dir_signal:
+                                    await self._handle_exit(
+                                        dir_signal, pos_doc[0], session, gateway, exit_flow,
+                                    )
 
                     # Check fill detector integrity (buffer overflow = RISK_PAUSE)
                     if detector.unmatched_buffer_overflow:
@@ -1376,6 +1390,62 @@ class H2LiveTraderV2:
                     session,
                 )
 
+    def _check_directional_exit(self, pos_doc: dict, snap) -> 'SignalEvent | None':
+        """Check if BB perp price has moved enough for a directional TP or SL.
+
+        Since all trades are BUY_BB_SELL_BN, BB is long perp with leverage.
+        BN was sold at entry = flat spot. Directional BB move is free P&L.
+
+        Returns a synthetic SignalEvent or None.
+        """
+        entry = pos_doc.get("entry", {})
+        bb_entry_price = float(entry.get("bb", {}).get("avg_fill_price", 0))
+        if bb_entry_price <= 0:
+            return None
+
+        direction = pos_doc.get("direction", "BUY_BB_SELL_BN")
+
+        # Get current BB price (bid for long exit = sell)
+        if direction == "BUY_BB_SELL_BN":
+            bb_current = snap.bb_bid if snap.bb_bid > 0 else 0
+        else:
+            bb_current = snap.bb_ask if snap.bb_ask > 0 else 0
+
+        if bb_current <= 0:
+            return None
+
+        # PnL % on the BB perp side
+        if direction == "BUY_BB_SELL_BN":
+            pnl_pct = (bb_current / bb_entry_price - 1) * 100
+        else:
+            pnl_pct = (1 - bb_current / bb_entry_price) * 100
+
+        signal_type = None
+        if DIRECTIONAL_TP_PCT > 0 and pnl_pct >= DIRECTIONAL_TP_PCT:
+            signal_type = "DIRECTIONAL_TP"
+            logger.info(
+                f"DIRECTIONAL TP: {pos_doc.get('symbol')} BB {pnl_pct:+.1f}% "
+                f"(entry={bb_entry_price:.4f} now={bb_current:.4f})"
+            )
+        elif DIRECTIONAL_SL_PCT < 0 and pnl_pct <= DIRECTIONAL_SL_PCT:
+            signal_type = "DIRECTIONAL_SL"
+            logger.warning(
+                f"DIRECTIONAL SL: {pos_doc.get('symbol')} BB {pnl_pct:+.1f}% "
+                f"(entry={bb_entry_price:.4f} now={bb_current:.4f})"
+            )
+
+        if signal_type:
+            from app.services.arb.signal_engine import SignalEvent
+            return SignalEvent(
+                symbol=pos_doc.get("symbol", ""),
+                signal_type=signal_type,
+                spread_snapshot=snap,
+                threshold_p90=0, threshold_p25=0,
+                threshold_median=0, excess_bps=0,
+                timestamp=time.time(),
+            )
+        return None
+
     async def _handle_exit(self, signal, pos_doc, session, gateway, exit_flow: ExitFlow):
         """Process exit signal through ExitFlow."""
         sym = signal.symbol
@@ -1386,10 +1456,15 @@ class H2LiveTraderV2:
 
         bb_side = "Sell" if direction == "BUY_BB_SELL_BN" else "Buy"
         bn_side = "Buy" if direction == "BUY_BB_SELL_BN" else "Sell"
-        is_stop_loss = signal.signal_type == "EXIT_STOP_LOSS"
+        is_stop_loss = signal.signal_type in ("EXIT_STOP_LOSS", "DIRECTIONAL_SL")
+        is_directional = signal.signal_type in ("DIRECTIONAL_TP", "DIRECTIONAL_SL")
 
         qty_bb = float(entry.get("bb", {}).get("filled_qty", 0))
         qty_bn = float(entry.get("bn", {}).get("filled_qty", 0))
+
+        # Directional exit: BB-only, skip BN. BN was sold at entry = flat spot.
+        if is_directional:
+            qty_bn = 0
 
         # Check if prior partial exit already closed some legs — use REMAINING qty
         # FIX #6: For PARTIAL legs, subtract already-filled exit qty from target
@@ -1479,19 +1554,34 @@ class H2LiveTraderV2:
 
             base = sym.replace("USDT", "")
             emoji = "\u2705" if result.pnl_net_bps > 0 else "\u274c"
-            # Get entry spread from pos_doc
-            entry_spread = entry.get("actual_spread_bps", pos_doc.get("signal_spread_bps", 0)) or 0
-            exit_spread = result.actual_exit_spread_bps if hasattr(result, 'actual_exit_spread_bps') else 0
             hold_s = time.time() - pos_doc.get("entry_time", time.time())
             safe_reason = signal.signal_type.replace("<", "&lt;").replace(">", "&gt;")
-            await tg_send(
-                f"\U0001f4dd <b>H2 V3 CLOSE</b> {emoji} <code>{base}</code>\n"
-                f"Entry: {entry_spread:.0f}bp \u2192 Exit: {exit_spread:.0f}bp\n"
-                f"Net: <b>{result.pnl_net_bps:+.0f}bp (${result.pnl_net_usd:.3f})</b>\n"
-                f"Hold: {hold_s/60:.0f}min | {safe_reason}\n"
-                f"Lat: {result.latency_ms:.0f}ms",
-                session,
-            )
+
+            if is_directional:
+                # Directional exit: show BB price move, not spread
+                bb_entry_px = float(entry.get("bb", {}).get("avg_fill_price", 0))
+                bb_exit_px = result.bb_fill_price if result.bb_fill_price > 0 else 0
+                pnl_pct = (bb_exit_px / bb_entry_px - 1) * 100 if bb_entry_px > 0 else 0
+                tp_sl = "\U0001f4b0 TP" if signal.signal_type == "DIRECTIONAL_TP" else "\U0001f6d1 SL"
+                await tg_send(
+                    f"\U0001f3af <b>H2 V3 DIRECTIONAL {tp_sl}</b> {emoji} <code>{base}</code>\n"
+                    f"BB: {bb_entry_px:.4f} \u2192 {bb_exit_px:.4f} ({pnl_pct:+.1f}%)\n"
+                    f"Net: <b>${result.pnl_net_usd:.3f}</b> (BB-only, BN flat)\n"
+                    f"Hold: {hold_s/60:.0f}min | {safe_reason}\n"
+                    f"Lat: {result.latency_ms:.0f}ms",
+                    session,
+                )
+            else:
+                entry_spread = entry.get("actual_spread_bps", pos_doc.get("signal_spread_bps", 0)) or 0
+                exit_spread = result.actual_exit_spread_bps if hasattr(result, 'actual_exit_spread_bps') else 0
+                await tg_send(
+                    f"\U0001f4dd <b>H2 V3 CLOSE</b> {emoji} <code>{base}</code>\n"
+                    f"Entry: {entry_spread:.0f}bp \u2192 Exit: {exit_spread:.0f}bp\n"
+                    f"Net: <b>{result.pnl_net_bps:+.0f}bp (${result.pnl_net_usd:.3f})</b>\n"
+                    f"Hold: {hold_s/60:.0f}min | {safe_reason}\n"
+                    f"Lat: {result.latency_ms:.0f}ms",
+                    session,
+                )
 
         elif result.outcome == "PARTIAL":
             # Update inventory immediately for whichever leg filled (don't wait for full close)
