@@ -123,8 +123,14 @@ class ContinuousValidationTask(NotifyingTaskMixin, BaseTask):
         return {"engines": len(self.engines), "alerts": len(alerts), "details": results}
 
     async def _validate_engine(self, db, engine_name: str, now: datetime) -> dict:
-        """Run walk-forward validation for one engine against recent data."""
-        from app.engines.strategy_registry import get_strategy
+        """Run fresh walk-forward validation for one engine against recent data.
+
+        Launches actual backtest subprocesses (same as BulkBacktestTask) on the
+        lookback window, then compares results against pair_historical baselines.
+        This ensures we test against CURRENT market data, not stale backtest_trades.
+        """
+        from app.engines.strategy_registry import get_strategy, build_backtest_config
+        import subprocess, pickle, tempfile, os
 
         meta = get_strategy(engine_name)
 
@@ -142,40 +148,76 @@ class ContinuousValidationTask(NotifyingTaskMixin, BaseTask):
         if not baselines:
             return {"status": "no_baseline", "pairs": []}
 
-        # Compute recent PF from backtest_trades (last N days)
-        cutoff_ms = int((now - timedelta(days=self.lookback_days)).timestamp() * 1000)
+        # Run fresh backtests for each pair over the lookback window
+        start_ts = int((now - timedelta(days=self.lookback_days)).timestamp())
+        end_ts = int(now.timestamp())
+        resolution = meta.backtesting_resolution or "1m"
+        trade_cost = 0.000375
 
         pair_results = []
         for pair, baseline_pf in baselines.items():
-            # Get recent trades for this engine+pair
-            trades = list(db["backtest_trades"].find({
-                "engine": engine_name,
-                "pair": pair,
-                "timestamp": {"$gte": cutoff_ms / 1000},  # trades use seconds
-            }))
+            try:
+                # Run backtest in subprocess (same as BulkBacktestTask)
+                with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+                    tmp_path = tmp.name
 
-            if len(trades) < 10:
+                cmd = [
+                    "/Users/hermes/miniforge3/envs/quants-lab/bin/python",
+                    "-m", "app.tasks.backtesting._backtest_worker",
+                    "--engine", engine_name,
+                    "--connector", self.connector_name,
+                    "--pair", pair,
+                    "--start", str(start_ts),
+                    "--end", str(end_ts),
+                    "--resolution", resolution,
+                    "--trade-cost", str(trade_cost),
+                    "--output", tmp_path,
+                ]
+
+                env = {**os.environ, "MONGO_URI": self.mongo_uri, "MONGO_DATABASE": self.mongo_db}
+                proc = subprocess.run(cmd, env=env, capture_output=True, timeout=300)
+
+                if proc.returncode != 0:
+                    pair_results.append({
+                        "pair": pair, "baseline_pf": baseline_pf,
+                        "current_pf": None, "n_trades": 0, "status": "backtest_failed",
+                    })
+                    continue
+
+                with open(tmp_path, "rb") as f:
+                    payload = pickle.load(f)
+                os.unlink(tmp_path)
+
+                if payload.get("status") != "ok":
+                    pair_results.append({
+                        "pair": pair, "baseline_pf": baseline_pf,
+                        "current_pf": None, "n_trades": 0,
+                        "status": f"error: {payload.get('error', 'unknown')}",
+                    })
+                    continue
+
+                r = payload["results"]
+                current_pf = r.get("profit_factor", 0) or 0
+                n_trades = r.get("total_executors", 0)
+
                 pair_results.append({
                     "pair": pair,
                     "baseline_pf": baseline_pf,
-                    "current_pf": None,
-                    "n_trades": len(trades),
-                    "status": "insufficient_data",
+                    "current_pf": round(float(current_pf), 3),
+                    "n_trades": n_trades,
+                    "status": "validated" if n_trades >= 10 else "insufficient_data",
                 })
-                continue
 
-            # Compute PF from recent trades
-            gross_profit = sum(t.get("net_pnl_quote", 0) for t in trades if t.get("net_pnl_quote", 0) > 0)
-            gross_loss = abs(sum(t.get("net_pnl_quote", 0) for t in trades if t.get("net_pnl_quote", 0) < 0))
-            current_pf = gross_profit / gross_loss if gross_loss > 0 else 0.0
-
-            pair_results.append({
-                "pair": pair,
-                "baseline_pf": baseline_pf,
-                "current_pf": round(current_pf, 3),
-                "n_trades": len(trades),
-                "status": "validated",
-            })
+            except subprocess.TimeoutExpired:
+                pair_results.append({
+                    "pair": pair, "baseline_pf": baseline_pf,
+                    "current_pf": None, "n_trades": 0, "status": "timeout",
+                })
+            except Exception as e:
+                pair_results.append({
+                    "pair": pair, "baseline_pf": baseline_pf,
+                    "current_pf": None, "n_trades": 0, "status": f"error: {e}",
+                })
 
         return {
             "status": "ok",

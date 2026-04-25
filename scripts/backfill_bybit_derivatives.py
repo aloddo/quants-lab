@@ -77,6 +77,8 @@ async def backfill_funding(session, db, pair: str, start_ms: int, end_ms: int, s
         min_ts = cursor_ms
         for row in rows:
             ts_ms = int(row["fundingRateTimestamp"])
+            if ts_ms < start_ms:
+                continue  # Don't insert rows outside requested window
             rate = float(row["fundingRate"])
             ops.append(UpdateOne(
                 {"pair": pair, "timestamp_utc": ts_ms},
@@ -93,9 +95,8 @@ async def backfill_funding(session, db, pair: str, start_ms: int, end_ms: int, s
             result = collection.bulk_write(ops, ordered=False)
             total += result.upserted_count
 
-        # Page backward: set endTime before the oldest record in this batch
-        if min_ts >= cursor_ms:
-            break  # No progress
+        if min_ts >= cursor_ms or min_ts <= start_ms:
+            break
         cursor_ms = min_ts - 1
 
         await asyncio.sleep(sleep_ms / 1000.0)
@@ -127,6 +128,8 @@ async def backfill_oi(session, db, pair: str, start_ms: int, end_ms: int, sleep_
         min_ts = cursor_ms
         for row in rows:
             ts_ms = int(row["timestamp"])
+            if ts_ms < start_ms:
+                continue  # Don't insert rows outside requested window
             oi_val = float(row["openInterest"])
             ops.append(UpdateOne(
                 {"pair": pair, "timestamp_utc": ts_ms},
@@ -143,7 +146,7 @@ async def backfill_oi(session, db, pair: str, start_ms: int, end_ms: int, sleep_
             result = collection.bulk_write(ops, ordered=False)
             total += result.upserted_count
 
-        if min_ts >= cursor_ms:
+        if min_ts >= cursor_ms or min_ts <= start_ms:
             break
         cursor_ms = min_ts - 1
 

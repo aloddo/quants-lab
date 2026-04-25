@@ -218,13 +218,19 @@ def validate_registry() -> List[str]:
     Returns list of error messages (empty = valid).
     """
     errors = []
+    keys_seen = set()
     names_seen = set()
 
-    for name, ds in DATA_SOURCE_REGISTRY.items():
-        # Check for duplicate names
-        if name in names_seen:
-            errors.append(f"Duplicate descriptor name: {name}")
-        names_seen.add(name)
+    for key, ds in DATA_SOURCE_REGISTRY.items():
+        # Check for duplicate dict keys (can't happen in literal, but guard for runtime adds)
+        if key in keys_seen:
+            errors.append(f"Duplicate registry key: {key}")
+        keys_seen.add(key)
+
+        # Check for duplicate ds.name across values (the actual identity)
+        if ds.name in names_seen:
+            errors.append(f"Duplicate descriptor name '{ds.name}' (key='{key}')")
+        names_seen.add(ds.name)
 
         # Validate CompositeDataSourceDescriptor merge functions
         if isinstance(ds, CompositeDataSourceDescriptor):

@@ -31,7 +31,8 @@ def main():
     args = parser.parse_args()
 
     db_name = MONGO_URI.rsplit("/", 1)[-1] or "quants_lab"
-    db = MongoClient(MONGO_URI)[db_name]
+    client = MongoClient(MONGO_URI)
+    db = client[db_name]
     coll = db[args.collection]
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
@@ -118,6 +119,8 @@ def main():
         print(f"\nTier 1 pairs (tradable taker-taker): {', '.join(t1['pair'].tolist())}")
     if len(t2) > 0:
         print(f"Tier 2 pairs (tradable maker-taker): {', '.join(t2['pair'].tolist())}")
+
+    client.close()
 
 
 if __name__ == "__main__":

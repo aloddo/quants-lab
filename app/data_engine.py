@@ -204,7 +204,7 @@ class DataEngine:
             by_interval.setdefault(req.interval, []).append(req)
 
         # 4. For each interval: aggregate candles + merge MongoDB data + compute features
-        feature_series: Dict[str, pd.Series] = {}
+        feature_series: Dict[str, pd.Series] = {}  # keyed by output column name
 
         for interval, interval_requests in by_interval.items():
             # Aggregate candles to this interval
@@ -254,28 +254,33 @@ class DataEngine:
                     df_interval, pair, coll_name, start_ms, end_ms
                 )
 
-            # Compute each feature
+            # Compute each feature — output column is "{name}_{interval}" to avoid
+            # collisions when the same feature is requested at different intervals
             for req in interval_requests:
+                # Use explicit alias if same name requested at multiple intervals
+                out_col = req.name if sum(1 for r in requests if r.name == req.name) == 1 \
+                    else f"{req.name}_{interval}"
+
                 compute_fn = FEATURE_COMPUTE.get(req.name)
                 if compute_fn:
                     try:
                         series = compute_fn(df_interval, **req.params)
-                        feature_series[req.name] = pd.Series(
-                            series.values, index=dt_idx[:len(series)], name=req.name
+                        feature_series[out_col] = pd.Series(
+                            series.values, index=dt_idx[:len(series)], name=out_col
                         )
                     except Exception as e:
                         logger.warning(f"Failed to compute {req.name}@{interval} for {pair}: {e}")
-                        feature_series[req.name] = pd.Series(
-                            0.0, index=dt_idx, name=req.name
+                        feature_series[out_col] = pd.Series(
+                            0.0, index=dt_idx, name=out_col
                         )
                 elif req.name in df_interval.columns:
                     # Raw column passthrough
-                    feature_series[req.name] = pd.Series(
-                        df_interval[req.name].values, index=dt_idx[:len(df_interval)], name=req.name
+                    feature_series[out_col] = pd.Series(
+                        df_interval[req.name].values, index=dt_idx[:len(df_interval)], name=out_col
                     )
                 else:
                     logger.warning(f"Unknown feature '{req.name}', filling with 0")
-                    feature_series[req.name] = pd.Series(0.0, index=dt_idx, name=req.name)
+                    feature_series[out_col] = pd.Series(0.0, index=dt_idx, name=out_col)
 
         # 5. Align all features to finest interval
         if not feature_series:

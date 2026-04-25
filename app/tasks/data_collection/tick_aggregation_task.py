@@ -182,34 +182,38 @@ class TickAggregationTask(BaseTask):
             # Use the later of the two cutoffs
             effective_cutoff = max(agg_cutoff, cutoff) if latest_agg else cutoff
 
-            # Query raw ticks
-            query = {cfg["ts_field"]: {"$gte": effective_cutoff}}
-            docs = list(src_coll.find(query).sort(cfg["ts_field"], 1))
-
-            if not docs:
-                results[src_coll_name] = {"processed": 0, "stats_written": 0}
-                continue
-
-            df = pd.DataFrame(docs)
-            df["_ts"] = pd.to_datetime(df[cfg["ts_field"]])
-            if df["_ts"].dt.tz is None:
-                df["_ts"] = df["_ts"].dt.tz_localize("UTC")
-            df["_minute"] = df["_ts"].dt.floor("min")
-
+            # Process in pair chunks to avoid memory blowup on large collections
+            # (30 pairs × 14 days × 5s = ~7M docs would be ~2GB in RAM)
             pair_field = cfg["pair_field"]
+            pairs = src_coll.distinct(pair_field)
+            total_processed = 0
             stats_docs = []
 
-            for (minute, pair), group in df.groupby(["_minute", pair_field]):
-                stats = _compute_minute_stats(group, cfg)
-                if stats is None:
+            for pair_val in pairs:
+                query = {
+                    cfg["ts_field"]: {"$gte": effective_cutoff},
+                    pair_field: pair_val,
+                }
+                docs = list(src_coll.find(query).sort(cfg["ts_field"], 1))
+                if not docs:
                     continue
 
-                doc = {
-                    "timestamp": minute.to_pydatetime(),
-                    "pair": pair,
-                    **stats,
-                }
-                stats_docs.append(doc)
+                total_processed += len(docs)
+                df = pd.DataFrame(docs)
+                df["_ts"] = pd.to_datetime(df[cfg["ts_field"]])
+                if df["_ts"].dt.tz is None:
+                    df["_ts"] = df["_ts"].dt.tz_localize("UTC")
+                df["_minute"] = df["_ts"].dt.floor("min")
+
+                for minute, group in df.groupby("_minute"):
+                    stats = _compute_minute_stats(group, cfg)
+                    if stats is None:
+                        continue
+                    stats_docs.append({
+                        "timestamp": minute.to_pydatetime(),
+                        "pair": pair_val,
+                        **stats,
+                    })
 
             # Upsert stats
             if stats_docs:
@@ -225,16 +229,16 @@ class TickAggregationTask(BaseTask):
                 n_written = result.upserted_count + result.modified_count
                 total_stats += n_written
                 results[src_coll_name] = {
-                    "processed": len(docs),
+                    "processed": total_processed,
                     "stats_written": n_written,
                     "minutes": len(stats_docs),
                 }
                 logger.info(
                     f"TickAggregation: {src_coll_name} → {stats_coll_name}: "
-                    f"{len(docs):,} ticks → {n_written:,} minute-stats"
+                    f"{total_processed:,} ticks → {n_written:,} minute-stats"
                 )
             else:
-                results[src_coll_name] = {"processed": len(docs), "stats_written": 0}
+                results[src_coll_name] = {"processed": total_processed, "stats_written": 0}
 
         client.close()
         logger.info(f"TickAggregation complete: {total_stats:,} stats written")
