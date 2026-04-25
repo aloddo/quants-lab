@@ -219,6 +219,10 @@ Examples:
 
     rs_all = research_sub.add_parser('all', help='Show research status for all engines')
 
+    # Feature catalog
+    catalog_parser = subparsers.add_parser('feature-catalog', help='Show feature store health dashboard')
+    catalog_parser.add_argument('--json', action='store_true', help='JSON output')
+
     return parser.parse_args()
 
 
@@ -995,6 +999,20 @@ async def main():
     elif args.command == 'bot-redeploy':
         await bot_stop(args.engine)
         await deploy_engine(args.engine, profile=args.profile)
+    elif args.command == 'feature-catalog':
+        from app.data_sources.catalog import build_catalog, print_catalog
+        import json
+        mongo_uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017/quants_lab")
+        catalog = build_catalog(mongo_uri)
+        if getattr(args, 'json', False):
+            import dataclasses
+            entries = [dataclasses.asdict(e) for e in catalog]
+            for e in entries:
+                if e.get("last_doc_timestamp"):
+                    e["last_doc_timestamp"] = e["last_doc_timestamp"].isoformat()
+            print(json.dumps(entries, indent=2))
+        else:
+            print_catalog(catalog)
     else:
         logger.error("No command specified. Use --help for usage.")
         sys.exit(1)
