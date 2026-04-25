@@ -335,6 +335,33 @@ class PositionStore:
         """Count non-terminal positions."""
         return await asyncio.to_thread(self._count_active_sync)
 
+    # ── State & Field Helpers ────────────────────────────────────
+
+    def _get_state_sync(self, position_id: str) -> Optional[PositionState]:
+        doc = self._coll.find_one({"position_id": position_id}, {"state": 1})
+        if doc and "state" in doc:
+            try:
+                return PositionState(doc["state"])
+            except ValueError:
+                return None
+        return None
+
+    async def get_state(self, position_id: str) -> Optional[PositionState]:
+        """Get the current state of a position."""
+        return await asyncio.to_thread(self._get_state_sync, position_id)
+
+    def _update_fields_sync(self, position_id: str, fields: dict) -> bool:
+        fields["updated_at"] = time.time()
+        result = self._coll.update_one(
+            {"position_id": position_id},
+            {"$set": fields},
+        )
+        return result.modified_count > 0
+
+    async def update_fields(self, position_id: str, fields: dict) -> bool:
+        """Update arbitrary fields on a position document (no state guard)."""
+        return await asyncio.to_thread(self._update_fields_sync, position_id, fields)
+
     # ── Convenience Updates (use transition() internally) ──────
 
     def _update_leg_sync(

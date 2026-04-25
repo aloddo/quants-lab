@@ -40,6 +40,7 @@ from app.services.arb.risk_manager import RiskManager, RiskAction
 from app.services.arb.crash_recovery_v2 import CrashRecoveryV2
 from app.services.arb.instrument_rules import InstrumentRules
 from app.services.arb.inventory_guard import InventoryImpairmentGuard
+from app.services.arb.inventory_risk_guard import InventoryRiskGuard
 from app.services.arb.tier_engine import TierEngine
 from app.services.arb.universe_manager import UniverseManager
 
@@ -95,6 +96,9 @@ MIN_RETAIN_USD = 2.0  # below this, treat remaining balance as dust
 AUTOSEED_BUFFER_TRADES = 2.0  # keep enough token inventory for N entries
 LIQUIDATE_DISCOUNT = 0.0015  # sell at bid * (1-discount) for fast liquidation
 SEED_SURCHARGE = 0.0010  # buy at ask * (1+surcharge) for fast seeding
+INVENTORY_SL_PCT = -8.0   # stop-loss: sell if inventory drops 8% from cost basis
+INVENTORY_TP_PCT = 25.0   # take-profit: sell if inventory rises 25% from cost basis
+INVENTORY_RISK_CHECK_INTERVAL = 30.0  # check every 30s
 REBALANCE_INTERVAL_POLL = 600  # every 5 minutes
 
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
@@ -268,6 +272,12 @@ class H2LiveTraderV2:
         self.inventory_guard = InventoryImpairmentGuard(
             impairment_threshold=3.0,
             absolute_impairment_limit=20.0,
+        )
+        self.inventory_risk_guard = InventoryRiskGuard(
+            sl_pct=INVENTORY_SL_PCT,
+            tp_pct=INVENTORY_TP_PCT,
+            db_uri=MONGO_URI,
+            check_interval=INVENTORY_RISK_CHECK_INTERVAL,
         )
 
         # MongoDB for positions (used by report/equity chart)
@@ -968,6 +978,10 @@ class H2LiveTraderV2:
                         await tg_send(f"H2 V3 KILLED: {reason}", session)
                         break
 
+                    # Inventory SL/TP check (every 30s)
+                    if self.inventory_risk_guard.needs_check():
+                        await self._check_inventory_risk(session, gateway)
+
                     # Inventory impairment + slippage + degraded-mode checks every 5 minutes
                     if self._poll_count % 600 == 0:
                         await self._check_inventory_guard(session)
@@ -1324,9 +1338,10 @@ class H2LiveTraderV2:
                     session,
                 )
             elif result.outcome == "LEG_FAILURE":
+                total_cost = result.unwind_pnl_usd - result.unwind_fees_usd  # pnl is negative, fees make it worse
                 self.risk_manager.record_trade(
                     result.unwind_pnl_usd,
-                    0.0,
+                    result.unwind_fees_usd,
                     abs(result.slippage_bps),
                     leg_failure=True,
                 )
@@ -1334,7 +1349,8 @@ class H2LiveTraderV2:
                 consec = self.risk_manager.status().get('consecutive_leg_failures', '?')
                 await tg_send(
                     f"\u26a0\ufe0f <b>H2 V3 LEG FAIL</b> <code>{base}</code>\n"
-                    f"Unwind: ${result.unwind_pnl_usd:.4f}\n"
+                    f"Unwind: ${result.unwind_pnl_usd:.4f} | Fees: ${result.unwind_fees_usd:.4f}\n"
+                    f"Total cost: ${total_cost:.4f}\n"
                     f"Consecutive: {consec}/3 (circuit breaker at 3)",
                     session,
                 )
@@ -1482,6 +1498,26 @@ class H2LiveTraderV2:
         elif result.outcome == "FAILED":
             logger.warning(f"Exit failed for {sym}, will retry next cycle")
 
+    async def _check_inventory_risk(self, session, gateway):
+        """Per-pair SL/TP check for inventory positions."""
+        try:
+            events = await self.inventory_risk_guard.check_all(
+                inventory=self.inventory,
+                price_feed=self.price_feed,
+                session=session,
+                instrument_rules=self.instrument_rules,
+                gateway=gateway,
+                pair_map=self._pair_map,
+                tg_send=tg_send,
+                tier_engine=self.tier_engine,
+            )
+            if events:
+                for e in events:
+                    logger.info(f"InventoryRisk {e.event_type}: {e.symbol} PnL={e.pnl_pct:+.1f}% ${e.pnl_usd:+.2f}")
+                    self._sync_inventory_guard_pair(e.symbol)
+        except Exception as ex:
+            logger.error(f"Inventory risk check failed: {ex}", exc_info=True)
+
     async def _check_inventory_guard(self, session):
         """Mark to market and check if inventory impairment exceeds alpha."""
         prices: dict[str, float] = {}
@@ -1570,16 +1606,21 @@ class H2LiveTraderV2:
                 self._positions_coll.find_one({}, {"_id": 1})
             except Exception:
                 issues.append("MONGO_DOWN")
-            # Check for idle system — no trades in last 6 hours
-            last_trade = self._positions_coll.find_one(
-                {"state": "CLOSED"}, sort=[("exit_time", -1)],
-                projection={"exit_time": 1},
+            # Check for idle system — no trades in last 6 hours AND no open positions
+            # Having open positions means the system is actively managing risk, not idle
+            active_count = self._positions_coll.count_documents(
+                {"state": {"$in": ["OPEN", "ENTERING", "EXITING", "UNWINDING"]}}
             )
-            if last_trade:
-                last_exit = last_trade.get("exit_time", 0)
-                if isinstance(last_exit, (int, float)) and time.time() - last_exit > 6 * 3600:
-                    hours_idle = (time.time() - last_exit) / 3600
-                    issues.append(f"IDLE({hours_idle:.0f}h)")
+            if active_count == 0:
+                last_trade = self._positions_coll.find_one(
+                    {"state": "CLOSED"}, sort=[("exit_time", -1)],
+                    projection={"exit_time": 1},
+                )
+                if last_trade:
+                    last_exit = last_trade.get("exit_time", 0)
+                    if isinstance(last_exit, (int, float)) and time.time() - last_exit > 6 * 3600:
+                        hours_idle = (time.time() - last_exit) / 3600
+                        issues.append(f"IDLE({hours_idle:.0f}h)")
 
             # Check for stuck positions (ENTERING/EXITING for > 5 min)
             stuck = list(self._positions_coll.find({
@@ -1759,12 +1800,39 @@ class H2LiveTraderV2:
         e = "\U0001f7e2" if total_inv_upnl >= 0 else "\U0001f534"
         lines.append(f"  {e} <b>Total: ${total_mkt:.2f} (cost ${total_cost:.2f}) uPnL ${total_inv_upnl:+.2f}</b>")
 
-        # Bottom line
+        # Realized PnL from retired/liquidated inventory
+        total_realized_pnl = 0.0
+        total_sell_proceeds = 0.0
+        retired_count = 0
+        for sym, inv in self.inventory.inventories.items():
+            if inv.lifecycle_state == "INACTIVE" and (inv.realized_pnl_usd != 0 or inv.sell_proceeds_usd > 0):
+                total_realized_pnl += inv.realized_pnl_usd
+                total_sell_proceeds += inv.sell_proceeds_usd
+                retired_count += 1
+        # Also include realized PnL from ACTIVE pairs (round-trip sells while still holding)
+        for sym, inv in self.inventory.inventories.items():
+            if inv.lifecycle_state != "INACTIVE" and inv.realized_pnl_usd != 0:
+                total_realized_pnl += inv.realized_pnl_usd
+
+        if retired_count > 0 or total_realized_pnl != 0:
+            lines.append("")
+            e = "\U0001f7e2" if total_realized_pnl >= 0 else "\U0001f534"
+            lines.append(f"<b>Retired Inventory:</b>")
+            lines.append(f"  {retired_count} pairs liquidated | Proceeds: ${total_sell_proceeds:.2f}")
+            lines.append(f"  {e} Realized PnL: <b>${total_realized_pnl:+.4f}</b>")
+
+        # Inventory risk guard status
+        rg = self.inventory_risk_guard.status()
+        if rg["sl_triggered"] > 0 or rg["tp_triggered"] > 0 or rg["tp_rebuys"] > 0:
+            lines.append("")
+            lines.append(f"<b>Risk Guard:</b> SL×{rg['sl_triggered']} TP×{rg['tp_triggered']} (rebuy×{rg['tp_rebuys']}) | {rg['sl_pct']}%/{rg['tp_pct']}%")
+
+        # Bottom line — include realized inventory PnL
         cap = guard.get("total_capture_usd", 0)
-        total_return = total_pnl + total_inv_upnl
+        total_return = total_pnl + total_inv_upnl + total_realized_pnl
         e = "\U0001f7e2" if total_return >= 0 else "\U0001f534"
         lines.append("")
-        lines.append(f"{e} <b>Net Return: ${total_return:+.2f}</b> (trades ${total_pnl:+.4f} + inv ${total_inv_upnl:+.2f})")
+        lines.append(f"{e} <b>Net Return: ${total_return:+.2f}</b> (trades ${total_pnl:+.4f} + inv uPnL ${total_inv_upnl:+.2f} + retired ${total_realized_pnl:+.4f})")
 
         return "\n".join(lines)
 

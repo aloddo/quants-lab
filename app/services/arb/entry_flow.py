@@ -42,6 +42,7 @@ class EntryResult:
     slippage_bps: float = 0.0
     latency_ms: float = 0.0
     unwind_pnl_usd: float = 0.0
+    unwind_fees_usd: float = 0.0
     failure_venue: str = ""
 
 
@@ -602,12 +603,25 @@ class EntryFlow:
         if bb_leg.has_any_fill or bn_leg.has_any_fill:
             # One or both have fills -- unwind ALL filled legs
             # CRITICAL FIX: Claude review #2 — must unwind BOTH if both have partial fills
-            if not await self._store.transition(position_id, PositionState.ENTERING, PositionState.UNWINDING, {
+            # FIX: Persist full fill data (incl fees) on failure path, not just qty/state
+            unwind_transition_data = {
                 "entry.bb.filled_qty": bb_leg.filled_qty,
+                "entry.bb.avg_fill_price": bb_leg.avg_fill_price,
+                "entry.bb.fee": bb_leg.fee,
+                "entry.bb.fee_asset": bb_leg.fee_asset,
+                "entry.bb.exec_ids": bb_leg.exec_ids,
                 "entry.bb.state": LegStateEnum.FILLED if bb_leg.is_filled else bb_leg.state,
+                "entry.bb.filled_at": bb_leg.filled_at,
                 "entry.bn.filled_qty": bn_leg.filled_qty,
+                "entry.bn.avg_fill_price": bn_leg.avg_fill_price,
+                "entry.bn.fee": bn_leg.fee,
+                "entry.bn.fee_asset": bn_leg.fee_asset,
+                "entry.bn.exec_ids": bn_leg.exec_ids,
                 "entry.bn.state": LegStateEnum.FILLED if bn_leg.is_filled else bn_leg.state,
-            }):
+                "entry.bn.filled_at": bn_leg.filled_at,
+            }
+            if not await self._store.transition(position_id, PositionState.ENTERING, PositionState.UNWINDING,
+                                                unwind_transition_data):
                 logger.critical(f"DB transition FAILED for {position_id} -> UNWINDING")
                 self._cleanup_legs(bb_leg, bn_leg)
                 return EntryResult(success=False, position_id=position_id, outcome="DB_FAILURE",
@@ -631,6 +645,11 @@ class EntryFlow:
                 unwind_pnl, all_unwinds_ok = await self._emergency_unwind(bn_leg, symbol, position_id)
 
             outcome = "RISK_PAUSE" if not all_unwinds_ok else "LEG_FAILURE"
+            # Compute total fees: entry leg fees + unwind fees (stored on leg objects by enrich)
+            total_fees = 0.0
+            for leg in (bb_leg, bn_leg):
+                if leg.has_any_fill and leg.fee_asset in ("USDT", "USDC", ""):
+                    total_fees += leg.fee
             self._log_fill_analytics(symbol, outcome, bb_leg, bn_leg,
                                      latency_ms=(time.time() - t0) * 1000,
                                      failure_venue=failure_venue,
@@ -639,6 +658,7 @@ class EntryFlow:
             return EntryResult(
                 success=False, position_id=position_id, outcome=outcome,
                 failure_venue=failure_venue, unwind_pnl_usd=unwind_pnl,
+                unwind_fees_usd=total_fees,
                 latency_ms=(time.time() - t0) * 1000,
             )
 
@@ -711,16 +731,51 @@ class EntryFlow:
                 unwind_leg.apply_rest_result(result)
 
             if unwind_leg.is_filled:
+                # Enrich unwind fee data (REST get_order doesn't return fees)
+                try:
+                    await self._detector.enrich_leg_fee(unwind_leg)
+                except Exception as e:
+                    logger.debug(f"Unwind fee enrichment failed for {symbol}: {e}")
+
                 loss = (unwind_leg.avg_fill_price - leg.avg_fill_price) * leg.filled_qty
                 if leg.side == "Sell":
                     loss = -loss
+                # Include entry leg fee + unwind leg fee in total
+                entry_fee_usd = leg.fee if leg.fee_asset in ("USDT", "USDC", "") else 0.0
+                unwind_fee_usd = unwind_leg.fee if unwind_leg.fee_asset in ("USDT", "USDC", "") else 0.0
+                total_fees_usd = entry_fee_usd + unwind_fee_usd
+
                 if not await self._store.transition(position_id, PositionState.UNWINDING, PositionState.FAILED, {
                     "unwind.order_id": oid,
                     "unwind.side": unwind_side,
                     "unwind.filled_qty": unwind_leg.filled_qty,
                     "unwind.avg_fill_price": unwind_leg.avg_fill_price,
+                    "unwind.fee": unwind_leg.fee,
+                    "unwind.fee_asset": unwind_leg.fee_asset,
                     "unwind.pnl_usd": loss,
+                    "unwind.total_fees_usd": total_fees_usd,
                 }):
+                    # FIX: When both legs unwind, the first transitions UNWINDING->FAILED.
+                    # The second finds state=FAILED, so transition is rejected. But the
+                    # unwind fill is confirmed — this is NOT a naked leg. Check if state
+                    # is already FAILED (another unwind completed first) and treat as success.
+                    current_state = await self._store.get_state(position_id)
+                    if current_state == PositionState.FAILED:
+                        logger.warning(
+                            f"DB transition expected UNWINDING but found FAILED for {position_id} "
+                            f"— prior unwind already transitioned. Unwind fill confirmed, treating as success."
+                        )
+                        # Still persist the unwind data as supplementary fields
+                        await self._store.update_fields(position_id, {
+                            f"unwind_{leg.venue}.order_id": oid,
+                            f"unwind_{leg.venue}.side": unwind_side,
+                            f"unwind_{leg.venue}.filled_qty": unwind_leg.filled_qty,
+                            f"unwind_{leg.venue}.avg_fill_price": unwind_leg.avg_fill_price,
+                            f"unwind_{leg.venue}.pnl_usd": loss,
+                        })
+                        self._detector.cleanup_leg(unwind_leg)
+                        logger.warning(f"Unwind complete (2nd leg): loss=${loss:.4f}")
+                        return (loss, True)
                     logger.critical(f"DB transition FAILED for {position_id} -> FAILED (unwind complete)")
                     self._detector.cleanup_leg(unwind_leg)
                     return (loss, False)
