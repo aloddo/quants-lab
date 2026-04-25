@@ -42,6 +42,53 @@ MONITORING (python cli.py feature-catalog)
 | `app/tasks/data_collection/data_retention_task.py` | Scheduled cleanup (RETENTION_CONFIG) |
 | `docs/feature_store_handbook.md` | Full reference documentation |
 
+## V2 DataEngine (multi-resolution)
+
+**File**: `app/data_engine.py`
+
+```python
+from app.data_engine import DataEngine, FeatureRequest
+
+engine = DataEngine()
+df = engine.get_features(
+    pair="BTC-USDT",
+    requests=[
+        FeatureRequest("atr", "5m", "candles", {"period": 14}),
+        FeatureRequest("funding_zscore", "1h", "derivatives", {"window": 30}),
+        FeatureRequest("spread_p90", "1m", "arb_hl_bybit_spread_stats_1m"),
+    ],
+    start_ts=1776000000, end_ts=1777100000,
+)
+```
+
+For backtesting with multi-resolution candles:
+```python
+engine.inject_into_backtest_engine(bt, pair="BTC-USDT", intervals=["5m", "15m"])
+```
+
+Available features in FEATURE_COMPUTE: atr, atr_percentile, ema, rsi, returns,
+volume_zscore, funding_zscore, oi_rsi, oi_change_pct, ls_zscore, liq_zscore,
+hl_funding_zscore, funding_spread, spread_p90, spread_mean, spread_exceedance.
+
+## Tick Aggregation (arb data)
+
+**File**: `app/tasks/data_collection/tick_aggregation_task.py`
+
+Runs daily 04:00 UTC. Compresses 5s raw ticks to 1m distributional stats:
+- Per-direction spreads (hl_over_bb, bb_over_hl): mean, std, min, max, p25-p90
+- Exceedance: time_above_5/10/15bps
+- Raw ticks kept 14d, stats kept 90d
+
+**Arb screening**: `python scripts/analyze_arb_spreads.py --days 7`
+
+## Continuous Validation
+
+**File**: `app/tasks/backtesting/continuous_validation_task.py`
+
+Weekly Sunday 3am UTC. Compares recent PF against pair_historical baseline.
+Alerts via Telegram on degradation (PF drop) or critical (PF < 1.0).
+Currently scoped to X10.
+
 ## How to Add a New Data Source (5 steps)
 
 1. **Write collector task** in `app/tasks/data_collection/`
