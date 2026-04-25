@@ -217,86 +217,42 @@ class X8DefiCexFundingSpreadController(DirectionalTradingControllerBase):
         return df
 
     def _merge_funding_from_mongodb(self, df: pd.DataFrame, trading_pair: str) -> pd.DataFrame:
-        """Merge funding rate data from MongoDB into candle DataFrame.
+        """Merge funding rate data from MongoDB into candle DataFrame (live mode).
 
-        Used when BacktestingEngine reloads from parquet (wiping pre-merged columns)
-        or in live mode as a data source.
+        Standard template: list of (collection, ts_field, val_field, col_name, fill, unit).
+        Same pattern used across all controllers -- see docs/feature_store_handbook.md.
         """
+        collections_config = [
+            ("hyperliquid_funding_rates", "timestamp_utc", "funding_rate", "hl_funding_rate", 0.0, "ms"),
+            ("bybit_funding_rates", "timestamp_utc", "funding_rate", "bybit_funding_rate", 0.0, "ms"),
+            ("binance_funding_rates", "timestamp_utc", "funding_rate", "binance_funding_rate", 0.0, "ms"),
+        ]
+        return self._merge_from_mongodb(df, trading_pair, collections_config)
+
+    def _merge_from_mongodb(self, df, pair, collections_config):
+        """Standard MongoDB merge for live mode. Same template across all controllers."""
         try:
             from pymongo import MongoClient as _MongoClient
             import os
-
-            mongo_uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017/quants_lab")
-            client = _MongoClient(mongo_uri)
+            uri = os.environ.get("MONGO_URI", "mongodb://host.docker.internal:27017/quants_lab")
             db_name = os.environ.get("MONGO_DATABASE", "quants_lab")
+            client = _MongoClient(uri, serverSelectionTimeoutMS=5000)
             db = client[db_name]
-
-            pair = trading_pair  # "BTC-USDT" format
-
-            # Fetch HL funding (1h resolution)
-            hl_docs = list(db["hyperliquid_funding_rates"].find(
-                {"pair": pair},
-                {"_id": 0, "timestamp_utc": 1, "funding_rate": 1},
-            ).sort("timestamp_utc", 1))
-
-            # Fetch Bybit funding (8h resolution)
-            bybit_docs = list(db["bybit_funding_rates"].find(
-                {"pair": pair},
-                {"_id": 0, "timestamp_utc": 1, "funding_rate": 1},
-            ).sort("timestamp_utc", 1))
-
-            # Fetch Binance funding (8h resolution)
-            binance_docs = list(db["binance_funding_rates"].find(
-                {"pair": pair},
-                {"_id": 0, "timestamp_utc": 1, "funding_rate": 1},
-            ).sort("timestamp_utc", 1))
-
-            client.close()
-
             df = df.copy()
-
-            if hl_docs:
-                hl_df = pd.DataFrame(hl_docs)
-                hl_df["timestamp"] = pd.to_datetime(hl_df["timestamp_utc"], unit="ms", utc=True)
-                hl_df = hl_df.set_index("timestamp").rename(columns={"funding_rate": "hl_funding_rate"})
-                hl_df = hl_df[~hl_df.index.duplicated(keep="last")]
-
-                if "timestamp" in df.columns:
-                    if df["timestamp"].dtype == "int64" or df["timestamp"].dtype == "float64":
-                        unit = "ms" if df["timestamp"].max() > 1e12 else "s"
-                        df["_dt"] = pd.to_datetime(df["timestamp"], unit=unit, utc=True)
-                    else:
-                        df["_dt"] = pd.to_datetime(df["timestamp"], utc=True)
+            candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+            for coll, ts_field, val_field, col_name, fill, unit in collections_config:
+                docs = list(db[coll].find({"pair": pair}).sort(ts_field, 1))
+                if docs:
+                    sdf = pd.DataFrame(docs)
+                    sdf["_ts"] = pd.to_datetime(sdf[ts_field], unit=unit, utc=True)
+                    sdf = sdf.set_index("_ts")[[val_field]].sort_index()
+                    sdf = sdf[~sdf.index.duplicated(keep="last")]
+                    df[col_name] = sdf.reindex(candle_idx, method="ffill")[val_field].fillna(fill).values
                 else:
-                    df["_dt"] = df.index
-
-                # Reindex HL to candle timestamps with forward-fill
-                df["hl_funding_rate"] = hl_df["hl_funding_rate"].reindex(df["_dt"]).ffill().values
-                # Fill remaining NaN with 0 (neutral)
-                df["hl_funding_rate"] = df["hl_funding_rate"].fillna(0)
-
-            if bybit_docs:
-                bybit_df = pd.DataFrame(bybit_docs)
-                bybit_df["timestamp"] = pd.to_datetime(bybit_df["timestamp_utc"], unit="ms", utc=True)
-                bybit_df = bybit_df.set_index("timestamp").rename(columns={"funding_rate": "bybit_funding_rate"})
-                bybit_df = bybit_df[~bybit_df.index.duplicated(keep="last")]
-                df["bybit_funding_rate"] = bybit_df["bybit_funding_rate"].reindex(df["_dt"]).ffill().values
-                df["bybit_funding_rate"] = df["bybit_funding_rate"].fillna(0)
-
-            if binance_docs:
-                binance_df = pd.DataFrame(binance_docs)
-                binance_df["timestamp"] = pd.to_datetime(binance_df["timestamp_utc"], unit="ms", utc=True)
-                binance_df = binance_df.set_index("timestamp").rename(columns={"funding_rate": "binance_funding_rate"})
-                binance_df = binance_df[~binance_df.index.duplicated(keep="last")]
-                df["binance_funding_rate"] = binance_df["binance_funding_rate"].reindex(df["_dt"]).ffill().values
-                df["binance_funding_rate"] = df["binance_funding_rate"].fillna(0)
-
-            if "_dt" in df.columns:
-                df = df.drop(columns=["_dt"])
-
+                    df[col_name] = fill
+            client.close()
         except Exception as e:
-            logger.warning(f"X8: failed to merge funding from MongoDB: {e}")
-
+            logger.warning(f"MongoDB merge failed for {pair}: {e}")
         return df
 
     def _compute_signal_live(self, trading_pair: str) -> dict:

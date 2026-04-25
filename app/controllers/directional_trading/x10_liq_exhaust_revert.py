@@ -295,55 +295,47 @@ class X10LiqExhaustRevertController(DirectionalTradingControllerBase):
         return df
 
     def _merge_liq_from_mongodb(self, df: pd.DataFrame, trading_pair: str) -> pd.DataFrame:
-        """Merge liquidation data from MongoDB into candle DataFrame.
+        """Merge liquidation data from MongoDB into candle DataFrame (live mode).
 
-        BacktestingEngine reloads from parquet, wiping pre-merged columns.
-        This queries MongoDB as fallback (same pattern as X5).
-        Uses config.mongo_uri if set (for Docker), else falls back to env var.
+        Standard template: list of (collection, ts_field, val_field, col_name, fill, unit).
+        Same pattern used across all controllers — see docs/feature_store_handbook.md.
         """
+        collections_config = [
+            ("coinalyze_liquidations", "timestamp_utc", "long_liquidations_usd", "long_liquidations_usd", 0.0, "ms"),
+            ("coinalyze_liquidations", "timestamp_utc", "short_liquidations_usd", "short_liquidations_usd", 0.0, "ms"),
+            ("coinalyze_liquidations", "timestamp_utc", "total_liquidations_usd", "total_liquidations_usd", 0.0, "ms"),
+        ]
+        return self._merge_from_mongodb(df, trading_pair, collections_config)
+
+    def _merge_from_mongodb(self, df, pair, collections_config):
+        """Standard MongoDB merge for live mode. Same template across all controllers."""
         try:
             from pymongo import MongoClient as _MongoClient
             import os
-
-            mongo_uri = self.config.mongo_uri or os.environ.get(
-                "MONGO_URI", "mongodb://localhost:27017/quants_lab"
+            uri = getattr(self.config, 'mongo_uri', '') or os.environ.get(
+                "MONGO_URI", "mongodb://host.docker.internal:27017/quants_lab"
             )
-            client = _MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-            db_name = self.config.mongo_database or os.environ.get(
+            db_name = getattr(self.config, 'mongo_database', '') or os.environ.get(
                 "MONGO_DATABASE", "quants_lab"
             )
+            client = _MongoClient(uri, serverSelectionTimeoutMS=5000)
             db = client[db_name]
-
-            pair = trading_pair
-            liq_docs = list(db["coinalyze_liquidations"].find(
-                {"pair": pair}
-            ).sort("timestamp_utc", 1))
-
-            if not liq_docs:
-                client.close()
-                return df
-
             df = df.copy()
             candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-
-            liqdf = pd.DataFrame(liq_docs)
-            liqdf["ts"] = pd.to_datetime(liqdf["timestamp_utc"], unit="ms", utc=True)
-            liqdf = liqdf.set_index("ts").sort_index()
-            liqdf = liqdf[~liqdf.index.duplicated(keep="last")]
-
-            for col in ["long_liquidations_usd", "short_liquidations_usd", "total_liquidations_usd"]:
-                if col in liqdf.columns:
-                    reindexed = liqdf[[col]].reindex(candle_idx, method="ffill")
-                    df[col] = reindexed[col].fillna(0.0).values
+            for coll, ts_field, val_field, col_name, fill, unit in collections_config:
+                docs = list(db[coll].find({"pair": pair}).sort(ts_field, 1))
+                if docs:
+                    sdf = pd.DataFrame(docs)
+                    sdf["_ts"] = pd.to_datetime(sdf[ts_field], unit=unit, utc=True)
+                    sdf = sdf.set_index("_ts")[[val_field]].sort_index()
+                    sdf = sdf[~sdf.index.duplicated(keep="last")]
+                    df[col_name] = sdf.reindex(candle_idx, method="ffill")[val_field].fillna(fill).values
                 else:
-                    df[col] = 0.0
-
+                    df[col_name] = fill
             client.close()
-            return df
-
         except Exception as e:
-            logger.warning(f"X10: MongoDB liq merge failed: {e}")
-            return df
+            logger.warning(f"MongoDB merge failed for {pair}: {e}")
+        return df
 
     def _fetch_liquidations_live(self, trading_pair: str) -> list:
         """Fetch recent liquidation data from Coinalyze REST API (live mode)."""
