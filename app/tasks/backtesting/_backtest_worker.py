@@ -2,8 +2,8 @@
 Subprocess worker for BulkBacktestTask — runs one pair's backtest in isolation.
 
 Called by BulkBacktestTask via subprocess.run(). Loads parquet, merges
-derivatives from MongoDB, runs BacktestingEngine, serializes results + full
-executor DataFrame to a pickle file. Parent reads it back.
+data sources from MongoDB via the generic merge engine, runs BacktestingEngine,
+serializes results + full executor DataFrame to a pickle file. Parent reads it back.
 
 This ensures full memory reclaim between pairs (3-5 GB per pair at 1m).
 All MongoDB writes happen in the parent — this worker only computes.
@@ -35,10 +35,21 @@ from core.data_paths import data_paths
 from app.engines.strategy_registry import get_strategy, build_backtest_config
 
 
-def _merge_derivatives_sync(bt, pair: str, connector: str):
-    """Merge derivatives from MongoDB into cached 1h candle DataFrame.
+def _merge_all_sources(bt, pair: str, connector: str, engine_name: str,
+                       start_ts=None, end_ts=None):
+    """Merge ALL data sources required by engine into cached candle DataFrame.
 
-    Mirrors BulkBacktestTask._merge_derivatives_into_candles() using pymongo (sync).
+    Uses the generic merge engine (app.data_sources.merge) which reads from the
+    Data Source Registry. Replaces the old hardcoded _merge_derivatives_sync and
+    _merge_funding_spread_sync functions.
+
+    Args:
+        bt: BacktestingEngine instance with loaded candle data.
+        pair: Trading pair (e.g., "BTC-USDT").
+        connector: Connector name (e.g., "bybit_perpetual").
+        engine_name: Strategy name (e.g., "E3", "X10").
+        start_ts: Optional start timestamp (unix seconds) for time-range filter.
+        end_ts: Optional end timestamp (unix seconds) for time-range filter.
     """
     feed_key = f"{connector}_{pair}_1h"
     provider = bt._bt_engine.backtesting_data_provider
@@ -46,120 +57,17 @@ def _merge_derivatives_sync(bt, pair: str, connector: str):
     if df is None or len(df) == 0:
         return
 
-    db = MongoClient("mongodb://localhost:27017").quants_lab
-    query = {"pair": pair}
-    candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-
-    def _merge_series(collection_name, ts_field, val_field, col_name, fill_val, method="ffill"):
-        docs = list(db[collection_name].find(query).sort(ts_field, 1))
-        if docs:
-            sdf = pd.DataFrame(docs)
-            if ts_field in sdf.columns and val_field in sdf.columns:
-                sdf["ts"] = pd.to_datetime(sdf[ts_field], unit="ms", utc=True)
-                sdf = sdf.set_index("ts")[[val_field]].sort_index()
-                sdf = sdf[~sdf.index.duplicated(keep="last")]
-                reindexed = sdf.reindex(candle_idx, method=method)[val_field]
-                if method == "ffill" and col_name == "oi_value":
-                    reindexed = reindexed.bfill()
-                df[col_name] = reindexed.fillna(fill_val).values
-                return
-        df[col_name] = fill_val
-
-    _merge_series("bybit_funding_rates", "timestamp_utc", "funding_rate", "funding_rate", 0.0)
-    _merge_series("bybit_open_interest", "timestamp_utc", "oi_value", "oi_value", 0.0)
-    _merge_series("bybit_ls_ratio", "timestamp_utc", "buy_ratio", "buy_ratio", 0.5)
-
-    # Binance funding
-    bin_docs = list(db.binance_funding_rates.find(query).sort("timestamp_utc", 1))
-    if bin_docs:
-        bdf = pd.DataFrame(bin_docs)
-        if "timestamp_utc" in bdf.columns and "funding_rate" in bdf.columns:
-            bdf["ts"] = pd.to_datetime(bdf["timestamp_utc"], unit="ms", utc=True)
-            bdf = bdf.set_index("ts")[["funding_rate"]].sort_index()
-            bdf = bdf.rename(columns={"funding_rate": "binance_funding_rate"})
-            bdf = bdf[~bdf.index.duplicated(keep="last")]
-            df["binance_funding_rate"] = bdf.reindex(candle_idx, method="ffill")["binance_funding_rate"].fillna(0.0).values
-    if "binance_funding_rate" not in df.columns:
-        df["binance_funding_rate"] = 0.0
-
-    # Coinalyze liquidations (daily, cross-exchange aggregated)
-    liq_docs = list(db.coinalyze_liquidations.find(
-        {"pair": pair, "resolution": "daily"}
-    ).sort("timestamp_utc", 1))
-    if liq_docs:
-        liqdf = pd.DataFrame(liq_docs)
-        if "timestamp_utc" in liqdf.columns:
-            liqdf["ts"] = pd.to_datetime(liqdf["timestamp_utc"], unit="ms", utc=True)
-            liqdf = liqdf.set_index("ts").sort_index()
-            liqdf = liqdf[~liqdf.index.duplicated(keep="last")]
-            for col in ["long_liquidations_usd", "short_liquidations_usd", "total_liquidations_usd"]:
-                if col in liqdf.columns:
-                    df[col] = liqdf[[col]].reindex(candle_idx, method="ffill")[col].fillna(0.0).values
-                else:
-                    df[col] = 0.0
-    for col in ["long_liquidations_usd", "short_liquidations_usd", "total_liquidations_usd"]:
-        if col not in df.columns:
-            df[col] = 0.0
-
-    provider.candles_feeds[feed_key] = df
-
-
-def _merge_funding_spread_sync(bt, pair: str, connector: str):
-    """Merge HL + Bybit + Binance funding rates for X8 funding spread strategy.
-
-    Adds columns: hl_funding_rate, bybit_funding_rate, binance_funding_rate
-    to the cached 1h candle DataFrame for spread computation in the controller.
-    """
-    feed_key = f"{connector}_{pair}_1h"
-    provider = bt._bt_engine.backtesting_data_provider
-    df = provider.candles_feeds.get(feed_key)
-    if df is None or len(df) == 0:
-        return
+    from app.data_sources.merge import merge_all_for_engine_sync
 
     db = MongoClient("mongodb://localhost:27017").quants_lab
-    query = {"pair": pair}
-    candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
 
-    # Hyperliquid funding (1h resolution)
-    hl_docs = list(db.hyperliquid_funding_rates.find(query).sort("timestamp_utc", 1))
-    if hl_docs:
-        hl_df = pd.DataFrame(hl_docs)
-        if "timestamp_utc" in hl_df.columns and "funding_rate" in hl_df.columns:
-            hl_df["ts"] = pd.to_datetime(hl_df["timestamp_utc"], unit="ms", utc=True)
-            hl_df = hl_df.set_index("ts")[["funding_rate"]].sort_index()
-            hl_df = hl_df.rename(columns={"funding_rate": "hl_funding_rate"})
-            hl_df = hl_df[~hl_df.index.duplicated(keep="last")]
-            df["hl_funding_rate"] = hl_df.reindex(candle_idx, method="ffill")["hl_funding_rate"].fillna(0.0).values
-    if "hl_funding_rate" not in df.columns:
-        df["hl_funding_rate"] = 0.0
+    # Convert seconds to millis for the merge engine
+    start_ms = int(start_ts * 1000) if start_ts else None
+    end_ms = int(end_ts * 1000) if end_ts else None
 
-    # Bybit funding (8h resolution, forward-filled to 1h)
-    bybit_docs = list(db.bybit_funding_rates.find(query).sort("timestamp_utc", 1))
-    if bybit_docs:
-        bybit_df = pd.DataFrame(bybit_docs)
-        if "timestamp_utc" in bybit_df.columns and "funding_rate" in bybit_df.columns:
-            bybit_df["ts"] = pd.to_datetime(bybit_df["timestamp_utc"], unit="ms", utc=True)
-            bybit_df = bybit_df.set_index("ts")[["funding_rate"]].sort_index()
-            bybit_df = bybit_df.rename(columns={"funding_rate": "bybit_funding_rate"})
-            bybit_df = bybit_df[~bybit_df.index.duplicated(keep="last")]
-            df["bybit_funding_rate"] = bybit_df.reindex(candle_idx, method="ffill")["bybit_funding_rate"].fillna(0.0).values
-    if "bybit_funding_rate" not in df.columns:
-        df["bybit_funding_rate"] = 0.0
-
-    # Binance funding (8h resolution, forward-filled to 1h)
-    bin_docs = list(db.binance_funding_rates.find(query).sort("timestamp_utc", 1))
-    if bin_docs:
-        bin_df = pd.DataFrame(bin_docs)
-        if "timestamp_utc" in bin_df.columns and "funding_rate" in bin_df.columns:
-            bin_df["ts"] = pd.to_datetime(bin_df["timestamp_utc"], unit="ms", utc=True)
-            bin_df = bin_df.set_index("ts")[["funding_rate"]].sort_index()
-            bin_df = bin_df.rename(columns={"funding_rate": "binance_funding_rate"})
-            bin_df = bin_df[~bin_df.index.duplicated(keep="last")]
-            df["binance_funding_rate"] = bin_df.reindex(candle_idx, method="ffill")["binance_funding_rate"].fillna(0.0).values
-    if "binance_funding_rate" not in df.columns:
-        df["binance_funding_rate"] = 0.0
-
-    provider.candles_feeds[feed_key] = df
+    provider.candles_feeds[feed_key] = merge_all_for_engine_sync(
+        db, engine_name, df, pair, start_ts=start_ms, end_ts=end_ms
+    )
 
 
 async def run_backtest(engine_name, connector, pair, start_ts, end_ts, resolution, trade_cost):
@@ -168,13 +76,9 @@ async def run_backtest(engine_name, connector, pair, start_ts, end_ts, resolutio
 
     bt = BacktestingEngine(load_cached_data=True)
 
-    # Merge derivatives if needed
-    if "derivatives" in (engine_meta.required_features or []):
-        _merge_derivatives_sync(bt, pair, connector)
-
-    # Merge funding spread data for X8
-    if "funding_spread" in (engine_meta.required_features or []):
-        _merge_funding_spread_sync(bt, pair, connector)
+    # Merge all required data sources via generic merge engine
+    if engine_meta.required_features:
+        _merge_all_sources(bt, pair, connector, engine_name, start_ts, end_ts)
 
     config = build_backtest_config(engine_name=engine_name, connector=connector, pair=pair)
 
