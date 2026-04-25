@@ -211,6 +211,30 @@ class BybitOrderAPI:
                 return []
             return data.get("result", {}).get("list", [])
 
+    async def get_closed_pnl(self, symbol: str, limit: int = 5) -> list[dict]:
+        """Query closed PnL records. Used to detect liquidation (execType=BustTrade)
+        and get actual settlement price (avgExitPrice)."""
+        ts = str(int(time.time() * 1000))
+        params = {"category": "linear", "symbol": symbol, "limit": str(limit)}
+        qs = urlencode(params)
+        sig = self._sign(ts, qs)
+
+        try:
+            async with self._session.get(
+                f"{self.BASE_URL}/v5/position/closed-pnl?{qs}",
+                headers=self._headers(ts, sig),
+                timeout=_REQ_TIMEOUT,
+            ) as resp:
+                if resp.status >= 400:
+                    return []
+                data = await resp.json()
+                if data.get("retCode") != 0:
+                    return []
+                return data.get("result", {}).get("list", [])
+        except Exception as e:
+            logger.warning(f"Bybit closed-pnl query failed for {symbol}: {e}")
+            return []
+
     async def get_order(self, symbol: str, order_id: str = "", client_order_id: str = "") -> dict:
         """
         Query single order status — definitive answer for fill detection.

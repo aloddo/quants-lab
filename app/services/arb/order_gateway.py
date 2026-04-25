@@ -190,6 +190,14 @@ class OrderGateway:
             return await self.binance_api.get_trades_for_order(bn_symbol, order_id)
         return []
 
+    async def get_closed_pnl(self, venue: str, symbol: str, limit: int = 5) -> list[dict]:
+        """Query closed PnL records. Returns list with execType, avgExitPrice, closedPnl, etc."""
+        if self._shadow:
+            return []
+        if venue == "bybit":
+            return await self.bybit_api.get_closed_pnl(symbol, limit)
+        return []
+
     async def check_position(self, venue: str, symbol: str) -> float | None:
         """
         Query actual exchange position size.

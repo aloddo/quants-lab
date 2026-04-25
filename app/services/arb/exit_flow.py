@@ -268,6 +268,34 @@ class ExitFlow:
                 slippage_bps=trade_slippage_bps,
             )
 
+        # 2b. PRE-SUBMIT: Check if BB position still exists on exchange.
+        # If Bybit liquidated the position, our sell order would open a NEW short
+        # (ghost position). Detect this BEFORE submitting.
+        if bb_leg and self._gateway:
+            try:
+                bb_position_size = await self._gateway.check_position("bybit", symbol)
+                if bb_position_size is not None and abs(bb_position_size) < qty_bb * 0.1:
+                    # Position gone or near-zero — likely liquidated
+                    logger.critical(
+                        f"BB POSITION GONE before exit submit: {symbol} "
+                        f"exchange_size={bb_position_size}, expected={qty_bb}. "
+                        f"Likely LIQUIDATED. Skipping BB exit to prevent ghost short."
+                    )
+                    # Mark BB as "liquidated" — skip BB leg entirely
+                    if bb_leg:
+                        self._detector.cleanup_leg(bb_leg)
+                    bb_leg = None
+                    legs_to_track = [l for l in legs_to_track if l and l.venue != "bybit"]
+                    # Persist liquidation flag
+                    await self._store.update_leg(position_id, "exit", "bb", {
+                        "state": LegStateEnum.FILLED,  # treat as filled (by liquidation)
+                        "liquidated": True,
+                        "filled_qty": qty_bb,
+                        "avg_fill_price": 0,  # will be enriched from closed-pnl later
+                    })
+            except Exception as e:
+                logger.warning(f"BB position check failed for {symbol}: {e} — proceeding with exit")
+
         # 3. Submit exit orders
         bb_oid = None
         bn_oid = None

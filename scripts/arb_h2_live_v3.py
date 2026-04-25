@@ -1539,6 +1539,72 @@ class H2LiveTraderV2:
 
         if result.outcome == "SUCCESS":
             self.signal_engine.unregister_position(sym)
+
+            # Check if BB was liquidated — enrich with actual settlement price
+            bb_was_liquidated = False
+            try:
+                closed_pnl = await gateway.get_closed_pnl("bybit", sym, limit=3)
+                for cpnl in closed_pnl:
+                    if cpnl.get("execType") == "BustTrade" and cpnl.get("qty") == str(int(float(entry.get("bb", {}).get("filled_qty", 0)))):
+                        liq_price = float(cpnl.get("avgExitPrice", 0))
+                        liq_pnl = float(cpnl.get("closedPnl", 0))
+                        if liq_price > 0:
+                            bb_was_liquidated = True
+                            logger.critical(
+                                f"BB LIQUIDATED: {sym} settled at {liq_price} "
+                                f"(closedPnl={liq_pnl:.4f}). Correcting PnL."
+                            )
+                            # Recalculate PnL with actual liquidation price
+                            bb_ep = float(entry.get("bb", {}).get("avg_fill_price", 0))
+                            bb_qty = float(entry.get("bb", {}).get("filled_qty", 0))
+                            bn_ep = float(entry.get("bn", {}).get("avg_fill_price", 0))
+                            bn_xp = result.bn_fill_price
+                            bn_qty = result.bn_filled_qty if result.bn_filled_qty > 0 else float(entry.get("bn", {}).get("filled_qty", 0))
+
+                            bb_pnl = (liq_price - bb_ep) * bb_qty  # long side
+                            bn_pnl = (bn_ep - bn_xp) * bn_qty if bn_xp > 0 else 0
+                            gross = bb_pnl + bn_pnl
+                            fees = float(cpnl.get("openFee", 0)) + float(cpnl.get("closeFee", 0))
+                            bn_fees = float(entry.get("bn", {}).get("fee", 0)) + getattr(result, "fees_usd", 0)
+                            net = gross - fees - bn_fees
+                            avg_notional = bb_ep * bb_qty
+                            net_bps = (net / avg_notional * 10000) if avg_notional > 0 else 0
+
+                            # Update MongoDB with corrected PnL
+                            from pymongo import MongoClient
+                            _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+                            _db = _client[MONGO_URI.rsplit("/", 1)[-1]]
+                            _db["arb_h2_positions_v2"].update_one(
+                                {"position_id": pid},
+                                {"$set": {
+                                    "exit.bb.avg_fill_price": liq_price,
+                                    "exit.bb.liquidated": True,
+                                    "exit.bb_bankruptcy_price": liq_price,
+                                    "pnl.gross_bps": gross / avg_notional * 10000 if avg_notional > 0 else 0,
+                                    "pnl.fees_bps": (fees + bn_fees) / avg_notional * 10000 if avg_notional > 0 else 0,
+                                    "pnl.net_bps": net_bps,
+                                    "pnl.net_usd": net,
+                                }},
+                            )
+                            _client.close()
+
+                            # Override result for downstream reporting
+                            result.pnl_net_usd = net
+                            result.pnl_net_bps = net_bps
+                            result.bb_fill_price = liq_price
+
+                            await tg_send(
+                                f"\U0001f6a8 <b>H2 V3 BB LIQUIDATED</b> <code>{sym.replace('USDT','')}</code>\n"
+                                f"BB: {bb_ep:.4f} \u2192 {liq_price:.4f} (bankruptcy)\n"
+                                f"BN hedge: {bn_ep:.4f} \u2192 {bn_xp:.4f}\n"
+                                f"Net: <b>${net:.3f}</b> ({net_bps:+.0f}bp)\n"
+                                f"BB loss: ${bb_pnl:.3f} | BN gain: ${bn_pnl:.3f}",
+                                session,
+                            )
+                            break
+            except Exception as e:
+                logger.warning(f"Liquidation check failed for {sym}: {e}")
+
             # Update inventory (buy-back)
             if bn_side == "Buy" and result.bn_filled_qty > 0:
                 self.inventory.bought(sym, result.bn_filled_qty, fill_price=result.bn_fill_price)
