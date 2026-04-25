@@ -28,23 +28,24 @@ logger = logging.getLogger(__name__)
 # unit: "ms" (Int64 millis), "s" (float seconds), "datetime" (Python datetime)
 # days: how many days of data to keep
 RETENTION_CONFIG: Dict[str, Dict[str, Any]] = {
-    # Bybit derivatives (90 days)
-    "bybit_funding_rates":          {"field": "timestamp_utc", "unit": "ms", "days": 90},
-    "bybit_open_interest":          {"field": "timestamp_utc", "unit": "ms", "days": 90},
-    "bybit_ls_ratio":               {"field": "timestamp_utc", "unit": "ms", "days": 90},
-    # Binance funding (90 days)
-    "binance_funding_rates":        {"field": "timestamp_utc", "unit": "ms", "days": 90},
-    # Hyperliquid funding (365 days — long history for research)
-    "hyperliquid_funding_rates":    {"field": "timestamp_utc", "unit": "ms", "days": 365},
+    # Bybit derivatives — 730 days (2 years). Backtests run up to 365d and need
+    # buffer for walk-forward + ffill anchor. DO NOT reduce below 400d.
+    "bybit_funding_rates":          {"field": "timestamp_utc", "unit": "ms", "days": 730},
+    "bybit_open_interest":          {"field": "timestamp_utc", "unit": "ms", "days": 730},
+    "bybit_ls_ratio":               {"field": "timestamp_utc", "unit": "ms", "days": 730},
+    # Binance funding — same reasoning as Bybit
+    "binance_funding_rates":        {"field": "timestamp_utc", "unit": "ms", "days": 730},
+    # Hyperliquid funding (730 days — matches Bybit for cross-venue strategies)
+    "hyperliquid_funding_rates":    {"field": "timestamp_utc", "unit": "ms", "days": 730},
     # Hyperliquid microstructure (7 days — high volume, low shelf life)
     "hyperliquid_l2_snapshots_1s":  {"field": "timestamp_utc", "unit": "ms", "days": 7},
     "hyperliquid_recent_trades_1s": {"field": "time",          "unit": "ms", "days": 7},
     # Deribit (180 days options, 365 days DVol)
     "deribit_options_surface":      {"field": "timestamp_utc", "unit": "ms", "days": 180},
     "deribit_dvol":                 {"field": "timestamp_utc", "unit": "ms", "days": 365},
-    # Coinalyze (365 days)
-    "coinalyze_liquidations":       {"field": "timestamp_utc", "unit": "ms", "days": 365},
-    "coinalyze_oi":                 {"field": "timestamp_utc", "unit": "ms", "days": 365},
+    # Coinalyze — 730 days (X10 does 365d backtests, need buffer)
+    "coinalyze_liquidations":       {"field": "timestamp_utc", "unit": "ms", "days": 730},
+    "coinalyze_oi":                 {"field": "timestamp_utc", "unit": "ms", "days": 730},
     # Signal candidates (365 days)
     "candidates":                   {"field": "timestamp_utc", "unit": "ms", "days": 365},
     # Arb operational data (shorter retention)
