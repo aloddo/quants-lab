@@ -18,6 +18,24 @@ tasks:
       min_notional_size: 10
     tags: [data, candles, bybit]
 
+  candles_downloader_hyperliquid:
+    enabled: true
+    task_class: app.tasks.data_collection.candles_downloader_task.CandlesDownloaderTask
+    schedule:
+      type: cron
+      cron: "10 * * * *"
+      timezone: UTC
+    max_retries: 3
+    retry_delay_seconds: 120
+    timeout_seconds: 1800
+    config:
+      connector_name: "hyperliquid_perpetual"
+      quote_asset: "USDT"
+      intervals: ["1h"]
+      days_data_retention: 90
+      min_notional_size: 10
+    tags: [data, candles, hyperliquid]
+
   bybit_derivatives:
     enabled: true
     task_class: app.tasks.data_collection.bybit_derivatives_task.BybitDerivativesTask
