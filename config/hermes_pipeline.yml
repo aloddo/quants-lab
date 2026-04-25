@@ -208,6 +208,22 @@ tasks:
       mongo_database: "quants_lab"
     tags: [ops, monitoring]
 
+  tick_aggregation:
+    enabled: true
+    task_class: app.tasks.data_collection.tick_aggregation_task.TickAggregationTask
+    schedule:
+      type: cron
+      cron: "0 4 * * *"
+      timezone: UTC
+    max_retries: 1
+    retry_delay_seconds: 60
+    timeout_seconds: 600
+    config:
+      mongo_uri: "mongodb://localhost:27017/quants_lab"
+      mongo_database: "quants_lab"
+      lookback_days: 2
+    tags: [ops, aggregation]
+
   data_retention:
     enabled: true
     task_class: app.tasks.data_collection.data_retention_task.DataRetentionTask
