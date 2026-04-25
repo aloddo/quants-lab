@@ -242,15 +242,24 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
 
         # Merge derivatives data if engine needs it (funding_rate, btc_return_4h, etc.)
         engine_meta = get_strategy(self.engine_name)
-        if "derivatives" in engine_meta.required_features:
-            from app.tasks.backtesting.bulk_backtest_task import BulkBacktestTask
-            # Borrow the merge methods from BulkBacktestTask
-            _merger = object.__new__(BulkBacktestTask)
-            _merger.connector_name = self.connector_name
-            _merger.engine_name = self.engine_name
-            _merger.mongodb_client = self.mongodb_client
-            n_enriched = await _merger._merge_derivatives_into_candles(shared_candles, pairs)
-            logger.info(f"Merged derivatives data into {n_enriched}/{len(pairs)} pairs")
+        if engine_meta.required_features:
+            from pymongo import MongoClient as SyncClient
+            from app.data_sources.merge import merge_all_for_engine_sync
+            sync_db = SyncClient("mongodb://localhost:27017").quants_lab
+            enriched = 0
+            for pair in pairs:
+                feed_key = f"{self.connector_name}_{pair}_1h"
+                df = shared_candles.get(feed_key)
+                if df is None or len(df) == 0:
+                    continue
+                try:
+                    shared_candles[feed_key] = merge_all_for_engine_sync(
+                        sync_db, self.engine_name, df, pair
+                    )
+                    enriched += 1
+                except Exception as e:
+                    logger.warning(f"Failed to merge data sources for {pair}: {e}")
+            logger.info(f"Merged data sources into {enriched}/{len(pairs)} pairs")
 
         logger.info(
             f"WalkForward {self.engine_name}: {len(pairs)} pairs, "

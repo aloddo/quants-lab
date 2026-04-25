@@ -80,31 +80,31 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         if not self.mongodb_client:
             raise RuntimeError("MongoDB required for BulkBacktestTask")
 
-    async def _merge_derivatives_into_candles(
-        self, shared_candles: dict, pairs: List[str]
+    async def _merge_all_sources_async(
+        self, shared_candles: dict, pairs: List[str], engine_meta
     ) -> int:
-        """Merge derivatives data (funding, OI, LS ratio) from MongoDB into candle DataFrames.
+        """Merge ALL required data sources into candle DataFrames via generic merge engine.
 
-        For each pair's 1h candle feed, queries MongoDB for historical derivatives
-        data and adds funding_rate, oi_value, buy_ratio columns aligned by timestamp.
-        Forward-fills gaps (funding is 8h, OI/LS are 15min-1h), then back-fills
-        and fills remaining NaN with neutral values.
+        Uses the sync merge engine (pymongo) since the parent process only needs this
+        for funding PnL computation in _store_trades. The actual backtest runs in a
+        subprocess which also uses the sync merge engine.
 
-        NaN safety: BacktestingEngineBase.prepare_market_data() calls
-        dropna(inplace=True) on the merged DataFrame (how='any'). Any NaN
-        in ANY column kills the row. We must ensure derivatives columns never
-        contain NaN, even for timestamps before MongoDB coverage begins.
-
-        Neutral fill values:
-          funding_rate = 0.0   (no funding → no signal)
-          oi_value     = bfill then 0.0 (use earliest known, else zero)
-          buy_ratio    = 0.5   (balanced → no crowd signal)
+        NaN safety: The generic merge engine fills all columns with neutral values
+        (0.0 for rates, 0.5 for ratios, 50 for indices) — same guarantees as the
+        old hardcoded merge. BacktestingEngineBase.prepare_market_data() calls
+        dropna(inplace=True) which kills rows with any NaN.
 
         Returns number of pairs enriched.
         """
-        db = self.mongodb_client.get_database()
-        enriched = 0
+        from pymongo import MongoClient as SyncClient
+        from app.data_sources.merge import merge_all_for_engine_sync
 
+        sync_db = SyncClient(
+            self.mongodb_client._uri if hasattr(self.mongodb_client, '_uri')
+            else "mongodb://localhost:27017"
+        ).quants_lab
+
+        enriched = 0
         for pair in pairs:
             feed_key = f"{self.connector_name}_{pair}_1h"
             if feed_key not in shared_candles:
@@ -114,145 +114,17 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
             if df is None or len(df) == 0:
                 continue
 
-            query = {"pair": pair}
-
             try:
-                candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-
-                # Funding rates
-                funding_cursor = db["bybit_funding_rates"].find(query).sort("timestamp_utc", 1)
-                funding_docs = await funding_cursor.to_list(length=100000)
-                if funding_docs:
-                    fdf = pd.DataFrame(funding_docs)
-                    if "timestamp_utc" in fdf.columns and "funding_rate" in fdf.columns:
-                        fdf["ts"] = pd.to_datetime(fdf["timestamp_utc"], unit="ms", utc=True)
-                        fdf = fdf.set_index("ts")[["funding_rate"]].sort_index()
-                        fdf = fdf[~fdf.index.duplicated(keep="last")]
-                        fdf_reindexed = fdf.reindex(candle_idx, method="ffill")
-                        df["funding_rate"] = fdf_reindexed["funding_rate"].fillna(0.0).values
-                else:
-                    df["funding_rate"] = 0.0
-
-                # Open interest
-                oi_cursor = db["bybit_open_interest"].find(query).sort("timestamp_utc", 1)
-                oi_docs = await oi_cursor.to_list(length=100000)
-                if oi_docs:
-                    odf = pd.DataFrame(oi_docs)
-                    if "timestamp_utc" in odf.columns and "oi_value" in odf.columns:
-                        odf["ts"] = pd.to_datetime(odf["timestamp_utc"], unit="ms", utc=True)
-                        odf = odf.set_index("ts")[["oi_value"]].sort_index()
-                        odf = odf[~odf.index.duplicated(keep="last")]
-                        odf_reindexed = odf.reindex(candle_idx, method="ffill")
-                        df["oi_value"] = odf_reindexed["oi_value"].bfill().fillna(0.0).values
-                else:
-                    df["oi_value"] = 0.0
-
-                # LS ratio
-                ls_cursor = db["bybit_ls_ratio"].find(query).sort("timestamp_utc", 1)
-                ls_docs = await ls_cursor.to_list(length=100000)
-                if ls_docs:
-                    ldf = pd.DataFrame(ls_docs)
-                    if "timestamp_utc" in ldf.columns and "buy_ratio" in ldf.columns:
-                        ldf["ts"] = pd.to_datetime(ldf["timestamp_utc"], unit="ms", utc=True)
-                        ldf = ldf.set_index("ts")[["buy_ratio"]].sort_index()
-                        ldf = ldf[~ldf.index.duplicated(keep="last")]
-                        ldf_reindexed = ldf.reindex(candle_idx, method="ffill")
-                        df["buy_ratio"] = ldf_reindexed["buy_ratio"].fillna(0.5).values
-                else:
-                    df["buy_ratio"] = 0.5
-
-                # Binance funding rates (for cross-exchange spread signals)
-                bin_cursor = db["binance_funding_rates"].find(query).sort("timestamp_utc", 1)
-                bin_docs = await bin_cursor.to_list(length=100000)
-                if bin_docs:
-                    bdf = pd.DataFrame(bin_docs)
-                    if "timestamp_utc" in bdf.columns and "funding_rate" in bdf.columns:
-                        bdf["ts"] = pd.to_datetime(bdf["timestamp_utc"], unit="ms", utc=True)
-                        bdf = bdf.set_index("ts")[["funding_rate"]].sort_index()
-                        bdf = bdf.rename(columns={"funding_rate": "binance_funding_rate"})
-                        bdf = bdf[~bdf.index.duplicated(keep="last")]
-                        bdf_reindexed = bdf.reindex(candle_idx, method="ffill")
-                        df["binance_funding_rate"] = bdf_reindexed["binance_funding_rate"].fillna(0.0).values
-                else:
-                    df["binance_funding_rate"] = 0.0
-
-                # Coinalyze liquidations (prefer hourly, fall back to daily)
-                # Provides: long_liquidations_usd, short_liquidations_usd, total_liquidations_usd
-                # Neutral fill: 0.0 (no liquidation = no signal)
-                # Hourly data is preferred for strategies like X10 that compute
-                # z-scores over hourly windows. Daily data forward-filled to 1h
-                # still works but loses intra-day variation.
-                liq_cursor = db["coinalyze_liquidations"].find(
-                    {"pair": pair, "resolution": "1hour"}
-                ).sort("timestamp_utc", 1)
-                liq_docs = await liq_cursor.to_list(length=500000)
-                if len(liq_docs) < 100:
-                    # Fall back to daily if hourly data is sparse
-                    liq_cursor = db["coinalyze_liquidations"].find(
-                        {"pair": pair, "resolution": "daily"}
-                    ).sort("timestamp_utc", 1)
-                    liq_docs = await liq_cursor.to_list(length=100000)
-                if liq_docs:
-                    liqdf = pd.DataFrame(liq_docs)
-                    if "timestamp_utc" in liqdf.columns:
-                        liqdf["ts"] = pd.to_datetime(liqdf["timestamp_utc"], unit="ms", utc=True)
-                        liqdf = liqdf.set_index("ts").sort_index()
-                        liqdf = liqdf[~liqdf.index.duplicated(keep="last")]
-                        for col, default in [
-                            ("long_liquidations_usd", 0.0),
-                            ("short_liquidations_usd", 0.0),
-                            ("total_liquidations_usd", 0.0),
-                        ]:
-                            if col in liqdf.columns:
-                                col_reindexed = liqdf[[col]].reindex(candle_idx, method="ffill")
-                                df[col] = col_reindexed[col].fillna(default).values
-                            else:
-                                df[col] = default
-                else:
-                    df["long_liquidations_usd"] = 0.0
-                    df["short_liquidations_usd"] = 0.0
-                    df["total_liquidations_usd"] = 0.0
-
-                shared_candles[feed_key] = df
+                shared_candles[feed_key] = merge_all_for_engine_sync(
+                    sync_db, self.engine_name, df, pair
+                )
                 enriched += 1
-
             except Exception as e:
-                logger.warning(f"Failed to merge derivatives for {pair}: {e}")
+                logger.warning(f"Failed to merge data sources for {pair}: {e}")
 
-        # Merge fear_greed_index and BTC regime features (pair-independent, do once)
-        await self._merge_sentiment_and_regime(shared_candles, pairs)
-
-        return enriched
-
-    async def _merge_sentiment_and_regime(
-        self, shared_candles: dict, pairs: List[str]
-    ) -> None:
-        """Merge fear_greed_value and BTC regime features into all pair candles.
-
-        These are pair-independent features (same value for all pairs at a given time).
-        Loaded once from MongoDB / BTC candle parquet, then merged into each pair's 1h candles.
-
-        NaN safety: all columns filled with neutral defaults after merge.
-        """
-        db = self.mongodb_client.get_database()
-
-        # 1. Fear & Greed Index
-        fg_cursor = db["fear_greed_index"].find(
-            {}, {"timestamp_utc": 1, "value": 1, "_id": 0}
-        ).sort("timestamp_utc", 1)
-        fg_docs = await fg_cursor.to_list(length=100000)
-        fg_df = None
-        if fg_docs:
-            fgd = pd.DataFrame(fg_docs)
-            if "timestamp_utc" in fgd.columns and "value" in fgd.columns:
-                fgd["ts"] = pd.to_datetime(fgd["timestamp_utc"], unit="ms", utc=True)
-                fg_df = fgd.set_index("ts")[["value"]].rename(
-                    columns={"value": "fear_greed_value"}
-                ).sort_index()
-                fg_df = fg_df[~fg_df.index.duplicated(keep="last")]
-                logger.info(f"Fear & Greed: {len(fg_df)} entries loaded for merge")
-
-        # 2. BTC regime from parquet
+        # BTC regime features (pair-independent, computed from BTC candle parquet)
+        # This is NOT a MongoDB source — it's computed from the BTC 1h candle DataFrame.
+        # Keep separate from the generic merge engine.
         btc_key = f"{self.connector_name}_BTC-USDT_1h"
         btc_df = shared_candles.get(btc_key)
         regime_df = None
@@ -264,29 +136,17 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
             regime_df = pd.DataFrame({"btc_return_4h": ret_4h}).dropna()
             logger.info(f"BTC regime: {len(regime_df)} bars for merge")
 
-        # 3. Merge into each pair's candle feed
         for pair in pairs:
             feed_key = f"{self.connector_name}_{pair}_1h"
             df = shared_candles.get(feed_key)
             if df is None or len(df) == 0:
                 continue
-
             candle_idx = pd.to_datetime(df["timestamp"], unit="s", utc=True)
-
-            # Fear & Greed
-            if fg_df is not None:
-                fg_reindexed = fg_df.reindex(candle_idx, method="ffill")
-                df["fear_greed_value"] = fg_reindexed["fear_greed_value"].fillna(50.0).values
-            else:
-                df["fear_greed_value"] = 50.0
-
-            # BTC regime
             if regime_df is not None:
                 reg_reindexed = regime_df.reindex(candle_idx, method="ffill")
                 df["btc_return_4h"] = reg_reindexed["btc_return_4h"].fillna(0.0).values
             else:
                 df["btc_return_4h"] = 0.0
-
             shared_candles[feed_key] = df
 
     def _discover_pairs(self, start_ts: int = 0) -> List[str]:
@@ -326,7 +186,7 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         Checks BOTH the backtesting resolution (e.g. 1m) AND the 1h feed.
         Uses the minimum of both as the binding constraint. This prevents
         initialize_candles_feed from refetching 1h data (which would overwrite
-        derivatives columns merged by _merge_derivatives_into_candles).
+        derivatives columns merged by _merge_all_sources_async).
 
         Without this, a 1m feed ending at 11:16 but 1h feed ending at 11:00
         would cause the engine to refetch 1h data from parquet, losing the
@@ -889,12 +749,13 @@ class BulkBacktestTask(NotifyingTaskMixin, BaseTask):
         del _shared_cache
         gc.collect()
 
-        # Merge derivatives into shared_candles for funding PnL computation in _store_trades
+        # Merge all required data sources into shared_candles for funding PnL
+        # computation in _store_trades. Uses the generic merge engine.
         from app.engines.strategy_registry import get_strategy
         engine_meta = get_strategy(self.engine_name)
-        if "derivatives" in engine_meta.required_features:
-            n_enriched = await self._merge_derivatives_into_candles(shared_candles, pairs)
-            logger.info(f"Merged derivatives data into {n_enriched}/{len(pairs)} pairs (for funding PnL)")
+        if engine_meta.required_features:
+            n_enriched = await self._merge_all_sources_async(shared_candles, pairs, engine_meta)
+            logger.info(f"Merged data sources into {n_enriched}/{len(pairs)} pairs (for funding PnL)")
 
         for pair in pairs:
             try:
