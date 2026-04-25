@@ -275,6 +275,8 @@ class H2LiveTraderV2:
         self._realized_costs: list[float] = []  # last N trades' effective RT cost in bps
         self._realized_cost_window = 20  # rolling window
         self._retire_queue: set[str] = set()
+        self._last_liq_check: float = 0.0  # throttle liquidation checks
+        self._slippage_alert_cooldown: dict[str, float] = {}  # per-symbol cooldown
 
         # V3: TierEngine drives pair selection
         self.tier_engine = TierEngine(mongo_uri=MONGO_URI)
@@ -1037,9 +1039,9 @@ class H2LiveTraderV2:
                             continue
 
                         # LIQUIDATION CHECK: verify BB position still exists on Bybit.
-                        # If BB was liquidated mid-hold, we have a naked BN exposure.
-                        # Must close BN immediately (buy back inventory).
-                        if pos_doc[0].get("state") == PositionState.OPEN:
+                        # Throttled to every 30s to avoid Bybit rate limit (was every 0.5s = 12 req/s).
+                        if pos_doc[0].get("state") == PositionState.OPEN and time.time() - self._last_liq_check >= 30.0:
+                            self._last_liq_check = time.time()
                             try:
                                 bb_size = await gateway.check_position("bybit", sym)
                                 bb_expected = float(pos_doc[0].get("entry", {}).get("bb", {}).get("filled_qty", 0))
@@ -1325,6 +1327,7 @@ class H2LiveTraderV2:
                     return
             except Exception as e:
                 logger.warning(f"{sym} USDC balance check failed: {e} — skipping entry")
+                return  # fail-closed: don't enter without confirmed balance
 
         bb_side = "Buy" if direction == "BUY_BB_SELL_BN" else "Sell"
         bn_side = "Sell" if direction == "BUY_BB_SELL_BN" else "Buy"
@@ -1681,11 +1684,14 @@ class H2LiveTraderV2:
             )
             self.inventory_guard.record_trade_capture(sym, result.pnl_net_usd)
             # Real-time effective cost tracking
-            if hasattr(result, 'pnl_net_bps'):
-                # Effective cost = gross - net (in bps)
-                gross_bps = result.pnl_net_bps + (FEE_RT_BPS if result.pnl_net_bps != 0 else 0)
-                effective_cost = gross_bps - result.pnl_net_bps if gross_bps != 0 else FEE_RT_BPS
-                self._realized_costs.append(effective_cost)
+            # Track actual effective cost from real fee data (not the constant FEE_RT_BPS)
+            actual_fees_usd = getattr(result, "fees_usd", 0.0)
+            bb_qty = float(entry.get("bb", {}).get("filled_qty", 0))
+            bb_ep = float(entry.get("bb", {}).get("avg_fill_price", 0))
+            position_notional = bb_qty * bb_ep if bb_qty > 0 and bb_ep > 0 else 1.0
+            if actual_fees_usd > 0 and position_notional > 0:
+                effective_cost_bps = actual_fees_usd / position_notional * 10000
+                self._realized_costs.append(effective_cost_bps)
                 if len(self._realized_costs) > self._realized_cost_window:
                     self._realized_costs = self._realized_costs[-self._realized_cost_window:]
 
@@ -1822,6 +1828,11 @@ class H2LiveTraderV2:
                 sym = r["_id"]
                 avg_slip = abs(r.get("avg_entry_slip", 0))
                 if avg_slip > 5.0:
+                    # Cooldown: only alert once per symbol per hour
+                    now = time.time()
+                    if now < self._slippage_alert_cooldown.get(sym, 0):
+                        continue
+                    self._slippage_alert_cooldown[sym] = now + 3600
                     logger.warning(f"SLIPPAGE ALERT: {sym} avg entry slippage {avg_slip:.1f}bp over {r['count']} trades")
                     await tg_send(
                         f"\u26a0\ufe0f Slippage alert: <b>{sym.replace('USDT','')}</b> "

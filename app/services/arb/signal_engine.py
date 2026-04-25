@@ -222,6 +222,7 @@ class SignalEngine:
         """
         if symbol_bb not in self.symbols:
             self.symbols.append(symbol_bb)
+        self._entry_streak[symbol_bb] = 0
         self.thresholds.seed_symbols([symbol_bb])
 
         # Check if already has history (re-promotion)
@@ -244,6 +245,7 @@ class SignalEngine:
         if symbol_bb in self.symbols:
             self.symbols.remove(symbol_bb)
         self._warming_up.pop(symbol_bb, None)
+        self._entry_streak.pop(symbol_bb, None)
         # CRITICAL: do NOT pop open_positions — exit/stop-loss monitoring must continue
         has_position = symbol_bb in self.open_positions
         if has_position:

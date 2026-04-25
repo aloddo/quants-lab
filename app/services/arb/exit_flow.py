@@ -645,6 +645,24 @@ class ExitFlow:
                     outcome="RISK_PAUSE",
                     latency_ms=(time.time() - t0) * 1000,
                 )
+            # Post-exit ghost detection: verify BB is flat
+            if bb_leg and self._gateway:
+                try:
+                    post_size = await self._gateway.check_position("bybit", symbol)
+                    if post_size is not None and abs(post_size) > 0:
+                        logger.critical(f"GHOST POSITION detected after exit: {symbol} size={post_size}")
+                        close_updates["exit.ghost_detected"] = True
+                        close_updates["exit.bb_post_verify_size"] = post_size
+                        # Persist ghost flag (transition already done, use direct update)
+                        await self._store.update_fields(position_id, {
+                            "exit.ghost_detected": True,
+                            "exit.bb_post_verify_size": post_size,
+                        })
+                    else:
+                        close_updates["exit.bb_post_verify_size"] = post_size
+                except Exception as e:
+                    logger.warning(f"Post-exit position check failed: {e}")
+
             self._log_fill_analytics(symbol, "SUCCESS", bb_leg, bn_leg,
                                      latency_ms=(time.time() - t0) * 1000,
                                      pnl_net_bps=net_bps, pnl_net_usd=net_usd,
@@ -674,9 +692,10 @@ class ExitFlow:
             prior_bb_qty = float(exit_stored.get("bb", {}).get("filled_qty", 0))
             cumulative_bb_qty = prior_bb_qty + bb_leg.filled_qty
             prior_bb_fee = float(exit_stored.get("bb", {}).get("fee", 0))
+            prior_bb_price = float(exit_stored.get("bb", {}).get("avg_fill_price", 0))
             partial_updates.update({
                 "exit.bb.filled_qty": cumulative_bb_qty,
-                "exit.bb.avg_fill_price": bb_leg.avg_fill_price,  # latest fill price
+                "exit.bb.avg_fill_price": bb_leg.avg_fill_price if bb_leg.has_any_fill else prior_bb_price,
                 "exit.bb.fee": prior_bb_fee + bb_leg.fee,  # cumulative fees
                 "exit.bb.fee_asset": bb_leg.fee_asset,
                 "exit.bb.state": bb_leg.state if bb_leg.is_filled else LegStateEnum.PARTIAL,
@@ -685,9 +704,10 @@ class ExitFlow:
             prior_bn_qty = float(exit_stored.get("bn", {}).get("filled_qty", 0))
             cumulative_bn_qty = prior_bn_qty + bn_leg.filled_qty
             prior_bn_fee = float(exit_stored.get("bn", {}).get("fee", 0))
+            prior_bn_price = float(exit_stored.get("bn", {}).get("avg_fill_price", 0))
             partial_updates.update({
                 "exit.bn.filled_qty": cumulative_bn_qty,
-                "exit.bn.avg_fill_price": bn_leg.avg_fill_price,
+                "exit.bn.avg_fill_price": bn_leg.avg_fill_price if bn_leg.has_any_fill else prior_bn_price,
                 "exit.bn.fee": prior_bn_fee + bn_leg.fee,
                 "exit.bn.fee_asset": bn_leg.fee_asset,
                 "exit.bn.state": bn_leg.state if bn_leg.is_filled else LegStateEnum.PARTIAL,

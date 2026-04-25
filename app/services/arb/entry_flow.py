@@ -624,12 +624,24 @@ class EntryFlow:
                 )
 
                 retry_client_id = self._gateway.generate_client_id("h2v2_retry")
+
+                # Persist retry client_id to MongoDB BEFORE submit (crash recovery)
+                missed_venue_key = "bb" if missed_leg.venue == "bybit" else "bn"
+                await self._store.update_fields(position_id, {
+                    f"entry.{missed_venue_key}.retry_client_order_id": retry_client_id,
+                    f"entry.{missed_venue_key}.retry_pending": True,
+                })
+
                 retry_leg = TrackedLeg(
                     venue=retry_venue, symbol=retry_symbol, side=retry_side,
                     client_order_id=retry_client_id,
                     target_qty=retry_qty, target_price=retry_price,
                 )
                 self._detector.register_leg(retry_leg)
+
+                # Remember original order ID for double-fill detection after retry
+                orig_oid = bb_oid if missed_leg is bb_leg else bn_oid
+                orig_client_id = bb_client_id if missed_leg is bb_leg else bn_client_id
 
                 try:
                     retry_oid = await self._gateway.submit(
@@ -638,6 +650,10 @@ class EntryFlow:
                     )
                     if retry_oid:
                         self._detector.register_exchange_id(retry_client_id, retry_oid)
+                        # Persist retry exchange order_id for crash recovery
+                        await self._store.update_fields(position_id, {
+                            f"entry.{missed_venue_key}.retry_order_id": retry_oid,
+                        })
 
                         # Wait for retry fill (short timeout — already naked)
                         await self._detector.wait_for_fills(
@@ -663,23 +679,143 @@ class EntryFlow:
                             retry_leg.apply_rest_result(result)
 
                         if retry_leg.is_filled or retry_leg.has_any_fill:
-                            # RETRY SUCCEEDED — enrich fee and merge into the missed leg
-                            if retry_venue == "binance":
-                                await self._detector.enrich_leg_fee(retry_leg)
-                            missed_leg.filled_qty = retry_leg.filled_qty
-                            missed_leg.avg_fill_price = retry_leg.avg_fill_price
-                            missed_leg.fee = retry_leg.fee
-                            missed_leg.fee_asset = retry_leg.fee_asset
-                            missed_leg.is_maker = retry_leg.is_maker
-                            missed_leg.exec_ids = retry_leg.exec_ids
-                            missed_leg.filled_at = retry_leg.filled_at
-                            missed_leg.state = LegStateEnum.FILLED
-                            missed_leg.fill_event.set()
-                            self._detector.cleanup_leg(retry_leg)
+                            # RETRY SUCCEEDED — but first, check if the ORIGINAL order
+                            # also filled (fill-after-cancel race). If so, we have a
+                            # double position and must unwind the retry order.
+                            orig_double_filled = False
+                            if orig_oid:
+                                orig_recheck = await self._detector.check_fill_definitive(
+                                    retry_venue, symbol, order_id=orig_oid,
+                                    client_order_id=orig_client_id,
+                                )
+                                orig_fill_result = orig_recheck.get("fill_result", "")
+                                orig_filled_qty = float(orig_recheck.get("filled_qty", 0))
+                                if orig_fill_result in ("FILLED", "PARTIAL") and orig_filled_qty > 0:
+                                    orig_double_filled = True
+                                    logger.critical(
+                                        f"DOUBLE-FILL DETECTED: original order {orig_oid} filled "
+                                        f"{orig_filled_qty} AFTER cancel, retry also filled "
+                                        f"{retry_leg.filled_qty}. Unwinding retry order."
+                                    )
+
+                            if orig_double_filled:
+                                # Use the ORIGINAL fill, unwind the RETRY order
+                                # Apply original fill data to the missed leg
+                                missed_leg.apply_rest_result(orig_recheck)
+                                missed_leg.state = LegStateEnum.FILLED
+                                missed_leg.fill_event.set()
+                                # Enrich fee for original fill (Binance REST doesn't return fees)
+                                if retry_venue == "binance":
+                                    try:
+                                        await self._detector.enrich_leg_fee(missed_leg)
+                                    except Exception as e:
+                                        logger.debug(f"Fee enrich for original fill failed: {e}")
+
+                                # Unwind the retry order
+                                retry_unwind_side = "Sell" if retry_leg.side == "Buy" else "Buy"
+                                retry_unwind_cid = self._gateway.generate_client_id("h2v2_dbl_unw")
+                                try:
+                                    retry_unwind_oid = await self._gateway.submit(
+                                        retry_venue, symbol, retry_unwind_side,
+                                        retry_leg.filled_qty, 0, "market", retry_unwind_cid,
+                                    )
+                                    retry_unwind_leg = TrackedLeg(
+                                        venue=retry_venue, symbol=symbol, side=retry_unwind_side,
+                                        order_id=retry_unwind_oid or "", client_order_id=retry_unwind_cid,
+                                        target_qty=retry_leg.filled_qty,
+                                        state=LegStateEnum.SUBMITTED, submitted_at=time.time(),
+                                    )
+                                    self._detector.register_leg(retry_unwind_leg)
+                                    await self._detector.wait_for_fills(
+                                        [retry_unwind_leg], timeout=self.UNWIND_MARKET_TIMEOUT_S,
+                                        ws_available=self._ws_available,
+                                    )
+                                    if not retry_unwind_leg.is_filled and retry_unwind_oid:
+                                        uw_result = await self._detector.check_fill_definitive(
+                                            retry_venue, symbol, order_id=retry_unwind_oid,
+                                        )
+                                        retry_unwind_leg.apply_rest_result(uw_result)
+                                    if retry_unwind_leg.is_filled:
+                                        logger.warning(
+                                            f"Double-fill retry unwind OK: {retry_venue} {symbol} "
+                                            f"{retry_unwind_leg.filled_qty} @ {retry_unwind_leg.avg_fill_price}"
+                                        )
+                                    else:
+                                        logger.critical(
+                                            f"DOUBLE-FILL RETRY UNWIND FAILED: {retry_venue} {symbol} "
+                                            f"— RISK_PAUSE required. Manual intervention needed."
+                                        )
+                                        self._detector.cleanup_leg(retry_unwind_leg)
+                                        self._detector.cleanup_leg(retry_leg)
+                                        # Proceed with original fill but flag risk
+                                        await self._store.update_fields(position_id, {
+                                            f"entry.{missed_venue_key}.double_fill": True,
+                                            f"entry.{missed_venue_key}.retry_unwind_failed": True,
+                                            f"entry.{missed_venue_key}.retry_pending": False,
+                                        })
+                                        # Fall through to unwind path (both legs filled via original)
+                                        # but the retry is still open — RISK_PAUSE
+                                        self._cleanup_legs(bb_leg, bn_leg)
+                                        return EntryResult(
+                                            success=False, position_id=position_id,
+                                            outcome="RISK_PAUSE",
+                                            failure_venue=f"{retry_venue}_double_fill_unwind_failed",
+                                            latency_ms=(time.time() - t0) * 1000,
+                                        )
+                                    self._detector.cleanup_leg(retry_unwind_leg)
+                                except Exception as e:
+                                    logger.critical(
+                                        f"DOUBLE-FILL RETRY UNWIND EXCEPTION: {retry_venue} {symbol}: {e} "
+                                        f"— RISK_PAUSE required."
+                                    )
+                                    await self._store.update_fields(position_id, {
+                                        f"entry.{missed_venue_key}.double_fill": True,
+                                        f"entry.{missed_venue_key}.retry_unwind_failed": True,
+                                        f"entry.{missed_venue_key}.retry_pending": False,
+                                    })
+                                    self._detector.cleanup_leg(retry_leg)
+                                    self._cleanup_legs(bb_leg, bn_leg)
+                                    return EntryResult(
+                                        success=False, position_id=position_id,
+                                        outcome="RISK_PAUSE",
+                                        failure_venue=f"{retry_venue}_double_fill_unwind_exception",
+                                        latency_ms=(time.time() - t0) * 1000,
+                                    )
+
+                                # Retry unwound successfully — clear retry state and continue
+                                # with original fill (missed_leg already has original fill data)
+                                await self._store.update_fields(position_id, {
+                                    f"entry.{missed_venue_key}.double_fill": True,
+                                    f"entry.{missed_venue_key}.double_fill_resolved": True,
+                                    f"entry.{missed_venue_key}.retry_pending": False,
+                                })
+                                self._detector.cleanup_leg(retry_leg)
+                                logger.info(
+                                    f"Double-fill resolved: using original order {orig_oid}, "
+                                    f"retry unwound successfully"
+                                )
+                                # Fall through — missed_leg now has original fill, proceed to OPEN
+                            else:
+                                # No double-fill — normal retry success path
+                                if retry_venue == "binance":
+                                    await self._detector.enrich_leg_fee(retry_leg)
+                                missed_leg.filled_qty = retry_leg.filled_qty
+                                missed_leg.avg_fill_price = retry_leg.avg_fill_price
+                                missed_leg.fee = retry_leg.fee
+                                missed_leg.fee_asset = retry_leg.fee_asset
+                                missed_leg.is_maker = retry_leg.is_maker
+                                missed_leg.exec_ids = retry_leg.exec_ids
+                                missed_leg.filled_at = retry_leg.filled_at
+                                missed_leg.state = LegStateEnum.FILLED
+                                missed_leg.fill_event.set()
+                                self._detector.cleanup_leg(retry_leg)
+                                await self._store.update_fields(position_id, {
+                                    f"entry.{missed_venue_key}.retry_pending": False,
+                                })
 
                             logger.info(
                                 f"LEG RETRY SUCCESS: {retry_venue} {symbol} "
-                                f"filled {retry_leg.filled_qty} @ {retry_leg.avg_fill_price}"
+                                f"filled {missed_leg.filled_qty} @ {missed_leg.avg_fill_price}"
                             )
 
                             # Both legs now filled — transition to OPEN
@@ -729,10 +865,16 @@ class EntryFlow:
                         else:
                             logger.warning(f"LEG RETRY MISSED: {retry_venue} {symbol} — proceeding to unwind")
                             self._detector.cleanup_leg(retry_leg)
+                            await self._store.update_fields(position_id, {
+                                f"entry.{missed_venue_key}.retry_pending": False,
+                            })
 
                 except Exception as e:
                     logger.error(f"LEG RETRY FAILED: {retry_venue} {symbol}: {e}")
                     self._detector.cleanup_leg(retry_leg)
+                    await self._store.update_fields(position_id, {
+                        f"entry.{missed_venue_key}.retry_pending": False,
+                    })
                     # Fall through to unwind
 
         if bb_leg.has_any_fill or bn_leg.has_any_fill:

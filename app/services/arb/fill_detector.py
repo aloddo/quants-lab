@@ -171,16 +171,11 @@ class TrackedLeg:
                 total_fee_usd += commission * price
                 fee_asset_seen = asset
             elif asset.upper() == "BNB" and price > 0 and qty > 0:
-                # BNB discount: fee paid in BNB. Convert to USD using the
-                # known discounted rate applied to fill notional.
-                # BNB commission = notional * discounted_rate / BNB_price
-                # So: fee_usd = notional * discounted_rate = commission * BNB_price
-                # We don't have BNB_price, but we can derive it:
-                # fee_usd = commission * BNB_price. Use the fee rate to back-calculate.
-                # Binance 25% BNB discount on 0.095% taker = 0.07125%
-                # fee_usd = notional * 0.0007125
                 notional = price * qty
-                fee_usd = notional * 0.0007125  # actual discounted rate
+                # BNB fee: we can't convert BNB to USD without BNB price.
+                # Use the actual discount rate from account settings (0.07125% for current tier).
+                # TODO: query actual rate from Binance computeCommissionRates at startup
+                fee_usd = notional * 0.0007125
                 total_fee_usd += fee_usd
                 fee_asset_seen = "BNB"
                 logger.info(
@@ -197,11 +192,8 @@ class TrackedLeg:
                     f"${notional:.4f} notional -> ${notional * 0.00095:.6f}"
                 )
             # else: can't convert, skip (shouldn't happen)
-        # MEDIUM FIX (Opus C3 #5): Only overwrite fee if REST data is more authoritative
-        # than existing WS-accumulated fee. If WS fee is already set, use the higher of the two
-        # (REST is more complete since it captures all fills, WS may miss some)
         if total_fee_usd > 0:
-            self.fee = max(self.fee, total_fee_usd)
+            self.fee = total_fee_usd  # REST is authoritative, overwrite WS estimate
         self.fee_asset = fee_asset_seen or "USD"
         # Set is_maker from first trade (all fills in an arb order should be same type)
         if trades:
@@ -418,8 +410,21 @@ class FillDetector:
 
     async def enrich_leg_fee(self, leg: TrackedLeg):
         """Public method to enrich fee data for a filled leg. Called by entry/exit flows."""
-        if leg.venue == "binance" and leg.has_any_fill and self._get_trades:
-            await self._enrich_fee(leg)
+        if leg.has_any_fill and self._get_trades:
+            if leg.venue == "binance":
+                await self._enrich_fee(leg)
+            elif leg.venue == "bybit" and leg.fee == 0:
+                # Bybit: estimate fee from fill data (WS usually provides it,
+                # but REST fallback doesn't). Use known taker/maker rates.
+                if leg.is_maker:
+                    leg.fee = leg.filled_qty * leg.avg_fill_price * 0.0002  # 0.02% maker
+                else:
+                    leg.fee = leg.filled_qty * leg.avg_fill_price * 0.00055  # 0.055% taker
+                leg.fee_asset = "USDT"
+                logger.info(
+                    f"BB fee estimated: {leg.venue} {leg.symbol} fee=${leg.fee:.6f} "
+                    f"({'maker' if leg.is_maker else 'taker'})"
+                )
 
     async def _enrich_fee(self, leg: TrackedLeg):
         """
