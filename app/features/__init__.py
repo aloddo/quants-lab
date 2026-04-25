@@ -24,6 +24,8 @@ ALL_FEATURES = [
     DerivativesFeature,  # derivatives (from MongoDB, not candles)
     MarketRegimeFeature, # computed (depends on ATR)
     MicrostructureFeature,  # microstructure (from 1m candle data)
+    OptionsFeature,      # from MongoDB deribit_options_surface (BTC/ETH only)
+    LiquidationFeature,  # from MongoDB coinalyze_liquidations + coinalyze_oi
 ]
 
 # External features are registered here when implemented.

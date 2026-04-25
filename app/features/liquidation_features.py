@@ -1,7 +1,7 @@
 """
-Liquidation-derived features from Coinglass data.
+Liquidation-derived features from Coinalyze data.
 
-Computes from MongoDB `coinglass_liquidations` and `coinglass_oi`:
+Computes from MongoDB `coinalyze_liquidations` and `coinalyze_oi`:
 - Liquidation cascade detector (acceleration of liquidation volume)
 - Liquidation imbalance momentum
 - Organic OI change (OI change + liquidation volume)
@@ -9,6 +9,13 @@ Computes from MongoDB `coinglass_liquidations` and `coinglass_oi`:
 - Liquidation heat map approximation
 
 Also includes Fear & Greed as a sentiment feature.
+
+Schema (coinalyze_liquidations):
+  timestamp_utc (Int64 ms), pair, resolution, long_liquidations_usd,
+  short_liquidations_usd, total_liquidations_usd
+
+Schema (coinalyze_oi):
+  timestamp_utc (Int64 ms), pair, resolution, oi_open, oi_high, oi_low, oi_close
 """
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -52,6 +59,20 @@ class LiquidationFeature(FeatureBase[LiquidationConfig]):
             value={},
         )
 
+    @staticmethod
+    def _compute_imbalance(doc: Dict) -> float:
+        """Compute liquidation imbalance: (long - short) / total.
+
+        Coinalyze does not store an imbalance field directly,
+        so we compute it from long/short/total liquidation values.
+        """
+        total = doc.get("total_liquidations_usd", 0)
+        if total == 0:
+            return 0.0
+        long_liq = doc.get("long_liquidations_usd", 0)
+        short_liq = doc.get("short_liquidations_usd", 0)
+        return (long_liq - short_liq) / total
+
     def create_feature_from_data(
         self,
         trading_pair: str,
@@ -60,33 +81,33 @@ class LiquidationFeature(FeatureBase[LiquidationConfig]):
         oi_docs: List[Dict],
         fear_greed_docs: Optional[List[Dict]] = None,
     ) -> Feature:
-        """Build liquidation features from Coinglass data.
+        """Build liquidation features from Coinalyze data.
 
-        liq_docs: from coinglass_liquidations, sorted by timestamp_utc DESC
-        oi_docs: from coinglass_oi, sorted by timestamp_utc DESC
+        liq_docs: from coinalyze_liquidations, sorted by timestamp_utc DESC
+        oi_docs: from coinalyze_oi, sorted by timestamp_utc DESC
         fear_greed_docs: from fear_greed_index, sorted by timestamp_utc DESC
         """
         value: Dict[str, Any] = {}
 
         # ── Liquidation features ─────────────────────────────
         if len(liq_docs) >= 2:
-            # Current values
-            value["liq_total_usd"] = liq_docs[0].get("total_liquidation_usd", 0)
-            value["liq_imbalance"] = liq_docs[0].get("liquidation_imbalance", 0)
-            value["liq_long_usd"] = liq_docs[0].get("long_liquidation_usd", 0)
-            value["liq_short_usd"] = liq_docs[0].get("short_liquidation_usd", 0)
+            # Current values (coinalyze uses plural field names)
+            value["liq_total_usd"] = liq_docs[0].get("total_liquidations_usd", 0)
+            value["liq_imbalance"] = self._compute_imbalance(liq_docs[0])
+            value["liq_long_usd"] = liq_docs[0].get("long_liquidations_usd", 0)
+            value["liq_short_usd"] = liq_docs[0].get("short_liquidations_usd", 0)
 
             # Liquidation momentum (change from previous bar)
-            prev_total = liq_docs[1].get("total_liquidation_usd", 0)
+            prev_total = liq_docs[1].get("total_liquidations_usd", 0)
             if prev_total > 0:
                 value["liq_momentum"] = (
-                    liq_docs[0].get("total_liquidation_usd", 0) / prev_total - 1
+                    liq_docs[0].get("total_liquidations_usd", 0) / prev_total - 1
                 )
 
             # Imbalance momentum
             value["liq_imbalance_momentum"] = (
-                liq_docs[0].get("liquidation_imbalance", 0)
-                - liq_docs[1].get("liquidation_imbalance", 0)
+                self._compute_imbalance(liq_docs[0])
+                - self._compute_imbalance(liq_docs[1])
             )
 
         # Cascade detection
@@ -99,13 +120,13 @@ class LiquidationFeature(FeatureBase[LiquidationConfig]):
         # Rolling liquidation stats (24h)
         if len(liq_docs) >= 24:
             total_24h = sum(
-                d.get("total_liquidation_usd", 0) for d in liq_docs[:24]
+                d.get("total_liquidations_usd", 0) for d in liq_docs[:24]
             )
             long_24h = sum(
-                d.get("long_liquidation_usd", 0) for d in liq_docs[:24]
+                d.get("long_liquidations_usd", 0) for d in liq_docs[:24]
             )
             short_24h = sum(
-                d.get("short_liquidation_usd", 0) for d in liq_docs[:24]
+                d.get("short_liquidations_usd", 0) for d in liq_docs[:24]
             )
             value["liq_total_24h_usd"] = total_24h
             value["liq_imbalance_24h"] = (
@@ -130,7 +151,7 @@ class LiquidationFeature(FeatureBase[LiquidationConfig]):
         # Organic OI change = OI_change + liquidation_volume
         if len(oi_docs) >= 2 and len(liq_docs) >= 1:
             oi_change = oi_docs[0].get("oi_close", 0) - oi_docs[1].get("oi_close", 0)
-            liq_volume = liq_docs[0].get("total_liquidation_usd", 0)
+            liq_volume = liq_docs[0].get("total_liquidations_usd", 0)
             value["organic_oi_change"] = oi_change + liq_volume
 
         # OI trend (4-bar)
@@ -176,13 +197,13 @@ class LiquidationFeature(FeatureBase[LiquidationConfig]):
         magnitude = 0.0
 
         for i in range(len(liq_docs) - 1):
-            current = liq_docs[i].get("total_liquidation_usd", 0)
-            previous = liq_docs[i + 1].get("total_liquidation_usd", 0)
+            current = liq_docs[i].get("total_liquidations_usd", 0)
+            previous = liq_docs[i + 1].get("total_liquidations_usd", 0)
 
             if previous > 0 and current >= previous * threshold:
                 accel_count += 1
                 magnitude += current
-                direction_sum += liq_docs[i].get("liquidation_imbalance", 0)
+                direction_sum += self._compute_imbalance(liq_docs[i])
             else:
                 break
 

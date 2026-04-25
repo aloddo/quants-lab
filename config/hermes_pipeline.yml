@@ -190,6 +190,21 @@ tasks:
       mongo_database: "quants_lab"
     tags: [ops, monitoring]
 
+  data_retention:
+    enabled: true
+    task_class: app.tasks.data_collection.data_retention_task.DataRetentionTask
+    schedule:
+      type: cron
+      cron: "30 5 * * *"
+      timezone: UTC
+    max_retries: 1
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+    config:
+      mongo_uri: "mongodb://localhost:27017/quants_lab"
+      mongo_database: "quants_lab"
+    tags: [ops, maintenance]
+
   # ═══════ Layer 2: Feature Computation ═══════════════════
   feature_computation:
     enabled: true
@@ -207,7 +222,7 @@ tasks:
       - task_name: "deribit_options"
         on_success: true
         delay_seconds: 5
-      - task_name: "coinglass"
+      - task_name: "coinalyze"
         on_success: true
         delay_seconds: 5
     max_retries: 2
