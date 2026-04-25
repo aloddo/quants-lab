@@ -659,6 +659,45 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         total_amount_quote=300.0,
         cooldown_time=3600,  # 1h cooldown (12h hold = no rapid re-entry needed)
     ),
+
+    "X12": StrategyMetadata(
+        name="X12",
+        display_name="HL Price Lead",
+        controller_module="app.controllers.directional_trading.x12_hl_price_lead",
+        config_class_name="X12HlPriceLeadConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 28800,  # 8h — convergence window
+        },
+        trailing_stop=None,
+        direction="BOTH",
+        blocked_pairs=[],
+        required_features=["hl_price"],  # triggers HL candle merge
+        max_concurrent=20,
+        controller_file="x12_hl_price_lead.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "z_threshold": 1.5,
+            "z_window": 24,
+            "atr_period": 14,
+            "tp_atr_mult": 1.5,
+            "sl_atr_mult": 2.0,
+            "trailing_activation_atr": 1.0,
+            "trailing_delta_atr": 0.5,
+            "time_limit_seconds": 28800,
+            "mongo_uri": "mongodb://host.docker.internal:27017/quants_lab",
+            "mongo_database": "quants_lab",
+        },
+        pair_source="explicit",
+        pair_allowlist=[
+            "AAVE-USDT", "BTC-USDT", "ETH-USDT", "FARTCOIN-USDT", "HYPE-USDT",
+            "SOL-USDT", "XRP-USDT", "DOGE-USDT", "TAO-USDT",
+        ],
+        total_amount_quote=300.0,
+        cooldown_time=3600,
+    ),
 }
 
 

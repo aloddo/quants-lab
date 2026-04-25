@@ -178,6 +178,18 @@ DATA_SOURCE_REGISTRY: Dict[str, Union[DataSourceDescriptor, CompositeDataSourceD
     ),
 
     # ═══════════════════════════════════════════════════════════
+    # HL price data (for cross-venue premium signal)
+    "hl_candles_1h": DataSourceDescriptor(
+        name="hl_candles_1h",
+        collection="hyperliquid_candles_1h",
+        feature_tag="hl_price",
+        sort_field="timestamp_utc",
+        sort_unit="ms",
+        columns={
+            "close": ColumnSpec("hl_close", fill_value=0.0),
+        },
+    ),
+
     # HL whale data (tag: "whale")
     # Used by: D1 research, future whale-signal strategies
     # ═══════════════════════════════════════════════════════════
