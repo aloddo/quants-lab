@@ -102,12 +102,22 @@ INVENTORY_TP_PCT = 25.0   # take-profit: sell if inventory rises 25% from cost b
 INVENTORY_RISK_CHECK_INTERVAL = 30.0  # check every 30s
 REBALANCE_INTERVAL_POLL = 600  # every 5 minutes
 
-# Directional TP/SL on BB perp side — exploits 10x leverage asymmetry.
+# Directional TP on BB perp side — exploits 10x leverage asymmetry.
 # Since BN was sold at entry (flat spot), BB directional gain is free.
-# Normal arb capture ~28bp ($0.056). Directional TP at 3% = $0.30 (5x better).
-# SL prevents approaching liquidation (~10% at 10x leverage).
-DIRECTIONAL_TP_PCT = 3.0   # close BB only if BB price up 3%+ from entry
-DIRECTIONAL_SL_PCT = -5.0  # close BB only if BB price down 5%+ from entry
+# Normal arb capture ~28bp ($0.056). Directional TP at 8% = $0.80 (14x better).
+#
+# Calibration from 28 closed positions:
+#   BB move range: -2.94% to +7.20% (std=2.6%)
+#   P90=+4.2%, P95=+5.3%, max=+7.2% (KAT, still closed profitably via arb)
+#   0 positions ever moved below -3% — arb spread-based SL handles downside
+#
+# TP threshold: 8% — well above the P95 (+5.3%) so it only fires on true outliers
+# where the directional gain massively exceeds any arb capture.
+# SL: DISABLED. The arb spread-based stop-loss (2x entry spread) already handles
+# downside. Directional SL interferes because BB and BN move together —
+# a -5% BB move is not a loss if BN also dropped (spread intact).
+DIRECTIONAL_TP_PCT = 8.0   # close BB only if BB price up 8%+ from entry
+DIRECTIONAL_SL_PCT = 0.0   # DISABLED — arb spread SL handles downside
 
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")

@@ -526,22 +526,30 @@ class ExitFlow:
             # CRITICAL FIX (Codex #2 + #8): Use min(entry_qty, exit_qty) for PnL to handle
             # partial exits that span multiple attempts. If exit filled less than entry
             # (shouldn't happen normally but can in partial retries), use the smaller qty.
+            # When a leg was not exited (directional exit: qty=0, price=0), PnL is 0 for that leg.
             bb_pnl_qty = min(bb_entry_qty, bb_exit_qty) if bb_exit_qty > 0 else bb_entry_qty
-            bn_pnl_qty = min(bn_entry_qty, bn_exit_qty) if bn_exit_qty > 0 else bn_entry_qty
+            bn_pnl_qty = min(bn_entry_qty, bn_exit_qty) if bn_exit_qty > 0 else 0  # 0 if BN not exited
 
             # Bybit perp PnL: (exit - entry) * qty for longs, (entry - exit) * qty for shorts
             bb_entry_side = entry.get("bb", {}).get("side", "Buy")
-            if bb_entry_side == "Buy":
-                bb_pnl = (bb_exit_price - bb_entry_price) * bb_pnl_qty
+            if bb_exit_price > 0 and bb_pnl_qty > 0:
+                if bb_entry_side == "Buy":
+                    bb_pnl = (bb_exit_price - bb_entry_price) * bb_pnl_qty
+                else:
+                    bb_pnl = (bb_entry_price - bb_exit_price) * bb_pnl_qty
             else:
-                bb_pnl = (bb_entry_price - bb_exit_price) * bb_pnl_qty
+                bb_pnl = 0.0
 
             # Binance spot PnL: sold high bought low (or vice versa)
+            # When BN was not exited (directional exit), bn_pnl = 0
             bn_entry_side = entry.get("bn", {}).get("side", "Sell")
-            if bn_entry_side == "Sell":
-                bn_pnl = (bn_entry_price - bn_exit_price) * bn_pnl_qty
+            if bn_exit_price > 0 and bn_pnl_qty > 0:
+                if bn_entry_side == "Sell":
+                    bn_pnl = (bn_entry_price - bn_exit_price) * bn_pnl_qty
+                else:
+                    bn_pnl = (bn_exit_price - bn_entry_price) * bn_pnl_qty
             else:
-                bn_pnl = (bn_exit_price - bn_entry_price) * bn_pnl_qty
+                bn_pnl = 0.0
 
             # Combined PnL
             gross_usd = bb_pnl + bn_pnl
