@@ -229,41 +229,36 @@ class HLBybitCollector:
         # The /info endpoint with type=l2Book requires per-coin calls.
         # For now, use mid price and note that executable spread needs L2 data.
 
-        # Better approach: fetch l2Book for all coins in one request (HL supports this)
-        hl_l2_requests = []
-        for pair, hl_coin, bb_sym in self._common_pairs:
-            hl_l2_requests.append(
-                session.post(
+        # Fetch L2 for all pairs in chunks via helper that properly releases responses
+        async def _fetch_l2(session, hl_coin):
+            """Fetch L2 book for one coin, properly releasing the response."""
+            try:
+                async with session.post(
                     "https://api.hyperliquid.xyz/info",
                     json={"type": "l2Book", "coin": hl_coin},
                     headers={"Content-Type": "application/json"},
-                )
-            )
-
-        # Batch in chunks of 20 to avoid hammering the API
-        hl_books: Dict[str, Dict] = {}
-        chunk_size = 20
-        for i in range(0, len(hl_l2_requests), chunk_size):
-            chunk = hl_l2_requests[i:i + chunk_size]
-            chunk_pairs = self._common_pairs[i:i + chunk_size]
-            responses = await asyncio.gather(*chunk, return_exceptions=True)
-            for (pair, hl_coin, bb_sym), resp in zip(chunk_pairs, responses):
-                if isinstance(resp, Exception):
-                    continue
-                try:
+                ) as resp:
                     data = await resp.json()
                     levels = data.get("levels", [[], []])
                     bids = levels[0] if len(levels) > 0 else []
                     asks = levels[1] if len(levels) > 1 else []
                     if bids and asks:
-                        hl_books[pair] = {
-                            "bid": float(bids[0].get("px", 0)),
-                            "ask": float(asks[0].get("px", 0)),
-                        }
-                except Exception:
-                    pass
-            if i + chunk_size < len(hl_l2_requests):
-                await asyncio.sleep(0.1)  # Small delay between chunks
+                        return {"bid": float(bids[0].get("px", 0)), "ask": float(asks[0].get("px", 0))}
+            except Exception:
+                pass
+            return None
+
+        hl_books: Dict[str, Dict] = {}
+        chunk_size = 20
+        for i in range(0, len(self._common_pairs), chunk_size):
+            chunk_pairs = self._common_pairs[i:i + chunk_size]
+            tasks = [_fetch_l2(session, hl_coin) for _, hl_coin, _ in chunk_pairs]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for (pair, _, _), result in zip(chunk_pairs, results):
+                if isinstance(result, dict):
+                    hl_books[pair] = result
+            if i + chunk_size < len(self._common_pairs):
+                await asyncio.sleep(0.1)
 
         # Build snapshot documents
         docs = []

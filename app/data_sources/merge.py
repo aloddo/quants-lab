@@ -60,10 +60,20 @@ def merge_source_sync(
     """
     candle_idx = pd.to_datetime(candle_df[candle_ts_col], unit=candle_ts_unit, utc=True)
 
-    # Build query
+    # Build query — normalize pair value for non-standard pair_fields
     query = {}
     if descriptor.pair_scoped:
-        query[descriptor.pair_field] = pair
+        pair_value = pair
+        if descriptor.pair_field == "currency":
+            # deribit_dvol uses "BTC"/"ETH", not "BTC-USDT"
+            pair_value = pair.split("-")[0]
+        elif descriptor.pair_field == "coin":
+            # whale_consensus uses "BTC", not "BTC-USDT"
+            pair_value = pair.split("-")[0]
+        elif descriptor.pair_field == "symbol":
+            # arb collections use "BTCUSDT"
+            pair_value = pair.replace("-", "")
+        query[descriptor.pair_field] = pair_value
     if descriptor.extra_filter:
         query.update(descriptor.extra_filter)
 
@@ -94,16 +104,15 @@ def merge_source_sync(
     # Query MongoDB
     docs = list(db[descriptor.collection].find(query).sort(descriptor.sort_field, 1))
 
-    # Fallback to alternate filter if too few docs
-    if len(docs) < descriptor.fallback_min_docs and descriptor.fallback_filter:
+    # Fallback to alternate filter ONLY if primary returns ZERO docs.
+    # Codex review: short backtest windows naturally have < fallback_min_docs
+    # hourly data — falling back to daily on "too few" silently corrupts features.
+    if len(docs) == 0 and descriptor.fallback_filter:
         query_fb = {k: v for k, v in query.items()}
-        # Remove extra_filter keys, apply fallback_filter
         for key in descriptor.extra_filter:
             query_fb.pop(key, None)
         query_fb.update(descriptor.fallback_filter)
-        docs_fb = list(db[descriptor.collection].find(query_fb).sort(descriptor.sort_field, 1))
-        if len(docs_fb) > len(docs):
-            docs = docs_fb
+        docs = list(db[descriptor.collection].find(query_fb).sort(descriptor.sort_field, 1))
 
     # If no docs, fill all columns with neutral values
     if not docs:

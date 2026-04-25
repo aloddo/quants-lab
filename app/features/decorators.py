@@ -17,15 +17,20 @@ from typing import List, Type
 logger = logging.getLogger(__name__)
 
 _SCREENING_FEATURES: List[Type] = []
+_REGISTERED_NAMES: set = set()
 
 
 def screening_feature(cls: Type) -> Type:
     """Mark a FeatureBase subclass as a screening feature.
 
     Classes decorated with this are automatically included in ALL_FEATURES
-    and computed by FeatureComputationTask.
+    and computed by FeatureComputationTask. Idempotent — re-importing
+    the same class does not duplicate registration.
     """
-    _SCREENING_FEATURES.append(cls)
+    name = f"{cls.__module__}.{cls.__qualname__}"
+    if name not in _REGISTERED_NAMES:
+        _SCREENING_FEATURES.append(cls)
+        _REGISTERED_NAMES.add(name)
     return cls
 
 

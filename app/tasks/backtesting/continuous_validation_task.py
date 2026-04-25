@@ -56,8 +56,10 @@ class ContinuousValidationTask(NotifyingTaskMixin, BaseTask):
                 result = await self._validate_engine(db, engine_name, now)
                 results[engine_name] = result
 
-                # Check for degradation
+                # Check for degradation (skip pairs without enough data)
                 for pair_result in result.get("pairs", []):
+                    if pair_result.get("status") != "validated" or pair_result.get("current_pf") is None:
+                        continue
                     pair = pair_result["pair"]
                     baseline_pf = pair_result.get("baseline_pf", 0)
                     current_pf = pair_result.get("current_pf", 0)

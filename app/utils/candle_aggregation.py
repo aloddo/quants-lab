@@ -95,6 +95,10 @@ def aggregate_candles(
 
     df["_dt"] = dt_index
 
+    # Sort by timestamp to ensure first/last aggregation is correct
+    # (unsorted data from backfill appends would corrupt open/close)
+    df = df.sort_values("_dt").drop_duplicates(subset=["_dt"], keep="last")
+
     # Build aggregation rules for columns that exist
     agg = {}
     for col, rule in _AGG_RULES.items():

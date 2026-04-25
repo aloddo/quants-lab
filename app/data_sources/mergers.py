@@ -74,8 +74,14 @@ def merge_options_surface_sync(
         if underlying_price is None or underlying_price == 0:
             continue
 
-        calls = group[group.get("type", group.get("instrument_type", "")) == "call"] if "type" in group.columns else pd.DataFrame()
-        puts = group[group.get("type", group.get("instrument_type", "")) == "put"] if "type" in group.columns else pd.DataFrame()
+        # Detect type column (Deribit uses "type", some schemas use "instrument_type")
+        type_col = "type" if "type" in group.columns else "instrument_type" if "instrument_type" in group.columns else None
+        if type_col:
+            calls = group[group[type_col] == "call"]
+            puts = group[group[type_col] == "put"]
+        else:
+            calls = pd.DataFrame()
+            puts = pd.DataFrame()
 
         # ATM IV: nearest strike to underlying price
         atm_iv = 0.0

@@ -88,9 +88,16 @@ def _compute_minute_stats(group: pd.DataFrame, cfg: dict) -> dict:
     if n == 0:
         return None
 
-    a = group[cfg["spread_a_field"]].values
-    b = group[cfg["spread_b_field"]].values
-    best = group[cfg["best_field"]].values
+    # Clean NaN/inf from raw tick data before computing stats
+    a = pd.to_numeric(group[cfg["spread_a_field"]], errors="coerce").values
+    b = pd.to_numeric(group[cfg["spread_b_field"]], errors="coerce").values
+    best = pd.to_numeric(group[cfg["best_field"]], errors="coerce").values
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    best = best[np.isfinite(best)]
+    if len(a) == 0 or len(b) == 0 or len(best) == 0:
+        return None
+    n = len(best)  # Update count to reflect cleaned data
 
     stats = {"count": n}
 
