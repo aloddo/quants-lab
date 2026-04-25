@@ -72,6 +72,7 @@ class EntryFlow:
         self._ws_available = ws_available or {"bybit": True, "binance": False}
         self._shadow = shadow
         self._max_naked_ms = max_naked_ms
+        self._max_retry_ms = max_naked_ms + 3000  # extra budget for retry attempt after fill timeout
         # Fill analytics collection
         self._analytics_coll = None
         if mongo_uri:
@@ -608,7 +609,7 @@ class EntryFlow:
             missed_leg = bn_leg if bb_leg.has_any_fill else bb_leg
             naked_ms = (time.time() - t0) * 1000
 
-            if naked_ms < self._max_naked_ms - 1000:  # need 1s budget for retry
+            if naked_ms < self._max_retry_ms - 1000:  # need 1s budget for retry (uses extended budget)
                 retry_venue = missed_leg.venue
                 retry_symbol = symbol
                 retry_side = missed_leg.side
