@@ -26,6 +26,7 @@ import pandas as pd
 from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
 from core.data_structures.candles import Candles
+from app.features.decorators import screening_feature
 
 
 class LiquidationConfig(FeatureConfig):
@@ -34,6 +35,7 @@ class LiquidationConfig(FeatureConfig):
     cascade_min_bars: int = 3  # consecutive accelerating bars
 
 
+@screening_feature
 class LiquidationFeature(FeatureBase[LiquidationConfig]):
     """
     Liquidation feature — reads from MongoDB coinglass_liquidations and coinglass_oi.

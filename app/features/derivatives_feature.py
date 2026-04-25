@@ -21,6 +21,7 @@ import pandas as pd
 from core.data_structures.candles import Candles
 from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
+from app.features.decorators import screening_feature
 
 
 def _rsi(series: pd.Series, length: int = 14) -> float:
@@ -67,6 +68,7 @@ class DerivativesConfig(FeatureConfig):
     name: str = "derivatives"
 
 
+@screening_feature
 class DerivativesFeature(FeatureBase[DerivativesConfig]):
     """
     Derivatives feature — reads from MongoDB (OI, funding, L/S ratio collections).

@@ -13,6 +13,7 @@ import pandas as pd
 from core.data_structures.candles import Candles
 from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
+from app.features.decorators import screening_feature
 
 
 class MarketRegimeConfig(FeatureConfig):
@@ -23,6 +24,7 @@ class MarketRegimeConfig(FeatureConfig):
     elevated_threshold: float = 0.70
 
 
+@screening_feature
 class MarketRegimeFeature(FeatureBase[MarketRegimeConfig]):
     """
     Reads ATR and momentum features from previously computed data.

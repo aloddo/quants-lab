@@ -19,6 +19,7 @@ import pandas as pd
 from core.data_structures.candles import Candles
 from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
+from app.features.decorators import screening_feature
 
 
 class MicrostructureConfig(FeatureConfig):
@@ -37,6 +38,7 @@ class MicrostructureConfig(FeatureConfig):
     vp_value_area_pct: float = 0.70  # 70% value area
 
 
+@screening_feature
 class MicrostructureFeature(FeatureBase[MicrostructureConfig]):
 
     def __init__(self, feature_config: Optional[MicrostructureConfig] = None):

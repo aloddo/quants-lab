@@ -9,6 +9,7 @@ from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
 
 from app.features.helpers import zscore
+from app.features.decorators import screening_feature
 
 
 class VolumeConfig(FeatureConfig):
@@ -17,6 +18,7 @@ class VolumeConfig(FeatureConfig):
     floor_multiplier: float = 1.6  # V3.2 locked, validated via stress testing (Apr 2026)
 
 
+@screening_feature
 class VolumeFeature(FeatureBase[VolumeConfig]):
 
     def __init__(self, feature_config: Optional[VolumeConfig] = None):

@@ -7,6 +7,7 @@ import pandas as pd
 from core.data_structures.candles import Candles
 from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
+from app.features.decorators import screening_feature
 
 
 class RangeConfig(FeatureConfig):
@@ -16,6 +17,7 @@ class RangeConfig(FeatureConfig):
     expansion_threshold: float = 0.20
 
 
+@screening_feature
 class RangeFeature(FeatureBase[RangeConfig]):
 
     def __init__(self, feature_config: Optional[RangeConfig] = None):

@@ -7,6 +7,7 @@ import pandas as pd
 from core.data_structures.candles import Candles
 from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
+from app.features.decorators import screening_feature
 
 
 class MomentumConfig(FeatureConfig):
@@ -15,6 +16,7 @@ class MomentumConfig(FeatureConfig):
     ema_long: int = 200
 
 
+@screening_feature
 class MomentumFeature(FeatureBase[MomentumConfig]):
 
     def __init__(self, feature_config: Optional[MomentumConfig] = None):

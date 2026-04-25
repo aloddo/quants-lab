@@ -9,6 +9,7 @@ from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
 
 from app.features.helpers import atr, percentile_rank
+from app.features.decorators import screening_feature
 
 
 class ATRConfig(FeatureConfig):
@@ -18,6 +19,7 @@ class ATRConfig(FeatureConfig):
     compression_threshold: float = 0.35  # V3.2 locked, validated via stress testing (Apr 2026)
 
 
+@screening_feature
 class ATRFeature(FeatureBase[ATRConfig]):
 
     def __init__(self, feature_config: Optional[ATRConfig] = None):

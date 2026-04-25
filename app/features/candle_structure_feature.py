@@ -9,6 +9,7 @@ from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
 
 from app.features.helpers import atr
+from app.features.decorators import screening_feature
 
 
 class CandleStructureConfig(FeatureConfig):
@@ -17,6 +18,7 @@ class CandleStructureConfig(FeatureConfig):
     range_period: int = 20
 
 
+@screening_feature
 class CandleStructureFeature(FeatureBase[CandleStructureConfig]):
 
     def __init__(self, feature_config: Optional[CandleStructureConfig] = None):

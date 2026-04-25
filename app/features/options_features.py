@@ -20,6 +20,7 @@ import pandas as pd
 from core.features.feature_base import FeatureBase, FeatureConfig
 from core.features.models import Feature
 from core.data_structures.candles import Candles
+from app.features.decorators import screening_feature
 
 
 class OptionsConfig(FeatureConfig):
@@ -27,6 +28,7 @@ class OptionsConfig(FeatureConfig):
     skew_zscore_window: int = 30  # 30 snapshots for z-score (~7.5 hours at 15min)
 
 
+@screening_feature
 class OptionsFeature(FeatureBase[OptionsConfig]):
     """
     Options feature — reads from MongoDB deribit_options_surface.
