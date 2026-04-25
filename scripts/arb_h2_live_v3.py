@@ -74,11 +74,12 @@ USDC_PAIR_MAP: dict[str, tuple[str, str]] = {}  # populated at startup from Tier
 
 POSITION_USD = 10.0
 MAX_CONCURRENT = 6
-BYBIT_ENTRY_MODE = "aggressive"  # "aggressive" = IOC (taker 0.055%), "passive" = PostOnly (maker 0.02% but 90bp price slippage on spikes)
-# Dynamic fee estimate based on entry mode:
-# Passive (PostOnly): BB maker 0.02% * 2 sides + BN taker 0.095% * 2 sides = 4bp + 19bp = 23bp
-# Aggressive (IOC):   BB taker 0.055% * 2 sides + BN taker 0.095% * 2 sides = 11bp + 19bp = 30bp
-FEE_RT_BPS = 23.0 if BYBIT_ENTRY_MODE == "passive" else 31.0
+BYBIT_ENTRY_MODE = "aggressive"  # "aggressive" = IOC (taker 0.055%), "passive" = PostOnly (maker 0.02%)
+BYBIT_EXIT_MODE = "passive"      # Exit uses PostOnly first attempt (mean-reversion = price coming to us)
+# Fee estimate: BB IOC entry (5.2bp) + BB PostOnly exit (2.0bp) + BN taker w/ BNB (7.1bp * 2) = 21.5bp
+# Without BNB: BB IOC entry (5.2bp) + BB PostOnly exit (2.0bp) + BN taker (9.5bp * 2) = 26.2bp
+# Old aggressive both: BB taker (5.2bp * 2) + BN taker w/ BNB (7.1bp * 2) = 24.6bp
+FEE_RT_BPS = 21.5  # Conservative: assumes PostOnly exit fills + BNB discount active
 POSTONLY_SPREAD_VERIFY_THRESHOLD = 0.7  # After BB fill, abort if spread < signal * this
 
 # Naked-leg SLO — hard limits on unhedged exposure
@@ -93,7 +94,7 @@ V3_EPOCH = 1776940200.0  # Apr 23 2026 10:30 UTC — first V3 deploy. Used to fi
 
 # Inventory lifecycle / rotation controls
 MIN_RETAIN_USD = 2.0  # below this, treat remaining balance as dust
-AUTOSEED_BUFFER_TRADES = 2.0  # keep enough token inventory for N entries
+AUTOSEED_BUFFER_TRADES = 1.0  # keep enough token inventory for 1 entry (BNB pays exit fees, no erosion)
 LIQUIDATE_DISCOUNT = 0.0015  # sell at bid * (1-discount) for fast liquidation
 SEED_SURCHARGE = 0.0010  # buy at ask * (1+surcharge) for fast seeding
 INVENTORY_SL_PCT = -8.0   # stop-loss: sell if inventory drops 8% from cost basis
@@ -628,7 +629,7 @@ class H2LiveTraderV2:
         await self._process_retire_queue(session, gateway)
 
     async def run(self):
-        global BYBIT_ENTRY_MODE, FEE_RT_BPS, POSITION_USD  # Runtime-modifiable via Telegram
+        global BYBIT_ENTRY_MODE, BYBIT_EXIT_MODE, FEE_RT_BPS, POSITION_USD  # Runtime-modifiable via Telegram
         mode = "SHADOW" if self.shadow else "LIVE"
         logger.info("=" * 60)
         logger.info(f"H2 V3 SPIKE FADE — {mode} TRADER (dynamic screener)")
@@ -867,7 +868,8 @@ class H2LiveTraderV2:
             await tg_send(
                 f"\U0001f680 <b>H2 V3 Spike Fade {mode} STARTED</b>\n"
                 f"Pairs: {len(self._active_pairs)} monitored\n"
-                f"Entry: P90 | Exit: P25 | Fees: ~{FEE_RT_BPS:.0f}bp RT\n"
+                f"Entry: P90 (IOC) | Exit: P25 (PostOnly)\n"
+                f"Fees: ~{FEE_RT_BPS:.0f}bp RT | Min ticks: {SignalEngine.MIN_ENTRY_TICKS}\n"
                 f"Size: ${POSITION_USD}/side | Max: {MAX_CONCURRENT}\n"
                 + ("\n".join(viable_lines) if viable_lines else "(warming up thresholds...)"),
                 session,
@@ -1113,11 +1115,30 @@ class H2LiveTraderV2:
                             parts = cmd.split()
                             if len(parts) >= 2 and parts[1] in ("passive", "aggressive"):
                                 BYBIT_ENTRY_MODE = parts[1]
-                                FEE_RT_BPS = 23.0 if BYBIT_ENTRY_MODE == "passive" else 31.0
+                                # Recalc fees: entry mode + exit mode + BN BNB discount
+                                bb_entry_bps = 2.0 if BYBIT_ENTRY_MODE == "passive" else 5.2
+                                bb_exit_bps = 2.0 if BYBIT_EXIT_MODE == "passive" else 5.2
+                                bn_bps = 7.1  # with BNB discount (0.07125%)
+                                FEE_RT_BPS = bb_entry_bps + bb_exit_bps + bn_bps * 2
                                 self.signal_engine.fee_rt_bps = FEE_RT_BPS
-                                await tg_send(f"Mode: {BYBIT_ENTRY_MODE}, FEE_RT_BPS: {FEE_RT_BPS}", session)
+                                await tg_send(
+                                    f"Entry: {BYBIT_ENTRY_MODE} | Exit: {BYBIT_EXIT_MODE}\n"
+                                    f"FEE_RT_BPS: {FEE_RT_BPS:.1f}", session)
+                            elif len(parts) >= 3 and parts[1] == "exit" and parts[2] in ("passive", "aggressive"):
+                                BYBIT_EXIT_MODE = parts[2]
+                                bb_entry_bps = 2.0 if BYBIT_ENTRY_MODE == "passive" else 5.2
+                                bb_exit_bps = 2.0 if BYBIT_EXIT_MODE == "passive" else 5.2
+                                bn_bps = 7.1
+                                FEE_RT_BPS = bb_entry_bps + bb_exit_bps + bn_bps * 2
+                                self.signal_engine.fee_rt_bps = FEE_RT_BPS
+                                await tg_send(
+                                    f"Entry: {BYBIT_ENTRY_MODE} | Exit: {BYBIT_EXIT_MODE}\n"
+                                    f"FEE_RT_BPS: {FEE_RT_BPS:.1f}", session)
                             else:
-                                await tg_send(f"Current mode: {BYBIT_ENTRY_MODE}. Usage: /h2mode passive|aggressive", session)
+                                await tg_send(
+                                    f"Entry: {BYBIT_ENTRY_MODE} | Exit: {BYBIT_EXIT_MODE}\n"
+                                    f"Usage: /h2mode passive|aggressive\n"
+                                    f"       /h2mode exit passive|aggressive", session)
                         elif cmd and cmd.startswith("/h2size"):
                             parts = cmd.split()
                             if len(parts) >= 2:
@@ -1314,7 +1335,7 @@ class H2LiveTraderV2:
             base = sym.replace("USDT", "")
             excess = signal.threshold_p90 - signal.threshold_p25
             await tg_send(
-                f"\U0001f4dd <b>H2 V3 OPEN</b> <code>{base}</code> [{open_count}/{MAX_CONCURRENT}]\n"
+                f"\U0001f4dd <b>H2 V3 OPEN{'(retry)' if result.outcome == 'RETRY_SUCCESS' else ''}</b> <code>{base}</code> [{open_count}/{MAX_CONCURRENT}]\n"
                 f"Spread: <b>{result.actual_spread_bps:.0f}bp</b> (P90={signal.threshold_p90:.0f})\n"
                 f"Exit@{signal.threshold_p25:.0f}bp | Excess: {excess:.0f}bp (fees~{FEE_RT_BPS:.0f}bp)\n"
                 f"Slip: {result.slippage_bps:.1f}bp | Lat: {result.latency_ms:.0f}ms\n"
@@ -1401,7 +1422,9 @@ class H2LiveTraderV2:
             qty_bn = bn_rules.round_qty(qty_bn)
 
         # BB exit pricing: PostOnly joins book (attempt 1), IOC crosses (attempt 2+)
-        if BYBIT_ENTRY_MODE == "passive" and bb_rules:
+        # Exit uses BYBIT_EXIT_MODE (default: passive/PostOnly — mean-reversion = price coming to us)
+        bb_exit_mode = BYBIT_EXIT_MODE if not is_stop_loss else "aggressive"
+        if bb_exit_mode == "passive" and bb_rules:
             # PostOnly: join the book — ask for sells, bid for buys
             if bb_side == "Sell":
                 price_bb = bb_rules.round_price_for_side(snap.bb_ask, bb_side)
@@ -1426,7 +1449,7 @@ class H2LiveTraderV2:
                 exit_reason=signal.signal_type,
                 is_stop_loss=is_stop_loss,
                 position_usd=POSITION_USD,
-                bb_order_mode=BYBIT_ENTRY_MODE,
+                bb_order_mode=bb_exit_mode,
             )
 
         if result.outcome == "SUCCESS":

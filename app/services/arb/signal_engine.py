@@ -194,6 +194,8 @@ class SignalEngine:
 
     WARMUP_TICKS = 15  # Fresh spread observations before a newly seeded pair can trade
     # (~2-3 min for low-vol USDC pairs that tick every 5-15s)
+    MIN_ENTRY_TICKS = 2  # Spread must be above P90 for N consecutive ticks before entry
+    # Filters flash spikes that vanish before IOC reaches exchange (reduces failure rate)
 
     def __init__(self, symbols: list[str], db_uri: str = "mongodb://localhost:27017/quants_lab",
                  fee_rt_bps: float = 31.0, margin_min_bps: float = 10.0):
@@ -204,6 +206,7 @@ class SignalEngine:
         self._update_counts: dict[str, int] = defaultdict(int)  # per-symbol counter
         self._subsample_rate = 12  # update thresholds every 12th spread (~1/min at WS rate)
         self._warming_up: dict[str, int] = {}  # symbol -> WS ticks received since seed
+        self._entry_streak: dict[str, int] = defaultdict(int)  # symbol -> consecutive ticks above P90
         self.fee_rt_bps = fee_rt_bps  # Centralized fee constant (single source of truth)
         self.margin_min_bps = margin_min_bps  # Minimum margin over fees for entry
 
@@ -315,18 +318,32 @@ class SignalEngine:
 
         thresh = self.thresholds.get_thresholds(sym, entry_quantile=entry_quantile)
         if not thresh:
+            self._entry_streak[sym] = 0
             return None
         # M1: Explicit margin gate — excess must cover fees + minimum margin
         if thresh["excess"] < self.fee_rt_bps + self.margin_min_bps:
+            self._entry_streak[sym] = 0
             return None
 
         if snap.spread_bps >= thresh["entry_gate"]:
+            # Min duration filter: require N consecutive ticks above threshold
+            # to filter flash spikes that vanish before IOC reaches exchange
+            self._entry_streak[sym] += 1
+            if self._entry_streak[sym] < self.MIN_ENTRY_TICKS:
+                if self._entry_streak[sym] == 1:
+                    logger.debug(
+                        f"ENTRY HOLD: {sym} spread={snap.spread_bps:.1f}bp >= gate "
+                        f"(tick {self._entry_streak[sym]}/{self.MIN_ENTRY_TICKS})"
+                    )
+                return None
+
             logger.info(
                 f"ENTRY SIGNAL: {sym} spread={snap.spread_bps:.1f}bp >= "
                 f"P{entry_quantile*100:.0f}={thresh['entry_gate']:.1f}bp "
                 f"(P25={thresh['p25']:.1f} excess={thresh['excess']:.1f} "
-                f"direction={snap.direction})"
+                f"direction={snap.direction} ticks={self._entry_streak[sym]})"
             )
+            self._entry_streak[sym] = 0  # reset after firing
             return SignalEvent(
                 symbol=sym,
                 signal_type="ENTRY",
@@ -338,6 +355,8 @@ class SignalEngine:
                 timestamp=time.time(),
             )
 
+        # Spread dropped below gate — reset streak
+        self._entry_streak[sym] = 0
         return None
 
     def check_exit(self, snap: SpreadSnapshot) -> Optional[SignalEvent]:

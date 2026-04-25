@@ -600,6 +600,140 @@ class EntryFlow:
                 latency_ms=(time.time() - t0) * 1000,
             )
 
+        # 8b. RETRY: If exactly one leg filled and the other missed, retry the
+        # missed leg once before unwinding. Saves ~$0.09 per failure when retry fills.
+        # Only retry if within naked-leg time budget (MAX_NAKED_MS).
+        if (bb_leg.has_any_fill != bn_leg.has_any_fill) and not (bb_leg.has_any_fill and bn_leg.has_any_fill):
+            filled_leg = bb_leg if bb_leg.has_any_fill else bn_leg
+            missed_leg = bn_leg if bb_leg.has_any_fill else bb_leg
+            naked_ms = (time.time() - t0) * 1000
+
+            if naked_ms < self._max_naked_ms - 1000:  # need 1s budget for retry
+                retry_venue = missed_leg.venue
+                retry_symbol = symbol
+                retry_side = missed_leg.side
+                retry_qty = missed_leg.target_qty
+
+                # Get fresh price for retry (current ask for buys, bid for sells)
+                retry_price = missed_leg.target_price  # fallback to original
+
+                logger.warning(
+                    f"LEG RETRY: {retry_venue} {symbol} {retry_side} qty={retry_qty} "
+                    f"(naked {naked_ms:.0f}ms, budget {self._max_naked_ms:.0f}ms)"
+                )
+
+                retry_client_id = self._gateway.generate_client_id("h2v2_retry")
+                retry_leg = TrackedLeg(
+                    venue=retry_venue, symbol=retry_symbol, side=retry_side,
+                    client_order_id=retry_client_id,
+                    target_qty=retry_qty, target_price=retry_price,
+                )
+                self._detector.register_leg(retry_leg)
+
+                try:
+                    retry_oid = await self._gateway.submit(
+                        retry_venue, retry_symbol, retry_side, retry_qty,
+                        retry_price, "limit", retry_client_id,
+                    )
+                    if retry_oid:
+                        self._detector.register_exchange_id(retry_client_id, retry_oid)
+
+                        # Wait for retry fill (short timeout — already naked)
+                        await self._detector.wait_for_fills(
+                            [retry_leg], timeout=min(1.5, (self._max_naked_ms - naked_ms) / 1000 - 0.3),
+                            ws_available=self._ws_available,
+                        )
+
+                        # REST fallback
+                        if not retry_leg.is_filled:
+                            result = await self._detector.check_fill_definitive(
+                                retry_venue, retry_symbol, order_id=retry_oid,
+                                client_order_id=retry_client_id,
+                            )
+                            retry_leg.apply_rest_result(result)
+
+                        if not retry_leg.is_filled:
+                            await self._gateway.cancel(retry_venue, retry_symbol, retry_oid)
+                            await asyncio.sleep(0.15)
+                            result = await self._detector.check_fill_definitive(
+                                retry_venue, retry_symbol, order_id=retry_oid,
+                                client_order_id=retry_client_id,
+                            )
+                            retry_leg.apply_rest_result(result)
+
+                        if retry_leg.is_filled or retry_leg.has_any_fill:
+                            # RETRY SUCCEEDED — enrich fee and merge into the missed leg
+                            if retry_venue == "binance":
+                                await self._detector.enrich_leg_fee(retry_leg)
+                            missed_leg.filled_qty = retry_leg.filled_qty
+                            missed_leg.avg_fill_price = retry_leg.avg_fill_price
+                            missed_leg.fee = retry_leg.fee
+                            missed_leg.fee_asset = retry_leg.fee_asset
+                            missed_leg.is_maker = retry_leg.is_maker
+                            missed_leg.exec_ids = retry_leg.exec_ids
+                            missed_leg.filled_at = retry_leg.filled_at
+                            missed_leg.state = LegStateEnum.FILLED
+                            missed_leg.fill_event.set()
+                            self._detector.cleanup_leg(retry_leg)
+
+                            logger.info(
+                                f"LEG RETRY SUCCESS: {retry_venue} {symbol} "
+                                f"filled {retry_leg.filled_qty} @ {retry_leg.avg_fill_price}"
+                            )
+
+                            # Both legs now filled — transition to OPEN
+                            actual_spread = self._compute_spread(bb_leg, bn_leg, bb_side)
+                            retry_updates = {
+                                "entry.bb.filled_qty": bb_leg.filled_qty,
+                                "entry.bb.avg_fill_price": bb_leg.avg_fill_price,
+                                "entry.bb.fee": bb_leg.fee,
+                                "entry.bb.fee_asset": bb_leg.fee_asset,
+                                "entry.bb.is_maker": bb_leg.is_maker,
+                                "entry.bb.exec_ids": bb_leg.exec_ids,
+                                "entry.bb.state": LegStateEnum.FILLED,
+                                "entry.bb.filled_at": bb_leg.filled_at,
+                                "entry.bn.filled_qty": bn_leg.filled_qty,
+                                "entry.bn.avg_fill_price": bn_leg.avg_fill_price,
+                                "entry.bn.fee": bn_leg.fee,
+                                "entry.bn.fee_asset": bn_leg.fee_asset,
+                                "entry.bn.is_maker": bn_leg.is_maker,
+                                "entry.bn.exec_ids": bn_leg.exec_ids,
+                                "entry.bn.state": LegStateEnum.FILLED,
+                                "entry.bn.filled_at": bn_leg.filled_at,
+                                "entry.actual_spread_bps": actual_spread,
+                                "entry.slippage_bps": signal_spread_bps - actual_spread,
+                                "entry.latency_ms": (time.time() - t0) * 1000,
+                                "entry.had_retry": True,
+                            }
+                            if not await self._store.transition(
+                                position_id, PositionState.ENTERING, PositionState.OPEN, retry_updates
+                            ):
+                                logger.critical(f"DB transition FAILED for {position_id} -> OPEN (retry success)")
+                                self._cleanup_legs(bb_leg, bn_leg)
+                                return EntryResult(success=False, position_id=position_id, outcome="DB_FAILURE",
+                                                   latency_ms=(time.time() - t0) * 1000)
+                            self._log_fill_analytics(symbol, "RETRY_SUCCESS", bb_leg, bn_leg,
+                                                     latency_ms=(time.time() - t0) * 1000,
+                                                     signal_spread_bps=signal_spread_bps,
+                                                     actual_spread_bps=actual_spread)
+                            self._cleanup_legs(bb_leg, bn_leg)
+                            return EntryResult(
+                                success=True, position_id=position_id, outcome="RETRY_SUCCESS",
+                                bb_filled_qty=bb_leg.filled_qty, bn_filled_qty=bn_leg.filled_qty,
+                                bb_fill_price=bb_leg.avg_fill_price, bn_fill_price=bn_leg.avg_fill_price,
+                                actual_spread_bps=actual_spread,
+                                slippage_bps=signal_spread_bps - actual_spread,
+                                latency_ms=(time.time() - t0) * 1000,
+                            )
+                        else:
+                            logger.warning(f"LEG RETRY MISSED: {retry_venue} {symbol} — proceeding to unwind")
+                            self._detector.cleanup_leg(retry_leg)
+
+                except Exception as e:
+                    logger.error(f"LEG RETRY FAILED: {retry_venue} {symbol}: {e}")
+                    self._detector.cleanup_leg(retry_leg)
+                    # Fall through to unwind
+
         if bb_leg.has_any_fill or bn_leg.has_any_fill:
             # One or both have fills -- unwind ALL filled legs
             # CRITICAL FIX: Claude review #2 — must unwind BOTH if both have partial fills
@@ -646,9 +780,10 @@ class EntryFlow:
 
             outcome = "RISK_PAUSE" if not all_unwinds_ok else "LEG_FAILURE"
             # Compute total fees: entry leg fees + unwind fees (stored on leg objects by enrich)
+            # Fee is already converted to USD equivalent by enrich_fee_from_trades
             total_fees = 0.0
             for leg in (bb_leg, bn_leg):
-                if leg.has_any_fill and leg.fee_asset in ("USDT", "USDC", ""):
+                if leg.has_any_fill:
                     total_fees += leg.fee
             self._log_fill_analytics(symbol, outcome, bb_leg, bn_leg,
                                      latency_ms=(time.time() - t0) * 1000,
@@ -741,8 +876,10 @@ class EntryFlow:
                 if leg.side == "Sell":
                     loss = -loss
                 # Include entry leg fee + unwind leg fee in total
-                entry_fee_usd = leg.fee if leg.fee_asset in ("USDT", "USDC", "") else 0.0
-                unwind_fee_usd = unwind_leg.fee if unwind_leg.fee_asset in ("USDT", "USDC", "") else 0.0
+                # Fee is already converted to USD by enrich_fee_from_trades regardless
+                # of fee_asset (BNB, USDC, base token — all stored as USD equivalent)
+                entry_fee_usd = leg.fee
+                unwind_fee_usd = unwind_leg.fee
                 total_fees_usd = entry_fee_usd + unwind_fee_usd
 
                 if not await self._store.transition(position_id, PositionState.UNWINDING, PositionState.FAILED, {

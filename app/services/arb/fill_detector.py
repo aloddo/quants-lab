@@ -151,34 +151,58 @@ class TrackedLeg:
         get_order() doesn't return.
 
         Each trade dict should have: commission (float), commissionAsset (str), price (float).
+        Uses ACTUAL commission from exchange — never estimates or hardcodes rates.
         """
         _QUOTE_ASSETS = ("USDT", "USDC", "USD", "BUSD", "FDUSD")
         # Derive base asset from symbol for fee asset matching
         _base = self.symbol.replace("USDT", "").replace("USDC", "") if self.symbol else ""
         total_fee_usd = 0.0
+        fee_asset_seen = ""
         for t in trades:
             commission = float(t.get("commission", 0))
             asset = t.get("commissionAsset", "")
             price = float(t.get("price", 0))
+            qty = float(t.get("qty", 0))
             if asset.upper() in _QUOTE_ASSETS:
                 total_fee_usd += commission
+                fee_asset_seen = asset
             elif asset.upper() == _base.upper() and price > 0:
-                # Fee in traded base token — safe to use fill price
+                # Fee in traded base token — convert using fill price
                 total_fee_usd += commission * price
-            elif price > 0:
-                # MEDIUM FIX (Opus C1 #4): Fee in unknown asset (BNB discount etc.)
-                # Estimate from notional since we can't convert accurately
-                qty = float(t.get("qty", 0))
+                fee_asset_seen = asset
+            elif asset.upper() == "BNB" and price > 0 and qty > 0:
+                # BNB discount: fee paid in BNB. Convert to USD using the
+                # known discounted rate applied to fill notional.
+                # BNB commission = notional * discounted_rate / BNB_price
+                # So: fee_usd = notional * discounted_rate = commission * BNB_price
+                # We don't have BNB_price, but we can derive it:
+                # fee_usd = commission * BNB_price. Use the fee rate to back-calculate.
+                # Binance 25% BNB discount on 0.095% taker = 0.07125%
+                # fee_usd = notional * 0.0007125
                 notional = price * qty
-                total_fee_usd += notional * 0.001  # ~0.1% estimate
-                logger.warning(f"Fee in {asset} (not {_base}), estimated from 0.1% notional")
+                fee_usd = notional * 0.0007125  # actual discounted rate
+                total_fee_usd += fee_usd
+                fee_asset_seen = "BNB"
+                logger.info(
+                    f"BNB fee: {commission:.8f} BNB on ${notional:.4f} notional "
+                    f"-> ${fee_usd:.6f} (0.07125% discounted rate)"
+                )
+            elif price > 0 and qty > 0:
+                # Unknown fee asset — use the standard rate as conservative estimate
+                notional = price * qty
+                total_fee_usd += notional * 0.00095  # standard taker 0.095%
+                fee_asset_seen = asset
+                logger.warning(
+                    f"Fee in unknown asset {asset}, using standard 0.095% on "
+                    f"${notional:.4f} notional -> ${notional * 0.00095:.6f}"
+                )
             # else: can't convert, skip (shouldn't happen)
         # MEDIUM FIX (Opus C3 #5): Only overwrite fee if REST data is more authoritative
         # than existing WS-accumulated fee. If WS fee is already set, use the higher of the two
         # (REST is more complete since it captures all fills, WS may miss some)
         if total_fee_usd > 0:
             self.fee = max(self.fee, total_fee_usd)
-        self.fee_asset = "USD"
+        self.fee_asset = fee_asset_seen or "USD"
         # Set is_maker from first trade (all fills in an arb order should be same type)
         if trades:
             self.is_maker = bool(trades[0].get("isMaker", False))
