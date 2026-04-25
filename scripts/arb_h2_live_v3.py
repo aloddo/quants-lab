@@ -275,7 +275,7 @@ class H2LiveTraderV2:
         self._realized_costs: list[float] = []  # last N trades' effective RT cost in bps
         self._realized_cost_window = 20  # rolling window
         self._retire_queue: set[str] = set()
-        self._last_liq_check: float = 0.0  # throttle liquidation checks
+        self._liq_check_times: dict[str, float] = {}  # per-symbol liquidation check throttle
         self._slippage_alert_cooldown: dict[str, float] = {}  # per-symbol cooldown
 
         # V3: TierEngine drives pair selection
@@ -1039,9 +1039,9 @@ class H2LiveTraderV2:
                             continue
 
                         # LIQUIDATION CHECK: verify BB position still exists on Bybit.
-                        # Throttled to every 30s to avoid Bybit rate limit (was every 0.5s = 12 req/s).
-                        if pos_doc[0].get("state") == PositionState.OPEN and time.time() - self._last_liq_check >= 30.0:
-                            self._last_liq_check = time.time()
+                        # Throttled to every 30s PER SYMBOL (was global = only 1 symbol per cycle).
+                        if pos_doc[0].get("state") == PositionState.OPEN and time.time() - self._liq_check_times.get(sym, 0) >= 30.0:
+                            self._liq_check_times[sym] = time.time()
                             try:
                                 bb_size = await gateway.check_position("bybit", sym)
                                 bb_expected = float(pos_doc[0].get("entry", {}).get("bb", {}).get("filled_qty", 0))
@@ -1688,9 +1688,12 @@ class H2LiveTraderV2:
             actual_fees_usd = getattr(result, "fees_usd", 0.0)
             bb_qty = float(entry.get("bb", {}).get("filled_qty", 0))
             bb_ep = float(entry.get("bb", {}).get("avg_fill_price", 0))
-            position_notional = bb_qty * bb_ep if bb_qty > 0 and bb_ep > 0 else 1.0
-            if actual_fees_usd > 0 and position_notional > 0:
-                effective_cost_bps = actual_fees_usd / position_notional * 10000
+            bn_qty = float(entry.get("bn", {}).get("filled_qty", 0))
+            bn_ep = float(entry.get("bn", {}).get("avg_fill_price", 0))
+            # Use average notional (both legs) to match exit_flow PnL convention
+            avg_notional = (bb_qty * bb_ep + bn_qty * bn_ep) / 2 if (bb_qty * bb_ep + bn_qty * bn_ep) > 0 else 1.0
+            if actual_fees_usd > 0 and avg_notional > 0:
+                effective_cost_bps = actual_fees_usd / avg_notional * 10000
                 self._realized_costs.append(effective_cost_bps)
                 if len(self._realized_costs) > self._realized_cost_window:
                     self._realized_costs = self._realized_costs[-self._realized_cost_window:]
@@ -1812,7 +1815,11 @@ class H2LiveTraderV2:
             # Don't auto-pause yet -- just alert. Alberto decides.
 
     async def _check_slippage_alerts(self, session):
-        """S3+S4: Check per-pair rolling slippage from closed trades. Alert if avg > 5bp."""
+        """S3+S4: Check per-pair rolling slippage from closed trades. Alert if avg > 5bp.
+        Cooldown: max 1 alert per symbol per hour. Skips first 10 min after startup."""
+        # Skip first 10 minutes after startup to avoid alert storm on restart
+        if time.time() - self._start_time < 600:
+            return
         try:
             pipeline = [
                 {"$match": {"state": "CLOSED", "created_at": {"$gte": V3_EPOCH}}},

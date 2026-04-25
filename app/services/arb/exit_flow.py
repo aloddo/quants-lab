@@ -645,23 +645,37 @@ class ExitFlow:
                     outcome="RISK_PAUSE",
                     latency_ms=(time.time() - t0) * 1000,
                 )
-            # Post-exit ghost detection: verify BB is flat
+
+            # Post-exit ghost detection: verify BB is flat BEFORE returning SUCCESS.
+            # If a ghost position remains on exchange, return RISK_PAUSE so the caller
+            # does NOT unregister the position or update inventory as if flat.
+            ghost_detected = False
             if bb_leg and self._gateway:
                 try:
                     post_size = await self._gateway.check_position("bybit", symbol)
                     if post_size is not None and abs(post_size) > 0:
                         logger.critical(f"GHOST POSITION detected after exit: {symbol} size={post_size}")
-                        close_updates["exit.ghost_detected"] = True
-                        close_updates["exit.bb_post_verify_size"] = post_size
-                        # Persist ghost flag (transition already done, use direct update)
                         await self._store.update_fields(position_id, {
                             "exit.ghost_detected": True,
                             "exit.bb_post_verify_size": post_size,
                         })
+                        ghost_detected = True
                     else:
-                        close_updates["exit.bb_post_verify_size"] = post_size
+                        await self._store.update_fields(position_id, {
+                            "exit.bb_post_verify_size": post_size,
+                        })
                 except Exception as e:
                     logger.warning(f"Post-exit position check failed: {e}")
+
+            if ghost_detected:
+                self._cleanup_legs(bb_leg, bn_leg)
+                return ExitResult(
+                    outcome="RISK_PAUSE",
+                    latency_ms=(time.time() - t0) * 1000,
+                    pnl_net_usd=net_usd,
+                    pnl_net_bps=net_bps,
+                    fees_usd=total_fees_usd,
+                )
 
             self._log_fill_analytics(symbol, "SUCCESS", bb_leg, bn_leg,
                                      latency_ms=(time.time() - t0) * 1000,
@@ -693,9 +707,16 @@ class ExitFlow:
             cumulative_bb_qty = prior_bb_qty + bb_leg.filled_qty
             prior_bb_fee = float(exit_stored.get("bb", {}).get("fee", 0))
             prior_bb_price = float(exit_stored.get("bb", {}).get("avg_fill_price", 0))
+            # VWAP across attempts: weighted average of prior fills and new fills
+            if bb_leg.has_any_fill and prior_bb_qty > 0:
+                bb_vwap = (prior_bb_price * prior_bb_qty + bb_leg.avg_fill_price * bb_leg.filled_qty) / cumulative_bb_qty if cumulative_bb_qty > 0 else bb_leg.avg_fill_price
+            elif bb_leg.has_any_fill:
+                bb_vwap = bb_leg.avg_fill_price
+            else:
+                bb_vwap = prior_bb_price
             partial_updates.update({
                 "exit.bb.filled_qty": cumulative_bb_qty,
-                "exit.bb.avg_fill_price": bb_leg.avg_fill_price if bb_leg.has_any_fill else prior_bb_price,
+                "exit.bb.avg_fill_price": bb_vwap,
                 "exit.bb.fee": prior_bb_fee + bb_leg.fee,  # cumulative fees
                 "exit.bb.fee_asset": bb_leg.fee_asset,
                 "exit.bb.state": bb_leg.state if bb_leg.is_filled else LegStateEnum.PARTIAL,
@@ -705,9 +726,16 @@ class ExitFlow:
             cumulative_bn_qty = prior_bn_qty + bn_leg.filled_qty
             prior_bn_fee = float(exit_stored.get("bn", {}).get("fee", 0))
             prior_bn_price = float(exit_stored.get("bn", {}).get("avg_fill_price", 0))
+            # VWAP across attempts: weighted average of prior fills and new fills
+            if bn_leg.has_any_fill and prior_bn_qty > 0:
+                bn_vwap = (prior_bn_price * prior_bn_qty + bn_leg.avg_fill_price * bn_leg.filled_qty) / cumulative_bn_qty if cumulative_bn_qty > 0 else bn_leg.avg_fill_price
+            elif bn_leg.has_any_fill:
+                bn_vwap = bn_leg.avg_fill_price
+            else:
+                bn_vwap = prior_bn_price
             partial_updates.update({
                 "exit.bn.filled_qty": cumulative_bn_qty,
-                "exit.bn.avg_fill_price": bn_leg.avg_fill_price if bn_leg.has_any_fill else prior_bn_price,
+                "exit.bn.avg_fill_price": bn_vwap,
                 "exit.bn.fee": prior_bn_fee + bn_leg.fee,
                 "exit.bn.fee_asset": bn_leg.fee_asset,
                 "exit.bn.state": bn_leg.state if bn_leg.is_filled else LegStateEnum.PARTIAL,

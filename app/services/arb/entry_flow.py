@@ -691,12 +691,65 @@ class EntryFlow:
                                 orig_fill_result = orig_recheck.get("fill_result", "")
                                 orig_filled_qty = float(orig_recheck.get("filled_qty", 0))
                                 if orig_fill_result in ("FILLED", "PARTIAL") and orig_filled_qty > 0:
-                                    orig_double_filled = True
-                                    logger.critical(
-                                        f"DOUBLE-FILL DETECTED: original order {orig_oid} filled "
-                                        f"{orig_filled_qty} AFTER cancel, retry also filled "
-                                        f"{retry_leg.filled_qty}. Unwinding retry order."
-                                    )
+                                    # FIX BUG 1: Only treat as resolved double-fill if original
+                                    # is FULLY filled (>= 95% of target). A partial original
+                                    # means we'd open a full position against a partial hedge
+                                    # = underhedged. In that case, unwind BOTH.
+                                    if orig_filled_qty >= retry_qty * 0.95:
+                                        orig_double_filled = True
+                                        logger.critical(
+                                            f"DOUBLE-FILL DETECTED: original order {orig_oid} filled "
+                                            f"{orig_filled_qty} AFTER cancel, retry also filled "
+                                            f"{retry_leg.filled_qty}. Unwinding retry order."
+                                        )
+                                    else:
+                                        # Original only partially filled — can't use it as hedge.
+                                        # Unwind both the retry fill and the original partial.
+                                        logger.warning(
+                                            f"Double-fill but original only partial "
+                                            f"({orig_filled_qty}/{retry_qty}), unwinding both"
+                                        )
+                                        # Transition to UNWINDING
+                                        await self._store.transition(
+                                            position_id, PositionState.ENTERING,
+                                            PositionState.UNWINDING, {
+                                                f"entry.{missed_venue_key}.double_fill": True,
+                                                f"entry.{missed_venue_key}.double_fill_partial": True,
+                                                f"entry.{missed_venue_key}.retry_pending": False,
+                                            },
+                                        )
+                                        # Unwind retry fill
+                                        retry_unwind_pnl, retry_unwind_ok = await self._emergency_unwind(
+                                            retry_leg, symbol, position_id,
+                                        )
+                                        # Unwind original partial — build a TrackedLeg from orig data
+                                        orig_partial_leg = TrackedLeg(
+                                            venue=retry_venue, symbol=symbol, side=missed_leg.side,
+                                            client_order_id=orig_client_id,
+                                            order_id=orig_oid or "",
+                                            target_qty=orig_filled_qty,
+                                        )
+                                        orig_partial_leg.filled_qty = orig_filled_qty
+                                        orig_partial_leg.avg_fill_price = float(
+                                            orig_recheck.get("avg_fill_price", 0)
+                                        )
+                                        orig_partial_leg.state = LegStateEnum.PARTIAL
+                                        orig_partial_leg.fill_event.set()
+                                        orig_unwind_pnl, orig_unwind_ok = await self._emergency_unwind(
+                                            orig_partial_leg, symbol, position_id,
+                                        )
+                                        self._detector.cleanup_leg(retry_leg)
+                                        self._detector.cleanup_leg(orig_partial_leg)
+                                        self._cleanup_legs(bb_leg, bn_leg)
+                                        all_ok = retry_unwind_ok and orig_unwind_ok
+                                        outcome = "RISK_PAUSE" if not all_ok else "LEG_FAILURE"
+                                        return EntryResult(
+                                            success=False, position_id=position_id,
+                                            outcome=outcome,
+                                            failure_venue=f"{retry_venue}_double_fill_partial",
+                                            unwind_pnl_usd=retry_unwind_pnl + orig_unwind_pnl,
+                                            latency_ms=(time.time() - t0) * 1000,
+                                        )
 
                             if orig_double_filled:
                                 # Use the ORIGINAL fill, unwind the RETRY order
@@ -714,11 +767,22 @@ class EntryFlow:
                                 # Unwind the retry order
                                 retry_unwind_side = "Sell" if retry_leg.side == "Buy" else "Buy"
                                 retry_unwind_cid = self._gateway.generate_client_id("h2v2_dbl_unw")
+                                # FIX BUG 2: Persist client_id BEFORE submit (crash recovery)
+                                await self._store.update_fields(position_id, {
+                                    f"entry.{missed_venue_key}.retry_unwind_client_order_id": retry_unwind_cid,
+                                    f"entry.{missed_venue_key}.retry_unwind_side": retry_unwind_side,
+                                    f"entry.{missed_venue_key}.retry_unwind_qty": retry_leg.filled_qty,
+                                })
                                 try:
                                     retry_unwind_oid = await self._gateway.submit(
                                         retry_venue, symbol, retry_unwind_side,
                                         retry_leg.filled_qty, 0, "market", retry_unwind_cid,
                                     )
+                                    # Persist exchange order_id immediately after submit
+                                    if retry_unwind_oid:
+                                        await self._store.update_fields(position_id, {
+                                            f"entry.{missed_venue_key}.retry_unwind_order_id": retry_unwind_oid,
+                                        })
                                     retry_unwind_leg = TrackedLeg(
                                         venue=retry_venue, symbol=symbol, side=retry_unwind_side,
                                         order_id=retry_unwind_oid or "", client_order_id=retry_unwind_cid,

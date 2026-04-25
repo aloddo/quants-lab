@@ -416,10 +416,12 @@ class FillDetector:
             elif leg.venue == "bybit" and leg.fee == 0:
                 # Bybit: estimate fee from fill data (WS usually provides it,
                 # but REST fallback doesn't). Use known taker/maker rates.
+                # Bybit fee rates (actual exchange rates, not FEE_RT_BPS estimate):
+                # Maker: 0.02% (PostOnly), Taker: 0.055% (IOC/Market)
                 if leg.is_maker:
-                    leg.fee = leg.filled_qty * leg.avg_fill_price * 0.0002  # 0.02% maker
+                    leg.fee = leg.filled_qty * leg.avg_fill_price * 0.0002
                 else:
-                    leg.fee = leg.filled_qty * leg.avg_fill_price * 0.00055  # 0.055% taker
+                    leg.fee = leg.filled_qty * leg.avg_fill_price * 0.00055
                 leg.fee_asset = "USDT"
                 logger.info(
                     f"BB fee estimated: {leg.venue} {leg.symbol} fee=${leg.fee:.6f} "
