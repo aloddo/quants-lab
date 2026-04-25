@@ -31,7 +31,7 @@ tasks:
     config:
       connector_name: "hyperliquid_perpetual"
       quote_asset: "USDT"
-      intervals: ["1h"]
+      intervals: ["1h", "1m"]
       days_data_retention: 90
       min_notional_size: 10
     tags: [data, candles, hyperliquid]
