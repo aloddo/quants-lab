@@ -45,14 +45,19 @@ Run `python cli.py feature-catalog` for live status. Current sources:
 | deribit_options | deribit_options_surface | options | (custom merge) | 15min | 180d |
 | whale_consensus | hl_whale_consensus | whale | whale_net_bias, whale_notional | 15min | n/a |
 
-### Standalone sources (not in registry, consumed directly)
+### Standalone tick-level sources (arb tier, NOT in feature store)
 
-| Collection | Consumer | Notes |
-|-----------|----------|-------|
-| arb_bb_spot_perp_snapshots | TierEngine (H2 arb) | 21M+ docs, 1-5s frequency |
-| arb_bn_usdc_bb_perp_snapshots | TierEngine (H2 arb) | 18M+ docs, 1-5s frequency |
-| hyperliquid_l2_snapshots_1s | Research only | 747K docs, 1s frequency |
-| hyperliquid_recent_trades_1s | Research only | 1.5M docs, 1s frequency |
+The feature store operates at 1h resolution for directional strategies. Arb
+strategies need tick-level data (1-5s) that flows through completely separate
+collectors. Do NOT try to merge these into 1h candle DataFrames.
+
+| Collection | Consumer | Frequency | Collector |
+|-----------|----------|-----------|-----------|
+| arb_bb_spot_perp_snapshots | TierEngine (H2) | 5s | `scripts/arb_dual_collector.py` |
+| arb_bn_usdc_bb_perp_snapshots | TierEngine (H2) | 5s | `scripts/arb_dual_collector.py` |
+| **arb_hl_bybit_perp_snapshots** | **HL-Bybit arb** | **5s** | **`scripts/arb_hl_bybit_collector.py`** |
+| hyperliquid_l2_snapshots_1s | Research | 1s | pipeline microstructure task |
+| hyperliquid_recent_trades_1s | Research | 1s | pipeline microstructure task |
 
 ## How to Add a New Data Source
 

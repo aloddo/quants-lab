@@ -109,21 +109,68 @@ python cli.py feature-catalog --json # Machine-readable
 | options | deribit_options (composite) | (none yet) |
 | whale | whale_consensus | (none yet) |
 
-## Standalone Sources (not in registry)
+## Standalone Sources (not in registry, consumed directly at tick level)
 
-| Collection | Consumer | Notes |
-|-----------|----------|-------|
-| arb_bb_spot_perp_snapshots | TierEngine (H2) | 21M+ docs, consumed via aggregation pipeline |
-| arb_bn_usdc_bb_perp_snapshots | TierEngine (H2) | 18M+ docs |
-| hyperliquid_l2_snapshots_1s | Research | 747K docs |
-| hyperliquid_recent_trades_1s | Research | 1.5M docs |
+These collections need SUB-SECOND data for arb strategies. They do NOT go through
+the 1h candle merge engine. The feature store serves directional strategies (1h).
+Arb strategies operate on entirely separate data at different resolution.
 
-## Backfill Needed
+| Collection | Consumer | Frequency | Collector Script | tmux Session |
+|-----------|----------|-----------|-----------------|--------------|
+| arb_bb_spot_perp_snapshots | TierEngine (H2) | 5s | `scripts/arb_dual_collector.py` | `arb-dual-collector` |
+| arb_bn_usdc_bb_perp_snapshots | TierEngine (H2) | 5s | `scripts/arb_dual_collector.py` | `arb-dual-collector` |
+| **arb_hl_bybit_perp_snapshots** | **HL-Bybit arb research** | **5s** | **`scripts/arb_hl_bybit_collector.py`** | **`arb-hl-bybit`** |
+| hyperliquid_l2_snapshots_1s | Research | 1s | pipeline task | pipeline |
+| hyperliquid_recent_trades_1s | Research | 1s | pipeline task | pipeline |
 
-The following collections had data deleted by the initial (incorrect) 90d retention run:
-- `bybit_funding_rates` — now starts 2026-01-25 (was 2020-03-25)
-- `bybit_open_interest` — now starts 2026-01-25 (was 2021-04)
-- `bybit_ls_ratio` — now starts 2026-01-25 (was 2024-11)
-- `binance_funding_rates` — now starts 2026-01-25 (was 2020-01)
+### Starting/Stopping Collectors
 
-Retention is now 730d. Data needs re-backfilling via Bybit/Binance historical APIs.
+```bash
+# HL-Bybit spread collector (30 pairs, 5s polls)
+tmux new-session -d -s arb-hl-bybit "set -a && source .env && set +a && python scripts/arb_hl_bybit_collector.py --max-pairs 30"
+
+# Dual venue collector (Bybit spot/perp + Binance USDC)
+tmux new-session -d -s arb-dual-collector "set -a && source .env && set +a && python scripts/arb_dual_collector.py"
+```
+
+## Two Data Tiers (know which one you're working in)
+
+| Tier | Resolution | Merge Engine | Strategies | Files |
+|------|-----------|--------------|------------|-------|
+| **Directional** | 1h candles | Feature Store (registry + merge) | X10, X8, E3, future directional | `app/data_sources/` |
+| **Arb/HFT** | 1-5s ticks | Direct MongoDB queries + WebSocket | H2 V3, future HL-Bybit arb | `app/services/arb/`, standalone collectors |
+
+The feature store does NOT serve arb strategies. They need tick-level data that
+the 1h merge engine can't provide. When working on arb, use the standalone
+collectors and direct MongoDB aggregation pipelines, not the feature store.
+
+## Backfill Procedures
+
+### When adding a new data source
+
+Every new collector MUST have a backfill mechanism. The pipeline only fetches
+recent data incrementally. Historical data for backtesting requires explicit backfill.
+
+### Current backfill scripts
+
+| Script | Purpose | Usage |
+|--------|---------|-------|
+| `scripts/backfill_hyperliquid_history.py` | HL candles + funding | `python scripts/backfill_hyperliquid_history.py --days 365 --max-pairs 65` |
+| `scripts/fix_oi_duplicates.py` | OI dedup (one-time) | Already run |
+
+### Backfill needed (data deleted by incorrect 90d retention, now fixed to 730d)
+
+| Collection | Current Start | Original Start | Action |
+|-----------|--------------|----------------|--------|
+| bybit_funding_rates | 2026-01-25 | 2020-03-25 | Re-backfill via Bybit API |
+| bybit_open_interest | 2026-01-25 | 2021-04 | Re-backfill via Bybit API |
+| bybit_ls_ratio | 2026-01-25 | 2024-11 | Re-backfill via Bybit API |
+| binance_funding_rates | 2026-01-25 | 2020-01 | Re-backfill via Binance API |
+
+### How to backfill a new collection
+
+1. Write a backfill script in `scripts/` (see `backfill_hyperliquid_history.py` as template)
+2. The script should: query the API with historical date range, upsert to MongoDB with dedup
+3. Run it BEFORE adding the source to the pipeline (pipeline only fetches recent)
+4. Document the script in this skill file under "Current backfill scripts"
+5. Add the collection to `RETENTION_CONFIG` in `data_retention_task.py`

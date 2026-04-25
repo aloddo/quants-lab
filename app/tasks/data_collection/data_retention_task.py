@@ -48,6 +48,8 @@ RETENTION_CONFIG: Dict[str, Dict[str, Any]] = {
     "coinalyze_oi":                 {"field": "timestamp_utc", "unit": "ms", "days": 730},
     # Signal candidates (365 days)
     "candidates":                   {"field": "timestamp_utc", "unit": "ms", "days": 365},
+    # Arb tick-level data (90 days — enough for spread analysis + strategy dev)
+    "arb_hl_bybit_perp_snapshots":  {"field": "timestamp",     "unit": "datetime", "days": 90},
     # Arb operational data (shorter retention)
     "arb_opportunities":            {"field": "timestamp",     "unit": "s",  "days": 30},
     "arb_h2_inventory_drift":       {"field": "timestamp",     "unit": "s",  "days": 30},
