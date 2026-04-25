@@ -1036,6 +1036,61 @@ class H2LiveTraderV2:
                             self.signal_engine.unregister_position(sym)
                             continue
 
+                        # LIQUIDATION CHECK: verify BB position still exists on Bybit.
+                        # If BB was liquidated mid-hold, we have a naked BN exposure.
+                        # Must close BN immediately (buy back inventory).
+                        if pos_doc[0].get("state") == PositionState.OPEN:
+                            try:
+                                bb_size = await gateway.check_position("bybit", sym)
+                                bb_expected = float(pos_doc[0].get("entry", {}).get("bb", {}).get("filled_qty", 0))
+                                if bb_size is not None and abs(bb_size) < bb_expected * 0.1 and bb_expected > 0:
+                                    # BB gone — likely liquidated. Get actual price from closed-pnl.
+                                    liq_price = 0.0
+                                    liq_pnl = 0.0
+                                    try:
+                                        closed_pnl = await gateway.get_closed_pnl("bybit", sym, limit=3)
+                                        for cpnl in closed_pnl:
+                                            if cpnl.get("execType") == "BustTrade":
+                                                liq_price = float(cpnl.get("avgExitPrice", 0))
+                                                liq_pnl = float(cpnl.get("closedPnl", 0))
+                                                break
+                                    except Exception:
+                                        pass
+
+                                    logger.critical(
+                                        f"BB LIQUIDATED (mid-hold): {sym} position gone "
+                                        f"(expected={bb_expected}, actual={bb_size}). "
+                                        f"Liq price={liq_price}. Triggering BN-only exit."
+                                    )
+                                    await tg_send(
+                                        f"\U0001f6a8 <b>H2 V3 BB LIQUIDATED</b> <code>{sym.replace('USDT','')}</code>\n"
+                                        f"BB position gone (liquidated at {liq_price:.4f})\n"
+                                        f"Closing BN side to flatten exposure...",
+                                        session,
+                                    )
+
+                                    # Trigger BN-only exit via directional signal path (qty_bn only)
+                                    direction = pos_doc[0].get("direction", "BUY_BB_SELL_BN")
+                                    snap = self.price_feed.get_spread_for_exit(sym)
+                                    if snap:
+                                        from app.services.arb.signal_engine import SignalEvent
+                                        liq_signal = SignalEvent(
+                                            symbol=sym, signal_type="BB_LIQUIDATED",
+                                            spread_snapshot=snap,
+                                            threshold_p90=0, threshold_p25=0,
+                                            threshold_median=0, excess_bps=0,
+                                            timestamp=time.time(),
+                                        )
+                                        # Store liq price for PnL correction
+                                        liq_signal._liq_price = liq_price
+                                        liq_signal._liq_pnl = liq_pnl
+                                        await self._handle_exit(
+                                            liq_signal, pos_doc[0], session, gateway, exit_flow,
+                                        )
+                                    continue  # skip normal exit check for this symbol
+                            except Exception as e:
+                                logger.debug(f"BB position check for {sym}: {e}")
+
                         direction = pos_doc[0].get("direction", "BUY_BB_SELL_BN")
                         # Use direction-aware spread for exit (Codex #6 fix)
                         snap = self.price_feed.get_spread_for_direction(sym, direction, for_exit=True)
@@ -1468,6 +1523,7 @@ class H2LiveTraderV2:
         bn_side = "Buy" if direction == "BUY_BB_SELL_BN" else "Sell"
         is_stop_loss = signal.signal_type in ("EXIT_STOP_LOSS", "DIRECTIONAL_SL")
         is_directional = signal.signal_type in ("DIRECTIONAL_TP", "DIRECTIONAL_SL")
+        is_bb_liquidated = signal.signal_type == "BB_LIQUIDATED"
 
         qty_bb = float(entry.get("bb", {}).get("filled_qty", 0))
         qty_bn = float(entry.get("bn", {}).get("filled_qty", 0))
@@ -1475,6 +1531,11 @@ class H2LiveTraderV2:
         # Directional exit: BB-only, skip BN. BN was sold at entry = flat spot.
         if is_directional:
             qty_bn = 0
+
+        # BB liquidated: BB is already gone. Only close BN (buy back inventory).
+        if is_bb_liquidated:
+            qty_bb = 0
+            is_stop_loss = True  # use market for BN to close fast
 
         # Check if prior partial exit already closed some legs — use REMAINING qty
         # FIX #6: For PARTIAL legs, subtract already-filled exit qty from target
