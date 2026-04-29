@@ -37,6 +37,8 @@ RETENTION_CONFIG: Dict[str, Dict[str, Any]] = {
     "binance_funding_rates":        {"field": "timestamp_utc", "unit": "ms", "days": 730},
     # Hyperliquid funding (730 days — matches Bybit for cross-venue strategies)
     "hyperliquid_funding_rates":    {"field": "timestamp_utc", "unit": "ms", "days": 730},
+    # Hyperliquid candles — 730 days (X12 needs max history, HL API only keeps ~6mo rolling)
+    "hyperliquid_candles_1h":       {"field": "timestamp_utc", "unit": "ms", "days": 730},
     # Hyperliquid microstructure (7 days — high volume, low shelf life)
     "hyperliquid_l2_snapshots_1s":  {"field": "timestamp_utc", "unit": "ms", "days": 7},
     "hyperliquid_recent_trades_1s": {"field": "time",          "unit": "ms", "days": 7},

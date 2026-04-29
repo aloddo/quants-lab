@@ -20,20 +20,22 @@ tasks:
 
   candles_downloader_hyperliquid:
     enabled: true
-    task_class: app.tasks.data_collection.candles_downloader_task.CandlesDownloaderTask
+    task_class: app.tasks.data_collection.hyperliquid_candles_task.HyperliquidCandlesTask
     schedule:
       type: cron
       cron: "10 * * * *"
       timezone: UTC
     max_retries: 3
     retry_delay_seconds: 120
-    timeout_seconds: 1800
+    timeout_seconds: 900
     config:
-      connector_name: "hyperliquid_perpetual"
-      quote_asset: "USDT"
-      intervals: ["1h", "1m"]
-      days_data_retention: 90
-      min_notional_size: 10
+      collection_name: "hyperliquid_candles_1h"
+      interval: "1h"
+      max_pairs: 15
+      lookback_hours: 48
+      bybit_collection: "bybit_funding_rates"
+      write_parquet: true
+      priority_pairs: ["FARTCOIN-USDT", "HYPE-USDT", "SOL-USDT", "BTC-USDT", "ETH-USDT"]
     tags: [data, candles, hyperliquid]
 
   bybit_derivatives:

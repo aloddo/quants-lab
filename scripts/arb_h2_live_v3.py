@@ -18,7 +18,6 @@ import os
 import signal
 import sys
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,8 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.arb.position_store import PositionStore, PositionState
 from app.services.arb.fill_detector import FillDetector
 from app.services.arb.order_gateway import OrderGateway
-from app.services.arb.entry_flow import EntryFlow, EntryResult
-from app.services.arb.exit_flow import ExitFlow, ExitResult
+from app.services.arb.entry_flow import EntryFlow
+from app.services.arb.exit_flow import ExitFlow
 from app.services.arb.price_feed import PriceFeed
 from app.services.arb.order_feed import OrderFeed, FillEvent, OrderUpdate
 from app.services.arb.signal_engine import SignalEngine, OpenPosition
@@ -66,13 +65,7 @@ logger = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────
 
-TRADING_MODE = "usdc"
-
-# V3: No static USDC_PAIR_MAP. TierEngine builds the pair list dynamically.
-# Legacy map kept for backward compat with inventory/recovery code.
-USDC_PAIR_MAP: dict[str, tuple[str, str]] = {}  # populated at startup from TierEngine
-
-POSITION_USD = 10.0
+POSITION_USD = 50.0
 MAX_CONCURRENT = 6
 BYBIT_ENTRY_MODE = "aggressive"  # "aggressive" = IOC (taker 0.055%), "passive" = PostOnly (maker 0.02%)
 BYBIT_EXIT_MODE = "passive"      # Exit uses PostOnly first attempt (mean-reversion = price coming to us)
@@ -82,14 +75,11 @@ BYBIT_EXIT_MODE = "passive"      # Exit uses PostOnly first attempt (mean-revers
 FEE_RT_BPS = 21.5  # Conservative: assumes PostOnly exit fills + BNB discount active
 POSTONLY_SPREAD_VERIFY_THRESHOLD = 0.7  # After BB fill, abort if spread < signal * this
 
-# Naked-leg SLO — hard limits on unhedged exposure
+# Naked-leg SLO — hard limit on unhedged exposure time
 MAX_NAKED_MS = 3000           # Max time with one leg filled, other not submitted (ms)
-MAX_UNHEDGED_USD = 2000.0     # Max unhedged notional before forced market close
-NAKED_LEG_ALERT_MS = 1500     # Alert threshold (half of hard limit)
 
 POLL_INTERVAL = 0.5
 TIER_RECOMPUTE_INTERVAL = 300  # 5 minutes
-UNIVERSE_REFRESH_INTERVAL = 4 * 3600  # 4 hours
 V3_EPOCH = 1776940200.0  # Apr 23 2026 10:30 UTC — first V3 deploy. Used to filter V3-only trades.
 
 # Inventory lifecycle / rotation controls
@@ -97,7 +87,7 @@ MIN_RETAIN_USD = 2.0  # below this, treat remaining balance as dust
 AUTOSEED_BUFFER_TRADES = 1.0  # keep enough token inventory for 1 entry (BNB pays exit fees, no erosion)
 LIQUIDATE_DISCOUNT = 0.0015  # sell at bid * (1-discount) for fast liquidation
 SEED_SURCHARGE = 0.0010  # buy at ask * (1+surcharge) for fast seeding
-INVENTORY_SL_PCT = -8.0   # stop-loss: sell if inventory drops 8% from cost basis
+INVENTORY_SL_PCT = -50.0  # catastrophic backstop only (delisting, exchange hack). Normal rotation handled by TierEngine.
 INVENTORY_TP_PCT = 25.0   # take-profit: sell if inventory rises 25% from cost basis
 INVENTORY_RISK_CHECK_INTERVAL = 30.0  # check every 30s
 REBALANCE_INTERVAL_POLL = 600  # every 5 minutes
@@ -135,17 +125,32 @@ _tg_last_update_id = 0
 
 
 async def tg_send(text: str, session: aiohttp.ClientSession):
-    """Send Telegram notification with HTML formatting."""
+    """Send Telegram notification with HTML formatting. Auto-splits at 4096 chars."""
     if not TG_TOKEN or not TG_CHAT:
         return
-    try:
-        await session.post(
-            f"{TG_URL}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=aiohttp.ClientTimeout(total=5),
-        )
-    except Exception as e:
-        logger.warning(f"TG send failed: {e}")
+    # Telegram max message length is 4096 chars — split on newlines if needed
+    chunks = []
+    if len(text) <= 4096:
+        chunks = [text]
+    else:
+        current = ""
+        for line in text.split("\n"):
+            if len(current) + len(line) + 1 > 4090:
+                chunks.append(current)
+                current = line
+            else:
+                current = current + "\n" + line if current else line
+        if current:
+            chunks.append(current)
+    for chunk in chunks:
+        try:
+            await session.post(
+                f"{TG_URL}/sendMessage",
+                json={"chat_id": TG_CHAT, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+        except Exception as e:
+            logger.warning(f"TG send failed: {e}")
 
 
 async def tg_send_photo(path: str, caption: str, session: aiohttp.ClientSession):
@@ -286,12 +291,12 @@ class H2LiveTraderV2:
         self.price_feed: PriceFeed | None = None
         self.signal_engine = SignalEngine([], MONGO_URI, fee_rt_bps=FEE_RT_BPS)  # empty, populated dynamically
         self.inventory = InventoryLedger(MONGO_URI)
-        self.risk_manager = RiskManager()
+        self.risk_manager = RiskManager(position_usd=POSITION_USD, max_concurrent=MAX_CONCURRENT)
         self.instrument_rules = InstrumentRules()
         self.position_store = PositionStore(MONGO_URI)
         self.inventory_guard = InventoryImpairmentGuard(
             impairment_threshold=3.0,
-            absolute_impairment_limit=20.0,
+            absolute_impairment_limit=POSITION_USD * MAX_CONCURRENT * 0.20,
         )
         self.inventory_risk_guard = InventoryRiskGuard(
             sl_pct=INVENTORY_SL_PCT,
@@ -2019,7 +2024,7 @@ class H2LiveTraderV2:
         if closed:
             lines.append("")
             lines.append("<b>Closed (this session):</b>")
-            for t in closed[:10]:  # last 10
+            for t in closed:  # all session trades
                 sym = t.get("symbol", "?").replace("USDT", "")
                 pnl_net = t.get("pnl", {}).get("net_usd", 0)
                 pnl_bps = t.get("pnl", {}).get("net_bps", 0)

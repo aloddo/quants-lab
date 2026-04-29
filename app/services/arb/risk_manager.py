@@ -97,26 +97,31 @@ class RiskManager:
     KILL: graceful shutdown (close everything, reconcile, stop)
     """
 
-    # Pre-committed operational criteria (Week 1)
-    MAX_DAILY_LOSS_USD = 20.0
+    # Pre-committed operational criteria
     MAX_AVG_SLIPPAGE_BPS = 15.0
     MAX_CONSECUTIVE_LEG_FAILURES = 3
     MAX_LEG_FAILURE_RATE = 0.30
     MIN_TRADES_FOR_SLIPPAGE_EVAL = 10
-    MAX_LOSS_PER_TRADE_USD = 5.0
-    MAX_CONCURRENT_POSITIONS = 3
     PAPER_LIVE_DIVERGENCE_PCT = 0.50
 
     # Profitability evaluation waits for 50+ trades
     MIN_TRADES_FOR_PROFIT_EVAL = 50
 
-    def __init__(self):
+    def __init__(self, position_usd: float = 10.0, max_concurrent: int = 6):
         self.stats = TradeStats()
         self.stats.daily_start = time.time()
         self._paused = False
         self._killed = False
         self._pause_reason = ""
         self._kill_reason = ""
+        # Scale risk limits proportionally to position size
+        self.MAX_DAILY_LOSS_USD = position_usd * max_concurrent * 0.15
+        self.MAX_LOSS_PER_TRADE_USD = position_usd * 0.50
+        self.MAX_CONCURRENT_POSITIONS = max_concurrent
+        logger.info(
+            f"RiskManager initialized: position=${position_usd} max_concurrent={max_concurrent} "
+            f"daily_loss_limit=${self.MAX_DAILY_LOSS_USD:.0f} per_trade_limit=${self.MAX_LOSS_PER_TRADE_USD:.1f}"
+        )
 
     @property
     def is_paused(self) -> bool:
