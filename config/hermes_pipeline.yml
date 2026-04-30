@@ -1016,3 +1016,38 @@ tasks:
       step_days: 30
       trade_cost: 0.000375
     tags: [backtesting, x13, capitulation, walk-forward, weekly]
+
+  x14_bulk_backtest:
+    enabled: false
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X14"
+      connector_name: "bybit_perpetual"
+      backtest_days: 90
+      trade_cost: 0.000375
+    tags: [backtesting, x14, crowd-fade, weekly]
+
+  x14_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X14"
+      connector_name: "bybit_perpetual"
+      total_days: 90
+      train_days: 60
+      test_days: 30
+      step_days: 15
+      trade_cost: 0.000375
+    tags: [backtesting, x14, crowd-fade, walk-forward, weekly]

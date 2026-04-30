@@ -736,6 +736,43 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         total_amount_quote=300.0,
         cooldown_time=43200,  # 12h cooldown (capitulation events are infrequent)
     ),
+
+    "X14": StrategyMetadata(
+        name="X14",
+        display_name="Crowd Fade V2",
+        controller_module="app.controllers.directional_trading.x14_crowd_fade_v2",
+        config_class_name="X14CrowdFadeV2Config",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 172800,  # 2 days
+        },
+        trailing_stop=None,
+        direction="SHORT",  # SHORT-only (crowded short → long doesn't work)
+        blocked_pairs=[
+            "APT-USDT", "AAVE-USDT", "HBAR-USDT", "ETH-USDT",  # Inverted signal
+        ],
+        required_features=["derivatives"],  # needs buy_ratio merged into candles
+        max_concurrent=20,
+        controller_file="x14_crowd_fade_v2.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "zscore_window": 168,
+            "zscore_threshold": 2.0,
+            "min_buy_ratio": 0.52,
+            "signal_cooldown_bars": 8,
+            "atr_period": 14,
+            "tp_atr_mult": 2.0,
+            "sl_atr_mult": 2.5,
+            "trailing_act_atr_mult": 1.2,
+            "trailing_delta_atr_mult": 0.6,
+            "time_limit_seconds": 172800,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=28800,  # 8h cooldown
+    ),
 }
 
 
