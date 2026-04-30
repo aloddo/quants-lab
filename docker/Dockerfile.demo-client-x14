@@ -1,0 +1,8 @@
+FROM hummingbot/hummingbot:latest
+
+# Install numpy/pandas/pandas_ta for X14 controller (and future controllers)
+RUN pip install numpy pandas pandas_ta --no-cache-dir
+
+# Copy and run patch script for Bybit demo environment
+COPY docker/patch_bybit_demo.py /tmp/patch_bybit_demo.py
+RUN python /tmp/patch_bybit_demo.py && rm /tmp/patch_bybit_demo.py
