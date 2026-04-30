@@ -698,6 +698,44 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         total_amount_quote=300.0,
         cooldown_time=3600,
     ),
+
+    "X13": StrategyMetadata(
+        name="X13",
+        display_name="Capitulation Reversal",
+        controller_module="app.controllers.directional_trading.x13_capitulation_reversal",
+        config_class_name="X13CapitulationReversalConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 172800,  # 2 days
+        },
+        trailing_stop=None,
+        direction="LONG",  # Always long (buying the dip after capitulation)
+        blocked_pairs=[],
+        required_features=["derivatives"],  # needs oi_value merged into candles
+        max_concurrent=20,
+        controller_file="x13_capitulation_reversal.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        default_config={
+            "oi_lookback": 24,
+            "price_lookback": 24,
+            "oi_drop_threshold": 0.05,
+            "price_drop_threshold": 0.02,
+            "signal_cooldown_bars": 12,
+            "atr_period": 14,
+            "tp_atr_mult": 2.5,
+            "sl_atr_mult": 2.0,
+            "trailing_act_atr_mult": 1.5,
+            "trailing_delta_atr_mult": 0.7,
+            "time_limit_seconds": 172800,
+            "btc_regime_enabled": True,
+            "btc_regime_threshold": -0.05,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=43200,  # 12h cooldown (capitulation events are infrequent)
+    ),
 }
 
 
