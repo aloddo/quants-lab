@@ -750,7 +750,8 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         trailing_stop=None,
         direction="SHORT",  # SHORT-only (crowded short → long doesn't work)
         blocked_pairs=[
-            "APT-USDT", "AAVE-USDT", "HBAR-USDT", "ETH-USDT",  # Inverted signal
+            "HBAR-USDT",  # Inverted signal confirmed in both EDA + WF
+            # APT, AAVE, ETH removed: WF-validated despite inverted EDA
         ],
         required_features=["derivatives"],  # needs buy_ratio merged into candles
         max_concurrent=20,

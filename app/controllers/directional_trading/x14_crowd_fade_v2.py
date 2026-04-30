@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 class X14CrowdFadeV2Config(DirectionalTradingControllerConfigBase):
     """X14 config -- Crowd Fade V2 with LS ratio z-score and ATR exits."""
+    model_config = {"extra": "ignore"}  # Ignore injected env vars (coinalyze_api_key etc.)
     controller_name: str = "x14_crowd_fade_v2"
 
     # Crowding detection parameters
