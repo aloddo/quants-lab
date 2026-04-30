@@ -72,6 +72,21 @@ tasks:
       funding_limit: 5
     tags: [data, funding, binance]
 
+  binance_top_trader:
+    enabled: true
+    task_class: app.tasks.data_collection.binance_top_trader_task.BinanceTopTraderTask
+    schedule:
+      type: cron
+      cron: "5,35 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+    config:
+      period: "1h"
+      limit: 50
+    tags: [data, positioning, binance, x14]
+
   # ═══════ Layer 1b: Exotic Data Collection ═══════════════
   deribit_options:
     enabled: true
