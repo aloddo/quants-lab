@@ -758,6 +758,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         controller_file="x14_crowd_fade_v2.py",
         hb_connector="bybit_perpetual_testnet",
         deployment_mode="hb_native",
+        bot_image="quants-lab/hummingbot:demo-client-x14",  # Custom image with numpy/pandas/pandas_ta
         default_config={
             "zscore_window": 168,
             "zscore_threshold": 2.0,
