@@ -322,10 +322,10 @@ class SignalEngine:
         if not thresh:
             self._entry_streak[sym] = 0
             return None
-        # M1: Explicit margin gate — excess must cover fees + minimum margin
-        if thresh["excess"] < self.fee_rt_bps + self.margin_min_bps:
-            self._entry_streak[sym] = 0
-            return None
+        # Fee gate removed: TierEngine already validates excess > 31bp (Tier B)
+        # or > 35bp (Tier A) over a 6h window. The signal engine's 1h rolling
+        # window can land in quiet periods where excess looks low, falsely
+        # blocking entry during the very spikes we want to trade.
 
         if snap.spread_bps >= thresh["entry_gate"]:
             # Min duration filter: require N consecutive ticks above threshold

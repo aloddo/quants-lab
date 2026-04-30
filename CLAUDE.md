@@ -2,7 +2,9 @@
 
 ## What is this repo
 
-Fork of `hummingbot/quants-lab` with a systematic crypto perpetual futures trading system built on QuantsLab primitives. 7 registered strategies (E1-E4, S6, S7, S9) at various validation stages. Paper trading on Bybit demo (api-demo.bybit.com) via Hummingbot API. All backtesting uses 1m resolution with derivatives data (funding, OI, LS ratio) merged from MongoDB.
+Fork of `hummingbot/quants-lab` with a systematic crypto trading system. Two execution modes: HB-native controllers (backtest + live via Docker) and custom Python scripts (H2 V3 arb engine). Trading on Bybit demo (api-demo.bybit.com) + Binance spot. All backtesting uses 1m resolution with derivatives data (funding, OI, LS ratio) merged from MongoDB.
+
+**For current strategy status, live positions, and roadmap:** see `~/albertos-kb/projects/quant/overview.md` (canonical source of truth, updated every session).
 
 Owner: Alberto Loddo (GitHub: aloddo)
 
@@ -20,8 +22,16 @@ quants-lab/                          # Fork of hummingbot/quants-lab
 │   │   ├── pair_selector.py         # Pair ranking from pair_historical
 │   │   └── registry.py              # DEPRECATED — re-exports from strategy_registry
 │   ├── features/                    # 8 FeatureBase subclasses → MongoDB (incl. derivatives w/ OI RSI, funding z-score, LS z-score)
-│   ├── services/                    # Bybit REST client, HB API client
-│   ├── controllers/directional_trading/  # HB V2 controllers (backtest + live) — E1-E4, S6, S7, S9
+│   ├── services/                    # Bybit REST client, HB API client, arb engine
+│   │   └── arb/                     # H2 V3 spike-fade arb engine (20+ modules)
+│   │       ├── signal_engine.py     # Spread spike detection
+│   │       ├── risk_manager.py      # Position/daily limits, proportional to size
+│   │       ├── price_feed.py        # Dual-exchange WS price feeds
+│   │       ├── inventory_ledger.py  # Position tracking + PnL
+│   │       ├── order_gateway.py     # IOC order execution
+│   │       ├── fill_detector.py     # Fill confirmation
+│   │       └── tier_engine.py       # Pair selection/rotation
+│   ├── controllers/directional_trading/  # HB V2 controllers (backtest + live)
 │   ├── tasks/
 │   │   ├── data_collection/         # CandlesDownloader, BybitDerivativesTask
 │   │   ├── screening/               # FeatureComputationTask, SignalScanTask
@@ -38,12 +48,13 @@ quants-lab/                          # Fork of hummingbot/quants-lab
 
 1. **Never modify `core/`** — that's upstream QuantsLab. Fetch updates with `git fetch upstream && git merge upstream/main`.
 2. **Always use QL primitives** — FeatureBase for features, BaseTask for tasks, TaskOrchestrator for scheduling. No custom cron scripts, no SQLite.
-3. **The controller IS the strategy** — one self-contained HB V2 controller file runs in both backtest (BacktestingEngine) and live (HB bot container). No separate eval functions, no custom signal pipelines.
-4. **Controllers must be self-contained** — only import from `hummingbot.*`, `pandas`, `pandas_ta`, `numpy`, `pydantic`, stdlib. No `app.*` imports. Inline any helpers.
-5. **Use the Strategy Registry** — all engine metadata lives in `app/engines/strategy_registry.py`. Every engine has `deployment_mode="hb_native"`. Add new engines via `python cli.py scaffold-strategy`.
-6. **MongoDB for everything dynamic** — features, candidates, pair_historical, derivatives, task executions.
-7. **Parquet for candle data** — written by CandlesDownloaderTask via CLOBDataSource.
-8. **Telegram bot token and chat IDs are in `.env`** — never commit secrets.
+3. **Two execution modes:**
+   - **HB-native controllers** (E1-E4, S6-S9, X10, X12): self-contained controller file runs in both backtest and live Docker container. Only import from `hummingbot.*`, `pandas`, `pandas_ta`, `numpy`, `pydantic`, stdlib.
+   - **Custom scripts** (H2 V3): standalone Python script in `scripts/`, uses `app/services/arb/` modules. For strategies that need cross-exchange execution or low-latency arb logic that HB controllers can't express.
+4. **Use the Strategy Registry** — all HB-native engine metadata lives in `app/engines/strategy_registry.py`. Custom scripts (H2) manage their own lifecycle.
+5. **MongoDB for everything dynamic** — features, candidates, pair_historical, derivatives, task executions.
+6. **Parquet for candle data** — written by CandlesDownloaderTask via CLOBDataSource.
+7. **Telegram bot token and chat IDs are in `.env`** — never commit secrets.
 
 ## Strategy lifecycle (HB-native)
 
@@ -214,7 +225,7 @@ git remote set-url origin https://github.com/aloddo/quants-lab.git  # clean up i
 | `paper_position_snapshots` | Periodic exchange position snapshots | none |
 | `paper_controller_stats` | Per-controller performance from HB orchestration | none |
 
-## Architecture: QL data pipeline + HB-native bots
+## Architecture: QL data pipeline + dual execution
 
 ```
 QL Data Pipeline (TaskOrchestrator, hermes_pipeline.yml):
@@ -226,51 +237,44 @@ QL Data Pipeline (TaskOrchestrator, hermes_pipeline.yml):
   fear_greed                (daily → sentiment index)
       ↓ (both on_success)
   feature_computation       (dependency-triggered, 8 feature types incl. derivatives + microstructure)
-      ↓ (feeds analytics/monitoring only)
 
-HB-Native Bots (one Docker container per engine):
-  Any engine: WebSocket feeds → Controller.update_processed_data() → auto executor
-  Deploy: python cli.py deploy --engine E1
-  Status: python cli.py bot-status --engine E1
-  Stop:   python cli.py bot-stop --engine E1
+Execution Mode 1 — Custom Scripts (H2 V3 arb):
+  scripts/arb_h2_live_v3.py → app/services/arb/* (20+ modules)
+  Runs in tmux (ql-h2-v3), not Docker. Direct Bybit+Binance API.
+  Telegram commands: /h2live /h2stats /h2pause /h2resume
+
+Execution Mode 2 — HB-Native Bots (X10, X12, etc.):
+  One Docker container per engine, WebSocket candle feeds, auto executor
+  Deploy: python cli.py deploy --engine X12
+  Status: python cli.py bot-status --engine X12
+  Stop:   python cli.py bot-stop --engine X12
+
+Data Collectors (standalone tmux sessions):
+  d1-whale-collector    — Hyperliquid whale positions (every 15min)
+  arb-dual-collector    — Bitvavo+Binance spread snapshots
 
 Backtesting (isolated, never in live pipeline):
-  All engines: bulk_backtest + walk_forward tasks (all `enabled: false` in pipeline)
+  All HB-native engines: bulk_backtest + walk_forward tasks (all disabled in pipeline)
   Run via: bash scripts/run_backtest.sh <task_name>
   Resolution: 1m (all engines, changed Apr 2026)
   Derivatives merge: BulkBacktestTask._merge_derivatives_into_candles() queries MongoDB
     for funding_rate, oi_value, buy_ratio, binance_funding_rate → reindexes to candle
     timestamps with ffill → injected as columns for engines with required_features: ["derivatives"]
   Signals: controllers must compute vectorized signal columns in update_processed_data()
-    (BacktestingEngine calls it once, reads signal from processed_data["features"] DataFrame)
 ```
 
-**Legacy tasks (E2 only, until migrated):** signal_scan, testnet_resolver
+## Strategy status
 
-## Engines and validation status
+**Canonical source:** `~/albertos-kb/projects/quant/overview.md` — updated every session with strategy status, kanban, roadmap, and kill evidence. Do NOT maintain a duplicate table here.
 
-All engine metadata lives in `app/engines/strategy_registry.py`. All backtests run at **1m resolution** (changed Apr 12, 2026 — prior results at 1h are invalidated by different SL mechanics).
+**Session handoff:** `~/albertos-kb/handoffs/quant-engineer.md` — last session state, findings, pending work.
 
-| Engine | Thesis | Status | Notes |
-|--------|--------|--------|-------|
-| **E1** Compression Breakout | Low ATR + range breakout | **Abandoned** (1h backtest: 91% TL exits). Needs re-eval at 1m. | `e1_compression_breakout.py` |
-| **E2** Range Fade | Low ATR + boundary rejection, LONG ONLY | **ADX filter coded, not yet backtested at 1m** | `e2_range_fade.py` |
-| **E3** Funding Carry | Fade persistent funding direction | **Mild edge on majors** (XRP 1.21, SUI 1.18, ADA 1.10). OI filter adds +0.03-0.07 PF on 6/8 pairs. Best candidate for further tuning. | `e3_funding_carry.py` |
-| **E4** Crowd Fade | Fade LS ratio extremes + OI rising | **Shelved** (PF ~1.0, no alpha). Vectorized signal fix shipped. | `e4_crowd_fade.py` |
-| **H2** Funding Divergence | Fade Bybit-Binance funding spread z-score | **Dead** (365d, 43 pairs, 11K trades, 0 ALLOW). Governance FAILED: positive expectancy only in SHOCK regime. SL drag destroys trailing stop edge. | `h2_funding_divergence.py` |
-| **S6** Spread Fade | Alt-BTC spread mean reversion | **Dead at 1h** (PF 0.79-0.92). Untested at 1m. | `s6_spread_fade.py` |
-| **S7** Hurst Adaptive | Hurst regime + RSI/EMA | **Dead at 1h** (69K trades, all PF<1.06). Untested at 1m. | `s7_hurst_adaptive.py` |
-| **S9** Session Compression | Session-aware ATR breakout | **Dead at 1h** (48% SL, 42% TL). Untested at 1m. | `s9_session_compression.py` |
-| **M1** ML Ensemble Signal | XGBoost on microstructure + derivatives + options + liquidation features | **Dead** (v1+v2: 0 ALLOW across 35 pairs, 6503 trades. Global model doesn't generalize — signal counts vary 15-6770 per pair at same threshold.) | `m1_ml_ensemble.py` |
+HB-native engine metadata (for backtesting/deploy tooling) lives in `app/engines/strategy_registry.py`. All backtests run at **1m resolution** (changed Apr 12, 2026 — prior results at 1h are invalidated).
 
-**Important:** E1, S6, S7, S9 were all tested at 1h resolution. The switch to 1m resolution changes SL mechanics fundamentally (intra-bar noise is 60x smaller), so these verdicts may not hold. E3/E4 had a scalar signal bug (producing 0 trades) that was fixed with vectorized `_compute_signals_vectorized()` — first correct E3 run showed DOGE PF=1.40/65% WR.
-
-Strategies tested outside the registry (pandas-only or one-off, all dead): S1 Crowded Fragility, S2 Funding Mean Rev, S3 OI-Price Divergence (inconclusive, N=5), S4 BTC Lead-Lag, S5 Volume Ignition (Sharpe 6.22 in pandas, 0-12% WR in HB at 1h), S8 Funding Carry+Momentum.
-
-### Portfolio limits
-- Max 3 concurrent positions across all engines
-- Max 2% total capital exposure
-- Position size: 0.3% of capital per trade ($300 on $100k demo)
+**Key architectural notes:**
+- E3/E4 had a scalar signal bug (producing 0 trades) that was fixed with vectorized `_compute_signals_vectorized()`.
+- E1, S6, S7, S9 were tested at 1h only. 1m changes SL mechanics fundamentally (intra-bar noise is 60x smaller).
+- H2 V3 is a custom arb engine (`scripts/arb_h2_live_v3.py` + `app/services/arb/`), NOT an HB-native controller. It runs as a standalone Python process in tmux, not in a Docker container.
 
 ## Position History & Analysis
 
@@ -358,8 +362,13 @@ bash /Users/hermes/quants-lab/scripts/start_pipeline.sh
 |---------|---------|--------|
 | `ql-pipeline` | TaskOrchestrator DAG | `tmux attach -t ql-pipeline` |
 | `ql-api` | QL Task API on :8001 | `tmux attach -t ql-api` |
-| `hummingbot` | HB instance | `tmux attach -t hummingbot` |
-| `gateway` | HB gateway | `tmux attach -t gateway` |
+| `ql-h2-v3` | H2 V3 spike-fade arb (LIVE) | `tmux attach -t ql-h2-v3` |
+| `d1-whale-collector` | D1 Hyperliquid whale data | `tmux attach -t d1-whale-collector` |
+| `arb-dual-collector` | Bitvavo/Binance spread data | `tmux attach -t arb-dual-collector` |
+| `hummingbot` | HB instance (if running) | `tmux attach -t hummingbot` |
+| `gateway` | HB gateway (if running) | `tmux attach -t gateway` |
+
+Note: active tmux sessions change as strategies are deployed/stopped. Run `tmux ls` for current state.
 
 ## Gotchas
 

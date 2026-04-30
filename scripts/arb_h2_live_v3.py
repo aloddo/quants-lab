@@ -1346,9 +1346,17 @@ class H2LiveTraderV2:
             else:
                 price_bb = bb_rules.round_price_for_side(snap.bb_ask, bb_side)
         else:
-            # IOC: cross the spread — ask for buys, bid for sells
-            price_bb = bb_rules.round_price_for_side(
-                snap.bb_ask if direction == "BUY_BB_SELL_BN" else snap.bb_bid, bb_side)
+            # IOC: cross the spread with 0.3% buffer to walk the book.
+            # On thin books, best ask may have <$10. Without buffer, IOC partially
+            # fills at BBO and expires — causing leg failures and costly unwinds.
+            # 30bp buffer fills through 3-5 levels (~$50-500 depth) and is far
+            # cheaper than a failed-leg unwind ($0.10-0.25 per failure).
+            IOC_BUFFER = 1.003  # 0.3% above/below best quote
+            if direction == "BUY_BB_SELL_BN":
+                raw_price = snap.bb_ask * IOC_BUFFER  # buy: willing to pay up to 30bp above ask
+            else:
+                raw_price = snap.bb_bid / IOC_BUFFER  # sell: willing to sell 30bp below bid
+            price_bb = bb_rules.round_price_for_side(raw_price, bb_side)
 
         # BN pricing: always cross (maker=taker on Binance, no benefit to posting)
         price_bn = bn_rules.round_price_for_side(
@@ -1585,8 +1593,13 @@ class H2LiveTraderV2:
             else:
                 price_bb = bb_rules.round_price_for_side(snap.bb_bid, bb_side)
         elif bb_rules:
-            price_bb = bb_rules.round_price_for_side(
-                snap.bb_bid if bb_side == "Sell" else snap.bb_ask, bb_side)
+            # IOC exit with buffer — same logic as entry, walk the book
+            IOC_BUFFER = 1.003
+            if bb_side == "Sell":
+                raw_price = snap.bb_bid / IOC_BUFFER
+            else:
+                raw_price = snap.bb_ask * IOC_BUFFER
+            price_bb = bb_rules.round_price_for_side(raw_price, bb_side)
         else:
             price_bb = snap.bb_bid
         # BN exit pricing: always cross (maker=taker)
