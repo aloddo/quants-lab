@@ -1924,7 +1924,12 @@ class H2LiveTraderV2:
                     self.risk_manager._paused = True
                     await tg_send(f"\U0001f6d1 {msg}\nTrading PAUSED.", session)
                 else:
-                    await tg_send(f"\u26a0\ufe0f {msg}", session)
+                    # Throttle WARNING alerts to once per hour (not every 5min)
+                    now = time.time()
+                    last_warn = getattr(self, '_last_degraded_warn', 0)
+                    if now - last_warn > 3600:
+                        await tg_send(f"\u26a0\ufe0f {msg}", session)
+                        self._last_degraded_warn = now
         except Exception as e:
             logger.debug(f"Degraded mode check failed: {e}")
 
