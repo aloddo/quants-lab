@@ -394,22 +394,22 @@ class HLMarketMaker:
                 self.signal_engine.update_trades(ws_coin, trade_data)
             self._latest_trades.clear()
 
-        # === STEP 1: Sync positions from exchange ===
-        # Bug #10 fix: Don't use wait_for(to_thread()) — the thread keeps running
-        # after timeout and can mutate inventory. Instead, sync_positions_safe()
-        # uses an internal requests timeout so the function itself is bounded.
-        # Bug #5 (Codex R4): Acquire OMS lock for inventory sync
-        async with self._oms_lock:
-            if self._consume_rate_token():
-                try:
-                    snapshot = await asyncio.to_thread(
-                        self.inventory.sync_positions_safe, 2.0
-                    )
-                except Exception as e:
-                    logger.warning(f"Position sync failed: {e}")
+        # === STEP 1: Sync positions from exchange (every 30s, not every tick) ===
+        now = time.time()
+        snapshot = None
+        if now - getattr(self, '_last_position_sync', 0) >= 30.0:
+            async with self._oms_lock:
+                if self._consume_rate_token():
+                    try:
+                        snapshot = await asyncio.to_thread(
+                            self.inventory.sync_positions_safe, 2.0
+                        )
+                        self._last_position_sync = now
+                    except Exception as e:
+                        logger.warning(f"Position sync failed: {e}")
+                        snapshot = None
+                else:
                     snapshot = None
-            else:
-                snapshot = None
 
         # Bug #14: Include Bybit hedge PnL in daily PnL
         bybit_hedge_pnl = self._compute_bybit_hedge_pnl()
@@ -558,7 +558,9 @@ class HLMarketMaker:
             hedge_active = coin in self._hedge_in_progress
 
             # Bug #11: circuit_breaker_active triggers on ANY toxic flag, not just anchor jump
-            cb_active = signal.any_toxic_flag
+            # Runtime fix: warmup period — don't trigger circuit breaker in first 30s
+            # (rolling medians are empty on cold start, causing false "spike" detections)
+            cb_active = signal.any_toxic_flag and (now - self._start_time > 30.0)
 
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,
