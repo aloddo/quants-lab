@@ -302,12 +302,19 @@ class HLMarketMaker:
             f"dry_run={self.dry_run}"
         )
 
-        # Init SDK (REST calls)
-        try:
-            await asyncio.to_thread(self._init_sdk)
-        except Exception as e:
-            logger.error(f"SDK init failed: {e}")
-            return
+        # Init SDK (REST calls) — retry on 429 with backoff
+        for attempt in range(5):
+            try:
+                await asyncio.to_thread(self._init_sdk)
+                break
+            except Exception as e:
+                if "429" in str(e) and attempt < 4:
+                    wait = 5 * (2 ** attempt)
+                    logger.warning(f"SDK init 429, retrying in {wait}s (attempt {attempt+1}/5)")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"SDK init failed: {e}")
+                    return
 
         self._init_components()
         self._running = True

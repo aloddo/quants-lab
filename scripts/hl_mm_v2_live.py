@@ -59,8 +59,8 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        "--coins", default="ORDI",
-        help="Comma-separated initial coins to trade (default: ORDI)",
+        "--coins", default="",
+        help="Comma-separated initial coins (empty = screener auto-selects)",
     )
     parser.add_argument(
         "--leverage", type=int, default=5,
