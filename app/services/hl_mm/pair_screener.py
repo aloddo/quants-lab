@@ -184,16 +184,30 @@ class PairScreener:
 
         logger.info(f"Screener: {len(candidates)} pairs above ${cfg.min_daily_volume_usd/1000:.0f}K volume")
 
-        # Step 3: Fetch L2 for each candidate (staggered)
+        # Step 3: Fetch L2 for each candidate (Gap 7: rate limit batching)
+        # If more than 20 pairs qualify, only fetch top 20 by volume
+        MAX_L2_FETCHES = 20
+        L2_STAGGER_MS = 300  # 300ms spacing between fetches
+
+        if len(candidates) > MAX_L2_FETCHES:
+            candidates.sort(key=lambda x: x[3], reverse=True)  # sort by daily_vol
+            logger.info(
+                f"Screener: {len(candidates)} candidates exceed L2 limit, "
+                f"fetching top {MAX_L2_FETCHES} by volume"
+            )
+            l2_candidates = candidates[:MAX_L2_FETCHES]
+        else:
+            l2_candidates = candidates
+
         rankings = []
-        for coin, pair_info, ctx, daily_vol in candidates:
+        for coin, pair_info, ctx, daily_vol in l2_candidates:
             try:
                 l2 = await asyncio.to_thread(self.info.l2_snapshot, coin)
-                await asyncio.sleep(cfg.l2_fetch_stagger_s)
+                await asyncio.sleep(L2_STAGGER_MS / 1000.0)
             except Exception as e:
                 if "429" in str(e):
-                    logger.debug(f"Screener: rate limited on {coin}, skipping")
-                    await asyncio.sleep(2.0)  # back off
+                    logger.debug(f"Screener: rate limited on {coin}, backing off 2s")
+                    await asyncio.sleep(2.0)
                     continue
                 logger.debug(f"Screener: L2 fetch failed for {coin}: {e}")
                 continue
@@ -201,6 +215,22 @@ class PairScreener:
             ranking = self._score_pair(coin, pair_info, ctx, daily_vol, l2)
             if ranking:
                 rankings.append(ranking)
+
+        # Also include non-L2 candidates with score=0 for ranking completeness
+        l2_coins = {r.coin for r in rankings}
+        for coin, pair_info, ctx, daily_vol in candidates:
+            if coin not in l2_coins:
+                # Score without L2 data: just volume-based, low priority
+                rankings.append(PairRanking(
+                    coin=coin, timestamp=time.time(), score=0.0,
+                    spread_bps=0.0, edge_room_bps=0.0,
+                    daily_volume_usd=daily_vol, depth_bid_usd=0.0,
+                    depth_ask_usd=0.0, anchor_type="none",
+                    tox_estimate=cfg.default_tox_buffer_bps, status="IDLE",
+                    native_half_spread=0.0, trade_count_hint=0.0,
+                    sz_decimals=self._sz_decimals.get(coin, 4),
+                    leverage_available=self._max_leverage.get(coin, 5),
+                ))
 
         # Step 4: Sort by score
         rankings.sort(key=lambda r: r.score, reverse=True)

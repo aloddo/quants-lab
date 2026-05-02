@@ -32,6 +32,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.hl_mm.orchestrator import HLMarketMaker
+from app.services.hl_mm.config import load_config
 
 
 def load_env():
@@ -77,6 +78,10 @@ def main():
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: INFO)",
+    )
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to hl_mm_config.yml (default: config/hl_mm_config.yml)",
     )
     args = parser.parse_args()
 
@@ -131,20 +136,31 @@ def main():
     if args.dry_run:
         print("\n  *** DRY RUN MODE -- no orders will be placed ***\n")
 
+    # Load config
+    config = load_config(args.config)
+
     # Create engine
     mm = HLMarketMaker(
         initial_coins=coins,
         leverage=args.leverage,
         mongo_uri=mongo_uri,
         dry_run=args.dry_run,
+        config=config,
     )
 
-    # Handle signals for graceful shutdown
+    # Handle signals for graceful shutdown (Gap 9)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    shutdown_initiated = False
 
     def handle_signal(signum, frame):
-        print(f"\nReceived signal {signum}, shutting down...")
+        nonlocal shutdown_initiated
+        if shutdown_initiated:
+            print("\nForce quit (second signal).")
+            sys.exit(1)
+        shutdown_initiated = True
+        sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+        print(f"\nReceived {sig_name}, initiating graceful shutdown...")
         mm.stop()
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -154,13 +170,19 @@ def main():
     try:
         loop.run_until_complete(mm.run())
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt, shutting down...")
-        mm.stop()
+        if not shutdown_initiated:
+            print("\nKeyboard interrupt, shutting down...")
+            mm.stop()
     finally:
-        # Give shutdown tasks a chance to complete
+        # Give shutdown tasks a chance to complete (max 10s)
         pending = asyncio.all_tasks(loop)
         if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(
+                asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=10.0,
+                )
+            )
         loop.close()
 
     print("Engine stopped.")

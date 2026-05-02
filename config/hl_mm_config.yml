@@ -1,0 +1,62 @@
+# HL Shitcoin Market Making Engine -- Configuration
+# All values have hardcoded defaults in app/services/hl_mm/config.py
+# Only override what you need to change.
+
+fees:
+  hl_maker_fee_bps: 1.44
+  hl_taker_fee_bps: 3.50
+  bybit_maker_fee_bps: 1.00
+  bybit_taker_fee_bps: 5.50
+
+timing:
+  requote_min_interval_s: 1.2
+  hard_refresh_interval_s: 5.0
+  screener_interval_s: 900.0
+  reconcile_interval_s: 30.0
+  fill_poll_interval_s: 30.0
+  mongo_flush_interval_s: 30.0
+  bybit_ws_ping_interval_s: 20.0
+  bybit_ws_reconnect_base_s: 1.0
+  bybit_ws_reconnect_max_s: 30.0
+
+risk:
+  max_live_pairs: 2
+  max_gross_notional: 150.0
+  max_net_exposure: 70.0
+  daily_stop_usd: 3.0
+  hard_stop_usd: 5.0
+
+hedge:
+  direct_slippage_budget_bps: 6.5
+  proxy_slippage_budget_bps: 8.5
+  hedge_pct_min: 0.80
+  hedge_pct_max: 1.00
+
+telegram:
+  enabled: true
+  min_message_interval_s: 3.0
+  daily_summary_hour_utc: 0
+
+# Per-pair overrides (coin name as key)
+pairs:
+  ORDI:
+    tox_buffer_bps: 0.8
+    gamma_target_shift_bps: 1.5
+    q_soft: 60
+    q_hard: 80
+    q_emergency: 100
+    child_size_notional: 50
+  BIO:
+    tox_buffer_bps: 0.9
+    gamma_target_shift_bps: 1.5
+    q_soft: 60
+    q_hard: 80
+    q_emergency: 100
+    child_size_notional: 50
+  DASH:
+    tox_buffer_bps: 1.2
+    gamma_target_shift_bps: 2.0
+    q_soft: 50
+    q_hard: 65
+    q_emergency: 80
+    child_size_notional: 40

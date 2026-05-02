@@ -16,22 +16,27 @@ Architecture:
 This is the top-level module. It creates and wires all components.
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
 import eth_account
+import requests as sync_requests
 import websockets
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 
+from .config import HLMMConfig, load_config
 from .fair_value import FairValueEngine, AnchorTier
 from .signal_engine import SignalEngine
 from .quote_engine import QuoteEngine, QuoteConfig
@@ -40,8 +45,13 @@ from .fill_tracker import FillTracker, QuoteLog
 from .risk_manager import RiskManager, RiskConfig, RiskAction
 from .state_machine import StateMachine, PairContext, PairState
 from .pair_screener import PairScreener, ScreenerConfig, BYBIT_PERPS
+from .notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
+
+# HL REST API for order/position queries
+HL_INFO_API = "https://api.hyperliquid.xyz/info"
+HL_ADDRESS = "0x11ca20aeb7cd014cf8406560ae405b12601994b4"
 
 # Bybit public WS endpoint (linear perps)
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
@@ -62,6 +72,7 @@ class HLMarketMaker:
         leverage: int = 5,
         mongo_uri: str = "mongodb://localhost:27017/quants_lab",
         dry_run: bool = False,
+        config: Optional[HLMMConfig] = None,
     ):
         # Credentials
         self.private_key = private_key or os.environ.get("HL_PRIVATE_KEY", "")
@@ -73,6 +84,11 @@ class HLMarketMaker:
         self.dry_run = dry_run
         self.mongo_uri = mongo_uri
         self._initial_coins = initial_coins or ["ORDI"]
+        self.config = config or load_config()
+
+        # Bybit hedge credentials
+        self._bybit_api_key = os.environ.get("BYBIT_API_KEY", "")
+        self._bybit_api_secret = os.environ.get("BYBIT_API_SECRET", "")
 
         # SDK init (deferred to run() for async context)
         self.info: Optional[Info] = None
@@ -84,7 +100,7 @@ class HLMarketMaker:
         db_name = mongo_uri.split("/")[-1]
         self._db = client[db_name]
         self._fills_col = self._db["hl_mm_fills"]
-        self._quotes_col = self._db["hl_mm_quote_logs"]
+        self._quotes_col = self._db["hl_mm_quote_log"]
 
         # Components (initialized in _init_components)
         self.screener: Optional[PairScreener] = None
@@ -95,16 +111,23 @@ class HLMarketMaker:
         self.fill_tracker: Optional[FillTracker] = None
         self.risk_manager: Optional[RiskManager] = None
         self.state_machine: Optional[StateMachine] = None
+        self.notifier: Optional[TelegramNotifier] = None
 
         # Runtime state
         self._running = False
+        self._shutting_down = False
         self._start_time = 0.0
         self._tick_count = 0
         self._active_coins: set[str] = set()
         self._bybit_ws_task: Optional[asyncio.Task] = None
         self._hl_ws_tasks: dict[str, asyncio.Task] = {}
         self._last_mongo_flush: float = 0.0
+        self._last_fill_poll: float = 0.0
+        self._known_fill_hashes: set[str] = set()
         self._prev_bybit_mids: dict[str, float] = {}
+        self._bybit_anchor_stale: bool = False
+        self._bybit_ws_backoff: float = 1.0
+        self._last_daily_summary: float = 0.0
 
     # ==================================================================
     # Initialization
@@ -132,7 +155,7 @@ class HLMarketMaker:
         self.screener = PairScreener(
             info=self.info,
             mongo_uri=self.mongo_uri,
-            config=ScreenerConfig(max_live_pairs=2),
+            config=ScreenerConfig(max_live_pairs=self.config.risk.max_live_pairs),
         )
 
         self.fv_engine = FairValueEngine(bybit_pairs=bybit_pairs)
@@ -148,6 +171,10 @@ class HLMarketMaker:
         self.fill_tracker = FillTracker()
         self.risk_manager = RiskManager()
         self.state_machine = StateMachine()
+        self.notifier = TelegramNotifier(
+            min_interval_s=self.config.telegram.min_message_interval_s,
+            enabled=self.config.telegram.enabled,
+        )
 
     # ==================================================================
     # Main event loop
@@ -171,6 +198,12 @@ class HLMarketMaker:
         self._running = True
         self._start_time = time.time()
 
+        # === STARTUP RECONCILIATION (Gap 2 + 3) ===
+        # Cancel any stale open orders from prior sessions
+        await self._reconcile_open_orders_on_startup()
+        # Load existing positions into inventory manager
+        await self._sync_positions_on_startup()
+
         # Set leverage for initial coins
         for coin in self._initial_coins:
             await self._set_leverage(coin)
@@ -180,12 +213,21 @@ class HLMarketMaker:
             self.screener.force_active(coin)
             self._activate_coin(coin)
 
+        # Notify engine start
+        self.notifier.notify_engine_event(
+            "STARTED",
+            f"Coins: {self._initial_coins}, Leverage: {self.leverage}x, "
+            f"Dry run: {self.dry_run}",
+        )
+
         # Start background tasks
         tasks = [
             asyncio.create_task(self._main_loop(), name="main_loop"),
             asyncio.create_task(self._screener_loop(), name="screener_loop"),
             asyncio.create_task(self._bybit_ws_loop(), name="bybit_ws"),
             asyncio.create_task(self._mongo_flush_loop(), name="mongo_flush"),
+            asyncio.create_task(self._fill_poll_loop(), name="fill_poll"),
+            asyncio.create_task(self._daily_summary_loop(), name="daily_summary"),
         ]
 
         try:
@@ -396,6 +438,10 @@ class HLMarketMaker:
                 # Not quoting: cancel any existing orders
                 self.quote_engine.cancel_coin(coin)
 
+            # Execute Bybit hedge if requested (Gap 1)
+            if state_info.hedge_requested and not self.dry_run:
+                await self._execute_bybit_hedge(coin, pos, fair_value)
+
             # Detect fills
             if not self.dry_run:
                 try:
@@ -443,6 +489,12 @@ class HLMarketMaker:
         logger.info(
             f"FILL: {coin} {side} {size:.6f} @ ${price:.6f} "
             f"(fee=${fee:.4f}, total_fills={tox.total_fills})"
+        )
+
+        # Telegram notification
+        self.notifier.notify_fill(
+            coin=coin, side=side, size=size, price=price,
+            size_usd=size * price, fee=fee,
         )
 
     # ==================================================================
@@ -543,76 +595,111 @@ class HLMarketMaker:
         """Maintain Bybit WS connection for price anchoring.
 
         Subscribes to tickers for all coins in BYBIT_PERPS that we might trade.
+        Features (Gap 5):
+          - Automatic reconnection with exponential backoff (1s, 2s, 4s, max 30s)
+          - Ping every 20s (Bybit requires heartbeat)
+          - On disconnect: set anchor_stale = True
+          - On reconnect: resubscribe to all tickers
         """
-        # Build subscription list: all potentially active pairs
-        coins_to_sub = list(BYBIT_PERPS & (self._active_coins | set(self._initial_coins)))
-        # Always include BTC/ETH for correlation stop
-        for c in ["BTC", "ETH", "SOL"]:
-            if c not in coins_to_sub:
-                coins_to_sub.append(c)
-
-        symbols = [f"{c}USDT" for c in coins_to_sub]
-        coin_map = {f"{c}USDT": c for c in coins_to_sub}
-
-        subscribe_msg = {
-            "op": "subscribe",
-            "args": [f"tickers.{s}" for s in symbols],
-        }
+        backoff = self.config.timing.bybit_ws_reconnect_base_s
+        max_backoff = self.config.timing.bybit_ws_reconnect_max_s
 
         while self._running:
+            # Build subscription list fresh each reconnect (coins may change)
+            coins_to_sub = list(BYBIT_PERPS & (self._active_coins | set(self._initial_coins)))
+            for c in ["BTC", "ETH", "SOL"]:
+                if c not in coins_to_sub:
+                    coins_to_sub.append(c)
+
+            symbols = [f"{c}USDT" for c in coins_to_sub]
+            coin_map = {f"{c}USDT": c for c in coins_to_sub}
+
+            subscribe_msg = {
+                "op": "subscribe",
+                "args": [f"tickers.{s}" for s in symbols],
+            }
+
             try:
                 async with websockets.connect(
                     BYBIT_WS_URL,
-                    ping_interval=20,
+                    ping_interval=None,  # we handle pings manually
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
                     await ws.send(json.dumps(subscribe_msg))
                     logger.info(f"Bybit WS connected, subscribed to {len(symbols)} tickers")
+                    self._bybit_anchor_stale = False
+                    backoff = self.config.timing.bybit_ws_reconnect_base_s  # reset on success
 
-                    async for raw_msg in ws:
-                        if not self._running:
-                            break
-                        try:
-                            msg = json.loads(raw_msg)
-                            topic = msg.get("topic", "")
-                            data = msg.get("data", {})
+                    # Start heartbeat task
+                    ping_task = asyncio.create_task(
+                        self._bybit_ws_ping(ws), name="bybit_ping"
+                    )
 
-                            if topic.startswith("tickers.") and data:
-                                symbol = data.get("symbol", "")
-                                coin = coin_map.get(symbol)
-                                if not coin:
-                                    continue
+                    try:
+                        async for raw_msg in ws:
+                            if not self._running:
+                                break
+                            try:
+                                msg = json.loads(raw_msg)
+                                topic = msg.get("topic", "")
+                                data = msg.get("data", {})
 
-                                bid1 = float(data.get("bid1Price", 0) or 0)
-                                ask1 = float(data.get("ask1Price", 0) or 0)
+                                if topic.startswith("tickers.") and data:
+                                    symbol = data.get("symbol", "")
+                                    coin = coin_map.get(symbol)
+                                    if not coin:
+                                        continue
 
-                                if bid1 > 0 and ask1 > 0:
-                                    prev_mid = self._prev_bybit_mids.get(coin, 0)
-                                    new_mid = (bid1 + ask1) / 2.0
+                                    bid1 = float(data.get("bid1Price", 0) or 0)
+                                    ask1 = float(data.get("ask1Price", 0) or 0)
 
-                                    self.fv_engine.update_bybit_ticker(coin, bid1, ask1)
-                                    self.risk_manager.update_reference_prices(
-                                        btc_mid=new_mid if coin == "BTC" else 0,
-                                        eth_mid=new_mid if coin == "ETH" else 0,
-                                    )
+                                    if bid1 > 0 and ask1 > 0:
+                                        prev_mid = self._prev_bybit_mids.get(coin, 0)
+                                        new_mid = (bid1 + ask1) / 2.0
 
-                                    # Check anchor jump
-                                    if prev_mid > 0:
-                                        self.signal_engine.check_anchor_jump(
-                                            coin, new_mid, prev_mid
+                                        self.fv_engine.update_bybit_ticker(coin, bid1, ask1)
+                                        self.risk_manager.update_reference_prices(
+                                            btc_mid=new_mid if coin == "BTC" else 0,
+                                            eth_mid=new_mid if coin == "ETH" else 0,
                                         )
-                                    self._prev_bybit_mids[coin] = new_mid
 
-                        except Exception as e:
-                            logger.debug(f"Bybit WS parse error: {e}")
+                                        if prev_mid > 0:
+                                            self.signal_engine.check_anchor_jump(
+                                                coin, new_mid, prev_mid
+                                            )
+                                        self._prev_bybit_mids[coin] = new_mid
+
+                            except Exception as e:
+                                logger.debug(f"Bybit WS parse error: {e}")
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
 
             except websockets.exceptions.ConnectionClosed:
-                logger.warning("Bybit WS disconnected, reconnecting in 5s")
+                logger.warning(f"Bybit WS disconnected, reconnecting in {backoff:.1f}s")
+                self._bybit_anchor_stale = True
             except Exception as e:
-                logger.warning(f"Bybit WS error: {e}, reconnecting in 5s")
+                logger.warning(f"Bybit WS error: {e}, reconnecting in {backoff:.1f}s")
+                self._bybit_anchor_stale = True
 
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    async def _bybit_ws_ping(self, ws) -> None:
+        """Send periodic pings to keep Bybit WS alive (Gap 5)."""
+        interval = self.config.timing.bybit_ws_ping_interval_s
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await ws.send(json.dumps({"op": "ping"}))
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                break
 
     # ==================================================================
     # Screener loop
@@ -647,25 +734,432 @@ class HLMarketMaker:
     # ==================================================================
 
     async def _mongo_flush_loop(self) -> None:
-        """Periodically flush fill and quote logs to MongoDB."""
+        """Periodically flush fill and quote logs to MongoDB (Gap 6).
+
+        Uses bulk_write with upsert for idempotency on fills (keyed by oid+timestamp).
+        Quote logs use insert_many (append-only, no dedup needed).
+        """
+        interval = self.config.timing.mongo_flush_interval_s
         while self._running:
-            await asyncio.sleep(30)
+            await asyncio.sleep(interval)
+            await self._flush_to_mongo()
+
+    async def _flush_to_mongo(self) -> None:
+        """Flush pending fills and quote logs to MongoDB."""
+        try:
+            # Flush fills with upsert (idempotent by oid + timestamp)
+            fill_docs = self.fill_tracker.fills_to_mongo()
+            if fill_docs:
+                ops = []
+                for doc in fill_docs:
+                    filt = {"oid": doc["oid"], "timestamp": doc["timestamp"]}
+                    ops.append(UpdateOne(filt, {"$set": doc}, upsert=True))
+                if ops:
+                    result = self._fills_col.bulk_write(ops, ordered=False)
+                    logger.debug(
+                        f"Mongo fills flush: {result.upserted_count} new, "
+                        f"{result.modified_count} updated"
+                    )
+
+            # Flush recent quote logs (append-only)
+            log_docs = self.fill_tracker.quote_logs_to_mongo(
+                since=self._last_mongo_flush
+            )
+            if log_docs:
+                self._quotes_col.insert_many(log_docs, ordered=False)
+
+            self._last_mongo_flush = time.time()
+
+            # Also flush notifier queue
+            self.notifier.flush_queue()
+
+        except Exception as e:
+            logger.warning(f"MongoDB flush error: {e}")
+
+    # ==================================================================
+    # Fill polling fallback (Gap 4)
+    # ==================================================================
+
+    async def _fill_poll_loop(self) -> None:
+        """REST poll fallback for fill detection every 30s (Gap 4).
+
+        Cross-references with known fills. Any new fills not yet tracked
+        are processed as if they came from the WS subscription.
+        """
+        # Wait for initial tick cycle
+        await asyncio.sleep(10)
+        interval = self.config.timing.fill_poll_interval_s
+
+        while self._running:
+            await asyncio.sleep(interval)
+            if self.dry_run:
+                continue
             try:
-                # Flush fills
-                fill_docs = self.fill_tracker.fills_to_mongo()
-                if fill_docs:
-                    self._fills_col.insert_many(fill_docs, ordered=False)
-
-                # Flush recent quote logs
-                log_docs = self.fill_tracker.quote_logs_to_mongo(
-                    since=self._last_mongo_flush
-                )
-                if log_docs:
-                    self._quotes_col.insert_many(log_docs, ordered=False)
-
-                self._last_mongo_flush = time.time()
+                await self._poll_fills_rest()
             except Exception as e:
-                logger.warning(f"MongoDB flush error: {e}")
+                logger.warning(f"Fill poll error: {e}")
+
+    async def _poll_fills_rest(self) -> None:
+        """Query HL REST for recent user fills and process any missed ones."""
+        try:
+            resp = await asyncio.to_thread(
+                sync_requests.post,
+                HL_INFO_API,
+                json={"type": "userFills", "user": self.address},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                logger.debug(f"Fill poll HTTP {resp.status_code}")
+                return
+
+            fills = resp.json()
+            if not isinstance(fills, list):
+                return
+
+            # Process recent fills (last 50)
+            for fill_data in fills[-50:]:
+                # Build a unique hash for dedup
+                fill_hash = self._fill_hash(fill_data)
+                if fill_hash in self._known_fill_hashes:
+                    continue
+
+                self._known_fill_hashes.add(fill_hash)
+
+                # Only process if it is a coin we are actively tracking
+                coin = fill_data.get("coin", "")
+                if coin not in self._active_coins:
+                    continue
+
+                side = "bid" if fill_data.get("side", "").upper() == "B" else "ask"
+                price = float(fill_data.get("px", 0) or 0)
+                size = float(fill_data.get("sz", 0) or 0)
+                fee = float(fill_data.get("fee", 0) or 0)
+                oid = fill_data.get("oid", 0)
+
+                if price > 0 and size > 0:
+                    logger.info(
+                        f"FILL (REST fallback): {coin} {side} {size:.6f} @ "
+                        f"${price:.6f} oid={oid}"
+                    )
+                    self._handle_fill(coin, {
+                        "side": side,
+                        "price": price,
+                        "size": size,
+                        "fee": fee,
+                        "oid": oid,
+                    })
+
+            # Cap the known fill set to prevent unbounded growth
+            if len(self._known_fill_hashes) > 5000:
+                # Keep most recent half
+                excess = len(self._known_fill_hashes) - 2500
+                for _ in range(excess):
+                    self._known_fill_hashes.pop()
+
+        except Exception as e:
+            logger.debug(f"Fill poll REST error: {e}")
+
+    @staticmethod
+    def _fill_hash(fill_data: dict) -> str:
+        """Create unique hash for a fill record."""
+        key = f"{fill_data.get('oid', '')}-{fill_data.get('time', '')}-{fill_data.get('hash', '')}"
+        return hashlib.md5(key.encode()).hexdigest()
+
+    # ==================================================================
+    # Daily summary loop (Gap 8)
+    # ==================================================================
+
+    async def _daily_summary_loop(self) -> None:
+        """Send daily PnL summary at 00:00 UTC."""
+        while self._running:
+            await asyncio.sleep(60)  # check every minute
+            now = datetime.now(timezone.utc)
+            if now.hour == self.config.telegram.daily_summary_hour_utc and now.minute == 0:
+                if time.time() - self._last_daily_summary > 3500:  # avoid double-send
+                    self._send_daily_summary()
+                    self._last_daily_summary = time.time()
+
+    def _send_daily_summary(self) -> None:
+        """Build and send daily PnL summary via Telegram."""
+        snapshot = self.inventory._get_snapshot()
+        total_fills = sum(
+            self.fill_tracker.get_toxicity(c).total_fills
+            for c in self._active_coins
+        )
+        uptime_hours = (time.time() - self._start_time) / 3600.0
+        self.notifier.notify_daily_summary(
+            daily_pnl=snapshot.daily_pnl,
+            total_fills=total_fills,
+            gross_notional=snapshot.total_gross_notional,
+            active_pairs=list(self._active_coins),
+            uptime_hours=uptime_hours,
+        )
+
+    # ==================================================================
+    # Startup reconciliation (Gap 2 + 3)
+    # ==================================================================
+
+    async def _reconcile_open_orders_on_startup(self) -> None:
+        """Cancel ALL existing resting orders from prior sessions (Gap 2).
+
+        On startup, before entering the main loop, query HL for open orders
+        and cancel everything. This prevents stale orders from a crashed session
+        from sitting on the book.
+        """
+        if self.dry_run:
+            logger.info("[DRY] Would reconcile open orders on startup")
+            return
+
+        logger.info("Startup: reconciling open orders...")
+        try:
+            resp = await asyncio.to_thread(
+                sync_requests.post,
+                HL_INFO_API,
+                json={"type": "openOrders", "user": self.address},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Startup order query failed: HTTP {resp.status_code}")
+                return
+
+            open_orders = resp.json()
+            if not isinstance(open_orders, list) or not open_orders:
+                logger.info("Startup: no stale open orders found")
+                return
+
+            logger.warning(f"Startup: found {len(open_orders)} stale orders, cancelling all")
+            for order in open_orders:
+                coin = order.get("coin", "")
+                oid = order.get("oid", 0)
+                side = order.get("side", "?")
+                px = order.get("px", "?")
+                sz = order.get("sz", "?")
+                try:
+                    await asyncio.to_thread(self.exchange.cancel, coin, oid)
+                    logger.info(f"  Cancelled stale order: {coin} {side} {sz}@{px} oid={oid}")
+                except Exception as e:
+                    logger.warning(f"  Failed to cancel {coin} oid={oid}: {e}")
+
+            logger.info(f"Startup: cancelled {len(open_orders)} stale orders")
+
+        except Exception as e:
+            logger.error(f"Startup order reconciliation failed: {e}")
+
+    async def _sync_positions_on_startup(self) -> None:
+        """Load existing positions into inventory manager on startup (Gap 3).
+
+        If any positions exist from a prior session, the inventory manager
+        is pre-loaded so the state machine can enter INVENTORY_EXIT for
+        those coins.
+        """
+        logger.info("Startup: syncing existing positions...")
+        try:
+            state = await asyncio.to_thread(self.info.user_state, self.address)
+            if not state:
+                logger.info("Startup: no user state returned")
+                return
+
+            positions_found = []
+            for pos_data in state.get("assetPositions", []):
+                p = pos_data.get("position", {})
+                coin = p.get("coin", "")
+                size = float(p.get("szi", 0))
+                entry = float(p.get("entryPx", 0) or 0)
+                unrealized = float(p.get("unrealizedPnl", 0) or 0)
+
+                if abs(size) > 0 and coin:
+                    positions_found.append((coin, size, entry))
+                    logger.warning(
+                        f"Startup: existing position {coin} size={size:.6f} "
+                        f"entry=${entry:.6f} upnl=${unrealized:.4f}"
+                    )
+
+            if not positions_found:
+                logger.info("Startup: no existing positions")
+                return
+
+            # Force a full inventory sync to load these into the manager
+            await asyncio.to_thread(self.inventory.sync_positions)
+
+            # For coins with existing positions, activate them and set to
+            # INVENTORY_EXIT so the engine works to close them
+            for coin, size, entry in positions_found:
+                if coin not in self._active_coins:
+                    self.screener.force_active(coin)
+                    self._activate_coin(coin)
+                    await self._set_leverage(coin)
+
+                # Force into INVENTORY_EXIT state
+                self.state_machine.register_pair(coin)
+                state_info = self.state_machine.get_state(coin)
+                if state_info:
+                    from .state_machine import PairState
+                    state_info.prev_state = state_info.state
+                    state_info.state = PairState.INVENTORY_EXIT
+                    state_info.entered_at = time.time()
+                    state_info.reason = f"startup: existing position size={size:.6f}"
+                    state_info.exit_mode = True
+
+            logger.info(
+                f"Startup: loaded {len(positions_found)} existing positions, "
+                f"entering INVENTORY_EXIT"
+            )
+
+        except Exception as e:
+            logger.error(f"Startup position sync failed: {e}")
+
+    # ==================================================================
+    # Bybit hedge execution (Gap 1)
+    # ==================================================================
+
+    async def _execute_bybit_hedge(
+        self,
+        coin: str,
+        pos,
+        fair_value: float,
+    ) -> None:
+        """Execute an emergency delta hedge on Bybit mainnet via REST (Gap 1).
+
+        Places an IOC limit order on Bybit at mid +/- max(1 tick, 1bp).
+        Hedges 80-100% of the HL delta.
+        Uses raw REST (pybit not available in this env).
+        """
+        if not self._bybit_api_key or not self._bybit_api_secret:
+            logger.error(f"HEDGE BLOCKED: {coin} - no Bybit API credentials")
+            return
+
+        if abs(pos.size) < 1e-10 or fair_value <= 0:
+            return
+
+        # Determine hedge direction: if we are long on HL, sell on Bybit
+        is_long_hl = pos.size > 0
+        bybit_side = "Sell" if is_long_hl else "Buy"
+
+        # Hedge size: 80-100% of delta
+        hedge_cfg = self.config.hedge
+        hedge_pct = (hedge_cfg.hedge_pct_min + hedge_cfg.hedge_pct_max) / 2.0
+        hedge_size = abs(pos.size) * hedge_pct
+
+        # Determine slippage budget
+        is_direct = coin in BYBIT_PERPS
+        slippage_bps = (
+            hedge_cfg.direct_slippage_budget_bps if is_direct
+            else hedge_cfg.proxy_slippage_budget_bps
+        )
+
+        # Compute limit price: mid +/- max(1 tick, slippage_budget)
+        slip_offset = fair_value * (slippage_bps / 10000.0)
+        tick_size = fair_value * 0.0001  # 1bp as minimum tick
+        offset = max(tick_size, slip_offset)
+
+        if bybit_side == "Buy":
+            limit_price = fair_value + offset
+        else:
+            limit_price = fair_value - offset
+
+        # Round for Bybit (perps use tick sizes, approximate with 2 decimals)
+        sz_str = f"{hedge_size:.4f}"
+        px_str = f"{limit_price:.2f}"
+        symbol = f"{coin}USDT"
+
+        logger.warning(
+            f"HEDGE: {coin} {bybit_side} {sz_str} @ {px_str} on Bybit "
+            f"(HL delta={pos.size:.6f}, hedge_pct={hedge_pct:.0%})"
+        )
+
+        try:
+            result = await asyncio.to_thread(
+                self._bybit_place_order,
+                symbol=symbol,
+                side=bybit_side,
+                qty=sz_str,
+                price=px_str,
+                order_type="Limit",
+                time_in_force="IOC",
+            )
+
+            if result and result.get("retCode") == 0:
+                order_result = result.get("result", {})
+                order_id = order_result.get("orderId", "?")
+                logger.info(f"HEDGE SUCCESS: {coin} orderId={order_id}")
+
+                # Calculate actual slippage
+                actual_slippage_bps = abs(limit_price - fair_value) / fair_value * 10000
+                self.notifier.notify_hedge(
+                    coin=coin, side=bybit_side, size=hedge_size,
+                    price=limit_price, slippage_bps=actual_slippage_bps,
+                )
+            else:
+                ret_code = result.get("retCode", "?") if result else "no response"
+                ret_msg = result.get("retMsg", "") if result else ""
+                logger.error(f"HEDGE FAILED: {coin} retCode={ret_code} msg={ret_msg}")
+                self.notifier.notify_engine_event(
+                    "HEDGE FAILED",
+                    f"{coin} {bybit_side} {sz_str}: {ret_msg}",
+                )
+
+        except Exception as e:
+            logger.error(f"HEDGE ERROR: {coin}: {e}", exc_info=True)
+            self.notifier.notify_engine_event("HEDGE ERROR", f"{coin}: {e}")
+
+    def _bybit_place_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: str,
+        price: str,
+        order_type: str = "Limit",
+        time_in_force: str = "IOC",
+    ) -> Optional[dict]:
+        """Place an order on Bybit mainnet via raw REST API.
+
+        No pybit dependency. Uses HMAC-SHA256 signing per Bybit V5 API spec.
+        """
+        api_url = "https://api.bybit.com"
+        endpoint = "/v5/order/create"
+        timestamp = str(int(time.time() * 1000))
+        recv_window = "5000"
+
+        payload = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": order_type,
+            "qty": qty,
+            "price": price,
+            "timeInForce": time_in_force,
+        }
+
+        payload_str = json.dumps(payload, separators=(",", ":"))
+
+        # Bybit V5 signature: timestamp + api_key + recv_window + payload
+        sign_str = f"{timestamp}{self._bybit_api_key}{recv_window}{payload_str}"
+        signature = hmac.new(
+            self._bybit_api_secret.encode("utf-8"),
+            sign_str.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        headers = {
+            "X-BAPI-API-KEY": self._bybit_api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "Content-Type": "application/json",
+        }
+
+        resp = sync_requests.post(
+            f"{api_url}{endpoint}",
+            headers=headers,
+            data=payload_str,
+            timeout=5,
+        )
+
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            logger.error(f"Bybit REST error: HTTP {resp.status_code}: {resp.text[:300]}")
+            return {"retCode": resp.status_code, "retMsg": resp.text[:200]}
 
     # ==================================================================
     # Leverage management
@@ -708,26 +1202,95 @@ class HLMarketMaker:
         self._running = False
 
     async def _shutdown(self) -> None:
-        """Graceful shutdown."""
-        logger.info("Shutting down...")
+        """Graceful shutdown (Gap 9).
+
+        Steps:
+          1. Set _shutting_down flag
+          2. Cancel ALL resting orders on HL (query + cancel loop)
+          3. If any inventory remains, log a WARNING (don't auto-hedge -- too risky)
+          4. Close WS connections
+          5. Flush all pending logs to MongoDB
+          6. Verify zero open orders via REST
+          7. Log final PnL summary
+        """
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        logger.info("Graceful shutdown initiated...")
         self._running = False
 
-        # Cancel all quotes
-        if self.quote_engine:
+        # Step 2: Cancel ALL resting orders
+        if self.quote_engine and not self.dry_run:
+            logger.info("Shutdown: cancelling all resting orders...")
             self.quote_engine.cancel_all()
 
-        # Disconnect WS
+            # Double-check via REST: cancel anything still open
+            for attempt in range(3):
+                try:
+                    resp = sync_requests.post(
+                        HL_INFO_API,
+                        json={"type": "openOrders", "user": self.address},
+                        timeout=5,
+                    )
+                    if resp.status_code == 200:
+                        remaining = resp.json()
+                        if not remaining:
+                            logger.info("Shutdown: verified zero open orders")
+                            break
+                        logger.warning(
+                            f"Shutdown: {len(remaining)} orders still open (attempt {attempt+1}), "
+                            f"cancelling..."
+                        )
+                        for order in remaining:
+                            try:
+                                self.exchange.cancel(order["coin"], order["oid"])
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"Shutdown order verify failed: {e}")
+                    break
+        elif self.quote_engine:
+            self.quote_engine.cancel_all()
+
+        # Step 3: Warn about remaining inventory
+        if self.inventory:
+            for coin in list(self._active_coins):
+                pos = self.inventory.get_position(coin)
+                if abs(pos.size) > 1e-10:
+                    logger.warning(
+                        f"SHUTDOWN WARNING: {coin} has remaining inventory "
+                        f"size={pos.size:.6f} (${pos.notional_usd:.2f}). "
+                        f"NOT auto-hedging -- manual intervention required."
+                    )
+
+        # Step 4: Close WS connections
         if self.info:
             try:
                 self.info.disconnect_websocket()
             except Exception:
                 pass
 
-        # Final MongoDB flush
+        # Step 5: Flush all pending logs to MongoDB
         try:
-            fill_docs = self.fill_tracker.fills_to_mongo()
-            if fill_docs:
-                self._fills_col.insert_many(fill_docs, ordered=False)
+            await self._flush_to_mongo()
+        except Exception as e:
+            logger.warning(f"Shutdown MongoDB flush failed: {e}")
+
+        # Step 7: Log final PnL summary
+        try:
+            snapshot = self.inventory._get_snapshot() if self.inventory else None
+            uptime = (time.time() - self._start_time) / 3600.0 if self._start_time > 0 else 0
+            pnl = snapshot.daily_pnl if snapshot else 0
+            logger.info(
+                f"FINAL SUMMARY: uptime={uptime:.1f}h pnl=${pnl:.2f} "
+                f"coins={list(self._active_coins)}"
+            )
+            self.notifier.notify_engine_event(
+                "STOPPED",
+                f"Uptime: {uptime:.1f}h, PnL: ${pnl:.2f}",
+            )
+            # Flush the stop notification
+            self.notifier.flush_queue()
         except Exception:
             pass
 
