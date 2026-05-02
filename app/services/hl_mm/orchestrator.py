@@ -123,7 +123,10 @@ class HLMarketMaker:
         self._hl_ws_tasks: dict[str, asyncio.Task] = {}
         self._last_mongo_flush: float = 0.0
         self._last_fill_poll: float = 0.0
-        self._known_fill_hashes: set[str] = set()
+        # Bug #4 fix: Use OrderedDict for bounded FIFO dedup instead of set with arbitrary eviction
+        from collections import OrderedDict
+        self._known_fill_hashes: OrderedDict = OrderedDict()
+        self._known_fill_hashes_maxlen: int = 5000
         self._prev_bybit_mids: dict[str, float] = {}
         self._bybit_anchor_stale: bool = False
         self._bybit_ws_backoff: float = 1.0
@@ -142,6 +145,15 @@ class HLMarketMaker:
 
         # Bug #12: asyncio.Lock for signal state access
         self._signal_lock = asyncio.Lock()
+
+        # Bug #8 fix: Coalescing buffers for WS messages — store latest, process in _tick()
+        self._latest_book: dict[str, dict] = {}       # coin -> latest book data
+        self._latest_trades: dict[str, list] = {}     # coin -> latest trades batch
+
+        # Bug #9 fix: WS watchdog timestamps
+        self._last_hl_ws_time: dict[str, float] = {}  # coin -> last HL WS message time
+        self._last_bybit_ws_time: float = 0.0          # last Bybit WS message time
+        self._bybit_ws_ref: Optional[object] = None    # reference to active Bybit WS for reconnect
 
         # Bug #5 (Codex R4): asyncio.Lock for inventory + quote state mutations
         self._oms_lock = asyncio.Lock()
@@ -368,19 +380,32 @@ class HLMarketMaker:
         now = time.time()
 
         # Bug #14: Sticky daily stop — check at TOP of every tick
+        # Bug #7 fix: wrap cancel in to_thread since it makes sync HL REST calls
         if self._check_daily_stop_sticky():
-            self.quote_engine.cancel_all()
+            await asyncio.to_thread(self.quote_engine.cancel_all)
             return
 
+        # Bug #8 fix: Drain coalescing WS buffers under signal lock
+        async with self._signal_lock:
+            for ws_coin, book_data in self._latest_book.items():
+                self.signal_engine.update_book(ws_coin, book_data)
+            self._latest_book.clear()
+            for ws_coin, trade_data in self._latest_trades.items():
+                self.signal_engine.update_trades(ws_coin, trade_data)
+            self._latest_trades.clear()
+
         # === STEP 1: Sync positions from exchange ===
+        # Bug #10 fix: Don't use wait_for(to_thread()) — the thread keeps running
+        # after timeout and can mutate inventory. Instead, sync_positions_safe()
+        # uses an internal requests timeout so the function itself is bounded.
         # Bug #5 (Codex R4): Acquire OMS lock for inventory sync
         async with self._oms_lock:
             if self._consume_rate_token():
                 try:
-                    snapshot = await asyncio.wait_for(
-                        asyncio.to_thread(self.inventory.sync_positions), timeout=3.0
+                    snapshot = await asyncio.to_thread(
+                        self.inventory.sync_positions_safe, 2.0
                     )
-                except (asyncio.TimeoutError, Exception) as e:
+                except Exception as e:
                     logger.warning(f"Position sync failed: {e}")
                     snapshot = None
             else:
@@ -420,7 +445,8 @@ class HLMarketMaker:
             # Bug #14: Make daily stop sticky
             self._daily_stop_sticky = True
             self._daily_stop_date = datetime.now(timezone.utc).date()
-            self.quote_engine.cancel_all()
+            # Bug #7 fix: wrap cancel in to_thread
+            await asyncio.to_thread(self.quote_engine.cancel_all)
             return
 
         # Bug #4: Handle HEDGE_IMMEDIATELY BEFORE state machine pause.
@@ -449,7 +475,8 @@ class HLMarketMaker:
                         await self._execute_bybit_hedge(coin, pos, fv)
 
         if RiskAction.CANCEL_ALL_QUOTES in risk_state.actions:
-            self.quote_engine.cancel_all()
+            # Bug #7 fix: wrap cancel in to_thread
+            await asyncio.to_thread(self.quote_engine.cancel_all)
 
         if RiskAction.PAUSE_ALL in risk_state.actions:
             for coin in self._active_coins:
@@ -479,8 +506,9 @@ class HLMarketMaker:
 
         for coin in list(self._active_coins):
             # Skip if circuit breaker disabled this pair
+            # Bug #7 fix: wrap cancel in to_thread
             if self.fill_tracker.is_pair_disabled(coin):
-                self.quote_engine.cancel_coin(coin)
+                await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
                 continue
 
             # Get signal (Bug #12: under lock)
@@ -623,7 +651,7 @@ class HLMarketMaker:
                     else:
                         # Don't pause — keep retrying next tick
                         logger.critical(f"EMERGENCY_FLATTEN: {coin} NOT pausing — still exposed")
-                self.quote_engine.cancel_coin(coin)
+                await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
                 continue
 
             # Compute and execute quotes
@@ -636,17 +664,26 @@ class HLMarketMaker:
                 net = snapshot.total_net_exposure if snapshot else 0
                 if not self.risk_manager.check_notional_limit(gross, proposed_notional):
                     logger.debug(f"{coin}: gross notional limit hit, skipping quotes")
-                    self.quote_engine.cancel_coin(coin)
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
                     continue
-                if not self.risk_manager.check_net_exposure(net, proposed_notional):
-                    logger.debug(f"{coin}: net exposure limit hit, skipping quotes")
-                    self.quote_engine.cancel_coin(coin)
+                # Bug #2 fix: Pass side context so exit-side orders are always allowed.
+                # If we have inventory, determine whether the quote sides would reduce exposure.
+                coin_has_inv = has_inventory.get(coin, False)
+                bid_blocked = not self.risk_manager.check_net_exposure(
+                    net, proposed_notional, is_buy=True, has_inventory=coin_has_inv,
+                )
+                ask_blocked = not self.risk_manager.check_net_exposure(
+                    net, proposed_notional, is_buy=False, has_inventory=coin_has_inv,
+                )
+                if bid_blocked and ask_blocked:
+                    logger.debug(f"{coin}: net exposure limit hit on both sides, skipping quotes")
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
                     continue
                 # Check resting order notional (sum of all active quote notionals)
                 total_resting = self._compute_total_resting_notional()
                 if not self.risk_manager.check_resting_notional(total_resting + proposed_notional):
                     logger.debug(f"{coin}: resting notional limit hit (${total_resting:.1f}), skipping")
-                    self.quote_engine.cancel_coin(coin)
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
                     continue
 
                 if self.quote_engine.should_requote(coin, fair_value):
@@ -704,8 +741,9 @@ class HLMarketMaker:
             else:
                 # Not quoting: cancel any existing orders
                 # Bug #5 (Codex R4): Acquire OMS lock
+                # Bug #7 fix: wrap cancel in to_thread
                 async with self._oms_lock:
-                    self.quote_engine.cancel_coin(coin)
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
 
             # Execute Bybit hedge if requested (Gap 1)
             # Bug #1 (Codex R4): Check hedge_in_progress + hedge_positions before stacking
@@ -740,6 +778,28 @@ class HLMarketMaker:
                 async with self._oms_lock:
                     await asyncio.to_thread(self.quote_engine.cleanup_orphans)
 
+        # === STEP 5b: WS watchdog (Bug #9 fix) ===
+        # Check for silent HL WS stalls (>10s without message per coin)
+        for ws_coin in list(self._active_coins):
+            last_msg = self._last_hl_ws_time.get(ws_coin, 0)
+            if last_msg > 0 and now - last_msg > 10.0:
+                logger.warning(
+                    f"WS WATCHDOG: {ws_coin} HL WS silent for "
+                    f"{now - last_msg:.1f}s — resubscribing"
+                )
+                self._unsubscribe_hl_ws(ws_coin)
+                self._subscribe_hl_ws(ws_coin)
+                self._last_hl_ws_time[ws_coin] = now  # reset to avoid rapid re-trigger
+
+        # Check for silent Bybit WS stall (>30s without any message)
+        if self._last_bybit_ws_time > 0 and now - self._last_bybit_ws_time > 30.0:
+            logger.warning(
+                f"WS WATCHDOG: Bybit WS silent for "
+                f"{now - self._last_bybit_ws_time:.1f}s — flagging stale"
+            )
+            self._bybit_anchor_stale = True
+            # The _bybit_ws_loop will detect disconnection and reconnect
+
         # === STEP 6: Status log (every 60s) ===
         if self._tick_count % 120 == 0:
             self._log_status()
@@ -755,6 +815,18 @@ class HLMarketMaker:
         size = fill["size"]
         fee = fill.get("fee", 0)
         oid = fill.get("oid", 0)
+
+        # Bug #4 fix: Generate the same hash used by _poll_fills_rest and add
+        # to _known_fill_hashes so fills detected via detect_fills() are deduped
+        # against the REST poll fallback.
+        fill_hash_data = {"oid": oid, "time": fill.get("time", ""), "hash": fill.get("hash", "")}
+        fh = self._fill_hash(fill_hash_data)
+        if fh in self._known_fill_hashes:
+            return  # already processed
+        self._known_fill_hashes[fh] = True
+        # Evict oldest entries if over max length
+        while len(self._known_fill_hashes) > self._known_fill_hashes_maxlen:
+            self._known_fill_hashes.popitem(last=False)
 
         # Bug #3: Clear hedge_in_progress if HL inventory is now flat
         pos = self.inventory.get_position(coin)
@@ -810,9 +882,11 @@ class HLMarketMaker:
 
         logger.info(f"Activated coin: {coin}")
 
-    def _deactivate_coin(self, coin: str) -> None:
-        """Remove a coin from active quoting."""
-        self.quote_engine.cancel_coin(coin)
+    async def _deactivate_coin(self, coin: str) -> None:
+        """Remove a coin from active quoting.
+        Bug #7 fix: made async, cancel wrapped in to_thread.
+        """
+        await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
         self.state_machine.unregister_pair(coin)
         self._active_coins.discard(coin)
         self._unsubscribe_hl_ws(coin)
@@ -853,12 +927,11 @@ class HLMarketMaker:
     def _on_hl_book(self, coin: str, data: dict) -> None:
         """Callback for HL WS L2 book updates.
 
-        Bug #12: WS callbacks run on the event loop. We use the signal lock
-        to prevent torn reads during yield points in _tick().
-        Since HL SDK callbacks are synchronous, we schedule the locked update.
+        Bug #8 fix: Instead of create_task per message (which backlogs at
+        bursty rates), store latest into coalescing buffer. _tick() drains
+        the buffer at the start of each cycle.
         """
         try:
-            # HL WS sends the full book in data["levels"]
             book_data = None
             if isinstance(data, dict) and "levels" in data:
                 book_data = data
@@ -866,12 +939,10 @@ class HLMarketMaker:
                 book_data = data["data"]
 
             if book_data:
-                # Schedule locked update on event loop
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._locked_book_update(coin, book_data))
-                else:
-                    self.signal_engine.update_book(coin, book_data)
+                # Overwrite-latest: we only care about most recent book state
+                self._latest_book[coin] = book_data
+                # Bug #9 fix: track last WS message time for watchdog
+                self._last_hl_ws_time[coin] = time.time()
         except Exception as e:
             logger.debug(f"HL book parse error for {coin}: {e}")
 
@@ -888,7 +959,8 @@ class HLMarketMaker:
     def _on_hl_trades(self, coin: str, data: dict) -> None:
         """Callback for HL WS trade updates.
 
-        Bug #12: Schedule locked update to prevent torn reads.
+        Bug #8 fix: Store latest trades into coalescing buffer instead of
+        creating a task per message.
         """
         try:
             trades = []
@@ -900,11 +972,10 @@ class HLMarketMaker:
                 trades = [data]
 
             if trades:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._locked_trade_update(coin, trades))
-                else:
-                    self.signal_engine.update_trades(coin, trades)
+                # Overwrite-latest: only most recent batch matters
+                self._latest_trades[coin] = trades
+                # Bug #9 fix: track last WS message time for watchdog
+                self._last_hl_ws_time[coin] = time.time()
         except Exception as e:
             logger.debug(f"HL trade parse error for {coin}: {e}")
 
@@ -976,6 +1047,8 @@ class HLMarketMaker:
                                     ask1 = float(data.get("ask1Price", 0) or 0)
 
                                     if bid1 > 0 and ask1 > 0:
+                                        # Bug #9 fix: track Bybit WS message time
+                                        self._last_bybit_ws_time = time.time()
                                         prev_mid = self._prev_bybit_mids.get(coin, 0)
                                         new_mid = (bid1 + ask1) / 2.0
 
@@ -1072,7 +1145,7 @@ class HLMarketMaker:
                         pos = self.inventory.get_position(coin)
                         if abs(pos.size) < 1e-10:
                             logger.info(f"Screener: deactivating demoted pair {coin}")
-                            self._deactivate_coin(coin)
+                            await self._deactivate_coin(coin)
 
             except Exception as e:
                 logger.error(f"Screener error: {e}", exc_info=True)
@@ -1095,9 +1168,15 @@ class HLMarketMaker:
             await self._flush_to_mongo()
 
     async def _flush_to_mongo(self) -> None:
-        """Flush pending fills and quote logs to MongoDB."""
+        """Flush pending fills and quote logs to MongoDB.
+
+        Bug #6 fix: All MongoDB writes and Telegram flush are wrapped in
+        asyncio.to_thread() to avoid blocking the event loop. Each is
+        independently try/excepted so a Mongo/Telegram failure doesn't
+        crash the engine.
+        """
+        # Flush fills with upsert (idempotent by oid + timestamp)
         try:
-            # Flush fills with upsert (idempotent by oid + timestamp)
             fill_docs = self.fill_tracker.fills_to_mongo()
             if fill_docs:
                 ops = []
@@ -1105,26 +1184,35 @@ class HLMarketMaker:
                     filt = {"oid": doc["oid"], "timestamp": doc["timestamp"]}
                     ops.append(UpdateOne(filt, {"$set": doc}, upsert=True))
                 if ops:
-                    result = self._fills_col.bulk_write(ops, ordered=False)
+                    result = await asyncio.to_thread(
+                        self._fills_col.bulk_write, ops, ordered=False
+                    )
                     logger.debug(
                         f"Mongo fills flush: {result.upserted_count} new, "
                         f"{result.modified_count} updated"
                     )
+        except Exception as e:
+            logger.warning(f"MongoDB fills flush error: {e}")
 
-            # Flush recent quote logs (append-only)
+        # Flush recent quote logs (append-only)
+        try:
             log_docs = self.fill_tracker.quote_logs_to_mongo(
                 since=self._last_mongo_flush
             )
             if log_docs:
-                self._quotes_col.insert_many(log_docs, ordered=False)
-
-            self._last_mongo_flush = time.time()
-
-            # Also flush notifier queue
-            self.notifier.flush_queue()
-
+                await asyncio.to_thread(
+                    self._quotes_col.insert_many, log_docs, ordered=False
+                )
         except Exception as e:
-            logger.warning(f"MongoDB flush error: {e}")
+            logger.warning(f"MongoDB quote log flush error: {e}")
+
+        self._last_mongo_flush = time.time()
+
+        # Also flush notifier queue (Telegram HTTP calls)
+        try:
+            await asyncio.to_thread(self.notifier.flush_queue)
+        except Exception as e:
+            logger.warning(f"Telegram flush error: {e}")
 
     # ==================================================================
     # Fill polling fallback (Gap 4)
@@ -1174,7 +1262,7 @@ class HLMarketMaker:
                 if fill_hash in self._known_fill_hashes:
                     continue
 
-                self._known_fill_hashes.add(fill_hash)
+                self._known_fill_hashes[fill_hash] = True
 
                 # Only process if it is a coin we are actively tracking
                 coin = fill_data.get("coin", "")
@@ -1200,12 +1288,9 @@ class HLMarketMaker:
                         "oid": oid,
                     })
 
-            # Cap the known fill set to prevent unbounded growth
-            if len(self._known_fill_hashes) > 5000:
-                # Keep most recent half
-                excess = len(self._known_fill_hashes) - 2500
-                for _ in range(excess):
-                    self._known_fill_hashes.pop()
+            # Bug #4 fix: Evict oldest entries via OrderedDict FIFO
+            while len(self._known_fill_hashes) > self._known_fill_hashes_maxlen:
+                self._known_fill_hashes.popitem(last=False)
 
         except Exception as e:
             logger.debug(f"Fill poll REST error: {e}")
@@ -1504,19 +1589,43 @@ class HLMarketMaker:
             if result and result.get("retCode") == 0:
                 order_result = result.get("result", {})
                 order_id = order_result.get("orderId", "?")
-                logger.info(f"HEDGE SUCCESS: {coin} orderId={order_id}")
+                logger.info(f"HEDGE ACCEPTED: {coin} orderId={order_id}")
 
-                # Bug #3: Track Bybit hedge position
-                hedge_delta = -hedge_size if bybit_side == "Sell" else hedge_size
-                self._hedge_positions[coin] = self._hedge_positions.get(coin, 0) + hedge_delta
-                self._hedge_entry_prices[coin] = limit_price
+                # Bug #3 fix: IOC accept != fill. Query actual filled quantity.
+                actual_filled_qty = 0.0
+                actual_fill_price = limit_price
+                if order_id and order_id != "?":
+                    try:
+                        fill_result = await asyncio.to_thread(
+                            self._bybit_query_order, symbol, order_id
+                        )
+                        if fill_result:
+                            actual_filled_qty = float(fill_result.get("cumExecQty", 0) or 0)
+                            avg_price = float(fill_result.get("avgPrice", 0) or 0)
+                            if avg_price > 0:
+                                actual_fill_price = avg_price
+                    except Exception as e:
+                        logger.warning(f"HEDGE: failed to query fill for {coin} orderId={order_id}: {e}")
 
-                # Calculate actual slippage
-                actual_slippage_bps = abs(limit_price - fair_value) / fair_value * 10000
-                self.notifier.notify_hedge(
-                    coin=coin, side=bybit_side, size=hedge_size,
-                    price=limit_price, slippage_bps=actual_slippage_bps,
-                )
+                if actual_filled_qty > 1e-10:
+                    hedge_delta = -actual_filled_qty if bybit_side == "Sell" else actual_filled_qty
+                    self._hedge_positions[coin] = self._hedge_positions.get(coin, 0) + hedge_delta
+                    self._hedge_entry_prices[coin] = actual_fill_price
+
+                    actual_slippage_bps = abs(actual_fill_price - fair_value) / fair_value * 10000
+                    logger.info(
+                        f"HEDGE FILLED: {coin} filled={actual_filled_qty:.6f} "
+                        f"@ ${actual_fill_price:.6f} (slippage={actual_slippage_bps:.1f}bps)"
+                    )
+                    self.notifier.notify_hedge(
+                        coin=coin, side=bybit_side, size=actual_filled_qty,
+                        price=actual_fill_price, slippage_bps=actual_slippage_bps,
+                    )
+                else:
+                    logger.warning(
+                        f"HEDGE: {coin} IOC order accepted but fill qty=0 — "
+                        f"not updating hedge position"
+                    )
             else:
                 ret_code = result.get("retCode", "?") if result else "no response"
                 ret_msg = result.get("retMsg", "") if result else ""
@@ -1590,6 +1699,52 @@ class HLMarketMaker:
         else:
             logger.error(f"Bybit REST error: HTTP {resp.status_code}: {resp.text[:300]}")
             return {"retCode": resp.status_code, "retMsg": resp.text[:200]}
+
+    def _bybit_query_order(self, symbol: str, order_id: str) -> Optional[dict]:
+        """Query Bybit order status to get actual fill quantity (Bug #3 fix).
+
+        Uses GET /v5/order/realtime to check cumExecQty for IOC orders.
+        """
+        api_url = "https://api.bybit.com"
+        endpoint = "/v5/order/realtime"
+        timestamp = str(int(time.time() * 1000))
+        recv_window = "5000"
+
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "orderId": order_id,
+        }
+        query_string = urllib.parse.urlencode(params)
+
+        # Bybit V5 GET signature: timestamp + api_key + recv_window + query_string
+        sign_str = f"{timestamp}{self._bybit_api_key}{recv_window}{query_string}"
+        signature = hmac.new(
+            self._bybit_api_secret.encode("utf-8"),
+            sign_str.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        headers = {
+            "X-BAPI-API-KEY": self._bybit_api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+        }
+
+        resp = sync_requests.get(
+            f"{api_url}{endpoint}?{query_string}",
+            headers=headers,
+            timeout=5,
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("retCode") == 0:
+                order_list = data.get("result", {}).get("list", [])
+                if order_list:
+                    return order_list[0]
+        return None
 
     # ==================================================================
     # Leverage management

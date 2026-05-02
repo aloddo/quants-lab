@@ -251,7 +251,7 @@ class PairScreener:
         self._manage_pair_lifecycle(rankings)
 
         # Step 6: Persist to MongoDB
-        self._persist_rankings(rankings)
+        await self._persist_rankings(rankings)
 
         self._rankings = rankings
         self._last_scan = time.time()
@@ -395,8 +395,11 @@ class PairScreener:
             else:
                 r.status = "IDLE"
 
-    def _persist_rankings(self, rankings: list[PairRanking]) -> None:
-        """Write rankings to MongoDB."""
+    async def _persist_rankings(self, rankings: list[PairRanking]) -> None:
+        """Write rankings to MongoDB.
+
+        Bug #6 fix: Wrapped in asyncio.to_thread to avoid blocking event loop.
+        """
         if not rankings:
             return
 
@@ -419,7 +422,9 @@ class PairScreener:
         ]
 
         try:
-            self._rankings_col.insert_many(docs, ordered=False)
+            await asyncio.to_thread(
+                self._rankings_col.insert_many, docs, ordered=False
+            )
             logger.debug(f"Screener: persisted {len(docs)} rankings to MongoDB")
         except Exception as e:
             logger.warning(f"Screener: MongoDB write failed: {e}")

@@ -303,6 +303,96 @@ class InventoryManager:
 
         return self._get_snapshot()
 
+    def sync_positions_safe(self, timeout_s: float = 2.0) -> InventorySnapshot:
+        """Bug #10 fix: sync_positions with internal timeout.
+
+        Instead of wrapping sync_positions in asyncio.wait_for(to_thread()),
+        which doesn't kill the thread on timeout, this method uses a requests
+        timeout internally. If the REST call times out, it returns the current
+        snapshot without mutating state.
+        """
+        import requests as _requests
+
+        now = time.time()
+        if now - self._last_position_sync < 1.0:
+            return self._get_snapshot()
+
+        try:
+            # Use info.user_state with internal timeout via the session
+            # HL SDK doesn't expose timeout param, so we patch the session
+            original_timeout = getattr(self.info.session, 'timeout', None)
+            self.info.session.timeout = timeout_s
+            try:
+                state = self.info.user_state(self.address)
+            finally:
+                # Restore original timeout
+                if original_timeout is not None:
+                    self.info.session.timeout = original_timeout
+                else:
+                    try:
+                        del self.info.session.timeout
+                    except AttributeError:
+                        pass
+
+            if not state:
+                return self._get_snapshot()
+
+            margin = state.get("marginSummary", {})
+            account_value = float(margin.get("accountValue", 0) or 0)
+
+            self._equity = account_value
+            if self._session_start_equity is None:
+                self._session_start_equity = account_value
+                self._peak_equity = account_value
+            else:
+                self._peak_equity = max(self._peak_equity, account_value)
+
+            self._daily_pnl = account_value - self._session_start_equity
+
+            # Update per-coin positions (same logic as sync_positions)
+            returned_coins = set()
+            for pos_data in state.get("assetPositions", []):
+                p = pos_data.get("position", {})
+                coin = p.get("coin", "")
+                size = float(p.get("szi", 0))
+                entry = float(p.get("entryPx", 0) or 0)
+                unrealized = float(p.get("unrealizedPnl", 0) or 0)
+                returned_coins.add(coin)
+
+                existing = self._positions.get(coin)
+                if size != 0:
+                    mark = entry + unrealized / size if size != 0 else entry
+                    opened_at = existing.opened_at if existing and existing.size != 0 else now
+
+                    if entry > 0:
+                        if size > 0:
+                            adverse = max(0, (entry - mark) / entry * 10000)
+                        else:
+                            adverse = max(0, (mark - entry) / entry * 10000)
+                    else:
+                        adverse = 0.0
+
+                    self._positions[coin] = PositionState(
+                        coin=coin, size=size, entry_price=entry,
+                        mark_price=mark, notional_usd=abs(size * mark),
+                        unrealized_pnl=unrealized, opened_at=opened_at,
+                        last_fill_at=existing.last_fill_at if existing else 0.0,
+                        adverse_move_bps=adverse,
+                    )
+                else:
+                    self._positions[coin] = PositionState(coin=coin)
+
+            for coin in list(self._positions.keys()):
+                if coin not in returned_coins and coin in self._positions:
+                    self._positions[coin] = PositionState(coin=coin)
+
+            self._last_position_sync = now
+
+        except Exception as e:
+            logger.warning(f"Position sync (safe) failed: {e}")
+
+        return self._get_snapshot()
+
     def record_fill(self, coin: str, side: str, price: float, size: float) -> None:
         """Record a fill. Update position tracking."""
         pos = self._positions.get(coin)

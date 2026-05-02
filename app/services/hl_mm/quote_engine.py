@@ -161,18 +161,22 @@ class QuoteEngine:
         return True  # no limiter configured, always allow
 
     def _get_tick_size(self, coin: str, mid_price: float) -> float:
-        """Bug #6 (Codex R4): Get the price tick size for a coin.
+        """Get the price tick size for a coin.
 
         HL uses 5 significant figures for prices. The tick size is the
         smallest price increment at the current price level.
+
+        Bug #5 (Codex R5) fix: int(price) collapses all prices in (0,1) to 0,
+        giving wrong magnitude. Use floor(log10(price)) instead.
         """
         if coin in self._tick_sizes:
             return self._tick_sizes[coin]
-        # Derive from HL's 5 significant figure convention
         if mid_price <= 0:
             return 0.0001
         import math
-        magnitude = len(str(int(mid_price)))
+        # For price P, tick = 10^(-(5 - floor(log10(max(P, 0.0001)))))
+        # which gives proper 5 sig figs for any price level including sub-$1
+        magnitude = math.floor(math.log10(max(mid_price, 0.0001))) + 1
         decimals = max(0, 5 - magnitude)
         return 10 ** (-decimals)
 
@@ -782,9 +786,14 @@ class QuoteEngine:
         return round(size, decimals)
 
     def _round_price(self, coin: str, price: float) -> float:
-        """Round price to venue tick size (5 significant figures)."""
+        """Round price to venue tick size (5 significant figures).
+
+        Bug #5 (Codex R5) fix: int(price) collapses sub-$1 prices to 0.
+        Use floor(log10(price)) for correct magnitude.
+        """
         if price <= 0:
             return 0.0
-        magnitude = len(str(int(price)))
+        import math
+        magnitude = math.floor(math.log10(max(price, 0.0001))) + 1
         decimals = max(0, 5 - magnitude)
         return round(price, decimals)

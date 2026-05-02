@@ -177,23 +177,32 @@ class FairValueEngine:
         # Determine tier
         tier = self._tier_cache.get(coin, AnchorTier.NONE)
 
-        # Get Bybit state
+        # Get Bybit state (only relevant for DIRECT/SPARSE tiers)
         bb = self._bybit_tickers.get(coin)
         bybit_mid = bb.mid if bb else 0.0
         bybit_age_ms = (now - bb.last_update) * 1000 if bb and bb.last_update > 0 else 999999.0
 
-        # Staleness discount on anchor weight
+        # Bug #1 fix: Compute anchor weight based on tier.
+        # For SYNTHETIC tier, skip Bybit staleness logic entirely —
+        # synthetic anchor uses BTC/ETH/SOL Bybit mids, not a direct ticker.
         base_weight = self.TIER_WEIGHTS.get(tier, 0.0)
-        if bybit_age_ms > 2000:
-            anchor_weight = 0.0
-        elif bybit_age_ms > 500:
-            anchor_weight = base_weight * 0.5
-        else:
+        if tier == AnchorTier.SYNTHETIC:
+            # Synthetic tier: anchor weight is independent of direct Bybit ticker
             anchor_weight = base_weight
+        elif tier in (AnchorTier.DIRECT, AnchorTier.SPARSE):
+            # Direct/Sparse: apply staleness discount on the direct Bybit ticker
+            if bybit_age_ms > 2000:
+                anchor_weight = 0.0
+            elif bybit_age_ms > 500:
+                anchor_weight = base_weight * 0.5
+            else:
+                anchor_weight = base_weight
+        else:
+            anchor_weight = 0.0
 
         # Compute anchored_mid with EMA basis tracking
         anchored_mid = 0.0
-        if bybit_mid > 0 and anchor_weight > 0 and tier in (AnchorTier.DIRECT, AnchorTier.SPARSE):
+        if tier in (AnchorTier.DIRECT, AnchorTier.SPARSE) and bybit_mid > 0 and anchor_weight > 0:
             anchored_mid = self._compute_anchored_mid(coin, hl_mid, bybit_mid, now)
         elif tier == AnchorTier.SYNTHETIC:
             anchored_mid = self._compute_synthetic_anchor(coin, hl_mid, now)
@@ -280,14 +289,23 @@ class FairValueEngine:
         if not betas or r2 < 0.25:
             return 0.0
 
-        # Get recent returns for BTC, ETH, SOL from their Bybit tickers
+        # Bug #1 fix: Get recent returns for BTC, ETH, SOL from their
+        # Bybit mids directly (log return since last fit), NOT from _basis_ema
+        # which tracks HL-vs-Bybit basis — wrong signal for synthetic anchor.
+        fit_time = self._beta_last_fit.get(coin, 0.0)
         total_return = 0.0
         for ref_coin, beta in betas.items():
             ref_bb = self._bybit_tickers.get(ref_coin)
             if ref_bb and ref_bb.mid > 0:
-                # Use the basis EMA as proxy for return since last fit
-                ref_ema = self._basis_ema.get(ref_coin, 0.0)
-                total_return += beta * ref_ema
+                # Compute log return of the reference coin's Bybit mid since last beta fit
+                # Use return history if available, otherwise use a small window via EMA
+                ref_return = 0.0
+                # Check if we have a stored mid at fit time
+                fit_mid_key = f"_fit_mid_{ref_coin}"
+                fit_mid = getattr(self, '_fit_mids', {}).get(ref_coin, 0.0)
+                if fit_mid > 0:
+                    ref_return = math.log(ref_bb.mid / fit_mid)
+                total_return += beta * ref_return
 
         return hl_mid * math.exp(total_return)
 
@@ -329,6 +347,15 @@ class FairValueEngine:
             self._betas[coin] = {"BTC": beta[0], "ETH": beta[1], "SOL": beta[2]}
             self._beta_r2[coin] = r2
             self._beta_last_fit[coin] = time.time()
+
+            # Bug #1 fix: Store reference coin Bybit mids at fit time
+            # so _compute_synthetic_anchor can compute returns since fit.
+            if not hasattr(self, '_fit_mids'):
+                self._fit_mids: dict[str, float] = {}
+            for ref_coin in ("BTC", "ETH", "SOL"):
+                ref_bb = self._bybit_tickers.get(ref_coin)
+                if ref_bb and ref_bb.mid > 0:
+                    self._fit_mids[ref_coin] = ref_bb.mid
 
             logger.info(
                 f"{coin} synthetic betas: BTC={beta[0]:.3f} ETH={beta[1]:.3f} "

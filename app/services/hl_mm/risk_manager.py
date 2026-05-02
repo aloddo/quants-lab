@@ -257,9 +257,34 @@ class RiskManager:
         """Check if a new order would exceed gross notional limit."""
         return (current_gross + new_order_notional) <= self.config.max_gross_notional
 
-    def check_net_exposure(self, current_net: float, new_order_exposure: float) -> bool:
-        """Check if new exposure would exceed net limit."""
-        return abs(current_net + new_order_exposure) <= self.config.max_net_exposure
+    def check_net_exposure(
+        self,
+        current_net: float,
+        new_order_exposure: float,
+        is_buy: bool = True,
+        has_inventory: bool = False,
+    ) -> bool:
+        """Check if new exposure would exceed net limit.
+
+        Bug #2 fix: If the order would REDUCE net exposure (exit-side),
+        always allow it. Only block if it would INCREASE net exposure
+        beyond the limit.
+
+        Args:
+            current_net: signed net exposure (positive = net long)
+            new_order_exposure: unsigned notional of the proposed order
+            is_buy: True if the proposed order is a buy
+            has_inventory: True if the coin has an existing position
+        """
+        # Determine signed impact: buy adds positive, sell adds negative
+        signed_impact = new_order_exposure if is_buy else -new_order_exposure
+        new_net = current_net + signed_impact
+
+        # If the order reduces abs(net exposure), always allow it
+        if abs(new_net) < abs(current_net):
+            return True
+
+        return abs(new_net) <= self.config.max_net_exposure
 
     def check_resting_notional(self, total_resting_notional: float) -> bool:
         """Bug #4 (Codex R4): Check if total resting order notional is within limit."""
