@@ -1,0 +1,13 @@
+# Secrets -- never read by Claude
+.env
+.env.*
+*.pem
+*.key
+config/credentials.json
+config/service-account*.json
+
+# SSH
+.ssh/
+
+# Sensitive config with embedded credentials
+# (quant agent accesses Bybit via Hummingbot MCP, not direct .env reads)
