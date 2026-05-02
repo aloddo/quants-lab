@@ -188,6 +188,11 @@ class SignalEngine:
 
         any_toxic = (active_depth_drop or active_spread_spike or active_trade_imbalance
                      or active_anchor_jump or active_touch_depl)
+        if any_toxic:
+            active = [n for n, v in [("depth_drop", active_depth_drop), ("spread_spike", active_spread_spike),
+                      ("trade_imbalance", active_trade_imbalance), ("anchor_jump", active_anchor_jump),
+                      ("touch_depletion", active_touch_depl)] if v]
+            logger.debug(f"[{coin}] toxic flags active: {active}")
 
         # Imbalance assessment
         strong_imb = abs(imb_z) >= self.z_threshold
@@ -241,7 +246,10 @@ class SignalEngine:
         if prev_bybit_mid <= 0 or bybit_mid <= 0:
             return False
         jump_bps = abs(bybit_mid - prev_bybit_mid) / prev_bybit_mid * 10000
-        if jump_bps > self.anchor_jump_bps:
+        # Scale threshold by pair's native spread: wide-spread pairs move more
+        median_spread = np.median(list(self._spread_history.get(coin, [self.anchor_jump_bps]))) if self._spread_history.get(coin) else self.anchor_jump_bps
+        adaptive_threshold = max(self.anchor_jump_bps, median_spread * 1.5)
+        if jump_bps > adaptive_threshold:
             now = time.time()
             if coin not in self._toxic_flag_timestamps:
                 self._toxic_flag_timestamps[coin] = {}
@@ -427,9 +435,17 @@ class SignalEngine:
     def _check_depth_drop(
         self, coin: str, prev_depth: Optional[tuple], book: BookSnapshot
     ) -> bool:
-        """Same-side top-5 depth drop > 40% in 1s."""
+        """Same-side top-5 depth drop > threshold in 1s.
+
+        Threshold scales with native spread: wide-spread pairs (shitcoins) have
+        naturally volatile depth, so use 60% instead of 40%.
+        """
         if not prev_depth:
             return False
+
+        # Scale threshold by spread regime: tight (<2bps) = 40%, wide (>5bps) = 65%
+        median_spread = np.median(list(self._spread_history[coin])) if self._spread_history[coin] else 1.0
+        drop_threshold = 0.40 if median_spread < 2.0 else (0.55 if median_spread < 5.0 else 0.65)
 
         prev_ts, prev_bid5, prev_ask5 = prev_depth
         age = book.timestamp - prev_ts
@@ -437,14 +453,18 @@ class SignalEngine:
         if age > 2.0 or age < 0.1:
             return False
 
-        if prev_bid5 > 0 and (book.bid_usd_top5 / prev_bid5) < (1 - self.depth_drop_threshold):
+        if prev_bid5 > 0 and (book.bid_usd_top5 / prev_bid5) < (1 - drop_threshold):
             return True
-        if prev_ask5 > 0 and (book.ask_usd_top5 / prev_ask5) < (1 - self.depth_drop_threshold):
+        if prev_ask5 > 0 and (book.ask_usd_top5 / prev_ask5) < (1 - drop_threshold):
             return True
         return False
 
     def _check_spread_spike(self, coin: str, current_spread: float) -> bool:
-        """Spread widening > 1.5x the 5-min median."""
+        """Spread widening > Nx the 5-min median.
+
+        Threshold scales with native spread: wide-spread pairs naturally fluctuate more.
+        Tight (<2bps): 1.5x. Mid (2-5bps): 2.0x. Wide (>5bps): 2.5x.
+        """
         history = self._spread_history[coin]
         if len(history) < 30:  # need at least 30s
             return False
@@ -453,7 +473,9 @@ class SignalEngine:
         if median <= 0:
             return False
 
-        return current_spread > median * self.spread_spike_factor
+        # Scale multiplier by spread regime
+        factor = 1.5 if median < 2.0 else (2.0 if median < 5.0 else 2.5)
+        return current_spread > median * factor
 
     def _check_trade_imbalance(self, coin: str) -> bool:
         """3s trade imbalance > 70/30."""
