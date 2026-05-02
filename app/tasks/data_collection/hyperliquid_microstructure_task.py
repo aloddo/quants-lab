@@ -329,23 +329,23 @@ class HyperliquidMicrostructureTask(NotifyingTaskMixin, BaseTask):
 
             while time.time() < end_time:
                 tick_start = time.time()
-                tasks = [
-                    self._fetch_pair_tick(session=session, pair=pair, coin=coin)
-                    for pair, coin in pair_coin
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for (pair, _coin), res in zip(pair_coin, results):
-                    if isinstance(res, Exception):
+                # Stagger pair fetches to avoid HL rate limits (each pair = 2 REST calls)
+                for pair, coin in pair_coin:
+                    if time.time() >= end_time:
+                        break
+                    try:
+                        res = await self._fetch_pair_tick(session=session, pair=pair, coin=coin)
+                        book_row, trade_rows = res
+                        if book_row is not None:
+                            books_by_pair[pair].append(book_row)
+                            stats["book_rows"] += 1
+                        if trade_rows:
+                            trades_by_pair[pair].extend(trade_rows)
+                            stats["trade_rows"] += len(trade_rows)
+                    except Exception:  # noqa: BLE001
                         stats["errors"] += 1
-                        continue
-                    book_row, trade_rows = res
-                    if book_row is not None:
-                        books_by_pair[pair].append(book_row)
-                        stats["book_rows"] += 1
-                    if trade_rows:
-                        trades_by_pair[pair].extend(trade_rows)
-                        stats["trade_rows"] += len(trade_rows)
+                    # 150ms stagger between pairs to stay under HL rate limit
+                    await asyncio.sleep(0.15)
 
                 stats["polls"] += 1
                 elapsed = time.time() - tick_start

@@ -159,12 +159,12 @@ tasks:
     retry_delay_seconds: 10
     timeout_seconds: 58
     config:
-      pairs: ["BTC-USDT", "ETH-USDT", "SOL-USDT", "HYPE-USDT", "ZEC-USDT", "PENDLE-USDT", "APE-USDT"]
-      max_pairs: 7
+      pairs: ["BTC-USDT", "ETH-USDT", "SOL-USDT", "HYPE-USDT", "ZEC-USDT"]
+      max_pairs: 5
       restrict_to_bybit_pairs: false
       bybit_collection: "bybit_funding_rates"
       duration_seconds: 50
-      poll_seconds: 1.0
+      poll_seconds: 1.5
       max_levels: 20
       write_mongo: true
       write_parquet: true
