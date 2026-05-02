@@ -101,11 +101,10 @@ def main():
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-    # Parse coins
+    # Parse coins (empty = screener will auto-select on first scan)
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     if not coins:
-        print("ERROR: no coins specified")
-        sys.exit(1)
+        print("  No initial coins — screener will auto-select on first scan")
 
     # MongoDB URI
     mongo_uri = args.mongo_uri or os.environ.get(

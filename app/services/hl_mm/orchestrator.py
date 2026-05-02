@@ -83,7 +83,7 @@ class HLMarketMaker:
         self.leverage = leverage
         self.dry_run = dry_run
         self.mongo_uri = mongo_uri
-        self._initial_coins = initial_coins or ["ORDI"]
+        self._initial_coins = initial_coins or []  # empty = screener auto-selects
         self.config = config or load_config()
 
         # Bybit hedge credentials
