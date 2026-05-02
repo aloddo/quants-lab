@@ -61,10 +61,14 @@ def query_open_orders():
 
 
 def query_account_value():
-    """Query unified account value."""
-    resp = requests.post(API, json={"type": "clearinghouseState", "user": ALBERTO_MAIN})
-    state = resp.json()
-    return float(state.get("marginSummary", {}).get("accountValue", 0))
+    """Query unified account value with retry."""
+    for attempt in range(3):
+        resp = requests.post(API, json={"type": "clearinghouseState", "user": ALBERTO_MAIN})
+        if resp.status_code == 200 and resp.json():
+            state = resp.json()
+            return float(state.get("marginSummary", {}).get("accountValue", 0))
+        time.sleep(3)
+    return 0.0  # fallback
 
 
 def main():
