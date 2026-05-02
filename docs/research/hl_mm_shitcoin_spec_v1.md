@@ -6,6 +6,45 @@
 
 ---
 
+## 0. Pair Screener (continuous, like H2 tier engine)
+
+The MM engine does NOT have a fixed pair list. It runs a live screener every 15 minutes that ranks ALL 230 HL pairs by MM profitability and auto-promotes/demotes pairs.
+
+### Screener Pipeline (every 15 min)
+
+```
+1. Fetch meta + asset contexts for all HL pairs (1 REST call)
+2. For each pair with dayNtlVlm > $100K:
+   a. Fetch L2 book (1 REST call, staggered 200ms)
+   b. Compute: native spread, top-20 depth, microprice
+   c. Check if Bybit anchor exists (from cached pairs list)
+3. Score each pair:
+   score = edge_room_per_side * sqrt(daily_volume) * depth_factor * anchor_bonus
+   where:
+     edge_room_per_side = native_half_spread - maker_fee(1.44bps) - tox_buffer
+     depth_factor = min(1.0, median_depth_usd / (10 * notional_per_order))
+     anchor_bonus = 1.5 if direct Bybit pair, 1.0 if synthetic, 0.6 if none
+4. Rank by score. Top N pairs (N = max_live_pairs setting) are ACTIVE.
+5. Pairs dropping out of top N: finish current inventory, then IDLE.
+6. New pairs entering top N: start in SHADOW for 1h (collect data, no quoting),
+   then promote to ACTIVE if validation passes.
+```
+
+### Screener Output (to MongoDB: `hl_mm_pair_rankings`)
+```
+{timestamp, pair, score, spread_bps, edge_room_bps, daily_vol, depth_usd,
+ anchor_type, tox_estimate, status (ACTIVE/SHADOW/IDLE/BLOCKED)}
+```
+
+### Dynamic Pair Management
+- max_live_pairs: 2 (at $54 capital), increase as capital grows
+- Re-score interval: 15 min
+- Promotion cooldown: 1h in SHADOW before ACTIVE
+- Demotion grace period: pair must fail criteria for 2 consecutive scores (30 min)
+- Permanent block list: pairs with known manipulation, delistings, or broken price feeds
+
+---
+
 ## 1. Pair Ranking and Launch Order
 
 **Launch now:** ORDI, then BIO after >=100 clean live fills on ORDI
@@ -117,7 +156,8 @@ Rounded to ticks. If improve <= 0, no inside quote on that side.
 ```
 size = min(12, 0.20*free_equity, 0.003*depth20_side, 0.75*Q_soft) * vol_scale * anchor_scale
 ```
-Starting sizes: ORDI/BIO $10, DASH/AXS/PNUT $8, APE $10, PENDLE $8.
+Starting sizes (notional, leveraged): ORDI/BIO $50 (=$10 margin at 5x), DASH/AXS/PNUT $40, APE $50, PENDLE $40.
+Default leverage: 5x. Can increase to 10x after validation on first 100 fills.
 
 ### Requote Frequency
 Only requote if >= 1.2s since last action AND one of:
@@ -173,14 +213,19 @@ tau = 8s
 
 Multiply gamma by 1.5x if rv_30s > 1.75x baseline, 2x if > 2.5x.
 
-### Position Limits (USD)
+### Position Limits (NOTIONAL USD, leveraged)
 
-| Pair | Q_soft | Q_hard | Q_emergency |
-|------|--------|--------|------------|
-| ORDI/BIO | 10 | 12 | 15 |
-| DASH/AXS/PNUT | 8 | 10 | 12 |
-| APE | 8 | 10 | 12 |
-| PENDLE | 6 | 8 | 10 |
+At 5x leverage with $54 capital, max total margin ~$40 (keep $14 buffer).
+Per-pair margin limit ~$12-15, meaning notional limits:
+
+| Pair | Q_soft (notional) | Q_hard | Q_emergency | Margin at 5x |
+|------|-------------------|--------|------------|-------------|
+| ORDI/BIO | $60 | $80 | $100 | $12-20 |
+| DASH/AXS/PNUT | $50 | $65 | $80 | $10-16 |
+| APE | $50 | $65 | $80 | $10-16 |
+| PENDLE | $40 | $50 | $65 | $8-13 |
+
+Portfolio-level: max gross notional $150 across all pairs (margin ~$30 at 5x).
 
 ### Inventory Age Limits
 - Soft: 30s
@@ -289,30 +334,62 @@ HL book WS → trade WS → Bybit WS → feature cache → pair state machine �
 
 ## 8. Expected Economics
 
+### Leverage Impact
+
+HL supports up to 20x leverage on most pairs. With $54 capital:
+- At 5x: $10 margin per side = **$50 notional** per order
+- At 10x: $10 margin per side = **$100 notional** per order
+
+The edge is proportional to NOTIONAL, not margin. All PnL calculations below use leveraged notional.
+
 ### Per-Pair Expected Net RT Edge (current 1.44bps fee)
+
+**At 5x leverage ($50 notional per side):**
 | Pair | Net RT Edge | Expected RT/day | Daily PnL |
 |------|-----------|----------------|-----------|
-| ORDI | 5.2bps | 12-20 | $0.06-$0.10 |
-| BIO | 3.6bps | 15-22 | $0.05-$0.08 |
-| DASH | 2.5bps | 5-8 | $0.01-$0.02 |
-| AXS | 1.5bps | 5-8 | ~$0.01 |
-| PNUT | 1.6bps | 4-6 | <$0.01 |
-| APE | 0.6bps | 12-20 | $0.01-$0.02 |
+| ORDI | 5.2bps | 12-20 | $0.31-$0.52 |
+| BIO | 3.6bps | 15-22 | $0.27-$0.40 |
+| DASH | 2.5bps | 5-8 | $0.06-$0.10 |
+| AXS | 1.5bps | 5-8 | $0.04-$0.06 |
+| PNUT | 1.6bps | 4-6 | $0.03-$0.05 |
+| APE | 0.6bps | 12-20 | $0.04-$0.06 |
 
-### Portfolio (ORDI + BIO live)
-- Expected daily net: $0.11-$0.18
-- Daily std: $0.15-$0.25
+**At 10x leverage ($100 notional per side):**
+| Pair | Net RT Edge | Expected RT/day | Daily PnL |
+|------|-----------|----------------|-----------|
+| ORDI | 5.2bps | 12-20 | $0.62-$1.04 |
+| BIO | 3.6bps | 15-22 | $0.54-$0.79 |
+| DASH | 2.5bps | 5-8 | $0.13-$0.20 |
+
+### Portfolio (ORDI + BIO live, 5x leverage)
+- Expected daily net: $0.58-$0.92
+- Monthly: **$17-$28**
 - Daily Sharpe: ~0.6-1.0
-- 30-day max drawdown: -$1.5 to -$2.5 (with kill switches)
+- 30-day max drawdown: -$7 to -$12 (with kill switches)
 
-### Break-Even RT/day (to absorb one $0.05 toxic event)
-ORDI: 10, BIO: 14, DASH: 25, AXS: 40, PNUT: 38, APE: 80
+### Portfolio (ORDI + BIO live, 10x leverage)
+- Expected daily net: $1.16-$1.83
+- Monthly: **$35-$55**
+- Daily Sharpe: ~0.6-1.0
+- 30-day max drawdown: -$15 to -$25 (with kill switches, higher leverage = wider stops needed)
+
+### Scaling Path
+As capital grows from trading profits + deposits:
+- $54 capital → 2 pairs, $50-100 notional → $17-55/month
+- $200 capital → 3-4 pairs, $200-400 notional → $70-220/month
+- $1K capital → 5-6 pairs, $1-2K notional → $350-1100/month
+- $5K capital → 8-10 pairs, $5-10K notional → target $500+/month MRR
+
+### Volume Generation (leveraged)
+At 10x leverage, $100 notional per side, 15 RT/day on 2 pairs:
+- Daily volume: 2 * 15 * 2 * $100 = **$6,000/day**
+- 14d weighted: ~$84,000
+- Still short of VIP1 ($5M), but meaningful for proving execution quality
 
 ### Fee Tier Reality Check
-- Current tier: 1.44bps maker. Strategy volume ~$800/day.
-- VIP1 ($5M 14d): ~6,250 days at current volume. Not realistic via self-grinding.
-- VIP3 ($100M 14d): impossible via self-grinding.
+- VIP1 ($5M 14d vol): needs ~$357K/day. Achievable only at $5K+ capital with many pairs.
 - **Real flywheel: prove edge with real fills → approach token projects for designated MM role → 0% fee accounts + rebates.**
+- Some HL token projects actively seek MMs and offer fee rebates or direct payment. Demonstrating consistent, reliable quoting on their pair is the path to 0% fees.
 
 ---
 
