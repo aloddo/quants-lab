@@ -100,12 +100,20 @@ class HyperliquidFundingTask(NotifyingTaskMixin, BaseTask):
     ) -> List[Dict]:
         """Fetch funding history page (up to 500 records) for a coin starting at start_time."""
         payload = {"type": "fundingHistory", "coin": coin, "startTime": start_time}
-        async with session.post(HL_API_URL, json=payload) as resp:
-            if resp.status != 200:
+        for attempt in range(3):
+            async with session.post(HL_API_URL, json=payload) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                if resp.status == 429:
+                    wait = 3.0 * (2 ** attempt)
+                    logger.warning(f"HL fundingHistory {coin}: 429, backing off {wait:.0f}s")
+                    await asyncio.sleep(wait)
+                    continue
                 text = await resp.text()
                 logger.warning(f"HL fundingHistory {coin}: HTTP {resp.status} - {text[:200]}")
                 return []
-            return await resp.json()
+        logger.warning(f"HL fundingHistory {coin}: 429 after 3 retries, skipping")
+        return []
 
     async def _collect_coin(
         self, session: aiohttp.ClientSession, coin: str, pair: str, backfill_start: int
@@ -151,8 +159,10 @@ class HyperliquidFundingTask(NotifyingTaskMixin, BaseTask):
                 break
             start_time = last_time
 
-            # Rate limiting: 20 weight per call, 1200/min budget
-            await asyncio.sleep(1.0)
+            # Rate limiting: HL IP-level limit is aggressive (~5-6 rapid calls → 429).
+            # This task runs every 2h and iterates 230+ coins, so 2s spacing is fine.
+            # Keeps headroom for the microstructure L2 collector running every minute.
+            await asyncio.sleep(2.0)
 
         return total
 
