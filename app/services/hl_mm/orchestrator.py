@@ -284,7 +284,16 @@ class HLMarketMaker:
         )
         self.inventory = InventoryManager(info=self.info, address=self.address)
         self.fill_tracker = FillTracker()
-        self.risk_manager = RiskManager()
+        # Wire config to risk manager
+        risk_cfg = RiskConfig(
+            max_gross_notional=self.config.risk.max_gross_notional,
+            max_net_exposure=self.config.risk.max_net_exposure,
+            max_gross_resting=self.config.risk.max_resting_notional,
+            daily_stop_usd=self.config.risk.daily_stop_usd,
+            hard_stop_usd=self.config.risk.hard_stop_usd,
+        )
+        self.risk_manager = RiskManager(risk_cfg)
+        logger.info(f"Risk limits: gross=${risk_cfg.max_gross_notional}, net=${risk_cfg.max_net_exposure}, resting=${risk_cfg.max_gross_resting}")
         self.state_machine = StateMachine()
         self.notifier = TelegramNotifier(
             min_interval_s=self.config.telegram.min_message_interval_s,
@@ -537,6 +546,7 @@ class HLMarketMaker:
                 ask_qty_top1=book.ask_qty_top1,
             )
             if not fv_est:
+                logger.debug(f"[{coin}] FV compute returned None — skipping")
                 continue
 
             fair_value = fv_est.fair_value
@@ -564,10 +574,26 @@ class HLMarketMaker:
             # Bug #3: Track hedge_in_progress properly
             hedge_active = coin in self._hedge_in_progress
 
-            # Bug #11: circuit_breaker_active triggers on ANY toxic flag, not just anchor jump
-            # Runtime fix: warmup period — don't trigger circuit breaker in first 30s
-            # (rolling medians are empty on cold start, causing false "spike" detections)
-            cb_active = signal.any_toxic_flag and (now - self._start_time > 30.0)
+            # Circuit breaker: scale sensitivity by spread regime
+            # Wide-spread shitcoins (>5bps) have noisy microstructure — single flags
+            # fire constantly on normal behavior. Only trigger CB on strong signals.
+            past_warmup = (now - self._start_time > 30.0)
+            if not past_warmup:
+                cb_active = False
+            elif book.spread_bps > 8.0:
+                # Wide spread: only CB on 2+ simultaneous flags or anchor_jump
+                flag_count = sum([signal.depth_drop_detected, signal.spread_spike_detected,
+                                  signal.trade_imbalance_toxic, signal.anchor_jump_detected,
+                                  signal.touch_depletion])
+                cb_active = signal.anchor_jump_detected or flag_count >= 2
+            elif book.spread_bps > 4.0:
+                # Mid spread: CB on anchor_jump or 2+ other flags
+                flag_count = sum([signal.depth_drop_detected, signal.spread_spike_detected,
+                                  signal.trade_imbalance_toxic, signal.touch_depletion])
+                cb_active = signal.anchor_jump_detected or flag_count >= 2
+            else:
+                # Tight spread (majors): any single flag triggers CB
+                cb_active = signal.any_toxic_flag
 
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,
@@ -695,9 +721,17 @@ class HLMarketMaker:
                     await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
                     continue
 
-                if self.quote_engine.should_requote(coin, fair_value):
+                should_rq = self.quote_engine.should_requote(coin, fair_value)
+                if not should_rq:
+                    pass  # normal: requote interval not reached
+                else:
                     vol_scale = 0.5 if risk_state.halve_sizes else 1.0
                     anchor_scale = 1.0 if fv_est.anchor_weight > 0.3 else 0.7
+                    logger.info(
+                        f"[{coin}] Computing quotes: fv={fair_value:.6f} "
+                        f"bid={book.best_bid:.6f} ask={book.best_ask:.6f} "
+                        f"spread={book.spread_bps:.1f}bps"
+                    )
 
                     quotes = self.quote_engine.compute_quotes(
                         coin=coin,
@@ -719,12 +753,15 @@ class HLMarketMaker:
                     )
 
                     if quotes:
+                        logger.info(f"[{coin}] Placing quotes: {quotes}")
                         # Bug #5 (Codex R4): Acquire OMS lock for quote execution
                         async with self._oms_lock:
                             if not self.dry_run:
                                 await asyncio.to_thread(self.quote_engine.execute_quotes, quotes)
                             else:
                                 self.quote_engine.execute_quotes(quotes)
+                    else:
+                        logger.debug(f"[{coin}] compute_quotes returned empty")
 
                         # Log quote decision
                         bid_o, ask_o = self.quote_engine.get_active_orders(coin)

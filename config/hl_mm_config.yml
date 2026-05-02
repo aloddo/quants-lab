@@ -21,9 +21,9 @@ timing:
 
 risk:
   max_live_pairs: 2
-  max_gross_notional: 20.0       # Bug #4 (Codex R4): $20 gross for $54 capital
-  max_net_exposure: 14.0         # Bug #4 (Codex R4): $14 net for $54 capital
-  max_resting_notional: 40.0     # Bug #4 (Codex R4): $40 resting order limit
+  max_gross_notional: 100.0      # $54 capital * 3x leverage ~= $160 capacity, keep buffer
+  max_net_exposure: 50.0         # Max one-sided exposure
+  max_resting_notional: 150.0    # Total resting order value across all pairs
   daily_stop_usd: 3.0
   hard_stop_usd: 5.0
 
@@ -50,10 +50,10 @@ pairs:
   BIO:
     tox_buffer_bps: 0.9
     gamma_target_shift_bps: 1.5
-    q_soft: 60
-    q_hard: 80
-    q_emergency: 100
-    child_size_notional: 50
+    q_soft: 30
+    q_hard: 45
+    q_emergency: 60
+    child_size_notional: 12
   DASH:
     tox_buffer_bps: 1.2
     gamma_target_shift_bps: 2.0
