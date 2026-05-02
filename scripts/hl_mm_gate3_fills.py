@@ -170,10 +170,21 @@ def main():
         print("ERROR: Cannot get book")
         sys.exit(1)
 
-    # Size: ~$12 notional
-    sz = round(12.0 / mid, 0 if mid < 0.01 else (2 if mid > 10 else 4))
+    # Size: ~$12 notional, respecting szDecimals from HL meta
+    meta = info.meta()
+    sz_decimals = 0
+    for asset in meta.get("universe", []):
+        if asset.get("name") == args.coin:
+            sz_decimals = asset.get("szDecimals", 0)
+            break
+    time.sleep(1)
+
+    sz = round(12.0 / mid, sz_decimals)
     while sz * mid < 10:
-        sz = round(sz * 1.5, 0 if mid < 0.01 else (2 if mid > 10 else 4))
+        sz = round(sz * 1.5, sz_decimals)
+    # Ensure sz is valid for szDecimals=0 (whole numbers)
+    if sz_decimals == 0:
+        sz = int(sz)
 
     logger.info(f"Mid: ${mid:.6f}, Spread: {spread:.1f}bps, Size: {sz} ({sz*mid:.2f}$)")
     print()
