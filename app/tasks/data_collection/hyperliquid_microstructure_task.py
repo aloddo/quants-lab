@@ -101,7 +101,7 @@ class HyperliquidMicrostructureTask(NotifyingTaskMixin, BaseTask):
             await db[self.book_collection].create_index([("pair", 1), ("timestamp_utc", 1)], unique=True)
             await db[self.trades_collection].create_index([("pair", 1), ("tid", 1), ("time", 1)], unique=True)
 
-    async def _hl_post(self, session: aiohttp.ClientSession, payload: dict, retries: int = 4) -> Any:
+    async def _hl_post(self, session: aiohttp.ClientSession, payload: dict, retries: int = 6) -> Any:
         last_err: Exception | None = None
         for i in range(retries):
             try:
@@ -110,9 +110,13 @@ class HyperliquidMicrostructureTask(NotifyingTaskMixin, BaseTask):
                     if resp.status == 200:
                         return json.loads(text)
                     last_err = RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                    if resp.status == 429:
+                        # Rate limited — back off more aggressively
+                        await asyncio.sleep(min(5.0, 0.5 * (2 ** i)))
+                        continue
             except Exception as e:  # noqa: BLE001
                 last_err = e
-            await asyncio.sleep(min(1.5, 0.2 * (2 ** i)))
+            await asyncio.sleep(min(2.0, 0.3 * (2 ** i)))
         raise RuntimeError(f"HL request failed ({payload.get('type')}): {last_err}")
 
     async def _get_bybit_pairs(self) -> set[str]:

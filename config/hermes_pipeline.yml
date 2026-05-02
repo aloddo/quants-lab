@@ -138,11 +138,11 @@ tasks:
     task_class: app.tasks.data_collection.hyperliquid_funding_task.HyperliquidFundingTask
     schedule:
       type: cron
-      cron: "*/15 * * * *"
+      cron: "5 */2 * * *"
       timezone: UTC
     max_retries: 2
-    retry_delay_seconds: 60
-    timeout_seconds: 600
+    retry_delay_seconds: 120
+    timeout_seconds: 900
     config:
       collection_name: "hyperliquid_funding_rates"
       backfill_days: 365
