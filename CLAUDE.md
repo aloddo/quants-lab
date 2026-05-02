@@ -1,8 +1,12 @@
 # CLAUDE.md — Project Instructions
 
+## Mission
+
+Generate $500 MRR from live crypto trading. Continuously ideate, validate, ship, and monitor strategies. When one is live, the next is already in research. Never idle.
+
 ## What is this repo
 
-Fork of `hummingbot/quants-lab` with a systematic crypto trading system. Two execution modes: HB-native controllers (backtest + live via Docker) and custom Python scripts (H2 V3 arb engine). Trading on Bybit demo (api-demo.bybit.com) + Binance spot. All backtesting uses 1m resolution with derivatives data (funding, OI, LS ratio) merged from MongoDB.
+Fork of `hummingbot/quants-lab` with a systematic crypto trading system. Two execution modes: HB-native controllers (backtest + live via Docker) and custom Python scripts (H2 V3 arb engine). Trading on Bybit (live + demo) + Binance spot. All backtesting uses 1m resolution with derivatives data (funding, OI, LS ratio) merged from MongoDB.
 
 **For current strategy status, live positions, and roadmap:** see `~/albertos-kb/projects/quant/overview.md` (canonical source of truth, updated every session).
 
