@@ -73,12 +73,25 @@ class HLMarketMaker:
         mongo_uri: str = "mongodb://localhost:27017/quants_lab",
         dry_run: bool = False,
         config: Optional[HLMMConfig] = None,
+        query_address: Optional[str] = None,
     ):
         # Credentials
+        # address = signing address (agent wallet from env)
+        # query_address = address for info queries (parent wallet where funds/positions live)
+        # On HL, an agent key signs orders that execute on the parent wallet.
+        # But info queries (user_state, open_orders, userFills) must target the PARENT wallet.
         self.private_key = private_key or os.environ.get("HL_PRIVATE_KEY", "")
-        self.address = address or os.environ.get("HL_ADDRESS", "")
-        if not self.private_key or not self.address:
-            raise ValueError("HL_PRIVATE_KEY and HL_ADDRESS required")
+        self.address = query_address or os.environ.get("HL_QUERY_ADDRESS", HL_ADDRESS)
+        self._signing_address = address or os.environ.get("HL_ADDRESS", "")
+        if not self.private_key:
+            raise ValueError("HL_PRIVATE_KEY required")
+        if not self.address:
+            raise ValueError("HL_ADDRESS or HL_QUERY_ADDRESS required")
+        if self.address != self._signing_address:
+            logger.info(
+                f"Agent mode: signing as {self._signing_address[:10]}..., "
+                f"querying parent {self.address[:10]}..."
+            )
 
         self.leverage = leverage
         self.dry_run = dry_run
@@ -137,10 +150,12 @@ class HLMarketMaker:
         self._hedge_entry_prices: dict[str, float] = {}
         self._hedge_in_progress: dict[str, float] = {}  # coin -> timestamp when hedge placed
 
-        # Bug #8: Shared rate limiter (token bucket: max 4/sec, burst 6)
-        self._rate_tokens: float = 6.0
-        self._rate_max: float = 6.0
-        self._rate_refill_per_sec: float = 4.0
+        # Bug #8: Shared rate limiter (token bucket)
+        # HL /exchange rate limit is ~12 calls/8s = 1.5/sec (undocumented, volume-gated)
+        # Set conservative: 1.2/sec refill, burst 3 to avoid 429 storms
+        self._rate_tokens: float = 3.0
+        self._rate_max: float = 3.0
+        self._rate_refill_per_sec: float = 1.2
         self._rate_last_refill: float = 0.0
 
         # Bug #12: asyncio.Lock for signal state access
@@ -164,6 +179,24 @@ class HLMarketMaker:
         # Bug #14: Sticky daily stop — tracks the UTC date when stopped
         self._daily_stop_sticky: bool = False
         self._daily_stop_date: Optional[object] = None  # date object
+
+        # === FILL DETECTION HARDENING (P0 — May 2 incident) ===
+        # WS userFills subscription ID (for unsubscribe)
+        self._ws_user_fills_sub_id: Optional[int] = None
+        self._ws_order_updates_sub_id: Optional[int] = None
+        self._ws_fills_received: int = 0  # count of fills via WS (vs REST)
+        self._ws_fills_last_time: float = 0.0  # last WS fill timestamp
+
+        # Fill sync health: consecutive REST poll failures trigger quoting pause
+        self._fill_poll_consecutive_failures: int = 0
+        self._fill_poll_max_failures: int = 3  # pause quoting after 3 consecutive failures
+        self._fill_sync_healthy: bool = True  # False = blind, pause quoting
+
+        # Max fills/min circuit breaker: if we get too many fills too fast,
+        # we're likely getting adversely selected or something is wrong
+        self._fill_timestamps: list[float] = []  # rolling window of fill times
+        self._max_fills_per_minute: int = 20  # circuit breaker threshold
+        self._fill_rate_breaker_until: float = 0.0  # pause quoting until this time
 
     # ==================================================================
     # Bug #8: Rate limiter
@@ -239,12 +272,18 @@ class HLMarketMaker:
     # ==================================================================
 
     def _init_sdk(self) -> None:
-        """Initialize HL SDK (makes REST calls, so not in __init__)."""
+        """Initialize HL SDK (makes REST calls, so not in __init__).
+
+        Agent mode: the private key is from the agent wallet, but positions
+        and fills live on the parent wallet (self.address). The Exchange SDK
+        needs account_address=parent_wallet to route orders correctly.
+        """
         wallet = eth_account.Account.from_key(self.private_key)
         api_url = constants.MAINNET_API_URL
 
         # skip_ws=False to enable WS subscriptions on Info
         self.info = Info(api_url, skip_ws=False)
+        # Exchange needs the parent (query) address so orders route there
         account_addr = self.address if wallet.address.lower() != self.address.lower() else None
         self.exchange = Exchange(wallet, api_url, account_address=account_addr)
 
@@ -357,6 +396,10 @@ class HLMarketMaker:
             f"Dry run: {self.dry_run}",
         )
 
+        # === FILL DETECTION HARDENING: Subscribe to WS userFills + orderUpdates ===
+        # These are the PRIMARY fill detection path. REST poll is fallback only.
+        self._subscribe_user_fills_ws()
+
         # Start background tasks
         tasks = [
             asyncio.create_task(self._main_loop(), name="main_loop"),
@@ -377,13 +420,13 @@ class HLMarketMaker:
             await self._shutdown()
 
     async def _main_loop(self) -> None:
-        """Core tick loop. Runs every ~500ms."""
+        """Core tick loop. Runs every ~1.5s (matched to HL exchange rate limit)."""
         while self._running:
             try:
                 await self._tick()
             except Exception as e:
                 logger.error(f"Tick error: {e}", exc_info=True)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.5)
 
     async def _tick(self) -> None:
         """Single iteration of the main loop.
@@ -580,20 +623,13 @@ class HLMarketMaker:
             past_warmup = (now - self._start_time > 30.0)
             if not past_warmup:
                 cb_active = False
-            elif book.spread_bps > 8.0:
-                # Wide spread: only CB on 2+ simultaneous flags or anchor_jump
-                flag_count = sum([signal.depth_drop_detected, signal.spread_spike_detected,
-                                  signal.trade_imbalance_toxic, signal.anchor_jump_detected,
-                                  signal.touch_depletion])
-                cb_active = signal.anchor_jump_detected or flag_count >= 2
-            elif book.spread_bps > 4.0:
-                # Mid spread: CB on anchor_jump or 2+ other flags
-                flag_count = sum([signal.depth_drop_detected, signal.spread_spike_detected,
-                                  signal.trade_imbalance_toxic, signal.touch_depletion])
-                cb_active = signal.anchor_jump_detected or flag_count >= 2
             else:
-                # Tight spread (majors): any single flag triggers CB
-                cb_active = signal.any_toxic_flag
+                # Shitcoin MM: signal-based CB is too noisy. Spread oscillates
+                # between 1-15bps and microstructure flags fire constantly.
+                # Only trigger signal CB on anchor_jump (major price dislocation
+                # detected via Bybit reference price divergence).
+                # Fill-based CB (toxic markout in fill_tracker) handles the rest.
+                cb_active = signal.anchor_jump_detected
 
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,
@@ -619,6 +655,12 @@ class HLMarketMaker:
 
             # Run state machine
             state_info = self.state_machine.transition(coin, ctx)
+
+            # Freeze inventory age during CB pause to prevent automatic
+            # emergency flatten (180s age limit < 300s CB pause = always taker exit)
+            if state_info.state == PairState.PAUSE and abs(pos.size) > 1e-10:
+                # Shift opened_at forward by tick interval to freeze age
+                self.inventory.pause_inventory_age(coin, 1.5)
 
             # Bug #9: Handle EMERGENCY_FLATTEN state
             # Bug #2 (Codex R4): Verify close, retry up to 3x, fallback to Bybit hedge
@@ -692,6 +734,25 @@ class HLMarketMaker:
             # Compute and execute quotes
             if state_info.state in (PairState.QUOTING_BOTH, PairState.QUOTING_ONE_SIDE,
                                      PairState.INVENTORY_EXIT):
+                # FILL DETECTION HARDENING: Block new quotes if fill detection is blind
+                if not self._fill_sync_healthy:
+                    if self._tick_count % 20 == 0:  # log every ~10s
+                        logger.warning(
+                            f"{coin}: quoting BLOCKED — fill sync unhealthy "
+                            f"({self._fill_poll_consecutive_failures} consecutive REST failures, "
+                            f"WS fills received: {self._ws_fills_received})"
+                        )
+                    # Cancel existing quotes but don't place new ones
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
+                    continue
+
+                # FILL DETECTION HARDENING: Block new quotes if fill rate breaker active
+                if self._check_fill_rate_breaker():
+                    if self._tick_count % 20 == 0:
+                        logger.warning(f"{coin}: quoting BLOCKED — fill rate breaker active")
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
+                    continue
+
                 # Bug #5: Portfolio-level check before quoting
                 # Bug #4 (Codex R4): Also check net exposure and resting notional
                 proposed_notional = self.inventory.get_limits(coin).q_soft * 0.5
@@ -846,6 +907,12 @@ class HLMarketMaker:
             self._bybit_anchor_stale = True
             # The _bybit_ws_loop will detect disconnection and reconnect
 
+        # === STEP 5c: HYPERCARE position reconciliation (every 5min) ===
+        # Compare inventory manager's position state vs actual exchange positions.
+        # Alert on any mismatch > threshold — catches blind fill accumulation.
+        if self._tick_count % 600 == 0 and not self.dry_run:
+            await self._hypercare_position_check()
+
         # === STEP 6: Status log (every 60s) ===
         if self._tick_count % 120 == 0:
             self._log_status()
@@ -882,6 +949,9 @@ class HLMarketMaker:
 
         # Bug #13: Track fill counts for pair lifecycle gating
         self._pair_fill_counts[coin] = self._pair_fill_counts.get(coin, 0) + 1
+
+        # FILL DETECTION HARDENING: Record fill timestamp for rate breaker
+        self._fill_timestamps.append(time.time())
 
         self.inventory.record_fill(coin, side, price, size)
         self.fill_tracker.record_fill(
@@ -1024,6 +1094,200 @@ class HLMarketMaker:
                 self._last_hl_ws_time[coin] = time.time()
         except Exception as e:
             logger.debug(f"HL trade parse error for {coin}: {e}")
+
+    # ==================================================================
+    # FILL DETECTION HARDENING: WS userFills + orderUpdates
+    # ==================================================================
+
+    def _subscribe_user_fills_ws(self) -> None:
+        """Subscribe to HL WS userFills + orderUpdates for this address.
+
+        PRIMARY fill detection path. Fires on every fill instantly via WS,
+        no REST rate limit concern. REST poll (_fill_poll_loop) is fallback.
+        """
+        if not self.info or self.dry_run:
+            return
+
+        try:
+            self._ws_user_fills_sub_id = self.info.subscribe(
+                {"type": "userFills", "user": self.address},
+                self._on_ws_user_fills,
+            )
+            logger.info(f"Subscribed to WS userFills for {self.address[:10]}...")
+        except Exception as e:
+            logger.error(f"Failed to subscribe WS userFills: {e}")
+
+        try:
+            self._ws_order_updates_sub_id = self.info.subscribe(
+                {"type": "orderUpdates", "user": self.address},
+                self._on_ws_order_updates,
+            )
+            logger.info(f"Subscribed to WS orderUpdates for {self.address[:10]}...")
+        except Exception as e:
+            logger.error(f"Failed to subscribe WS orderUpdates: {e}")
+
+    def _unsubscribe_user_fills_ws(self) -> None:
+        """Unsubscribe from userFills + orderUpdates."""
+        if not self.info:
+            return
+        try:
+            if self._ws_user_fills_sub_id is not None:
+                self.info.unsubscribe(
+                    {"type": "userFills", "user": self.address},
+                    self._ws_user_fills_sub_id,
+                )
+            if self._ws_order_updates_sub_id is not None:
+                self.info.unsubscribe(
+                    {"type": "orderUpdates", "user": self.address},
+                    self._ws_order_updates_sub_id,
+                )
+        except Exception:
+            pass
+
+    def _on_ws_user_fills(self, data: dict) -> None:
+        """Callback for WS userFills messages.
+
+        Format: {"user": "0x...", "isSnapshot": bool, "fills": [
+            {"coin": "BIO", "px": "0.123", "sz": "100", "side": "B",
+             "time": 1714..., "hash": "0x...", "oid": 123, "fee": "0.01",
+             "tid": 456, "crossed": true, ...}
+        ]}
+
+        This is the PRIMARY fill detection path. Each fill is processed
+        immediately and deduped against the REST poll fallback.
+        """
+        try:
+            fills_data = None
+            if isinstance(data, dict):
+                if "fills" in data:
+                    fills_data = data["fills"]
+                elif "data" in data and isinstance(data["data"], dict):
+                    fills_data = data["data"].get("fills", [])
+
+            if not fills_data:
+                return
+
+            is_snapshot = False
+            if isinstance(data, dict):
+                is_snapshot = data.get("isSnapshot", False)
+                if "data" in data:
+                    is_snapshot = data["data"].get("isSnapshot", False)
+
+            for fill_data in fills_data:
+                coin = fill_data.get("coin", "")
+                if coin not in self._active_coins:
+                    continue
+
+                # Build fill dict matching _handle_fill format
+                raw_side = fill_data.get("side", "")
+                side = "bid" if raw_side == "B" else "ask"
+                price = float(fill_data.get("px", 0) or 0)
+                size = float(fill_data.get("sz", 0) or 0)
+                fee = float(fill_data.get("fee", 0) or 0)
+                oid = fill_data.get("oid", 0)
+                fill_time = fill_data.get("time", "")
+                fill_hash = fill_data.get("hash", "")
+
+                if price <= 0 or size <= 0:
+                    continue
+
+                # Skip snapshot fills (historical) — only process live fills
+                if is_snapshot:
+                    # Still add to known hashes to avoid REST re-processing
+                    fh = self._fill_hash({"oid": oid, "time": fill_time, "hash": fill_hash})
+                    self._known_fill_hashes[fh] = True
+                    while len(self._known_fill_hashes) > self._known_fill_hashes_maxlen:
+                        self._known_fill_hashes.popitem(last=False)
+                    continue
+
+                logger.info(
+                    f"FILL (WS): {coin} {side} {size:.6f} @ ${price:.6f} "
+                    f"oid={oid} fee=${fee:.4f}"
+                )
+
+                self._ws_fills_received += 1
+                self._ws_fills_last_time = time.time()
+
+                # Process fill (same path as REST fallback)
+                self._handle_fill(coin, {
+                    "side": side,
+                    "price": price,
+                    "size": size,
+                    "fee": fee,
+                    "oid": oid,
+                    "time": fill_time,
+                    "hash": fill_hash,
+                    "source": "ws",
+                })
+
+        except Exception as e:
+            logger.warning(f"WS userFills callback error: {e}")
+
+    def _on_ws_order_updates(self, data: dict) -> None:
+        """Callback for WS orderUpdates messages.
+
+        Provides real-time order status changes (filled, cancelled, etc.)
+        which helps the quote engine clear stale order state faster.
+        """
+        try:
+            orders = None
+            if isinstance(data, list):
+                orders = data
+            elif isinstance(data, dict) and "data" in data:
+                orders = data["data"] if isinstance(data["data"], list) else [data["data"]]
+            elif isinstance(data, dict):
+                orders = [data]
+
+            if not orders:
+                return
+
+            for order_data in orders:
+                coin = order_data.get("coin", "")
+                status = order_data.get("status", "")
+                oid = order_data.get("oid", 0)
+
+                if status in ("filled", "canceled", "cancelled", "marginCanceled"):
+                    logger.debug(
+                        f"ORDER UPDATE (WS): {coin} oid={oid} status={status}"
+                    )
+                    # Clear from quote engine tracking if still present
+                    if self.quote_engine and coin in self._active_coins:
+                        self.quote_engine.clear_order_by_oid(coin, oid)
+
+        except Exception as e:
+            logger.debug(f"WS orderUpdates callback error: {e}")
+
+    def _check_fill_rate_breaker(self) -> bool:
+        """Check if fill rate circuit breaker is active.
+
+        Returns True if quoting should be paused due to excessive fill rate.
+        """
+        now = time.time()
+
+        # Check if in breaker cooldown
+        if now < self._fill_rate_breaker_until:
+            return True
+
+        # Clean old timestamps (keep last 60s)
+        self._fill_timestamps = [
+            t for t in self._fill_timestamps if now - t < 60.0
+        ]
+
+        if len(self._fill_timestamps) >= self._max_fills_per_minute:
+            # Trip the breaker: pause for 60s
+            self._fill_rate_breaker_until = now + 60.0
+            logger.warning(
+                f"FILL RATE BREAKER: {len(self._fill_timestamps)} fills in last 60s "
+                f"(max={self._max_fills_per_minute}). Pausing quoting for 60s."
+            )
+            self.notifier.notify_engine_event(
+                "FILL_RATE_BREAKER",
+                f"{len(self._fill_timestamps)} fills/min exceeded threshold "
+                f"of {self._max_fills_per_minute}. Quoting paused 60s.",
+            )
+            return True
+
+        return False
 
     # ==================================================================
     # Bybit WebSocket
@@ -1270,8 +1534,17 @@ class HLMarketMaker:
         Cross-references with known fills. Any new fills not yet tracked
         are processed as if they came from the WS subscription.
         """
-        # Wait for initial tick cycle
-        await asyncio.sleep(10)
+        # FILL DETECTION HARDENING: Seed dedup hash set from initial REST query.
+        # This prevents old fills from prior sessions being re-processed.
+        # Wait 5s for WS snapshot to arrive first, then seed remaining.
+        await asyncio.sleep(5)
+        try:
+            await self._seed_fill_hashes()
+        except Exception as e:
+            logger.warning(f"Fill hash seeding failed: {e}")
+
+        # Wait remaining time before first real poll
+        await asyncio.sleep(5)
         interval = self.config.timing.fill_poll_interval_s
 
         while self._running:
@@ -1284,7 +1557,12 @@ class HLMarketMaker:
                 logger.warning(f"Fill poll error: {e}")
 
     async def _poll_fills_rest(self) -> None:
-        """Query HL REST for recent user fills and process any missed ones."""
+        """Query HL REST for recent user fills and process any missed ones.
+
+        FILL DETECTION HARDENING: Tracks consecutive failures.
+        If REST fails 3x in a row AND no WS fills have been received recently,
+        mark fill sync as unhealthy → quoting pauses until sync recovers.
+        """
         try:
             # Bug #3 (Codex R4): Gate through shared rate limiter
             resp = await self._hl_rest_call(
@@ -1294,12 +1572,23 @@ class HLMarketMaker:
                 timeout=5,
             )
             if resp.status_code != 200:
-                logger.debug(f"Fill poll HTTP {resp.status_code}")
+                self._fill_poll_consecutive_failures += 1
+                logger.warning(
+                    f"Fill poll HTTP {resp.status_code} "
+                    f"(consecutive failures: {self._fill_poll_consecutive_failures})"
+                )
+                self._update_fill_sync_health()
                 return
 
             fills = resp.json()
             if not isinstance(fills, list):
+                self._fill_poll_consecutive_failures += 1
+                self._update_fill_sync_health()
                 return
+
+            # SUCCESS: Reset consecutive failure counter
+            self._fill_poll_consecutive_failures = 0
+            self._update_fill_sync_health()
 
             # Process recent fills (last 50)
             for fill_data in fills[-50:]:
@@ -1332,6 +1621,7 @@ class HLMarketMaker:
                         "size": size,
                         "fee": fee,
                         "oid": oid,
+                        "source": "rest",
                     })
 
             # Bug #4 fix: Evict oldest entries via OrderedDict FIFO
@@ -1339,13 +1629,199 @@ class HLMarketMaker:
                 self._known_fill_hashes.popitem(last=False)
 
         except Exception as e:
-            logger.debug(f"Fill poll REST error: {e}")
+            self._fill_poll_consecutive_failures += 1
+            logger.warning(
+                f"Fill poll REST error: {e} "
+                f"(consecutive failures: {self._fill_poll_consecutive_failures})"
+            )
+            self._update_fill_sync_health()
+
+    def _update_fill_sync_health(self) -> None:
+        """Update fill sync health status based on REST poll failures + WS state.
+
+        Fill sync is HEALTHY if EITHER:
+        - REST poll succeeded recently (consecutive_failures == 0), OR
+        - WS userFills received a fill in the last 120s (WS is alive)
+
+        Fill sync is UNHEALTHY (blind) if BOTH:
+        - REST poll failed >= 3 consecutive times, AND
+        - No WS fills received in the last 120s
+        """
+        now = time.time()
+        rest_ok = self._fill_poll_consecutive_failures == 0
+        ws_alive = (now - self._ws_fills_last_time) < 120.0 if self._ws_fills_last_time > 0 else False
+        # WS subscription is healthy if it was set up (even without fills yet)
+        ws_subscribed = self._ws_user_fills_sub_id is not None
+
+        was_healthy = self._fill_sync_healthy
+
+        if rest_ok:
+            self._fill_sync_healthy = True
+        elif ws_subscribed and (ws_alive or self._ws_fills_received == 0):
+            # WS is subscribed. If no fills yet, give benefit of doubt
+            # (maybe no fills have occurred — that's fine)
+            self._fill_sync_healthy = True
+        elif self._fill_poll_consecutive_failures >= self._fill_poll_max_failures:
+            self._fill_sync_healthy = False
+        else:
+            self._fill_sync_healthy = True
+
+        # Log state transitions
+        if was_healthy and not self._fill_sync_healthy:
+            logger.error(
+                f"FILL SYNC UNHEALTHY: REST failed {self._fill_poll_consecutive_failures}x, "
+                f"WS fills last seen {now - self._ws_fills_last_time:.0f}s ago. "
+                f"QUOTING PAUSED until fill sync recovers."
+            )
+            self.notifier.notify_engine_event(
+                "FILL_SYNC_BLIND",
+                f"REST poll failed {self._fill_poll_consecutive_failures}x consecutively. "
+                f"WS fills not received recently. Quoting paused — fills cannot be detected.",
+            )
+        elif not was_healthy and self._fill_sync_healthy:
+            logger.info("FILL SYNC RECOVERED: fill detection operational, resuming quoting")
+            self.notifier.notify_engine_event(
+                "FILL_SYNC_RECOVERED",
+                "Fill detection recovered. Quoting resumed.",
+            )
+
+    async def _seed_fill_hashes(self) -> None:
+        """Seed the dedup hash set with existing fills from REST.
+
+        Called once on startup BEFORE the first real poll. This prevents
+        old fills from prior sessions being re-processed as new fills.
+        Only adds hashes — does NOT process any fills.
+        """
+        try:
+            resp = await self._hl_rest_call(
+                sync_requests.post,
+                HL_INFO_API,
+                json={"type": "userFills", "user": self.address},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Fill hash seeding HTTP {resp.status_code}")
+                return
+
+            fills = resp.json()
+            if not isinstance(fills, list):
+                return
+
+            seeded = 0
+            for fill_data in fills:
+                fh = self._fill_hash(fill_data)
+                if fh not in self._known_fill_hashes:
+                    self._known_fill_hashes[fh] = True
+                    seeded += 1
+
+            while len(self._known_fill_hashes) > self._known_fill_hashes_maxlen:
+                self._known_fill_hashes.popitem(last=False)
+
+            logger.info(
+                f"Seeded {seeded} fill hashes from REST "
+                f"(total known: {len(self._known_fill_hashes)})"
+            )
+
+        except Exception as e:
+            logger.warning(f"Fill hash seeding error: {e}")
 
     @staticmethod
     def _fill_hash(fill_data: dict) -> str:
         """Create unique hash for a fill record."""
         key = f"{fill_data.get('oid', '')}-{fill_data.get('time', '')}-{fill_data.get('hash', '')}"
         return hashlib.md5(key.encode()).hexdigest()
+
+    # ==================================================================
+    # HYPERCARE: Position reconciliation
+    # ==================================================================
+
+    async def _hypercare_position_check(self) -> None:
+        """Compare inventory manager's position state vs actual exchange state.
+
+        Runs every 5 minutes. If there's a position on-exchange that the
+        inventory manager doesn't know about (or vice versa), raise alarm
+        and potentially pause quoting.
+
+        This catches the exact failure mode from the BIO incident: fills
+        accumulating without inventory awareness.
+        """
+        try:
+            # Fresh REST query for actual exchange positions
+            state = await asyncio.to_thread(
+                self.info.user_state, self.address
+            )
+            if not state:
+                logger.warning("HYPERCARE: user_state returned None")
+                return
+
+            exchange_positions: dict[str, float] = {}
+            for pos_data in state.get("assetPositions", []):
+                p = pos_data.get("position", {})
+                coin = p.get("coin", "")
+                size = float(p.get("szi", 0))
+                if abs(size) > 1e-10:
+                    exchange_positions[coin] = size
+
+            # Compare with inventory manager
+            discrepancies = []
+            all_coins = set(exchange_positions.keys()) | self._active_coins
+
+            for coin in all_coins:
+                exchange_size = exchange_positions.get(coin, 0)
+                inv_pos = self.inventory.get_position(coin)
+                inv_size = inv_pos.size
+
+                diff = abs(exchange_size - inv_size)
+                if diff > 1e-10:
+                    # Check if this is a meaningful discrepancy
+                    # (ignore dust from rounding)
+                    mid = self.fv_engine.get_mid(coin) if self.fv_engine else 0
+                    diff_usd = diff * mid if mid > 0 else diff
+                    if diff_usd > 1.0:  # $1 threshold
+                        discrepancies.append({
+                            "coin": coin,
+                            "exchange": exchange_size,
+                            "inventory": inv_size,
+                            "diff": diff,
+                            "diff_usd": diff_usd,
+                        })
+
+            if discrepancies:
+                msg_parts = ["HYPERCARE POSITION MISMATCH:"]
+                for d in discrepancies:
+                    msg_parts.append(
+                        f"  {d['coin']}: exchange={d['exchange']:.6f} "
+                        f"inv={d['inventory']:.6f} diff=${d['diff_usd']:.2f}"
+                    )
+                msg = "\n".join(msg_parts)
+                logger.error(msg)
+
+                # Telegram alert
+                self.notifier.notify_engine_event(
+                    "POSITION_MISMATCH",
+                    "\n".join(
+                        f"{d['coin']}: exch={d['exchange']:.4f} inv={d['inventory']:.4f} "
+                        f"(${d['diff_usd']:.2f})"
+                        for d in discrepancies
+                    ),
+                )
+
+                # If any discrepancy > $10, pause all quoting
+                max_disc = max(d["diff_usd"] for d in discrepancies)
+                if max_disc > 10.0:
+                    logger.critical(
+                        f"HYPERCARE: ${max_disc:.2f} position discrepancy — "
+                        f"pausing all quoting for 300s"
+                    )
+                    for coin in self._active_coins:
+                        self.state_machine.force_pause(
+                            coin, 300, f"HYPERCARE: position mismatch ${max_disc:.2f}"
+                        )
+            else:
+                logger.info("HYPERCARE: positions reconciled OK")
+
+        except Exception as e:
+            logger.warning(f"HYPERCARE position check error: {e}")
 
     # ==================================================================
     # Daily summary loop (Gap 8)
@@ -1611,9 +2087,15 @@ class HLMarketMaker:
         else:
             limit_price = fair_value - offset
 
-        # Round for Bybit (perps use tick sizes, approximate with 2 decimals)
-        sz_str = f"{hedge_size:.4f}"
-        px_str = f"{limit_price:.2f}"
+        # Round for Bybit: floor to whole number (most shitcoin perps have qtyStep=1)
+        # TODO: query instrument info for exact qtyStep per symbol
+        hedge_size = math.floor(hedge_size)
+        if hedge_size < 1:
+            logger.warning(f"HEDGE SKIP: {coin} hedge_size={hedge_size} < 1 after rounding")
+            return
+
+        sz_str = f"{hedge_size:.0f}"
+        px_str = f"{limit_price:.4f}"
         symbol = f"{coin}USDT"
 
         logger.warning(
@@ -1850,6 +2332,9 @@ class HLMarketMaker:
         logger.info("Graceful shutdown initiated...")
         self._running = False
 
+        # Unsubscribe from WS userFills + orderUpdates
+        self._unsubscribe_user_fills_ws()
+
         # Step 2: Cancel ALL resting orders with retry loop (Bug #2: up to 60s)
         verified_clean = False
         if self.quote_engine and not self.dry_run:
@@ -1985,13 +2470,22 @@ class HLMarketMaker:
         uptime = time.time() - self._start_time
         snapshot = self.inventory._get_snapshot()
 
+        fill_sync_str = "HEALTHY" if self._fill_sync_healthy else "BLIND"
+        ws_fills_str = f"ws_fills={self._ws_fills_received}"
+        rest_fail_str = f"rest_fail={self._fill_poll_consecutive_failures}"
+        rate_breaker = "ACTIVE" if time.time() < self._fill_rate_breaker_until else "off"
+
         logger.info(
             f"STATUS: uptime={uptime/60:.0f}m ticks={self._tick_count} "
             f"coins={list(self._active_coins)} "
             f"gross=${snapshot.total_gross_notional:.2f} "
             f"net=${snapshot.total_net_exposure:.2f} "
             f"pnl=${snapshot.daily_pnl:.2f} "
-            f"equity=${self.inventory._equity:.2f}"
+            f"equity=${self.inventory._equity:.2f} "
+            f"(spot=${getattr(self.inventory, '_cached_spot_equity', 0):.2f} "
+            f"start=${self.inventory._session_start_equity or 0:.2f}) "
+            f"fill_sync={fill_sync_str} {ws_fills_str} {rest_fail_str} "
+            f"rate_breaker={rate_breaker}"
         )
 
         for coin in self._active_coins:

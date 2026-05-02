@@ -261,6 +261,10 @@ class QuoteEngine:
                 # We are short, buying to exit -> more aggressive bid
                 bid_px = min(bid_px + improve_price + exit_extra, hl_ask - tick_sz)
 
+            # MAKER ENFORCEMENT: Never place bid above best bid (would cross and pay taker)
+            # Allow joining the touch (bid_px == hl_bid) but never improving past it
+            bid_px = min(bid_px, hl_bid)
+
             # Bug #6 (Codex R4): Round to tick size FIRST, then check crosses
             bid_sz_usd = self._compute_child_size(
                 coin, depth20_bid_usd, free_equity_usd, q_soft, vol_scale, anchor_scale
@@ -290,6 +294,10 @@ class QuoteEngine:
             elif exit_mode and inventory_usd > 0:
                 # We are long, selling to exit -> more aggressive ask
                 ask_px = max(ask_px - improve_price - exit_extra, hl_bid + tick_sz)
+
+            # MAKER ENFORCEMENT: Never place ask below best ask (would cross and pay taker)
+            # Allow joining the touch (ask_px == hl_ask) but never improving past it
+            ask_px = max(ask_px, hl_ask)
 
             # Bug #6 (Codex R4): Round to tick size FIRST, then check crosses
             ask_sz_usd = self._compute_child_size(
@@ -478,6 +486,22 @@ class QuoteEngine:
         if cancel_ok:
             self._states[coin] = QuoteState()
         # If cancel failed, state is preserved with stale orders tracked
+
+    def clear_order_by_oid(self, coin: str, oid: int) -> None:
+        """Clear a tracked order by OID (called when WS orderUpdates reports
+        the order is filled/cancelled). This avoids stale order state that
+        would otherwise persist until the next detect_fills() REST call."""
+        state = self._states.get(coin)
+        if not state:
+            return
+        for attr in ("bid_order", "ask_order"):
+            order = getattr(state, attr)
+            if order and order.oid == oid:
+                logger.debug(f"Cleared {coin} {attr} oid={oid} via WS orderUpdate")
+                setattr(state, attr, None)
+                # Also remove from pending fill check if present
+                self._pending_fill_check.pop(oid, None)
+                return
 
     def detect_fills(self, coin: str) -> list[dict]:
         """Detect fills by checking order status changes.

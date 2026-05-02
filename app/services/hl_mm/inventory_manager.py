@@ -131,6 +131,11 @@ class InventoryManager:
         self._daily_pnl: float = 0.0
         self._last_position_sync: float = 0.0
 
+        # FILL DETECTION HARDENING: Track whether position sync has ever succeeded.
+        # Never trust inventory=0 if sync hasn't completed at least once.
+        self._sync_ever_succeeded: bool = False
+        self._sync_consecutive_failures: int = 0
+
     def get_limits(self, coin: str) -> PairLimits:
         """Get inventory limits for a coin."""
         return PAIR_LIMITS.get(coin, DEFAULT_LIMITS)
@@ -229,6 +234,59 @@ class InventoryManager:
             return 0.0
         return time.time() - pos.opened_at
 
+    def pause_inventory_age(self, coin: str, pause_duration_s: float) -> None:
+        """Shift opened_at forward to freeze inventory age during CB pause.
+
+        Without this, a 5min CB pause always exceeds the 180s emergency
+        flatten limit, causing every paused position to be market-closed.
+        """
+        pos = self._positions.get(coin)
+        if pos and pos.size != 0 and pos.opened_at > 0:
+            pos.opened_at += pause_duration_s
+            logger.debug(
+                f"{coin}: inventory age paused {pause_duration_s:.0f}s "
+                f"(effective age now {time.time() - pos.opened_at:.0f}s)"
+            )
+
+    # ------------------------------------------------------------------
+    # Spot equity fallback (HL unified account fix)
+    # ------------------------------------------------------------------
+
+    def _query_spot_equity(self) -> float:
+        """Query spot USDC balance as equity fallback.
+
+        On HL unified accounts, all funds may be in spot USDC (still usable
+        as perps margin) but accountValue reports $0. This queries spot
+        balances and sums USDC holdings as the true equity.
+
+        Rate-limited: caches result for 5s to balance accuracy vs API load.
+        """
+        now = time.time()
+        if hasattr(self, '_last_spot_query') and now - self._last_spot_query < 5.0:
+            return getattr(self, '_cached_spot_equity', 0.0)
+
+        try:
+            spot_state = self.info.spot_user_state(self.address)
+            if not spot_state:
+                return 0.0
+
+            total_usdc = 0.0
+            for bal in spot_state.get("balances", []):
+                coin = bal.get("coin", "")
+                if coin == "USDC":
+                    total_usdc += float(bal.get("total", 0) or 0)
+
+            self._last_spot_query = now
+            self._cached_spot_equity = total_usdc
+
+            if total_usdc > 0:
+                logger.debug(f"Spot equity fallback: ${total_usdc:.2f} USDC")
+
+            return total_usdc
+        except Exception as e:
+            logger.debug(f"Spot equity query failed: {e}")
+            return getattr(self, '_cached_spot_equity', 0.0)
+
     # ------------------------------------------------------------------
     # Position sync from exchange
     # ------------------------------------------------------------------
@@ -251,10 +309,14 @@ class InventoryManager:
             account_value = float(margin.get("accountValue", 0) or 0)
             total_margin = float(margin.get("totalMarginUsed", 0) or 0)
 
-            # On HL unified accounts, accountValue may show $0 if all funds
-            # are in spot USDC (still usable as perps margin).
-            if account_value > 0:
-                self._equity = account_value
+            # HL unified accounts: total equity = perps accountValue + spot USDC.
+            # When flat: accountValue=0, all in spot. When position open:
+            # accountValue has margin+uPnL, spot has the rest. Must sum BOTH.
+            spot_equity = self._query_spot_equity()
+            combined_equity = account_value + spot_equity
+
+            if combined_equity > 0:
+                self._equity = combined_equity
                 self._equity_ever_confirmed = True
             # else: keep existing _equity (default 54.0 or last known good)
 
@@ -304,15 +366,29 @@ class InventoryManager:
                 else:
                     self._positions[coin] = PositionState(coin=coin)
 
-            # Clear coins not returned
+            # Clear coins not returned — but ONLY if sync has succeeded before.
+            # If this is the first successful sync, we trust it. If sync has
+            # never succeeded, we don't zero out positions (they might be real
+            # positions the sync hasn't seen yet).
             for coin in list(self._positions.keys()):
                 if coin not in returned_coins and coin in self._positions:
-                    self._positions[coin] = PositionState(coin=coin)
+                    if self._sync_ever_succeeded:
+                        self._positions[coin] = PositionState(coin=coin)
+                    else:
+                        logger.warning(
+                            f"Position sync: {coin} not returned but sync never "
+                            f"confirmed — keeping existing position state"
+                        )
 
             self._last_position_sync = now
+            self._sync_ever_succeeded = True
+            self._sync_consecutive_failures = 0
 
         except Exception as e:
-            logger.warning(f"Position sync failed: {e}")
+            self._sync_consecutive_failures += 1
+            logger.warning(
+                f"Position sync failed ({self._sync_consecutive_failures}x): {e}"
+            )
 
         return self._get_snapshot()
 
@@ -353,9 +429,12 @@ class InventoryManager:
             margin = state.get("marginSummary", {})
             account_value = float(margin.get("accountValue", 0) or 0)
 
-            # HL unified accounts may report $0 accountValue when funds are in spot
-            if account_value > 0:
-                self._equity = account_value
+            # HL unified accounts: total equity = perps accountValue + spot USDC
+            spot_equity = self._query_spot_equity()
+            combined_equity = account_value + spot_equity
+
+            if combined_equity > 0:
+                self._equity = combined_equity
                 self._equity_ever_confirmed = True
 
             if self._session_start_equity is None and self._equity > 0:
@@ -403,12 +482,16 @@ class InventoryManager:
 
             for coin in list(self._positions.keys()):
                 if coin not in returned_coins and coin in self._positions:
-                    self._positions[coin] = PositionState(coin=coin)
+                    if self._sync_ever_succeeded:
+                        self._positions[coin] = PositionState(coin=coin)
 
             self._last_position_sync = now
+            self._sync_ever_succeeded = True
+            self._sync_consecutive_failures = 0
 
         except Exception as e:
-            logger.warning(f"Position sync (safe) failed: {e}")
+            self._sync_consecutive_failures += 1
+            logger.warning(f"Position sync (safe) failed ({self._sync_consecutive_failures}x): {e}")
 
         return self._get_snapshot()
 
