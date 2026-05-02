@@ -113,6 +113,17 @@ class SignalEngine:
         self._signals: dict[str, SignalState] = {}
         self._last_book_time: dict[str, float] = {}
 
+        # Bug #11: Toxic flag timestamps with per-type cooldowns
+        # {coin: {flag_name: timestamp_when_triggered}}
+        self._toxic_flag_timestamps: dict[str, dict[str, float]] = {}
+        self._toxic_cooldowns: dict[str, float] = {
+            "depth_drop": 5.0,
+            "spread_spike": 10.0,
+            "trade_imbalance": 5.0,
+            "anchor_jump": 15.0,
+            "touch_depletion": 5.0,
+        }
+
     def update_book(self, coin: str, l2: dict) -> Optional[SignalState]:
         """Process an L2 book update. Returns updated signal state.
 
@@ -149,11 +160,34 @@ class SignalEngine:
         ofi_bps = self._compute_ofi(coin)
         sigma_1s, rv_30s = self._compute_volatility(coin)
 
-        # Toxic flow detection
+        # Toxic flow detection — record new triggers with timestamps
         depth_drop = self._check_depth_drop(coin, prev_depth, book)
         spread_spike = self._check_spread_spike(coin, book.spread_bps)
         trade_imbalance = self._check_trade_imbalance(coin)
         touch_depl = False  # requires time-series logic, tracked via depth_drop
+
+        # Bug #11: Set toxic flag timestamps when triggered (don't just use booleans)
+        if coin not in self._toxic_flag_timestamps:
+            self._toxic_flag_timestamps[coin] = {}
+        flags = self._toxic_flag_timestamps[coin]
+        if depth_drop:
+            flags["depth_drop"] = now
+        if spread_spike:
+            flags["spread_spike"] = now
+        if trade_imbalance:
+            flags["trade_imbalance"] = now
+        if touch_depl:
+            flags["touch_depletion"] = now
+
+        # Bug #11: Check if ANY toxic flag is still within its cooldown period
+        active_depth_drop = self._is_toxic_active(coin, "depth_drop", now)
+        active_spread_spike = self._is_toxic_active(coin, "spread_spike", now)
+        active_trade_imbalance = self._is_toxic_active(coin, "trade_imbalance", now)
+        active_anchor_jump = self._is_toxic_active(coin, "anchor_jump", now)
+        active_touch_depl = self._is_toxic_active(coin, "touch_depletion", now)
+
+        any_toxic = (active_depth_drop or active_spread_spike or active_trade_imbalance
+                     or active_anchor_jump or active_touch_depl)
 
         # Imbalance assessment
         strong_imb = abs(imb_z) >= self.z_threshold
@@ -163,8 +197,6 @@ class SignalEngine:
         imb_side = 0
         if strong_confirmed:
             imb_side = 1 if imb_z > 0 else -1
-
-        any_toxic = depth_drop or spread_spike or trade_imbalance
 
         signal = SignalState(
             coin=coin,
@@ -176,11 +208,11 @@ class SignalEngine:
             ofi_bps=ofi_bps,
             sigma_1s=sigma_1s,
             rv_30s=rv_30s,
-            depth_drop_detected=depth_drop,
-            spread_spike_detected=spread_spike,
-            trade_imbalance_toxic=trade_imbalance,
-            anchor_jump_detected=False,  # set by orchestrator from FV engine
-            touch_depletion=touch_depl,
+            depth_drop_detected=active_depth_drop,
+            spread_spike_detected=active_spread_spike,
+            trade_imbalance_toxic=active_trade_imbalance,
+            anchor_jump_detected=active_anchor_jump,
+            touch_depletion=active_touch_depl,
             any_toxic_flag=any_toxic,
             book_age_ms=0.0,
             is_stale=False,
@@ -202,11 +234,19 @@ class SignalEngine:
             self._trade_sides[coin].append((now, direction))
 
     def check_anchor_jump(self, coin: str, bybit_mid: float, prev_bybit_mid: float) -> bool:
-        """Check if Bybit anchor jumped > 6bps in 1s (Spec Section 5)."""
+        """Check if Bybit anchor jumped > 6bps in 1s (Spec Section 5).
+
+        Bug #11: Uses timestamp-based flag persistence instead of clearing on next tick.
+        """
         if prev_bybit_mid <= 0 or bybit_mid <= 0:
             return False
         jump_bps = abs(bybit_mid - prev_bybit_mid) / prev_bybit_mid * 10000
         if jump_bps > self.anchor_jump_bps:
+            now = time.time()
+            if coin not in self._toxic_flag_timestamps:
+                self._toxic_flag_timestamps[coin] = {}
+            self._toxic_flag_timestamps[coin]["anchor_jump"] = now
+
             signal = self._signals.get(coin)
             if signal:
                 signal.anchor_jump_detected = True
@@ -229,6 +269,15 @@ class SignalEngine:
     # Internal computations
     # ------------------------------------------------------------------
 
+    def _is_toxic_active(self, coin: str, flag_name: str, now: float) -> bool:
+        """Bug #11: Check if a toxic flag is still within its cooldown period."""
+        flags = self._toxic_flag_timestamps.get(coin, {})
+        triggered_at = flags.get(flag_name, 0)
+        if triggered_at <= 0:
+            return False
+        cooldown = self._toxic_cooldowns.get(flag_name, 5.0)
+        return (now - triggered_at) < cooldown
+
     def _ensure_coin(self, coin: str) -> None:
         """Initialize history containers for a coin if needed."""
         if coin not in self._imb_history:
@@ -238,6 +287,7 @@ class SignalEngine:
             self._depth5_history[coin] = deque(maxlen=60)  # 1 min
             self._trade_sides[coin] = deque(maxlen=200)
             self._sigma_ema[coin] = 0.0
+            self._toxic_flag_timestamps[coin] = {}
 
     def _parse_book(
         self, coin: str, bids: list, asks: list, now: float

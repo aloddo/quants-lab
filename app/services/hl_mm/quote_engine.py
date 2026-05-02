@@ -140,6 +140,13 @@ class QuoteEngine:
         self._states: dict[str, QuoteState] = {}
         self._last_orphan_check: float = 0.0
 
+        # Bug #1: Track orders that failed to cancel so reconciliation can clean them up
+        self._stale_orders: set[int] = set()
+
+        # Bug #6/#7: Pending fill checks — OID -> (timestamp, original_size)
+        self._pending_fill_check: dict[int, tuple[float, str, float]] = {}
+        # {oid: (disappeared_at, coin, original_size)}
+
     # ------------------------------------------------------------------
     # Quote computation (pure, no side effects)
     # ------------------------------------------------------------------
@@ -212,12 +219,14 @@ class QuoteEngine:
             # Reservation price is already inventory-skewed (AS)
             bid_px = reservation_price - fair_value * (cfg.maker_fee_bps / 10000.0)
 
-            # Inside improvement: move bid UP toward mid
+            # Bug #10: Inside improvement should quote INSIDE the spread (better than touch).
+            # Removed cap at hl_bid that pinned us at touch. Now cap at hl_ask - 1 tick
+            # to prevent crossing.
             if improve > 0 and not exit_mode:
-                bid_px = min(bid_px + improve_price, hl_bid)
+                bid_px = min(bid_px + improve_price, hl_ask - fair_value * 0.0001)
             elif exit_mode and inventory_usd < 0:
                 # We are short, buying to exit -> more aggressive bid
-                bid_px = min(bid_px + improve_price + exit_extra, hl_bid)
+                bid_px = min(bid_px + improve_price + exit_extra, hl_ask - fair_value * 0.0001)
 
             # Never cross the ask
             bid_px = min(bid_px, hl_ask * 0.9999)
@@ -241,11 +250,13 @@ class QuoteEngine:
         if quote_ask:
             ask_px = reservation_price + fair_value * (cfg.maker_fee_bps / 10000.0)
 
+            # Bug #10: Inside improvement should quote INSIDE the spread (better than touch).
+            # Removed cap at hl_ask. Now cap at hl_bid + 1 tick to prevent crossing.
             if improve > 0 and not exit_mode:
-                ask_px = max(ask_px - improve_price, hl_ask)
+                ask_px = max(ask_px - improve_price, hl_bid + fair_value * 0.0001)
             elif exit_mode and inventory_usd > 0:
                 # We are long, selling to exit -> more aggressive ask
-                ask_px = max(ask_px - improve_price - exit_extra, hl_ask)
+                ask_px = max(ask_px - improve_price - exit_extra, hl_bid + fair_value * 0.0001)
 
             # Never cross the bid
             ask_px = max(ask_px, hl_bid * 1.0001)
@@ -344,8 +355,12 @@ class QuoteEngine:
             logger.debug(f"{coin}: batch in flight, skipping")
             return
 
-        # Cancel existing orders
-        self._cancel_coin_orders(coin, state)
+        # Cancel existing orders — if cancel fails, don't place new orders
+        # to avoid ghost order accumulation (Bug #1)
+        cancel_ok = self._cancel_coin_orders(coin, state)
+        if not cancel_ok:
+            logger.warning(f"{coin}: cancel failed, skipping new quote placement — retry next tick")
+            return
 
         # Place new orders
         now = time.time()
@@ -406,11 +421,19 @@ class QuoteEngine:
     def cancel_coin(self, coin: str) -> None:
         """Cancel all orders for a specific coin."""
         state = self._states.get(coin, QuoteState())
-        self._cancel_coin_orders(coin, state)
-        self._states[coin] = QuoteState()
+        cancel_ok = self._cancel_coin_orders(coin, state)
+        if cancel_ok:
+            self._states[coin] = QuoteState()
+        # If cancel failed, state is preserved with stale orders tracked
 
     def detect_fills(self, coin: str) -> list[dict]:
-        """Detect fills by checking if tracked orders disappeared.
+        """Detect fills by checking order status changes.
+
+        Bug #6 fix: When an order disappears, query userFills for that OID
+        before recording a fill. If no fill found, treat as cancel.
+
+        Bug #7 fix: Check remaining size vs original for partial fills on
+        still-resting orders.
 
         Returns list of fill dicts: {side, price, size, fee, oid}
         """
@@ -422,29 +445,104 @@ class QuoteEngine:
             return []
 
         fills = []
+        now = time.time()
         try:
             open_orders = self.info.open_orders(self.address)
-            open_oids = {o["oid"] for o in (open_orders or [])}
+            open_oids = {}
+            for o in (open_orders or []):
+                open_oids[o["oid"]] = o
         except Exception:
             return []
 
         for attr, side in [("bid_order", "bid"), ("ask_order", "ask")]:
             order = getattr(state, attr)
-            if order and order.oid not in open_oids:
-                fill_info = self._query_fill(order.oid)
-                fills.append({
-                    "side": side,
-                    "price": fill_info.get("price", order.price) if fill_info else order.price,
-                    "size": fill_info.get("size", order.size) if fill_info else order.size,
-                    "fee": fill_info.get("fee", 0) if fill_info else 0,
-                    "oid": order.oid,
-                })
-                setattr(state, attr, None)
+            if not order:
+                continue
+
+            if order.oid in open_oids:
+                # Bug #7: Order still resting — check for partial fills
+                resting_order = open_oids[order.oid]
+                remaining_sz = float(resting_order.get("sz", order.size) or order.size)
+                if remaining_sz < order.size - 1e-10:
+                    # Partial fill detected
+                    filled_sz = order.size - remaining_sz
+                    fill_info = self._query_fill(order.oid)
+                    fills.append({
+                        "side": side,
+                        "price": fill_info.get("price", order.price) if fill_info else order.price,
+                        "size": filled_sz,
+                        "fee": fill_info.get("fee", 0) if fill_info else 0,
+                        "oid": order.oid,
+                        "partial": True,
+                    })
+                    # Update tracked order with new remaining size
+                    order.size = remaining_sz
+                    logger.debug(
+                        f"{coin} partial fill: {side} {filled_sz:.6f}, "
+                        f"remaining={remaining_sz:.6f}"
+                    )
+            else:
+                # Order disappeared — could be fill OR cancel (Bug #6)
+                # First check pending fill check buffer
+                if order.oid in self._pending_fill_check:
+                    disappeared_at, _, _ = self._pending_fill_check[order.oid]
+                    if now - disappeared_at < 5.0:
+                        # Still within grace period — query for fill confirmation
+                        fill_info = self._query_fill(order.oid)
+                        if fill_info and fill_info.get("size", 0) > 0:
+                            fills.append({
+                                "side": side,
+                                "price": fill_info.get("price", order.price),
+                                "size": fill_info.get("size", order.size),
+                                "fee": fill_info.get("fee", 0),
+                                "oid": order.oid,
+                            })
+                            setattr(state, attr, None)
+                            del self._pending_fill_check[order.oid]
+                        # else: still waiting, don't clear
+                    else:
+                        # 5s passed with no fill confirmation — assume cancel
+                        logger.info(
+                            f"{coin} order {order.oid} ({side}) disappeared with no fill "
+                            f"after 5s — treating as cancel"
+                        )
+                        setattr(state, attr, None)
+                        del self._pending_fill_check[order.oid]
+                else:
+                    # First time we notice it disappeared — query immediately
+                    fill_info = self._query_fill(order.oid)
+                    if fill_info and fill_info.get("size", 0) > 0:
+                        # Confirmed fill
+                        fills.append({
+                            "side": side,
+                            "price": fill_info.get("price", order.price),
+                            "size": fill_info.get("size", order.size),
+                            "fee": fill_info.get("fee", 0),
+                            "oid": order.oid,
+                        })
+                        setattr(state, attr, None)
+                    else:
+                        # No fill found yet — add to pending check buffer
+                        self._pending_fill_check[order.oid] = (now, coin, order.size)
+                        logger.debug(
+                            f"{coin} order {order.oid} ({side}) disappeared, "
+                            f"queued for fill confirmation"
+                        )
+
+        # Clean up old pending fill checks (for orders from deactivated coins etc.)
+        stale_pending = [
+            oid for oid, (ts, _, _) in self._pending_fill_check.items()
+            if now - ts > 10.0
+        ]
+        for oid in stale_pending:
+            del self._pending_fill_check[oid]
 
         return fills
 
     def cleanup_orphans(self) -> None:
-        """Reconcile: cancel any open orders not tracked by us. Every 30s."""
+        """Reconcile: cancel any open orders not tracked by us. Every 30s.
+        Also retries cancellation of stale orders from failed cancels (Bug #1).
+        """
         now = time.time()
         if now - self._last_orphan_check < 30.0:
             return
@@ -456,6 +554,8 @@ class QuoteEngine:
         try:
             all_orders = self.info.open_orders(self.address)
             if not all_orders:
+                # No open orders — clear all stale tracking
+                self._stale_orders.clear()
                 return
 
             tracked_oids = set()
@@ -465,14 +565,35 @@ class QuoteEngine:
                 if state.ask_order:
                     tracked_oids.add(state.ask_order.oid)
 
+            open_oids = {o.get("oid") for o in all_orders}
+            cancelled_stale = set()
+
             for order in all_orders:
                 oid = order.get("oid")
-                if oid and oid not in tracked_oids:
-                    logger.warning(f"Orphan: {order.get('coin')} oid={oid}, cancelling")
+                if not oid:
+                    continue
+
+                # Cancel orphans (not tracked) AND stale orders (failed prior cancel)
+                if oid not in tracked_oids or oid in self._stale_orders:
+                    label = "stale" if oid in self._stale_orders else "orphan"
+                    logger.warning(f"{label.title()}: {order.get('coin')} oid={oid}, cancelling")
                     try:
                         self.exchange.cancel(order["coin"], oid)
+                        cancelled_stale.add(oid)
                     except Exception as e:
-                        logger.error(f"Cancel orphan failed: {e}")
+                        logger.error(f"Cancel {label} failed: {e}")
+
+            # Clean up stale orders that are no longer open (cancelled elsewhere or filled)
+            self._stale_orders -= cancelled_stale
+            self._stale_orders -= (self._stale_orders - open_oids)
+
+            # Also clean up local state for stale orders that were successfully cancelled
+            for coin, state in self._states.items():
+                if state.bid_order and state.bid_order.oid in cancelled_stale:
+                    state.bid_order = None
+                if state.ask_order and state.ask_order.oid in cancelled_stale:
+                    state.ask_order = None
+
         except Exception as e:
             logger.warning(f"Orphan check failed: {e}")
 
@@ -500,6 +621,9 @@ class QuoteEngine:
 
         size = min(notional_target, 0.20*free_equity, 0.003*depth20, 0.75*Q_soft)
                * vol_scale * anchor_scale
+
+        Bug #5 fix: removed $10 floor. If constraints say size < HL minimum,
+        return 0 (don't quote) instead of overriding to $10.
         """
         notional_target = DEFAULT_NOTIONAL.get(coin, 50.0)
         size = min(
@@ -509,16 +633,23 @@ class QuoteEngine:
             0.75 * q_soft,
         )
         size *= vol_scale * anchor_scale
-        return max(self.config.min_notional_usd, size)
+        # Return 0 if below HL minimum — caller will skip quoting this side
+        if size < self.config.min_notional_usd:
+            return 0.0
+        return size
 
-    def _cancel_coin_orders(self, coin: str, state: QuoteState) -> None:
-        """Cancel all tracked orders for a coin."""
+    def _cancel_coin_orders(self, coin: str, state: QuoteState) -> bool:
+        """Cancel all tracked orders for a coin.
+
+        Returns True if cancel succeeded (safe to clear local state).
+        Returns False if cancel failed (orders kept in tracking + stale set).
+        """
         if self.dry_run:
             if state.bid_order or state.ask_order:
                 logger.info(f"[DRY] Cancel {coin} orders")
             state.bid_order = None
             state.ask_order = None
-            return
+            return True
 
         cancels = []
         if state.bid_order:
@@ -526,14 +657,25 @@ class QuoteEngine:
         if state.ask_order:
             cancels.append(CancelRequest(coin=coin, oid=state.ask_order.oid))
 
-        if cancels:
-            try:
-                self.exchange.bulk_cancel(cancels)
-            except Exception as e:
-                logger.warning(f"Cancel {coin} failed: {e}")
+        if not cancels:
+            state.bid_order = None
+            state.ask_order = None
+            return True
 
-        state.bid_order = None
-        state.ask_order = None
+        try:
+            self.exchange.bulk_cancel(cancels)
+            # Cancel confirmed — safe to clear local state
+            state.bid_order = None
+            state.ask_order = None
+            return True
+        except Exception as e:
+            logger.warning(f"Cancel {coin} failed: {e} — orders kept in stale tracking")
+            # Bug #1: Do NOT clear local state. Add to stale set for reconciliation.
+            if state.bid_order:
+                self._stale_orders.add(state.bid_order.oid)
+            if state.ask_order:
+                self._stale_orders.add(state.ask_order.oid)
+            return False
 
     def _place_alo(self, coin: str, is_buy: bool, size: float, price: float) -> Optional[int]:
         """Place ALO (Add Liquidity Only) limit order. Returns oid or None."""

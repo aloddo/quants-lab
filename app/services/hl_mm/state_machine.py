@@ -30,6 +30,7 @@ class PairState(Enum):
     QUOTING_ONE_SIDE = "QUOTING_ONE_SIDE"
     INVENTORY_EXIT = "INVENTORY_EXIT"
     HEDGE = "HEDGE"
+    EMERGENCY_FLATTEN = "EMERGENCY_FLATTEN"  # Bug #9: taker flatten + pause
     PAUSE = "PAUSE"
 
 
@@ -144,16 +145,29 @@ class StateMachine:
                 return info
 
         # --- HEDGE state handling ---
+        # Bug #3: Stay in HEDGE while hedge_in_progress is True
         if old_state == PairState.HEDGE:
-            if not ctx.hedge_in_progress and abs(ctx.inventory_usd) < ctx.q_soft * 0.3:
-                self._enter_state(info, PairState.IDLE, now, "hedge complete, inventory reduced")
-            elif not ctx.hedge_in_progress:
-                self._enter_state(info, PairState.INVENTORY_EXIT, now,
-                                  "hedge done but inventory remains")
-            else:
+            if ctx.hedge_in_progress:
+                # Hedge still active — stay in HEDGE, don't transition
                 info.quote_bid = False
                 info.quote_ask = False
                 info.hedge_requested = True
+                return info
+            elif abs(ctx.inventory_usd) < ctx.q_soft * 0.3:
+                self._enter_state(info, PairState.IDLE, now, "hedge complete, inventory reduced")
+            else:
+                self._enter_state(info, PairState.INVENTORY_EXIT, now,
+                                  "hedge done but inventory remains")
+
+        # --- INVENTORY_EXIT -> EMERGENCY_FLATTEN (Bug #9) ---
+        if old_state == PairState.INVENTORY_EXIT:
+            if self._should_emergency_flatten(ctx):
+                self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
+                                  self._emergency_flatten_reason(ctx))
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = True
+                info.hedge_requested = False
                 return info
 
         # --- INVENTORY_EXIT -> HEDGE (escalation) ---
@@ -258,6 +272,24 @@ class StateMachine:
             return f"age={ctx.inventory_age_s:.0f}s > 60s, adverse={ctx.adverse_move_bps:.1f}bps"
         return "stale HL data with inventory"
 
+    def _should_emergency_flatten(self, ctx: PairContext) -> bool:
+        """Bug #9: Check if emergency flatten is needed.
+
+        Triggers when: inventory age > 180s, OR loss > 12bps and no hedge available.
+        """
+        if abs(ctx.inventory_usd) < 5.0:
+            return False
+        if ctx.inventory_age_s > 180:
+            return True
+        if ctx.adverse_move_bps > 12.0 and not ctx.bybit_hedge_available:
+            return True
+        return False
+
+    def _emergency_flatten_reason(self, ctx: PairContext) -> str:
+        if ctx.inventory_age_s > 180:
+            return f"age={ctx.inventory_age_s:.0f}s > 180s emergency limit"
+        return f"adverse={ctx.adverse_move_bps:.1f}bps > 12bps, no hedge available"
+
     def _set_output_flags(self, info: PairStateInfo, ctx: PairContext) -> None:
         """Set quote_bid/quote_ask/exit_mode based on state + context."""
         state = info.state
@@ -314,6 +346,13 @@ class StateMachine:
             info.quote_ask = False
             info.exit_mode = True
             info.hedge_requested = True
+
+        elif state == PairState.EMERGENCY_FLATTEN:
+            # Bug #9: taker flatten handled by orchestrator
+            info.quote_bid = False
+            info.quote_ask = False
+            info.exit_mode = True
+            info.hedge_requested = False
 
         elif state == PairState.PAUSE:
             info.quote_bid = False

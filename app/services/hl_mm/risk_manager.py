@@ -138,9 +138,9 @@ class RiskManager:
         cfg = self.config
         actions = []
 
-        # Check if new UTC day -> reset daily stop
+        # Bug #14: Sticky daily stop — only reset on new UTC day
+        current_utc_day = datetime.now(timezone.utc).date()
         if self._is_daily_stopped or self._is_hard_stopped:
-            current_utc_day = datetime.now(timezone.utc).date()
             stopped_day = datetime.fromtimestamp(
                 self._stopped_at, tz=timezone.utc
             ).date() if self._stopped_at > 0 else None
@@ -148,6 +148,17 @@ class RiskManager:
                 self._is_daily_stopped = False
                 self._is_hard_stopped = False
                 logger.info("New UTC day: risk stops reset")
+
+        # Bug #14: If already stopped for today, stay stopped (sticky)
+        if self._is_daily_stopped or self._is_hard_stopped:
+            action = RiskAction.HARD_STOP if self._is_hard_stopped else RiskAction.DAILY_STOP
+            return RiskState(
+                daily_pnl=daily_pnl, gross_notional=gross_notional,
+                net_exposure=net_exposure, live_pair_count=live_pair_count,
+                is_daily_stopped=self._is_daily_stopped,
+                is_hard_stopped=self._is_hard_stopped,
+                actions=[action], reason="stopped for UTC day (sticky)",
+            )
 
         # Hard stop: -$5
         if daily_pnl <= -cfg.hard_stop_usd:
@@ -171,15 +182,6 @@ class RiskManager:
                 net_exposure=net_exposure, live_pair_count=live_pair_count,
                 is_daily_stopped=True, actions=actions,
                 reason=f"DAILY STOP: PnL ${daily_pnl:.2f} <= -${cfg.daily_stop_usd}",
-            )
-
-        if self._is_daily_stopped or self._is_hard_stopped:
-            return RiskState(
-                daily_pnl=daily_pnl, gross_notional=gross_notional,
-                net_exposure=net_exposure, live_pair_count=live_pair_count,
-                is_daily_stopped=self._is_daily_stopped,
-                is_hard_stopped=self._is_hard_stopped,
-                actions=actions, reason="stopped for UTC day",
             )
 
         # Correlation stop
@@ -233,6 +235,20 @@ class RiskManager:
     def can_add_pair(self, current_live: int) -> bool:
         """Check if we can add another live pair."""
         return current_live < self.config.max_live_pairs
+
+    def check_can_quote(self, coin: str, proposed_notional: float,
+                        current_gross: float, current_net: float) -> bool:
+        """Bug #5: Check if a new quote would exceed portfolio limits.
+
+        Called from orchestrator before passing to quote_engine.
+        Uses actual config limits (not hardcoded).
+        """
+        cfg = self.config
+        if current_gross + proposed_notional > cfg.max_gross_notional:
+            return False
+        if abs(current_net + proposed_notional) > cfg.max_net_exposure:
+            return False
+        return True
 
     def check_notional_limit(self, current_gross: float, new_order_notional: float) -> bool:
         """Check if a new order would exceed gross notional limit."""

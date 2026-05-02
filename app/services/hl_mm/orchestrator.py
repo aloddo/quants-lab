@@ -129,6 +129,73 @@ class HLMarketMaker:
         self._bybit_ws_backoff: float = 1.0
         self._last_daily_summary: float = 0.0
 
+        # Bug #3: Bybit hedge position tracking {coin: delta_size}
+        self._hedge_positions: dict[str, float] = {}
+        self._hedge_entry_prices: dict[str, float] = {}
+        self._hedge_in_progress: dict[str, float] = {}  # coin -> timestamp when hedge placed
+
+        # Bug #8: Shared rate limiter (token bucket: max 4/sec, burst 6)
+        self._rate_tokens: float = 6.0
+        self._rate_max: float = 6.0
+        self._rate_refill_per_sec: float = 4.0
+        self._rate_last_refill: float = 0.0
+
+        # Bug #12: asyncio.Lock for signal state access
+        self._signal_lock = asyncio.Lock()
+
+        # Bug #13: Pair fill counts for lifecycle gating
+        self._pair_fill_counts: dict[str, int] = {}
+
+        # Bug #14: Sticky daily stop — tracks the UTC date when stopped
+        self._daily_stop_sticky: bool = False
+        self._daily_stop_date: Optional[object] = None  # date object
+
+    # ==================================================================
+    # Bug #8: Rate limiter
+    # ==================================================================
+
+    def _consume_rate_token(self, priority: bool = False) -> bool:
+        """Try to consume a rate limit token. Returns True if allowed.
+
+        Args:
+            priority: If True (cancel/hedge), always allow but still deduct.
+        """
+        now = time.time()
+        elapsed = now - self._rate_last_refill if self._rate_last_refill > 0 else 0
+        self._rate_last_refill = now
+
+        # Refill tokens
+        self._rate_tokens = min(
+            self._rate_max,
+            self._rate_tokens + elapsed * self._rate_refill_per_sec,
+        )
+
+        if priority:
+            self._rate_tokens = max(0, self._rate_tokens - 1)
+            return True
+
+        if self._rate_tokens >= 1.0:
+            self._rate_tokens -= 1.0
+            return True
+
+        return False
+
+    # ==================================================================
+    # Bug #14: Sticky daily stop check
+    # ==================================================================
+
+    def _check_daily_stop_sticky(self) -> bool:
+        """Check if daily stop is active. Sticky until next UTC day."""
+        from datetime import date
+        today = datetime.now(timezone.utc).date()
+        if self._daily_stop_sticky and self._daily_stop_date == today:
+            return True
+        if self._daily_stop_sticky and self._daily_stop_date != today:
+            self._daily_stop_sticky = False
+            self._daily_stop_date = None
+            logger.info("New UTC day: sticky daily stop cleared")
+        return False
+
     # ==================================================================
     # Initialization
     # ==================================================================
@@ -213,6 +280,12 @@ class HLMarketMaker:
             self.screener.force_active(coin)
             self._activate_coin(coin)
 
+        # Bug #2: If startup reconciliation couldn't verify clean state, pause all coins
+        if getattr(self, '_startup_pause_required', False):
+            for coin in self._initial_coins:
+                self.state_machine.force_pause(coin, 60, "startup: unverified order state")
+            logger.warning("All coins starting in PAUSE due to unverified startup state")
+
         # Notify engine start
         self.notifier.notify_engine_event(
             "STARTED",
@@ -251,32 +324,46 @@ class HLMarketMaker:
     async def _tick(self) -> None:
         """Single iteration of the main loop.
 
-        Order: sync positions -> risk check -> per-pair (signal -> FV -> state
-        machine -> quote -> execute) -> fill detection -> logging.
+        Order: sync positions -> daily stop check -> risk check ->
+        HEDGE_IMMEDIATELY check -> per-pair (signal -> FV -> state machine ->
+        portfolio check -> quote -> execute) -> fill detection -> logging.
         """
         self._tick_count += 1
         now = time.time()
 
+        # Bug #14: Sticky daily stop — check at TOP of every tick
+        if self._check_daily_stop_sticky():
+            self.quote_engine.cancel_all()
+            return
+
         # === STEP 1: Sync positions from exchange ===
-        try:
-            snapshot = await asyncio.wait_for(
-                asyncio.to_thread(self.inventory.sync_positions), timeout=3.0
-            )
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"Position sync failed: {e}")
+        if self._consume_rate_token():
+            try:
+                snapshot = await asyncio.wait_for(
+                    asyncio.to_thread(self.inventory.sync_positions), timeout=3.0
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning(f"Position sync failed: {e}")
+                snapshot = None
+        else:
             snapshot = None
+
+        # Bug #14: Include Bybit hedge PnL in daily PnL
+        bybit_hedge_pnl = self._compute_bybit_hedge_pnl()
+        effective_daily_pnl = (snapshot.daily_pnl if snapshot else 0) + bybit_hedge_pnl
 
         # === STEP 2: Portfolio risk check ===
         hl_book_ages = {}
         has_inventory = {}
-        for coin in self._active_coins:
-            sig = self.signal_engine.get_signal(coin)
-            hl_book_ages[coin] = sig.book_age_ms if sig else 999999.0
-            pos = self.inventory.get_position(coin)
-            has_inventory[coin] = abs(pos.notional_usd) > 1.0
+        async with self._signal_lock:  # Bug #12: lock for signal reads
+            for coin in self._active_coins:
+                sig = self.signal_engine.get_signal(coin)
+                hl_book_ages[coin] = sig.book_age_ms if sig else 999999.0
+                pos = self.inventory.get_position(coin)
+                has_inventory[coin] = abs(pos.notional_usd) > 1.0
 
         risk_state = self.risk_manager.evaluate(
-            daily_pnl=snapshot.daily_pnl if snapshot else 0,
+            daily_pnl=effective_daily_pnl,
             gross_notional=snapshot.total_gross_notional if snapshot else 0,
             net_exposure=snapshot.total_net_exposure if snapshot else 0,
             live_pair_count=len(self._active_coins),
@@ -292,8 +379,27 @@ class HLMarketMaker:
 
         if RiskAction.DAILY_STOP in risk_state.actions:
             logger.warning(f"DAILY STOP: {risk_state.reason}")
+            # Bug #14: Make daily stop sticky
+            self._daily_stop_sticky = True
+            self._daily_stop_date = datetime.now(timezone.utc).date()
             self.quote_engine.cancel_all()
             return
+
+        # Bug #4: Handle HEDGE_IMMEDIATELY BEFORE state machine pause.
+        # If risk manager says hedge immediately and we have inventory, do it now
+        # regardless of state machine state.
+        if RiskAction.HEDGE_IMMEDIATELY in risk_state.actions and not self.dry_run:
+            for coin in list(self._active_coins):
+                if has_inventory.get(coin, False) and coin in BYBIT_PERPS:
+                    pos = self.inventory.get_position(coin)
+                    sig = self.signal_engine.get_signal(coin)
+                    fv = sig.book.mid if sig and sig.book else 0
+                    if abs(pos.size) > 0 and fv > 0:
+                        logger.warning(
+                            f"HEDGE_IMMEDIATELY: {coin} stale HL data with inventory, "
+                            f"hedging before state machine runs"
+                        )
+                        await self._execute_bybit_hedge(coin, pos, fv)
 
         if RiskAction.CANCEL_ALL_QUOTES in risk_state.actions:
             self.quote_engine.cancel_all()
@@ -308,14 +414,21 @@ class HLMarketMaker:
         # === STEP 3: Per-pair processing ===
         current_mids: dict[str, float] = {}
 
+        # Bug #3: Expire hedge_in_progress after 60s
+        for hcoin in list(self._hedge_in_progress.keys()):
+            if now - self._hedge_in_progress[hcoin] > 60.0:
+                logger.info(f"{hcoin}: hedge_in_progress expired after 60s")
+                del self._hedge_in_progress[hcoin]
+
         for coin in list(self._active_coins):
             # Skip if circuit breaker disabled this pair
             if self.fill_tracker.is_pair_disabled(coin):
                 self.quote_engine.cancel_coin(coin)
                 continue
 
-            # Get signal
-            signal = self.signal_engine.get_signal(coin)
+            # Get signal (Bug #12: under lock)
+            async with self._signal_lock:
+                signal = self.signal_engine.get_signal(coin)
             if not signal or not signal.book:
                 continue
 
@@ -356,6 +469,12 @@ class HLMarketMaker:
             bid_ev = edge_room - tox > 0
             ask_ev = edge_room - tox > 0
 
+            # Bug #3: Track hedge_in_progress properly
+            hedge_active = coin in self._hedge_in_progress
+
+            # Bug #11: circuit_breaker_active triggers on ANY toxic flag, not just anchor jump
+            cb_active = signal.any_toxic_flag
+
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,
                 bybit_anchor_healthy=fv_est.anchor_weight > 0,
@@ -369,21 +488,49 @@ class HLMarketMaker:
                 q_emergency=limits.q_emergency,
                 inventory_age_s=inv_age,
                 adverse_move_bps=pos.adverse_move_bps,
-                circuit_breaker_active=signal.any_toxic_flag and signal.anchor_jump_detected,
+                circuit_breaker_active=cb_active,
                 oms_mismatch=False,
                 regime_shock=RiskAction.PAUSE_ALL in risk_state.actions,
                 strong_imbalance=signal.strong_imbalance,
                 imbalance_side=signal.imbalance_side,
-                hedge_in_progress=False,
+                hedge_in_progress=hedge_active,
                 bybit_hedge_available=coin in BYBIT_PERPS,
             )
 
             # Run state machine
             state_info = self.state_machine.transition(coin, ctx)
 
+            # Bug #9: Handle EMERGENCY_FLATTEN state
+            if state_info.state == PairState.EMERGENCY_FLATTEN:
+                if not self.dry_run and abs(pos.size) > 0:
+                    logger.critical(
+                        f"EMERGENCY_FLATTEN: {coin} pos={pos.size:.6f}, "
+                        f"placing taker close on HL"
+                    )
+                    try:
+                        result = await asyncio.to_thread(
+                            self.exchange.market_close, coin
+                        )
+                        logger.info(f"Emergency flatten {coin}: {result}")
+                    except Exception as e:
+                        logger.error(f"Emergency flatten failed for {coin}: {e}")
+                    # Force pause 10 minutes after flatten
+                    self.state_machine.force_pause(coin, 600, "post-emergency-flatten cooldown")
+                self.quote_engine.cancel_coin(coin)
+                continue
+
             # Compute and execute quotes
             if state_info.state in (PairState.QUOTING_BOTH, PairState.QUOTING_ONE_SIDE,
                                      PairState.INVENTORY_EXIT):
+                # Bug #5: Portfolio-level check before quoting
+                proposed_notional = self.inventory.get_limits(coin).q_soft * 0.5
+                gross = snapshot.total_gross_notional if snapshot else 0
+                net = snapshot.total_net_exposure if snapshot else 0
+                if not self.risk_manager.check_notional_limit(gross, proposed_notional):
+                    logger.debug(f"{coin}: gross notional limit hit, skipping quotes")
+                    self.quote_engine.cancel_coin(coin)
+                    continue
+
                 if self.quote_engine.should_requote(coin, fair_value):
                     vol_scale = 0.5 if risk_state.halve_sizes else 1.0
                     anchor_scale = 1.0 if fv_est.anchor_weight > 0.3 else 0.7
@@ -441,6 +588,8 @@ class HLMarketMaker:
             # Execute Bybit hedge if requested (Gap 1)
             if state_info.hedge_requested and not self.dry_run:
                 await self._execute_bybit_hedge(coin, pos, fair_value)
+                # Bug #3: Mark hedge as in progress
+                self._hedge_in_progress[coin] = now
 
             # Detect fills
             if not self.dry_run:
@@ -474,6 +623,15 @@ class HLMarketMaker:
         size = fill["size"]
         fee = fill.get("fee", 0)
         oid = fill.get("oid", 0)
+
+        # Bug #3: Clear hedge_in_progress if HL inventory is now flat
+        pos = self.inventory.get_position(coin)
+        post_fill_flat = abs(pos.size) < 1e-10  # will be updated by record_fill
+        if post_fill_flat and coin in self._hedge_in_progress:
+            del self._hedge_in_progress[coin]
+
+        # Bug #13: Track fill counts for pair lifecycle gating
+        self._pair_fill_counts[coin] = self._pair_fill_counts.get(coin, 0) + 1
 
         self.inventory.record_fill(coin, side, price, size)
         self.fill_tracker.record_fill(
@@ -561,18 +719,45 @@ class HLMarketMaker:
             pass
 
     def _on_hl_book(self, coin: str, data: dict) -> None:
-        """Callback for HL WS L2 book updates."""
+        """Callback for HL WS L2 book updates.
+
+        Bug #12: WS callbacks run on the event loop. We use the signal lock
+        to prevent torn reads during yield points in _tick().
+        Since HL SDK callbacks are synchronous, we schedule the locked update.
+        """
         try:
             # HL WS sends the full book in data["levels"]
+            book_data = None
             if isinstance(data, dict) and "levels" in data:
-                self.signal_engine.update_book(coin, data)
+                book_data = data
             elif isinstance(data, dict) and "data" in data:
-                self.signal_engine.update_book(coin, data["data"])
+                book_data = data["data"]
+
+            if book_data:
+                # Schedule locked update on event loop
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._locked_book_update(coin, book_data))
+                else:
+                    self.signal_engine.update_book(coin, book_data)
         except Exception as e:
             logger.debug(f"HL book parse error for {coin}: {e}")
 
+    async def _locked_book_update(self, coin: str, data: dict) -> None:
+        """Update book under signal lock (Bug #12)."""
+        async with self._signal_lock:
+            self.signal_engine.update_book(coin, data)
+
+    async def _locked_trade_update(self, coin: str, trades: list) -> None:
+        """Update trades under signal lock (Bug #12)."""
+        async with self._signal_lock:
+            self.signal_engine.update_trades(coin, trades)
+
     def _on_hl_trades(self, coin: str, data: dict) -> None:
-        """Callback for HL WS trade updates."""
+        """Callback for HL WS trade updates.
+
+        Bug #12: Schedule locked update to prevent torn reads.
+        """
         try:
             trades = []
             if isinstance(data, list):
@@ -583,7 +768,11 @@ class HLMarketMaker:
                 trades = [data]
 
             if trades:
-                self.signal_engine.update_trades(coin, trades)
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._locked_trade_update(coin, trades))
+                else:
+                    self.signal_engine.update_trades(coin, trades)
         except Exception as e:
             logger.debug(f"HL trade parse error for {coin}: {e}")
 
@@ -706,7 +895,12 @@ class HLMarketMaker:
     # ==================================================================
 
     async def _screener_loop(self) -> None:
-        """Run pair screener every 15 minutes."""
+        """Run pair screener every 15 minutes.
+
+        Bug #13: Second-tier coins start in SHADOW and promote to ACTIVE
+        only after first-tier reaches fill count gate. Demoted pairs get
+        deactivated after inventory exit + WS unsubscribe.
+        """
         # Wait for initial data collection
         await asyncio.sleep(30)
 
@@ -718,12 +912,36 @@ class HLMarketMaker:
                     # Sync active coins with screener
                     screener_active = self.screener.active_pairs
                     for coin in screener_active - self._active_coins:
-                        if self.risk_manager.can_add_pair(len(self._active_coins)):
-                            await self._set_leverage(coin)
-                            self._activate_coin(coin)
+                        if not self.risk_manager.can_add_pair(len(self._active_coins)):
+                            continue
 
-                    # Note: we don't auto-deactivate here -- deactivation requires
-                    # inventory exit first, handled by state machine
+                        # Bug #13: Second-tier coins need first-tier fill gate
+                        # If any initial coin hasn't reached 100 fills, new coins stay shadow
+                        first_tier_ready = all(
+                            self._pair_fill_counts.get(c, 0) >= 100
+                            for c in self._initial_coins
+                            if c in self._active_coins
+                        )
+                        if not first_tier_ready and coin not in self._initial_coins:
+                            logger.debug(
+                                f"Screener: {coin} waiting for first-tier fill gate "
+                                f"(fills: {self._pair_fill_counts})"
+                            )
+                            continue
+
+                        await self._set_leverage(coin)
+                        self._activate_coin(coin)
+
+                    # Bug #13: Deactivate demoted pairs (not in screener active set)
+                    # Only if they have no inventory (inventory exit handled by state machine)
+                    for coin in list(self._active_coins):
+                        if coin in screener_active or coin in self._initial_coins:
+                            continue
+                        pos = self.inventory.get_position(coin)
+                        if abs(pos.size) < 1e-10:
+                            logger.info(f"Screener: deactivating demoted pair {coin}")
+                            self._deactivate_coin(coin)
+
             except Exception as e:
                 logger.error(f"Screener error: {e}", exc_info=True)
 
@@ -902,48 +1120,84 @@ class HLMarketMaker:
     async def _reconcile_open_orders_on_startup(self) -> None:
         """Cancel ALL existing resting orders from prior sessions (Gap 2).
 
-        On startup, before entering the main loop, query HL for open orders
-        and cancel everything. This prevents stale orders from a crashed session
-        from sitting on the book.
+        Bug #2 fix: Retry cancel loop up to 30s with backoff, then VERIFY
+        with REST query that zero orders remain. If can't verify, refuse to
+        start quoting (stay in PAUSE). Also checks for unclean shutdown breadcrumb.
         """
         if self.dry_run:
             logger.info("[DRY] Would reconcile open orders on startup")
             return
 
-        logger.info("Startup: reconciling open orders...")
-        try:
-            resp = await asyncio.to_thread(
-                sync_requests.post,
-                HL_INFO_API,
-                json={"type": "openOrders", "user": self.address},
-                timeout=5,
+        # Check for unclean shutdown from prior session
+        UNCLEAN_FILE = "/tmp/hl_mm_unclean_shutdown"
+        if os.path.exists(UNCLEAN_FILE):
+            logger.critical(
+                "Startup: found /tmp/hl_mm_unclean_shutdown from prior session. "
+                "Performing aggressive reconciliation."
             )
-            if resp.status_code != 200:
-                logger.warning(f"Startup order query failed: HTTP {resp.status_code}")
-                return
 
-            open_orders = resp.json()
-            if not isinstance(open_orders, list) or not open_orders:
-                logger.info("Startup: no stale open orders found")
-                return
+        logger.info("Startup: reconciling open orders (retry loop up to 30s)...")
+        deadline = time.time() + 30.0
+        backoff = 1.0
+        verified_clean = False
 
-            logger.warning(f"Startup: found {len(open_orders)} stale orders, cancelling all")
-            for order in open_orders:
-                coin = order.get("coin", "")
-                oid = order.get("oid", 0)
-                side = order.get("side", "?")
-                px = order.get("px", "?")
-                sz = order.get("sz", "?")
-                try:
-                    await asyncio.to_thread(self.exchange.cancel, coin, oid)
-                    logger.info(f"  Cancelled stale order: {coin} {side} {sz}@{px} oid={oid}")
-                except Exception as e:
-                    logger.warning(f"  Failed to cancel {coin} oid={oid}: {e}")
+        while time.time() < deadline:
+            try:
+                resp = await asyncio.to_thread(
+                    sync_requests.post,
+                    HL_INFO_API,
+                    json={"type": "openOrders", "user": self.address},
+                    timeout=5,
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"Startup order query failed: HTTP {resp.status_code}, retrying in {backoff:.0f}s")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 10.0)
+                    continue
 
-            logger.info(f"Startup: cancelled {len(open_orders)} stale orders")
+                open_orders = resp.json()
+                if not isinstance(open_orders, list) or not open_orders:
+                    logger.info("Startup: verified zero open orders")
+                    verified_clean = True
+                    break
 
-        except Exception as e:
-            logger.error(f"Startup order reconciliation failed: {e}")
+                logger.warning(f"Startup: found {len(open_orders)} stale orders, cancelling all")
+                for order in open_orders:
+                    coin = order.get("coin", "")
+                    oid = order.get("oid", 0)
+                    side = order.get("side", "?")
+                    px = order.get("px", "?")
+                    sz = order.get("sz", "?")
+                    try:
+                        await asyncio.to_thread(self.exchange.cancel, coin, oid)
+                        logger.info(f"  Cancelled stale order: {coin} {side} {sz}@{px} oid={oid}")
+                    except Exception as e:
+                        logger.warning(f"  Failed to cancel {coin} oid={oid}: {e}")
+
+                # Wait then verify
+                await asyncio.sleep(1.0)
+
+            except Exception as e:
+                logger.warning(f"Startup reconciliation error: {e}, retrying in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+
+        if not verified_clean:
+            logger.critical(
+                "Startup: could NOT verify zero open orders after 30s. "
+                "Engine will start in PAUSE mode for all coins."
+            )
+            # Force all initial coins to PAUSE on activation
+            self._startup_pause_required = True
+        else:
+            self._startup_pause_required = False
+
+        # Clean up breadcrumb file if it exists
+        if os.path.exists(UNCLEAN_FILE):
+            try:
+                os.remove(UNCLEAN_FILE)
+            except OSError:
+                pass
 
     async def _sync_positions_on_startup(self) -> None:
         """Load existing positions into inventory manager on startup (Gap 3).
@@ -1007,6 +1261,23 @@ class HLMarketMaker:
 
         except Exception as e:
             logger.error(f"Startup position sync failed: {e}")
+
+    # ==================================================================
+    # Bug #14: Bybit hedge PnL tracking
+    # ==================================================================
+
+    def _compute_bybit_hedge_pnl(self) -> float:
+        """Compute unrealized PnL from Bybit hedge positions."""
+        total_pnl = 0.0
+        for coin, delta in self._hedge_positions.items():
+            if abs(delta) < 1e-10:
+                continue
+            entry = self._hedge_entry_prices.get(coin, 0)
+            current = self._prev_bybit_mids.get(coin, 0)
+            if entry > 0 and current > 0:
+                # delta > 0 means we are long on Bybit (short on HL)
+                total_pnl += delta * (current - entry)
+        return total_pnl
 
     # ==================================================================
     # Bybit hedge execution (Gap 1)
@@ -1082,6 +1353,11 @@ class HLMarketMaker:
                 order_result = result.get("result", {})
                 order_id = order_result.get("orderId", "?")
                 logger.info(f"HEDGE SUCCESS: {coin} orderId={order_id}")
+
+                # Bug #3: Track Bybit hedge position
+                hedge_delta = -hedge_size if bybit_side == "Sell" else hedge_size
+                self._hedge_positions[coin] = self._hedge_positions.get(coin, 0) + hedge_delta
+                self._hedge_entry_prices[coin] = limit_price
 
                 # Calculate actual slippage
                 actual_slippage_bps = abs(limit_price - fair_value) / fair_value * 10000
@@ -1204,28 +1480,30 @@ class HLMarketMaker:
     async def _shutdown(self) -> None:
         """Graceful shutdown (Gap 9).
 
-        Steps:
-          1. Set _shutting_down flag
-          2. Cancel ALL resting orders on HL (query + cancel loop)
-          3. If any inventory remains, log a WARNING (don't auto-hedge -- too risky)
-          4. Close WS connections
-          5. Flush all pending logs to MongoDB
-          6. Verify zero open orders via REST
-          7. Log final PnL summary
+        Bug #2 fix: Retry cancel+verify loop up to 60s. If still can't confirm
+        clean, leave a breadcrumb file for startup to check. Also close Bybit
+        hedges (Bug #3).
         """
         if self._shutting_down:
+            # Bug #2: Second SIGINT — still cancel orders, just skip verify
+            logger.warning("Second shutdown request — cancelling orders without verify")
+            if self.quote_engine and not self.dry_run:
+                self.quote_engine.cancel_all()
+            self._running = False
             return
         self._shutting_down = True
         logger.info("Graceful shutdown initiated...")
         self._running = False
 
-        # Step 2: Cancel ALL resting orders
+        # Step 2: Cancel ALL resting orders with retry loop (Bug #2: up to 60s)
+        verified_clean = False
         if self.quote_engine and not self.dry_run:
             logger.info("Shutdown: cancelling all resting orders...")
             self.quote_engine.cancel_all()
 
-            # Double-check via REST: cancel anything still open
-            for attempt in range(3):
+            deadline = time.time() + 60.0
+            backoff = 1.0
+            while time.time() < deadline:
                 try:
                     resp = sync_requests.post(
                         HL_INFO_API,
@@ -1236,21 +1514,63 @@ class HLMarketMaker:
                         remaining = resp.json()
                         if not remaining:
                             logger.info("Shutdown: verified zero open orders")
+                            verified_clean = True
                             break
                         logger.warning(
-                            f"Shutdown: {len(remaining)} orders still open (attempt {attempt+1}), "
-                            f"cancelling..."
+                            f"Shutdown: {len(remaining)} orders still open, cancelling..."
                         )
                         for order in remaining:
                             try:
                                 self.exchange.cancel(order["coin"], order["oid"])
                             except Exception:
                                 pass
+                    else:
+                        logger.warning(f"Shutdown order query HTTP {resp.status_code}")
                 except Exception as e:
                     logger.warning(f"Shutdown order verify failed: {e}")
-                    break
+
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+
+            if not verified_clean:
+                # Bug #2: Leave breadcrumb for startup
+                logger.critical(
+                    "Shutdown: could NOT confirm zero open orders after 60s. "
+                    "Leaving /tmp/hl_mm_unclean_shutdown breadcrumb."
+                )
+                try:
+                    with open("/tmp/hl_mm_unclean_shutdown", "w") as f:
+                        f.write(f"unclean shutdown at {datetime.now(timezone.utc).isoformat()}\n")
+                except OSError:
+                    pass
         elif self.quote_engine:
             self.quote_engine.cancel_all()
+
+        # Bug #3: Close Bybit hedge positions
+        if self._hedge_positions and not self.dry_run:
+            for coin, delta in self._hedge_positions.items():
+                if abs(delta) > 1e-10:
+                    logger.warning(
+                        f"Shutdown: closing Bybit hedge {coin} delta={delta:.6f}"
+                    )
+                    bybit_side = "Sell" if delta > 0 else "Buy"
+                    try:
+                        mid = self._prev_bybit_mids.get(coin, 0)
+                        if mid > 0:
+                            # Use market-crossing price for IOC
+                            offset = mid * 0.001  # 10bps
+                            px = mid + offset if bybit_side == "Buy" else mid - offset
+                            await asyncio.to_thread(
+                                self._bybit_place_order,
+                                symbol=f"{coin}USDT",
+                                side=bybit_side,
+                                qty=f"{abs(delta):.4f}",
+                                price=f"{px:.2f}",
+                                order_type="Limit",
+                                time_in_force="IOC",
+                            )
+                    except Exception as e:
+                        logger.error(f"Shutdown hedge close failed for {coin}: {e}")
 
         # Step 3: Warn about remaining inventory
         if self.inventory:
@@ -1280,7 +1600,7 @@ class HLMarketMaker:
         try:
             snapshot = self.inventory._get_snapshot() if self.inventory else None
             uptime = (time.time() - self._start_time) / 3600.0 if self._start_time > 0 else 0
-            pnl = snapshot.daily_pnl if snapshot else 0
+            pnl = (snapshot.daily_pnl if snapshot else 0) + self._compute_bybit_hedge_pnl()
             logger.info(
                 f"FINAL SUMMARY: uptime={uptime:.1f}h pnl=${pnl:.2f} "
                 f"coins={list(self._active_coins)}"
