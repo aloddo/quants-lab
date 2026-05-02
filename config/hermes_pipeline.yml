@@ -87,6 +87,20 @@ tasks:
       limit: 50
     tags: [data, positioning, binance, x14]
 
+  okx_funding:
+    enabled: true
+    task_class: app.tasks.data_collection.okx_funding_task.OKXFundingTask
+    schedule:
+      type: cron
+      cron: "10,40 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+    config:
+      limit: 100
+    tags: [data, funding, okx, exotic]
+
   # ═══════ Layer 1b: Exotic Data Collection ═══════════════
   deribit_options:
     enabled: true
@@ -145,9 +159,9 @@ tasks:
     retry_delay_seconds: 10
     timeout_seconds: 58
     config:
-      pairs: "auto"
-      max_pairs: 4
-      restrict_to_bybit_pairs: true
+      pairs: ["BTC-USDT", "ETH-USDT", "SOL-USDT", "HYPE-USDT", "ZEC-USDT", "PENDLE-USDT", "APE-USDT"]
+      max_pairs: 7
+      restrict_to_bybit_pairs: false
       bybit_collection: "bybit_funding_rates"
       duration_seconds: 50
       poll_seconds: 1.0
@@ -1066,3 +1080,40 @@ tasks:
       step_days: 15
       trade_cost: 0.000375
     tags: [backtesting, x14, crowd-fade, walk-forward, weekly]
+
+  x16_bulk_backtest:
+    enabled: false
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X16"
+      connector_name: "bybit_perpetual"
+      backtest_days: 200
+      trade_cost: 0.000375
+      pairs: ["BTC-USDT"]
+    tags: [backtesting, x16, vol-fear-fade]
+
+  x16_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X16"
+      connector_name: "bybit_perpetual"
+      total_days: 200
+      train_days: 120
+      test_days: 60
+      step_days: 30
+      trade_cost: 0.000375
+      pairs: ["BTC-USDT"]
+    tags: [backtesting, x16, vol-fear-fade, walk-forward]

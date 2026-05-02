@@ -775,6 +775,42 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         total_amount_quote=300.0,
         cooldown_time=28800,  # 8h cooldown
     ),
+    "X16": StrategyMetadata(
+        name="X16",
+        display_name="Vol Fear Fade",
+        controller_module="app.controllers.directional_trading.x16_vol_fear_fade",
+        config_class_name="X16VolFearFadeConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 172800,  # 2 days
+        },
+        trailing_stop=None,
+        direction="LONG",  # LONG-only (vol crush → SHORT doesn't work)
+        blocked_pairs=[],  # BTC-only strategy — pair filtering handled at deploy
+        required_features=["volatility"],  # needs dvol_close column merged from deribit_dvol
+        max_concurrent=5,
+        controller_file="x16_vol_fear_fade.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        bot_image="quants-lab/hummingbot:demo-client-x14",
+        default_config={
+            "dvol_zscore_window": 168,
+            "dvol_spike_threshold": 2.0,
+            "dvol_level_threshold": 2.0,
+            "dvol_delta_lookback": 24,
+            "signal_cooldown_bars": 24,
+            "atr_period": 14,
+            "tp_atr_mult": 2.5,
+            "sl_atr_mult": 3.0,
+            "trailing_act_atr_mult": 1.5,
+            "trailing_delta_atr_mult": 0.8,
+            "time_limit_seconds": 172800,
+        },
+        pair_source="manual",  # BTC-USDT only
+        total_amount_quote=600.0,  # 2x normal (high conviction, BTC-only)
+        cooldown_time=86400,  # 24h cooldown (1 trade per day max)
+    ),
 }
 
 
