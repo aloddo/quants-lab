@@ -173,6 +173,32 @@ tasks:
       out_dir: "app/data/cache/hyperliquid_micro_1s"
     tags: [data, hyperliquid, microstructure, 1s, exotic]
 
+  # MM target shitcoins — wide spreads, potential MM edge
+  hyperliquid_microstructure_mm_targets:
+    enabled: true
+    task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
+    schedule:
+      type: cron
+      cron: "* * * * *"
+      timezone: UTC
+    max_retries: 1
+    retry_delay_seconds: 10
+    timeout_seconds: 58
+    config:
+      pairs: ["MEGA-USDT", "APE-USDT", "BIO-USDT", "ORDI-USDT", "DASH-USDT", "PENDLE-USDT", "AXS-USDT", "PNUT-USDT"]
+      max_pairs: 8
+      restrict_to_bybit_pairs: false
+      bybit_collection: "bybit_funding_rates"
+      duration_seconds: 50
+      poll_seconds: 2.5
+      max_levels: 20
+      write_mongo: true
+      write_parquet: true
+      book_collection: "hyperliquid_l2_snapshots_1s"
+      trades_collection: "hyperliquid_recent_trades_1s"
+      out_dir: "app/data/cache/hyperliquid_micro_1s"
+    tags: [data, hyperliquid, microstructure, 1s, mm-targets]
+
   coinalyze:
     enabled: true
     task_class: app.tasks.data_collection.coinalyze_task.CoinalyzeTask
