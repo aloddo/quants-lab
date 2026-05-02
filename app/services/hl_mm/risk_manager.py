@@ -50,11 +50,14 @@ class RiskAction(Enum):
 
 @dataclass
 class RiskConfig:
-    """Risk parameters from spec."""
+    """Risk parameters from spec.
+
+    Bug #4 (Codex R4): Updated to match spec for $54 capital.
+    """
     max_live_pairs: int = 2
-    max_gross_notional: float = 150.0      # max gross inventory
-    max_net_exposure: float = 70.0         # max beta-adjusted net
-    max_gross_resting: float = 150.0       # max notional in resting orders
+    max_gross_notional: float = 20.0       # was 150, spec says $20 for $54 capital
+    max_net_exposure: float = 14.0         # was 70, spec says $14
+    max_gross_resting: float = 40.0        # was 150, spec says $40 resting
 
     daily_stop_usd: float = 3.0            # -$3 combined
     hard_stop_usd: float = 5.0             # -$5 full shutdown
@@ -257,6 +260,10 @@ class RiskManager:
     def check_net_exposure(self, current_net: float, new_order_exposure: float) -> bool:
         """Check if new exposure would exceed net limit."""
         return abs(current_net + new_order_exposure) <= self.config.max_net_exposure
+
+    def check_resting_notional(self, total_resting_notional: float) -> bool:
+        """Bug #4 (Codex R4): Check if total resting order notional is within limit."""
+        return total_resting_notional <= self.config.max_gross_resting
 
     # ------------------------------------------------------------------
     # Correlation stop

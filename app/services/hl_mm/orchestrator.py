@@ -143,6 +143,9 @@ class HLMarketMaker:
         # Bug #12: asyncio.Lock for signal state access
         self._signal_lock = asyncio.Lock()
 
+        # Bug #5 (Codex R4): asyncio.Lock for inventory + quote state mutations
+        self._oms_lock = asyncio.Lock()
+
         # Bug #13: Pair fill counts for lifecycle gating
         self._pair_fill_counts: dict[str, int] = {}
 
@@ -179,6 +182,29 @@ class HLMarketMaker:
             return True
 
         return False
+
+    # ==================================================================
+    # Bug #3 (Codex R4): Shared rate limiter for ALL HL REST calls
+    # ==================================================================
+
+    async def _hl_rest_call(self, fn, *args, priority: bool = False, **kwargs):
+        """Gate any HL REST call through the shared token bucket.
+
+        Args:
+            fn: callable (sync) to execute via to_thread
+            *args: positional args for fn
+            priority: if True (cancel/hedge), always allow
+            **kwargs: keyword args for fn
+
+        Returns:
+            Result of fn(*args, **kwargs)
+
+        Raises:
+            RuntimeError if rate limited and not priority
+        """
+        if not self._consume_rate_token(priority=priority):
+            raise RuntimeError("HL REST rate limited")
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     # ==================================================================
     # Bug #14: Sticky daily stop check
@@ -223,16 +249,26 @@ class HLMarketMaker:
             info=self.info,
             mongo_uri=self.mongo_uri,
             config=ScreenerConfig(max_live_pairs=self.config.risk.max_live_pairs),
+            rate_limit_fn=self._consume_rate_token,  # Bug #3 (Codex R4): shared limiter
         )
 
         self.fv_engine = FairValueEngine(bybit_pairs=bybit_pairs)
         self.signal_engine = SignalEngine()
+        # Bug #6 (Codex R4): Compute per-coin tick sizes from HL meta
+        # HL uses 5 significant figures; tick = 10^(-(5 - digits_before_decimal))
+        tick_sizes = {}
+        for coin, sz_dec in self._sz_decimals.items():
+            # We don't have the price yet at init time — tick_sizes will be
+            # computed dynamically by QuoteEngine._get_tick_size() using mid price.
+            pass
+
         self.quote_engine = QuoteEngine(
             exchange=self.exchange,
             info=self.info,
             address=self.address,
             sz_decimals=self._sz_decimals,
             dry_run=self.dry_run,
+            rate_limit_fn=self._consume_rate_token,  # Bug #3 (Codex R4): shared limiter
         )
         self.inventory = InventoryManager(info=self.info, address=self.address)
         self.fill_tracker = FillTracker()
@@ -337,16 +373,18 @@ class HLMarketMaker:
             return
 
         # === STEP 1: Sync positions from exchange ===
-        if self._consume_rate_token():
-            try:
-                snapshot = await asyncio.wait_for(
-                    asyncio.to_thread(self.inventory.sync_positions), timeout=3.0
-                )
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning(f"Position sync failed: {e}")
+        # Bug #5 (Codex R4): Acquire OMS lock for inventory sync
+        async with self._oms_lock:
+            if self._consume_rate_token():
+                try:
+                    snapshot = await asyncio.wait_for(
+                        asyncio.to_thread(self.inventory.sync_positions), timeout=3.0
+                    )
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Position sync failed: {e}")
+                    snapshot = None
+            else:
                 snapshot = None
-        else:
-            snapshot = None
 
         # Bug #14: Include Bybit hedge PnL in daily PnL
         bybit_hedge_pnl = self._compute_bybit_hedge_pnl()
@@ -388,9 +426,18 @@ class HLMarketMaker:
         # Bug #4: Handle HEDGE_IMMEDIATELY BEFORE state machine pause.
         # If risk manager says hedge immediately and we have inventory, do it now
         # regardless of state machine state.
+        # Bug #1 (Codex R4): Also check _hedge_in_progress and _hedge_positions
+        # to prevent stacking multiple hedges for the same coin.
         if RiskAction.HEDGE_IMMEDIATELY in risk_state.actions and not self.dry_run:
             for coin in list(self._active_coins):
                 if has_inventory.get(coin, False) and coin in BYBIT_PERPS:
+                    # Skip if already hedged or hedge in flight for this coin
+                    if coin in self._hedge_in_progress:
+                        logger.debug(f"HEDGE_IMMEDIATELY: {coin} skipped — hedge already in progress")
+                        continue
+                    if abs(self._hedge_positions.get(coin, 0)) > 1e-10:
+                        logger.debug(f"HEDGE_IMMEDIATELY: {coin} skipped — Bybit hedge position exists")
+                        continue
                     pos = self.inventory.get_position(coin)
                     sig = self.signal_engine.get_signal(coin)
                     fv = sig.book.mid if sig and sig.book else 0
@@ -414,11 +461,21 @@ class HLMarketMaker:
         # === STEP 3: Per-pair processing ===
         current_mids: dict[str, float] = {}
 
-        # Bug #3: Expire hedge_in_progress after 60s
+        # Bug #1 (Codex R4): hedge_in_progress TTL should only expire when
+        # HL inventory is flat OR a Bybit close-hedge was confirmed — not on
+        # a blind 60s timer. Check actual HL position before expiring.
         for hcoin in list(self._hedge_in_progress.keys()):
-            if now - self._hedge_in_progress[hcoin] > 60.0:
-                logger.info(f"{hcoin}: hedge_in_progress expired after 60s")
+            hl_pos = self.inventory.get_position(hcoin)
+            hl_flat = abs(hl_pos.size) < 1e-10
+            if hl_flat:
+                logger.info(f"{hcoin}: hedge_in_progress cleared — HL inventory is flat")
                 del self._hedge_in_progress[hcoin]
+            elif now - self._hedge_in_progress[hcoin] > 60.0:
+                # 60s passed but HL still has inventory — do NOT expire, just log
+                logger.warning(
+                    f"{hcoin}: hedge_in_progress >60s but HL inventory "
+                    f"still {hl_pos.size:.6f} — keeping hedge active"
+                )
 
         for coin in list(self._active_coins):
             # Skip if circuit breaker disabled this pair
@@ -501,21 +558,71 @@ class HLMarketMaker:
             state_info = self.state_machine.transition(coin, ctx)
 
             # Bug #9: Handle EMERGENCY_FLATTEN state
+            # Bug #2 (Codex R4): Verify close, retry up to 3x, fallback to Bybit hedge
             if state_info.state == PairState.EMERGENCY_FLATTEN:
                 if not self.dry_run and abs(pos.size) > 0:
                     logger.critical(
                         f"EMERGENCY_FLATTEN: {coin} pos={pos.size:.6f}, "
                         f"placing taker close on HL"
                     )
-                    try:
-                        result = await asyncio.to_thread(
-                            self.exchange.market_close, coin
-                        )
-                        logger.info(f"Emergency flatten {coin}: {result}")
-                    except Exception as e:
-                        logger.error(f"Emergency flatten failed for {coin}: {e}")
-                    # Force pause 10 minutes after flatten
-                    self.state_machine.force_pause(coin, 600, "post-emergency-flatten cooldown")
+                    flatten_success = False
+                    for attempt in range(3):
+                        try:
+                            result = await asyncio.to_thread(
+                                self.exchange.market_close, coin
+                            )
+                            logger.info(f"Emergency flatten {coin} attempt {attempt+1}: {result}")
+                        except Exception as e:
+                            logger.error(f"Emergency flatten {coin} attempt {attempt+1} failed: {e}")
+
+                        # Verify position is actually flat
+                        await asyncio.sleep(2.0)
+                        try:
+                            await asyncio.to_thread(self.inventory.sync_positions)
+                        except Exception:
+                            pass
+                        verify_pos = self.inventory.get_position(coin)
+                        if abs(verify_pos.size) < 1e-10:
+                            logger.info(f"Emergency flatten {coin}: verified flat after attempt {attempt+1}")
+                            flatten_success = True
+                            break
+                        else:
+                            logger.warning(
+                                f"Emergency flatten {coin}: still has position "
+                                f"{verify_pos.size:.6f} after attempt {attempt+1}"
+                            )
+
+                    if not flatten_success:
+                        # Fallback: Bybit hedge if available
+                        if coin in BYBIT_PERPS and abs(self._hedge_positions.get(coin, 0)) < 1e-10:
+                            logger.critical(
+                                f"EMERGENCY_FLATTEN: {coin} failed 3 close attempts, "
+                                f"falling back to Bybit hedge"
+                            )
+                            verify_pos = self.inventory.get_position(coin)
+                            sig = self.signal_engine.get_signal(coin)
+                            fv = sig.book.mid if sig and sig.book else fair_value
+                            if fv > 0:
+                                await self._execute_bybit_hedge(coin, verify_pos, fv)
+                                self._hedge_in_progress[coin] = now
+                        else:
+                            logger.critical(
+                                f"EMERGENCY_FLATTEN: {coin} failed 3 close attempts and "
+                                f"no Bybit hedge available — MANUAL INTERVENTION REQUIRED"
+                            )
+                            self.notifier.notify_engine_event(
+                                "EMERGENCY FLATTEN FAILED",
+                                f"{coin}: 3 close attempts failed, no hedge. Manual intervention required.",
+                            )
+
+                    # Only pause 10min if actually flat or hedged
+                    verify_pos = self.inventory.get_position(coin)
+                    hedged = abs(self._hedge_positions.get(coin, 0)) > 1e-10
+                    if abs(verify_pos.size) < 1e-10 or hedged:
+                        self.state_machine.force_pause(coin, 600, "post-emergency-flatten cooldown")
+                    else:
+                        # Don't pause — keep retrying next tick
+                        logger.critical(f"EMERGENCY_FLATTEN: {coin} NOT pausing — still exposed")
                 self.quote_engine.cancel_coin(coin)
                 continue
 
@@ -523,11 +630,22 @@ class HLMarketMaker:
             if state_info.state in (PairState.QUOTING_BOTH, PairState.QUOTING_ONE_SIDE,
                                      PairState.INVENTORY_EXIT):
                 # Bug #5: Portfolio-level check before quoting
+                # Bug #4 (Codex R4): Also check net exposure and resting notional
                 proposed_notional = self.inventory.get_limits(coin).q_soft * 0.5
                 gross = snapshot.total_gross_notional if snapshot else 0
                 net = snapshot.total_net_exposure if snapshot else 0
                 if not self.risk_manager.check_notional_limit(gross, proposed_notional):
                     logger.debug(f"{coin}: gross notional limit hit, skipping quotes")
+                    self.quote_engine.cancel_coin(coin)
+                    continue
+                if not self.risk_manager.check_net_exposure(net, proposed_notional):
+                    logger.debug(f"{coin}: net exposure limit hit, skipping quotes")
+                    self.quote_engine.cancel_coin(coin)
+                    continue
+                # Check resting order notional (sum of all active quote notionals)
+                total_resting = self._compute_total_resting_notional()
+                if not self.risk_manager.check_resting_notional(total_resting + proposed_notional):
+                    logger.debug(f"{coin}: resting notional limit hit (${total_resting:.1f}), skipping")
                     self.quote_engine.cancel_coin(coin)
                     continue
 
@@ -555,10 +673,12 @@ class HLMarketMaker:
                     )
 
                     if quotes:
-                        if not self.dry_run:
-                            await asyncio.to_thread(self.quote_engine.execute_quotes, quotes)
-                        else:
-                            self.quote_engine.execute_quotes(quotes)
+                        # Bug #5 (Codex R4): Acquire OMS lock for quote execution
+                        async with self._oms_lock:
+                            if not self.dry_run:
+                                await asyncio.to_thread(self.quote_engine.execute_quotes, quotes)
+                            else:
+                                self.quote_engine.execute_quotes(quotes)
 
                         # Log quote decision
                         bid_o, ask_o = self.quote_engine.get_active_orders(coin)
@@ -583,30 +703,42 @@ class HLMarketMaker:
                         ))
             else:
                 # Not quoting: cancel any existing orders
-                self.quote_engine.cancel_coin(coin)
+                # Bug #5 (Codex R4): Acquire OMS lock
+                async with self._oms_lock:
+                    self.quote_engine.cancel_coin(coin)
 
             # Execute Bybit hedge if requested (Gap 1)
+            # Bug #1 (Codex R4): Check hedge_in_progress + hedge_positions before stacking
             if state_info.hedge_requested and not self.dry_run:
-                await self._execute_bybit_hedge(coin, pos, fair_value)
-                # Bug #3: Mark hedge as in progress
-                self._hedge_in_progress[coin] = now
+                if coin in self._hedge_in_progress:
+                    logger.debug(f"{coin}: hedge requested but already in progress, skipping")
+                elif abs(self._hedge_positions.get(coin, 0)) > 1e-10:
+                    logger.debug(f"{coin}: hedge requested but Bybit position exists, skipping")
+                else:
+                    await self._execute_bybit_hedge(coin, pos, fair_value)
+                    # Mark hedge as in progress
+                    self._hedge_in_progress[coin] = now
 
             # Detect fills
+            # Bug #5 (Codex R4): Acquire OMS lock for fill detection + recording
             if not self.dry_run:
-                try:
-                    fills = await asyncio.to_thread(self.quote_engine.detect_fills, coin)
-                    for fill in fills:
-                        self._handle_fill(coin, fill)
-                except Exception as e:
-                    logger.warning(f"Fill detection error for {coin}: {e}")
+                async with self._oms_lock:
+                    try:
+                        fills = await asyncio.to_thread(self.quote_engine.detect_fills, coin)
+                        for fill in fills:
+                            self._handle_fill(coin, fill)
+                    except Exception as e:
+                        logger.warning(f"Fill detection error for {coin}: {e}")
 
         # === STEP 4: Update markouts ===
         self.fill_tracker.update_markouts(current_mids)
 
         # === STEP 5: Orphan cleanup (every 30s) ===
+        # Bug #5 (Codex R4): Acquire OMS lock for orphan cleanup
         if self._tick_count % 60 == 0:
             if not self.dry_run:
-                await asyncio.to_thread(self.quote_engine.cleanup_orphans)
+                async with self._oms_lock:
+                    await asyncio.to_thread(self.quote_engine.cleanup_orphans)
 
         # === STEP 6: Status log (every 60s) ===
         if self._tick_count % 120 == 0:
@@ -1020,7 +1152,8 @@ class HLMarketMaker:
     async def _poll_fills_rest(self) -> None:
         """Query HL REST for recent user fills and process any missed ones."""
         try:
-            resp = await asyncio.to_thread(
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            resp = await self._hl_rest_call(
                 sync_requests.post,
                 HL_INFO_API,
                 json={"type": "userFills", "user": self.address},
@@ -1143,11 +1276,13 @@ class HLMarketMaker:
 
         while time.time() < deadline:
             try:
-                resp = await asyncio.to_thread(
+                # Bug #3 (Codex R4): Gate through shared rate limiter (priority for startup)
+                resp = await self._hl_rest_call(
                     sync_requests.post,
                     HL_INFO_API,
                     json={"type": "openOrders", "user": self.address},
                     timeout=5,
+                    priority=True,
                 )
                 if resp.status_code != 200:
                     logger.warning(f"Startup order query failed: HTTP {resp.status_code}, retrying in {backoff:.0f}s")
@@ -1169,7 +1304,8 @@ class HLMarketMaker:
                     px = order.get("px", "?")
                     sz = order.get("sz", "?")
                     try:
-                        await asyncio.to_thread(self.exchange.cancel, coin, oid)
+                        # Priority cancel
+                        await self._hl_rest_call(self.exchange.cancel, coin, oid, priority=True)
                         logger.info(f"  Cancelled stale order: {coin} {side} {sz}@{px} oid={oid}")
                     except Exception as e:
                         logger.warning(f"  Failed to cancel {coin} oid={oid}: {e}")
@@ -1208,7 +1344,8 @@ class HLMarketMaker:
         """
         logger.info("Startup: syncing existing positions...")
         try:
-            state = await asyncio.to_thread(self.info.user_state, self.address)
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            state = await self._hl_rest_call(self.info.user_state, self.address, priority=True)
             if not state:
                 logger.info("Startup: no user state returned")
                 return
@@ -1261,6 +1398,21 @@ class HLMarketMaker:
 
         except Exception as e:
             logger.error(f"Startup position sync failed: {e}")
+
+    # ==================================================================
+    # Bug #4 (Codex R4): Resting notional computation
+    # ==================================================================
+
+    def _compute_total_resting_notional(self) -> float:
+        """Sum notional of all currently resting quotes across all coins."""
+        total = 0.0
+        for coin in self._active_coins:
+            bid_o, ask_o = self.quote_engine.get_active_orders(coin)
+            if bid_o:
+                total += bid_o.size * bid_o.price
+            if ask_o:
+                total += ask_o.size * ask_o.price
+        return total
 
     # ==================================================================
     # Bug #14: Bybit hedge PnL tracking
@@ -1386,6 +1538,7 @@ class HLMarketMaker:
         price: str,
         order_type: str = "Limit",
         time_in_force: str = "IOC",
+        reduce_only: bool = False,
     ) -> Optional[dict]:
         """Place an order on Bybit mainnet via raw REST API.
 
@@ -1404,6 +1557,7 @@ class HLMarketMaker:
             "qty": qty,
             "price": price,
             "timeInForce": time_in_force,
+            "reduceOnly": reduce_only,
         }
 
         payload_str = json.dumps(payload, separators=(",", ":"))
@@ -1568,6 +1722,7 @@ class HLMarketMaker:
                                 price=f"{px:.2f}",
                                 order_type="Limit",
                                 time_in_force="IOC",
+                                reduce_only=True,  # Bug #1 (Codex R4): close-hedge must be reduceOnly
                             )
                     except Exception as e:
                         logger.error(f"Shutdown hedge close failed for {coin}: {e}")

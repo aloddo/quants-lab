@@ -128,6 +128,8 @@ class QuoteEngine:
         config: Optional[QuoteConfig] = None,
         tox_buffers: Optional[dict[str, float]] = None,
         dry_run: bool = False,
+        rate_limit_fn: Optional[object] = None,
+        tick_sizes: Optional[dict[str, float]] = None,
     ):
         self.exchange = exchange
         self.info = info
@@ -136,6 +138,11 @@ class QuoteEngine:
         self.config = config or QuoteConfig()
         self.tox_buffers = tox_buffers or DEFAULT_TOX_BUFFERS
         self.dry_run = dry_run
+        # Bug #3 (Codex R4): Shared rate limiter callback — callable(priority=False) -> bool
+        self._rate_limit_fn = rate_limit_fn
+        # Bug #6 (Codex R4): Per-coin tick sizes (price increment)
+        # If not provided, derived from szDecimals as fallback
+        self._tick_sizes: dict[str, float] = tick_sizes or {}
 
         self._states: dict[str, QuoteState] = {}
         self._last_orphan_check: float = 0.0
@@ -146,6 +153,28 @@ class QuoteEngine:
         # Bug #6/#7: Pending fill checks — OID -> (timestamp, original_size)
         self._pending_fill_check: dict[int, tuple[float, str, float]] = {}
         # {oid: (disappeared_at, coin, original_size)}
+
+    def _consume_rate_token(self, priority: bool = False) -> bool:
+        """Bug #3 (Codex R4): Check shared rate limiter before REST calls."""
+        if self._rate_limit_fn:
+            return self._rate_limit_fn(priority=priority)
+        return True  # no limiter configured, always allow
+
+    def _get_tick_size(self, coin: str, mid_price: float) -> float:
+        """Bug #6 (Codex R4): Get the price tick size for a coin.
+
+        HL uses 5 significant figures for prices. The tick size is the
+        smallest price increment at the current price level.
+        """
+        if coin in self._tick_sizes:
+            return self._tick_sizes[coin]
+        # Derive from HL's 5 significant figure convention
+        if mid_price <= 0:
+            return 0.0001
+        import math
+        magnitude = len(str(int(mid_price)))
+        decimals = max(0, 5 - magnitude)
+        return 10 ** (-decimals)
 
     # ------------------------------------------------------------------
     # Quote computation (pure, no side effects)
@@ -195,6 +224,9 @@ class QuoteEngine:
         native_half_spread = native_spread_bps / 2.0
         tox_buffer = self.tox_buffers.get(coin, 1.0)
 
+        # Bug #6 (Codex R4): Use actual tick size instead of 1bp stand-in
+        tick_sz = self._get_tick_size(coin, fair_value)
+
         # Edge room per side
         edge_room = native_half_spread - cfg.maker_fee_bps - tox_buffer
 
@@ -208,10 +240,8 @@ class QuoteEngine:
 
         improve_price = fair_value * (improve / 10000.0)
 
-        # Extra improvement in exit mode
-        exit_extra = 0.0
-        if exit_mode:
-            exit_extra = fair_value * (1.0 / 10000.0)  # 1 extra tick
+        # Extra improvement in exit mode: 1 tick (not 1bp)
+        exit_extra = tick_sz if exit_mode else 0.0
 
         # Build bid quote
         bid_decision = None
@@ -219,18 +249,14 @@ class QuoteEngine:
             # Reservation price is already inventory-skewed (AS)
             bid_px = reservation_price - fair_value * (cfg.maker_fee_bps / 10000.0)
 
-            # Bug #10: Inside improvement should quote INSIDE the spread (better than touch).
-            # Removed cap at hl_bid that pinned us at touch. Now cap at hl_ask - 1 tick
-            # to prevent crossing.
+            # Bug #6 (Codex R4): Cap at opposite_touch - tick_size (not - 1bp)
             if improve > 0 and not exit_mode:
-                bid_px = min(bid_px + improve_price, hl_ask - fair_value * 0.0001)
+                bid_px = min(bid_px + improve_price, hl_ask - tick_sz)
             elif exit_mode and inventory_usd < 0:
                 # We are short, buying to exit -> more aggressive bid
-                bid_px = min(bid_px + improve_price + exit_extra, hl_ask - fair_value * 0.0001)
+                bid_px = min(bid_px + improve_price + exit_extra, hl_ask - tick_sz)
 
-            # Never cross the ask
-            bid_px = min(bid_px, hl_ask * 0.9999)
-
+            # Bug #6 (Codex R4): Round to tick size FIRST, then check crosses
             bid_sz_usd = self._compute_child_size(
                 coin, depth20_bid_usd, free_equity_usd, q_soft, vol_scale, anchor_scale
             )
@@ -238,7 +264,10 @@ class QuoteEngine:
             bid_sz = self._round_size(coin, bid_sz)
             bid_px = self._round_price(coin, bid_px)
 
-            if bid_sz > 0 and bid_px > 0 and bid_sz * bid_px >= cfg.min_notional_usd:
+            # Post-rounding cross check: if bid >= ask after rounding, cancel this side
+            if bid_px >= hl_ask:
+                bid_decision = None  # crossed — don't quote
+            elif bid_sz > 0 and bid_px > 0 and bid_sz * bid_px >= cfg.min_notional_usd:
                 bid_decision = QuoteDecision(
                     price=bid_px, size=bid_sz,
                     notional_usd=bid_sz * bid_px,
@@ -250,17 +279,14 @@ class QuoteEngine:
         if quote_ask:
             ask_px = reservation_price + fair_value * (cfg.maker_fee_bps / 10000.0)
 
-            # Bug #10: Inside improvement should quote INSIDE the spread (better than touch).
-            # Removed cap at hl_ask. Now cap at hl_bid + 1 tick to prevent crossing.
+            # Bug #6 (Codex R4): Cap at opposite_touch + tick_size (not + 1bp)
             if improve > 0 and not exit_mode:
-                ask_px = max(ask_px - improve_price, hl_bid + fair_value * 0.0001)
+                ask_px = max(ask_px - improve_price, hl_bid + tick_sz)
             elif exit_mode and inventory_usd > 0:
                 # We are long, selling to exit -> more aggressive ask
-                ask_px = max(ask_px - improve_price - exit_extra, hl_bid + fair_value * 0.0001)
+                ask_px = max(ask_px - improve_price - exit_extra, hl_bid + tick_sz)
 
-            # Never cross the bid
-            ask_px = max(ask_px, hl_bid * 1.0001)
-
+            # Bug #6 (Codex R4): Round to tick size FIRST, then check crosses
             ask_sz_usd = self._compute_child_size(
                 coin, depth20_ask_usd, free_equity_usd, q_soft, vol_scale, anchor_scale
             )
@@ -268,12 +294,26 @@ class QuoteEngine:
             ask_sz = self._round_size(coin, ask_sz)
             ask_px = self._round_price(coin, ask_px)
 
-            if ask_sz > 0 and ask_px > 0 and ask_sz * ask_px >= cfg.min_notional_usd:
+            # Post-rounding cross check: if ask <= bid after rounding, cancel this side
+            if ask_px <= hl_bid:
+                ask_decision = None  # crossed — don't quote
+            elif ask_sz > 0 and ask_px > 0 and ask_sz * ask_px >= cfg.min_notional_usd:
                 ask_decision = QuoteDecision(
                     price=ask_px, size=ask_sz,
                     notional_usd=ask_sz * ask_px,
                     is_improvement=ask_px < hl_ask,
                 )
+
+        if not bid_decision and not ask_decision:
+            return None
+
+        # Bug #6 (Codex R4): Final cross check between our own bid and ask
+        if bid_decision and ask_decision and bid_decision.price >= ask_decision.price:
+            logger.warning(
+                f"{coin}: own quotes crossed after rounding "
+                f"(bid={bid_decision.price} >= ask={ask_decision.price}), cancelling bid"
+            )
+            bid_decision = None
 
         if not bid_decision and not ask_decision:
             return None
@@ -406,13 +446,16 @@ class QuoteEngine:
 
         if not self.dry_run:
             try:
-                all_orders = self.info.open_orders(self.address)
-                if all_orders:
-                    for order in all_orders:
-                        try:
-                            self.exchange.cancel(order["coin"], order["oid"])
-                        except Exception:
-                            pass
+                # Bug #3 (Codex R4): Gate through shared rate limiter (priority: cancel)
+                if self._consume_rate_token(priority=True):
+                    all_orders = self.info.open_orders(self.address)
+                    if all_orders:
+                        for order in all_orders:
+                            try:
+                                self._consume_rate_token(priority=True)
+                                self.exchange.cancel(order["coin"], order["oid"])
+                            except Exception:
+                                pass
             except Exception as e:
                 logger.warning(f"Orphan cleanup failed: {e}")
 
@@ -447,6 +490,9 @@ class QuoteEngine:
         fills = []
         now = time.time()
         try:
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            if not self._consume_rate_token():
+                return []
             open_orders = self.info.open_orders(self.address)
             open_oids = {}
             for o in (open_orders or []):
@@ -552,6 +598,9 @@ class QuoteEngine:
             return
 
         try:
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            if not self._consume_rate_token():
+                return
             all_orders = self.info.open_orders(self.address)
             if not all_orders:
                 # No open orders — clear all stale tracking
@@ -663,6 +712,8 @@ class QuoteEngine:
             return True
 
         try:
+            # Bug #3 (Codex R4): Gate through shared rate limiter (priority: cancel)
+            self._consume_rate_token(priority=True)
             self.exchange.bulk_cancel(cancels)
             # Cancel confirmed — safe to clear local state
             state.bid_order = None
@@ -684,6 +735,10 @@ class QuoteEngine:
             return None
 
         try:
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            if not self._consume_rate_token():
+                logger.debug(f"{coin}: ALO rate limited, skipping")
+                return None
             order_type = OrderType(limit={"tif": "Alo"})
             result = self.exchange.order(coin, is_buy, size, price, order_type)
 
@@ -706,6 +761,9 @@ class QuoteEngine:
     def _query_fill(self, oid: int) -> Optional[dict]:
         """Query HL for fill details of a specific order."""
         try:
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            if not self._consume_rate_token():
+                return None
             result = self.info.query_order_by_oid(self.address, oid)
             if result and result.get("order", {}).get("status") == "filled":
                 order = result.get("order", {})

@@ -21,8 +21,9 @@ timing:
 
 risk:
   max_live_pairs: 2
-  max_gross_notional: 150.0
-  max_net_exposure: 70.0
+  max_gross_notional: 20.0       # Bug #4 (Codex R4): $20 gross for $54 capital
+  max_net_exposure: 14.0         # Bug #4 (Codex R4): $14 net for $54 capital
+  max_resting_notional: 40.0     # Bug #4 (Codex R4): $40 resting order limit
   daily_stop_usd: 3.0
   hard_stop_usd: 5.0
 

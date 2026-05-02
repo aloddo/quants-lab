@@ -99,9 +99,12 @@ class PairScreener:
         info: Info,
         mongo_uri: str = "mongodb://localhost:27017/quants_lab",
         config: Optional[ScreenerConfig] = None,
+        rate_limit_fn: Optional[object] = None,
     ):
         self.info = info
         self.config = config or ScreenerConfig()
+        # Bug #3 (Codex R4): Shared rate limiter callback
+        self._rate_limit_fn = rate_limit_fn
 
         # MongoDB
         client = MongoClient(mongo_uri)
@@ -151,6 +154,10 @@ class PairScreener:
 
         # Step 1: Fetch meta + asset contexts
         try:
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            if self._rate_limit_fn and not self._rate_limit_fn():
+                logger.debug("Screener: rate limited on meta fetch, skipping scan")
+                return self._rankings
             meta_data = await asyncio.to_thread(self.info.meta_and_asset_ctxs)
         except Exception as e:
             logger.error(f"Screener: meta fetch failed: {e}")
@@ -202,6 +209,11 @@ class PairScreener:
         rankings = []
         for coin, pair_info, ctx, daily_vol in l2_candidates:
             try:
+                # Bug #3 (Codex R4): Gate through shared rate limiter
+                if self._rate_limit_fn and not self._rate_limit_fn():
+                    await asyncio.sleep(0.5)  # back off if rate limited
+                    if self._rate_limit_fn and not self._rate_limit_fn():
+                        continue  # still limited, skip this coin
                 l2 = await asyncio.to_thread(self.info.l2_snapshot, coin)
                 await asyncio.sleep(L2_STAGGER_MS / 1000.0)
             except Exception as e:

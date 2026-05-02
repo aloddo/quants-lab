@@ -77,10 +77,15 @@ class TimingConfig:
 
 @dataclass
 class GlobalRiskConfig:
-    """Global risk limits."""
+    """Global risk limits.
+
+    Bug #4 (Codex R4): Updated to match spec for $54 capital:
+    max_gross=20, max_net=14, max_resting=40.
+    """
     max_live_pairs: int = 2
-    max_gross_notional: float = 150.0
-    max_net_exposure: float = 70.0
+    max_gross_notional: float = 20.0       # was 150, spec says $20 for $54 capital
+    max_net_exposure: float = 14.0         # was 70, spec says $14
+    max_resting_notional: float = 40.0     # new: max total resting order notional
     daily_stop_usd: float = 3.0
     hard_stop_usd: float = 5.0
 
