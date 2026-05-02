@@ -197,12 +197,23 @@ def check_account_state(info: Info, address: str) -> dict:
     print(f"  Account State")
     print(f"{'='*60}")
 
-    try:
-        user_state = info.user_state(address)
-        time.sleep(2)  # Rate limit spacing
-    except Exception as e:
-        print(f"  ERROR fetching user state: {e}")
-        return {"error": str(e)}
+    user_state = None
+    for attempt in range(5):
+        try:
+            user_state = info.user_state(address)
+            time.sleep(3)
+            break
+        except Exception as e:
+            if "429" in str(e):
+                wait = 5 * (2 ** attempt)
+                print(f"  429 on user_state, backing off {wait}s (attempt {attempt+1}/5)")
+                time.sleep(wait)
+            else:
+                print(f"  ERROR fetching user state: {e}")
+                return {"error": str(e)}
+    if user_state is None:
+        print(f"  ERROR: Could not fetch user state after 5 retries")
+        return {"error": "429 after retries"}
 
     margin = user_state.get("marginSummary", {})
     account_value = float(margin.get("accountValue", 0))
@@ -268,8 +279,11 @@ def measure_order_roundtrip(
         # Place ALO bid at 5% below mid (guaranteed won't fill, likely won't reject)
         test_price = round(mid * 0.95, 2 if mid > 10 else 4)
         order_type = OrderType(limit={"tif": "Alo"})
-        # HL minimum order value is $10. Use 1.0 SOL (~$84) to be safe.
-        sz = 1.0 if mid > 20 else round(15 / mid, 2)
+        # HL minimum order value is $10. Size must fit within available margin.
+        # At 1x leverage, margin needed = notional. Use ~$12 notional (safely above $10 min).
+        sz = round(12.0 / (test_price if test_price > 0 else mid), 2 if mid > 10 else 4)
+        if sz * mid < 10:
+            sz = round(11.0 / mid, 2 if mid > 10 else 4)
 
         t0 = time.time()
         try:
@@ -386,8 +400,10 @@ def measure_alo_reject_rate(
             order_type = OrderType(limit={"tif": "Alo"})
 
             try:
-                # HL minimum order value is $10. Use 1.0 SOL (~$84) to be safe.
-                sz = 1.0 if mid > 20 else round(15 / mid, 2)
+                # Size: above $10 min but within $50 margin at 1x
+                sz = round(12.0 / (test_price if test_price > 0 else mid), 2 if mid > 10 else 4)
+                if sz * mid < 10:
+                    sz = round(11.0 / mid, 2 if mid > 10 else 4)
                 result = exchange.order(coin, True, sz, test_price, order_type)
             except Exception as e:
                 rejected += 1
@@ -532,18 +548,25 @@ def main():
         print("  Then re-run this script.")
         all_results["order_tests"] = "SKIPPED — insufficient margin"
     else:
-        # Phase 3: Order tests (rate-limit-aware, 2s spacing)
+        # Cool down between phases — let the rate limit bucket refill
+        print("\n  Cooling down 10s before order tests...")
+        time.sleep(10)
+
+        # Phase 3: Order tests (rate-limit-aware, 3s spacing)
         print("\n" + "=" * 60)
-        print("  PHASE 3: Order Tests (2s spacing, ~50s total)")
+        print("  PHASE 3: Order Tests (3s spacing, ~60s total)")
         print("=" * 60)
 
         all_results["order_rtt"] = measure_order_roundtrip(
-            exchange, info, "SOL", n_orders=10, spacing_s=2.0
+            exchange, info, "SOL", n_orders=10, spacing_s=3.0
         )
+
+        print("\n  Cooling down 10s before ALO tests...")
+        time.sleep(10)
 
         # Phase 4: ALO reject rate (rate-limit-aware)
         print("\n" + "=" * 60)
-        print("  PHASE 4: ALO Reject Rate (2s spacing, ~60s total)")
+        print("  PHASE 4: ALO Reject Rate (3s spacing, ~90s total)")
         print("=" * 60)
 
         all_results["alo_reject"] = measure_alo_reject_rate(
