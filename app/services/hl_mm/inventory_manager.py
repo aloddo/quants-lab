@@ -121,7 +121,11 @@ class InventoryManager:
         self._rv_baseline: dict[str, float] = {}  # baseline 30s realized vol per coin
 
         # Portfolio state
-        self._equity: float = 0.0
+        # HL unified accounts report $0 accountValue in clearinghouse when all
+        # funds are in spot USDC. Use a flag to track if we've ever gotten a
+        # real equity reading. If not, disable PnL-based stops.
+        self._equity: float = 54.0  # default to known HL capital
+        self._equity_ever_confirmed: bool = False
         self._session_start_equity: Optional[float] = None
         self._peak_equity: float = 0.0
         self._daily_pnl: float = 0.0
@@ -247,14 +251,23 @@ class InventoryManager:
             account_value = float(margin.get("accountValue", 0) or 0)
             total_margin = float(margin.get("totalMarginUsed", 0) or 0)
 
-            self._equity = account_value
-            if self._session_start_equity is None:
-                self._session_start_equity = account_value
-                self._peak_equity = account_value
+            # On HL unified accounts, accountValue may show $0 if all funds
+            # are in spot USDC (still usable as perps margin).
+            if account_value > 0:
+                self._equity = account_value
+                self._equity_ever_confirmed = True
+            # else: keep existing _equity (default 54.0 or last known good)
+
+            if self._session_start_equity is None and self._equity > 0:
+                self._session_start_equity = self._equity
+                self._peak_equity = self._equity
             else:
                 self._peak_equity = max(self._peak_equity, account_value)
 
-            self._daily_pnl = account_value - self._session_start_equity
+            # Only compute daily PnL if we have a real equity reading
+            if self._equity_ever_confirmed and self._session_start_equity:
+                self._daily_pnl = self._equity - self._session_start_equity
+            # else: keep daily_pnl at 0 (no confirmed readings yet)
 
             # Update per-coin positions
             returned_coins = set()
@@ -340,14 +353,20 @@ class InventoryManager:
             margin = state.get("marginSummary", {})
             account_value = float(margin.get("accountValue", 0) or 0)
 
-            self._equity = account_value
-            if self._session_start_equity is None:
-                self._session_start_equity = account_value
-                self._peak_equity = account_value
-            else:
-                self._peak_equity = max(self._peak_equity, account_value)
+            # HL unified accounts may report $0 accountValue when funds are in spot
+            if account_value > 0:
+                self._equity = account_value
+                self._equity_ever_confirmed = True
 
-            self._daily_pnl = account_value - self._session_start_equity
+            if self._session_start_equity is None and self._equity > 0:
+                self._session_start_equity = self._equity
+                self._peak_equity = self._equity
+            elif self._equity > 0:
+                self._peak_equity = max(self._peak_equity, self._equity)
+
+            # Only compute daily PnL with confirmed equity
+            if self._equity_ever_confirmed and self._session_start_equity:
+                self._daily_pnl = self._equity - self._session_start_equity
 
             # Update per-coin positions (same logic as sync_positions)
             returned_coins = set()

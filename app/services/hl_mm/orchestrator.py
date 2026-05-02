@@ -763,27 +763,27 @@ class HLMarketMaker:
                     else:
                         logger.debug(f"[{coin}] compute_quotes returned empty")
 
-                        # Log quote decision
-                        bid_o, ask_o = self.quote_engine.get_active_orders(coin)
-                        self.fill_tracker.log_quote(QuoteLog(
-                            coin=coin,
-                            timestamp=now,
-                            state=state_info.state.value,
-                            fair_value=fair_value,
-                            reservation_price=reservation,
-                            hl_bid=book.best_bid,
-                            hl_ask=book.best_ask,
-                            spread_bps=book.spread_bps,
-                            depth_bid_usd=book.bid_usd_top20,
-                            depth_ask_usd=book.ask_usd_top20,
-                            microprice=book.microprice,
-                            anchor_mid=fv_est.anchored_mid,
-                            imbalance_z=signal.imbalance_z,
-                            bid_price=quotes.bid.price if quotes.bid else None,
-                            ask_price=quotes.ask.price if quotes.ask else None,
-                            bid_oid=bid_o.oid if bid_o else None,
-                            ask_oid=ask_o.oid if ask_o else None,
-                        ))
+                    # Log quote decision (regardless of whether quotes were placed)
+                    bid_o, ask_o = self.quote_engine.get_active_orders(coin)
+                    self.fill_tracker.log_quote(QuoteLog(
+                        coin=coin,
+                        timestamp=now,
+                        state=state_info.state.value,
+                        fair_value=fair_value,
+                        reservation_price=reservation,
+                        hl_bid=book.best_bid,
+                        hl_ask=book.best_ask,
+                        spread_bps=book.spread_bps,
+                        depth_bid_usd=book.bid_usd_top20,
+                        depth_ask_usd=book.ask_usd_top20,
+                        microprice=book.microprice,
+                        anchor_mid=fv_est.anchored_mid,
+                        imbalance_z=signal.imbalance_z,
+                        bid_price=quotes.bid.price if quotes and quotes.bid else None,
+                        ask_price=quotes.ask.price if quotes and quotes.ask else None,
+                        bid_oid=bid_o.oid if bid_o else None,
+                        ask_oid=ask_o.oid if ask_o else None,
+                    ))
             else:
                 # Not quoting: cancel any existing orders
                 # Bug #5 (Codex R4): Acquire OMS lock

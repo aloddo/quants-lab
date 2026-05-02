@@ -231,14 +231,15 @@ class QuoteEngine:
         # Bug #6 (Codex R4): Use actual tick size instead of 1bp stand-in
         tick_sz = self._get_tick_size(coin, fair_value)
 
-        # Edge room per side
-        edge_room = native_half_spread - cfg.maker_fee_bps - tox_buffer
+        # Edge room per side (spread/2 minus maker fee)
+        edge_room = native_half_spread - cfg.maker_fee_bps
 
-        # Inside improvement (Spec Section 3)
-        # improve = min(0.35 * edge_room, edge_room - tox_buffer - 1.0bps)
-        if edge_room > 0:
-            improve = min(0.35 * edge_room, edge_room - tox_buffer - cfg.min_edge_target_bps)
-            improve = max(0.0, improve)
+        # Inside improvement: how much can we improve from touch?
+        # Must preserve: edge_room - improve >= tox_buffer + min_edge_target
+        # So: improve <= edge_room - tox_buffer - min_edge_target
+        if edge_room > tox_buffer:
+            max_improve = edge_room - tox_buffer - cfg.min_edge_target_bps
+            improve = max(0.0, min(0.35 * edge_room, max_improve))
         else:
             improve = 0.0
 
@@ -309,6 +310,11 @@ class QuoteEngine:
                 )
 
         if not bid_decision and not ask_decision:
+            # Log why both sides failed
+            logger.info(
+                f"[{coin}] No quotes: bid={'crossed' if quote_bid and bid_px >= hl_ask else 'sz=0' if quote_bid and bid_sz <= 0 else 'notional<10' if quote_bid else 'disabled'}, "
+                f"ask={'crossed' if quote_ask and ask_px <= hl_bid else 'sz=0' if quote_ask and ask_sz <= 0 else 'notional<10' if quote_ask else 'disabled'}"
+            )
             return None
 
         # Bug #6 (Codex R4): Final cross check between our own bid and ask
@@ -679,13 +685,16 @@ class QuoteEngine:
         return 0 (don't quote) instead of overriding to $10.
         """
         notional_target = DEFAULT_NOTIONAL.get(coin, 50.0)
-        size = min(
-            notional_target,
-            0.20 * free_equity_usd,
-            0.003 * depth20_usd if depth20_usd > 0 else notional_target,
-            0.75 * q_soft,
-        )
+        eq_limit = 0.20 * free_equity_usd
+        depth_limit = 0.003 * depth20_usd if depth20_usd > 0 else notional_target
+        inv_limit = 0.75 * q_soft
+        size = min(notional_target, eq_limit, depth_limit, inv_limit)
         size *= vol_scale * anchor_scale
+        if size < 10:
+            logger.info(
+                f"[{coin}] child_size TOO SMALL: target={notional_target:.1f} eq={eq_limit:.1f} "
+                f"depth={depth_limit:.1f} inv={inv_limit:.1f} free_eq={free_equity_usd:.1f} -> {size:.1f}"
+            )
         # Return 0 if below HL minimum — caller will skip quoting this side
         if size < self.config.min_notional_usd:
             return 0.0
