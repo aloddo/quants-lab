@@ -191,20 +191,33 @@ class PairScreener:
 
         logger.info(f"Screener: {len(candidates)} pairs above ${cfg.min_daily_volume_usd/1000:.0f}K volume")
 
-        # Step 3: Fetch L2 for each candidate (Gap 7: rate limit batching)
-        # If more than 20 pairs qualify, only fetch top 20 by volume
-        MAX_L2_FETCHES = 20
+        # Step 3: Fetch L2 for a smart subset of candidates
+        # Strategy: top 10 by volume (for anchor coverage) + top 15 by funding rate
+        # (high funding = volatile = likely wider spreads). Dedup. Max 25 L2 fetches.
+        MAX_L2_FETCHES = 25
         L2_STAGGER_MS = 300  # 300ms spacing between fetches
 
-        if len(candidates) > MAX_L2_FETCHES:
-            candidates.sort(key=lambda x: x[3], reverse=True)  # sort by daily_vol
-            logger.info(
-                f"Screener: {len(candidates)} candidates exceed L2 limit, "
-                f"fetching top {MAX_L2_FETCHES} by volume"
-            )
-            l2_candidates = candidates[:MAX_L2_FETCHES]
-        else:
-            l2_candidates = candidates
+        # Sort by volume for one bucket
+        by_vol = sorted(candidates, key=lambda x: x[3], reverse=True)[:10]
+        # Sort by abs(funding) as a proxy for volatility/wider spreads
+        by_funding = sorted(
+            candidates,
+            key=lambda x: abs(float(x[2].get("funding", 0) or 0)),
+            reverse=True
+        )[:15]
+        # Merge + dedup, preserving order
+        seen = set()
+        l2_candidates = []
+        for c in by_vol + by_funding:
+            if c[0] not in seen:
+                seen.add(c[0])
+                l2_candidates.append(c)
+        l2_candidates = l2_candidates[:MAX_L2_FETCHES]
+
+        logger.info(
+            f"Screener: {len(candidates)} candidates, fetching L2 for "
+            f"{len(l2_candidates)} (top vol + high funding)"
+        )
 
         rankings = []
         for coin, pair_info, ctx, daily_vol in l2_candidates:
@@ -256,8 +269,10 @@ class PairScreener:
         self._rankings = rankings
         self._last_scan = time.time()
 
-        # Log top pairs
-        for i, r in enumerate(rankings[:10]):
+        # Log only viable MM targets (positive edge)
+        viable = [r for r in rankings if r.edge_room_bps > 0]
+        logger.info(f"Screener: {len(viable)} pairs with positive edge out of {len(rankings)} scanned")
+        for i, r in enumerate(viable[:10]):
             logger.info(
                 f"  #{i+1} {r.coin}: score={r.score:.1f} spread={r.spread_bps:.1f}bps "
                 f"edge={r.edge_room_bps:.1f}bps vol=${r.daily_volume_usd/1000:.0f}K "
