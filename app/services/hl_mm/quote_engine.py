@@ -59,6 +59,9 @@ class ActiveOrder:
     price: float
     size: float
     placed_at: float
+    # V2: Quote attempt telemetry fields
+    ticks_from_touch: int = 0         # 0 = at touch, 1 = one tick inside, etc.
+    spread_bps_at_place: float = 0.0  # spread when order was placed
 
 
 @dataclass
@@ -130,6 +133,7 @@ class QuoteEngine:
         dry_run: bool = False,
         rate_limit_fn: Optional[object] = None,
         tick_sizes: Optional[dict[str, float]] = None,
+        ws_client: Optional[object] = None,  # V2: WSOrderClient for low-latency orders
     ):
         self.exchange = exchange
         self.info = info
@@ -143,6 +147,10 @@ class QuoteEngine:
         # Bug #6 (Codex R4): Per-coin tick sizes (price increment)
         # If not provided, derived from szDecimals as fallback
         self._tick_sizes: dict[str, float] = tick_sizes or {}
+        # V2: WS order client — used by _place_alo and _cancel_coin_orders
+        # when connected. Falls back to REST if None or disconnected.
+        self._ws_client = ws_client
+        self._event_loop = None  # set by orchestrator after event loop starts
 
         self._states: dict[str, QuoteState] = {}
         self._last_orphan_check: float = 0.0
@@ -160,6 +168,21 @@ class QuoteEngine:
         # Bug #6/#7: Pending fill checks — OID -> (timestamp, original_size)
         self._pending_fill_check: dict[int, tuple[float, str, float]] = {}
         # {oid: (disappeared_at, coin, original_size)}
+
+    def set_ws_client(self, ws_client, event_loop=None) -> None:
+        """V2: Inject WS client and event loop after initialization."""
+        self._ws_client = ws_client
+        if event_loop:
+            self._event_loop = event_loop
+        logger.info(f"QuoteEngine: WS client {'set' if ws_client else 'cleared'}")
+
+    def _use_ws(self) -> bool:
+        """Check if WS transport is available and connected."""
+        return (
+            self._ws_client is not None
+            and hasattr(self._ws_client, 'is_connected')
+            and self._ws_client.is_connected
+        )
 
     def _consume_rate_token(self, priority: bool = False) -> bool:
         """Bug #3 (Codex R4): Check shared rate limiter before REST calls."""
@@ -862,22 +885,26 @@ class QuoteEngine:
             state.ask_order = None
             return True
 
-        cancels = []
+        oids_to_cancel = []
         if state.bid_order:
-            cancels.append(CancelRequest(coin=coin, oid=state.bid_order.oid))
+            oids_to_cancel.append((coin, state.bid_order.oid))
         if state.ask_order:
-            cancels.append(CancelRequest(coin=coin, oid=state.ask_order.oid))
+            oids_to_cancel.append((coin, state.ask_order.oid))
 
-        if not cancels:
+        if not oids_to_cancel:
             state.bid_order = None
             state.ask_order = None
             return True
 
+        # V2: Try WS cancel first (faster, no rate limit cost)
+        if self._use_ws():
+            return self._cancel_coin_orders_ws(coin, state, oids_to_cancel)
+
+        # REST fallback
         try:
-            # Bug #3 (Codex R4): Gate through shared rate limiter (priority: cancel)
+            cancels = [CancelRequest(coin=c, oid=o) for c, o in oids_to_cancel]
             self._consume_rate_token(priority=True)
             self.exchange.bulk_cancel(cancels)
-            # Cancel confirmed — safe to clear local state
             state.bid_order = None
             state.ask_order = None
             return True
@@ -890,14 +917,46 @@ class QuoteEngine:
                 self._stale_orders.add(state.ask_order.oid)
             return False
 
+    def _cancel_coin_orders_ws(
+        self, coin: str, state, oids_to_cancel: list[tuple[str, int]]
+    ) -> bool:
+        """V2: Cancel orders via WS transport."""
+        import asyncio
+        if not self._event_loop:
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._ws_client.bulk_cancel(oids_to_cancel),
+                self._event_loop,
+            )
+            result = future.result(timeout=5.0)
+            state.bid_order = None
+            state.ask_order = None
+            logger.debug(f"{coin}: cancelled {len(oids_to_cancel)} orders (WS)")
+            return True
+        except Exception as e:
+            logger.warning(f"WS cancel {coin} failed: {e}")
+            if state.bid_order:
+                self._stale_orders.add(state.bid_order.oid)
+            if state.ask_order:
+                self._stale_orders.add(state.ask_order.oid)
+            return False
+
     def _place_alo(self, coin: str, is_buy: bool, size: float, price: float) -> Optional[int]:
-        """Place ALO (Add Liquidity Only) limit order. Returns oid or None."""
+        """Place ALO (Add Liquidity Only) limit order. Returns oid or None.
+
+        V2: Uses WS transport when available (~100ms RTT), falls back to REST (~500ms).
+        """
         notional = size * price
         if notional < self.config.min_notional_usd:
             return None
 
+        # V2: Try WS transport first
+        if self._use_ws():
+            return self._place_alo_ws(coin, is_buy, size, price)
+
+        # REST fallback
         try:
-            # Bug #3 (Codex R4): Gate through shared rate limiter
             if not self._consume_rate_token():
                 logger.debug(f"{coin}: ALO rate limited, skipping")
                 return None
@@ -909,7 +968,7 @@ class QuoteEngine:
                 if statuses and "resting" in statuses[0]:
                     oid = statuses[0]["resting"]["oid"]
                     logger.debug(
-                        f"{coin} {'BID' if is_buy else 'ASK'} placed: "
+                        f"{coin} {'BID' if is_buy else 'ASK'} placed (REST): "
                         f"{size:.6f} @ {price:.6f} oid={oid}"
                     )
                     return oid
@@ -918,6 +977,33 @@ class QuoteEngine:
             return None
         except Exception as e:
             logger.error(f"Order failed: {coin} {'BUY' if is_buy else 'SELL'} {size}@{price}: {e}")
+            return None
+
+    def _place_alo_ws(self, coin: str, is_buy: bool, size: float, price: float) -> Optional[int]:
+        """V2: Place ALO via WS transport. Called from sync context (to_thread).
+
+        Uses asyncio.run_coroutine_threadsafe to bridge sync thread → async event loop.
+        """
+        import asyncio
+        if not self._event_loop:
+            logger.warning("WS place: no event loop reference, falling back to REST")
+            return None
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._ws_client.place_and_wait(coin, is_buy, size, price, tif="Alo"),
+                self._event_loop,
+            )
+            oid, rtt = future.result(timeout=5.0)
+            if oid:
+                logger.debug(
+                    f"{coin} {'BID' if is_buy else 'ASK'} placed (WS {rtt:.0f}ms): "
+                    f"{size:.6f} @ {price:.6f} oid={oid}"
+                )
+            return oid
+        except Exception as e:
+            logger.warning(f"WS place failed: {e}")
+            # Don't disable WS permanently — might be a transient issue
             return None
 
     def _query_fill(self, oid: int) -> Optional[dict]:

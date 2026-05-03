@@ -46,6 +46,7 @@ from .state_machine import StateMachine, PairContext, PairState
 from .pair_screener import PairScreener, ScreenerConfig, BYBIT_PERPS
 from .wallet_scorer import WalletScorer
 from .mm_tracker import MMTracker
+from .ws_order_client import WSOrderClient
 from .notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -403,6 +404,31 @@ class HLMarketMaker:
         self._start_time = time.time()
         # Codex R2 #3: Store event loop reference for WS thread -> async bridge
         self._event_loop = asyncio.get_running_loop()
+
+        # V2: Initialize WS order client for low-latency order placement
+        self._ws_order_client: Optional[WSOrderClient] = None
+        if not self.dry_run:
+            try:
+                wallet = eth_account.Account.from_key(self.private_key)
+                self._ws_order_client = WSOrderClient(
+                    wallet=wallet,
+                    exchange=self.exchange,
+                    is_mainnet=True,
+                )
+                ws_ok = self._ws_order_client.start()
+                if ws_ok:
+                    # Inject into QuoteEngine so it uses WS for place/cancel
+                    self.quote_engine.set_ws_client(
+                        self._ws_order_client,
+                        event_loop=self._event_loop,
+                    )
+                    logger.info(f"WS order client started, injected into QuoteEngine")
+                else:
+                    logger.warning("WS order client failed to start, using REST")
+                    self._ws_order_client = None
+            except Exception as e:
+                logger.warning(f"WS order client init failed: {e}, using REST")
+                self._ws_order_client = None
 
         # === STARTUP RECONCILIATION (Gap 2 + 3) ===
         # Cancel any stale open orders from prior sessions
@@ -1079,7 +1105,7 @@ class HLMarketMaker:
 
                     if quotes:
                         logger.info(f"[{coin}] Placing quotes: {quotes}")
-                        # Bug #5 (Codex R4): Acquire OMS lock for quote execution
+                        # V2: QuoteEngine handles WS vs REST internally
                         async with self._oms_lock:
                             if not self.dry_run:
                                 await asyncio.to_thread(self.quote_engine.execute_quotes, quotes)
