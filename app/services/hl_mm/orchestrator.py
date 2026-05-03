@@ -686,28 +686,69 @@ class HLMarketMaker:
             self.fill_tracker.update_pair_spread(coin, book.spread_bps)
 
             # Build state machine context
-            edge_room = (book.spread_bps / 2.0) - 1.44  # maker fee
             from .quote_engine import DEFAULT_TOX_BUFFERS
-            tox = DEFAULT_TOX_BUFFERS.get(coin, 1.0)
-            bid_ev = edge_room - tox > 0
-            ask_ev = edge_room - tox > 0
+            tox = DEFAULT_TOX_BUFFERS.get(coin, 1.0)  # used for spread_threshold_met
 
             # Bug #3: Track hedge_in_progress properly
             hedge_active = coin in self._hedge_in_progress
 
-            # Circuit breaker: scale sensitivity by spread regime
-            # Wide-spread shitcoins (>5bps) have noisy microstructure — single flags
-            # fire constantly on normal behavior. Only trigger CB on strong signals.
+            # === V2: SIDE-SPECIFIC EV GATING ===
+            # Replace symmetric bid_ev = ask_ev = (edge_room - tox > 0)
+            # with per-side markout-based expected value.
+            bid_markout_ewma, bid_fill_count = self.fill_tracker.get_side_markout_ewma(coin, "bid")
+            ask_markout_ewma, ask_fill_count = self.fill_tracker.get_side_markout_ewma(coin, "ask")
+
+            half_spread = book.spread_bps / 2.0
+            maker_fee = 1.44  # bps
+
+            # Convert markout to cost: adverse (negative) markout = positive cost
+            # Favorable (positive) markout = zero cost (don't reward, just don't penalize)
+            bid_markout_cost = max(0.0, -bid_markout_ewma) if bid_fill_count >= 3 else 1.0  # prior: assume 1bps adverse
+            ask_markout_cost = max(0.0, -ask_markout_ewma) if ask_fill_count >= 3 else 1.0
+
+            # Exit penalty: probability of taker exit * taker fee
+            # Simple model: if we have inventory on this side, exit is harder
+            inv_usd = pos.size * fair_value if fair_value > 0 else 0
+            bid_exit_penalty = 0.5 * 3.5 if inv_usd > limits.q_soft * 0.3 else 0.2 * 3.5  # bps
+            ask_exit_penalty = 0.5 * 3.5 if inv_usd < -limits.q_soft * 0.3 else 0.2 * 3.5
+
+            bid_ev_bps = half_spread - maker_fee - bid_markout_cost - bid_exit_penalty
+            ask_ev_bps = half_spread - maker_fee - ask_markout_cost - ask_exit_penalty
+
+            ev_threshold = 0.5  # minimum bps to quote a side
+            bid_ev = bid_ev_bps > ev_threshold
+            ask_ev = ask_ev_bps > ev_threshold
+
+            if self._tick_count % 60 == 0:  # log every ~30s
+                logger.info(
+                    f"[{coin}] EV: bid={bid_ev_bps:.1f}bps (markout_cost={bid_markout_cost:.1f}, "
+                    f"exit_pen={bid_exit_penalty:.1f}, fills={bid_fill_count}) "
+                    f"ask={ask_ev_bps:.1f}bps (markout_cost={ask_markout_cost:.1f}, "
+                    f"exit_pen={ask_exit_penalty:.1f}, fills={ask_fill_count}) "
+                    f"half_spread={half_spread:.1f}"
+                )
+
+            # === V2: SIGNAL-BASED CIRCUIT BREAKER ===
+            # Wire ALL computed toxic flags as quoting gates, not just anchor_jump.
             past_warmup = (now - self._start_time > 30.0)
             if not past_warmup:
                 cb_active = False
             else:
-                # Shitcoin MM: signal-based CB is too noisy. Spread oscillates
-                # between 1-15bps and microstructure flags fire constantly.
-                # Only trigger signal CB on anchor_jump (major price dislocation
-                # detected via Bybit reference price divergence).
-                # Fill-based CB (toxic markout in fill_tracker) handles the rest.
-                cb_active = signal.anchor_jump_detected
+                # Hard gates: anchor_jump, depth_drop, spread_spike -> cancel all
+                cb_active = (
+                    signal.anchor_jump_detected
+                    or signal.depth_drop_detected
+                    or signal.spread_spike_detected
+                )
+                # Soft gates: trade imbalance, touch depletion -> suppress adverse side
+                if signal.trade_imbalance_toxic and not cb_active:
+                    # Trade flow is one-sided: suppress the side getting hit
+                    # (If buys dominate, asking is safe but bidding is toxic)
+                    # Check which side is dominant from the signal
+                    if signal.imbalance_side > 0:  # bid-heavy (lots of buying)
+                        bid_ev = False  # suppress bid (adverse to buy into buying pressure)
+                    elif signal.imbalance_side < 0:  # ask-heavy
+                        ask_ev = False  # suppress ask
 
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,

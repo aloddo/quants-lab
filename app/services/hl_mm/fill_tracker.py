@@ -101,6 +101,14 @@ class FillTracker:
         self._pending_markouts: list[Fill] = []
         self._toxicity: dict[str, PairToxicity] = {}
 
+        # V2: Per-side EWMA markout for side-specific EV gating.
+        # Key: (coin, side) -> EWMA of markout_5s in bps.
+        # Convention: favorable markout = positive, adverse = negative.
+        # EV formula uses: E[markout_cost] = max(0, -ewma) to convert to cost.
+        self._side_markout_ewma: dict[tuple[str, str], float] = {}
+        self._side_fill_count: dict[tuple[str, str], int] = {}
+        self._ewma_alpha: float = 0.15  # EWMA decay: ~7-fill half-life
+
         # Per-pair spread for calibrated CB thresholds.
         # Updated by orchestrator from signal engine data.
         self._pair_spread_bps: dict[str, float] = {}
@@ -223,19 +231,38 @@ class FillTracker:
         self._pending_markouts = still_pending
 
     def _update_toxicity(self, fill: Fill) -> None:
-        """Update toxicity stats + circuit breakers after 5s markout computed."""
+        """Update toxicity stats + circuit breakers after 5s markout computed.
+
+        V2: Also updates per-side EWMA markout for side-specific EV gating.
+        """
         tox = self._toxicity.get(fill.coin)
         if not tox:
             return
 
         tox.total_fills += 1
 
-        # Running averages
+        # Running averages (legacy, per-coin)
         n = tox.total_fills
         if fill.markout_1s is not None:
             tox.avg_markout_1s_bps += (fill.markout_1s - tox.avg_markout_1s_bps) / n
         if fill.markout_5s is not None:
             tox.avg_markout_5s_bps += (fill.markout_5s - tox.avg_markout_5s_bps) / n
+
+        # V2: Per-side EWMA markout
+        if fill.markout_5s is not None:
+            key = (fill.coin, fill.side)
+            count = self._side_fill_count.get(key, 0) + 1
+            self._side_fill_count[key] = count
+            old_ewma = self._side_markout_ewma.get(key, 0.0)
+            if count == 1:
+                # First fill for this side: use raw value
+                self._side_markout_ewma[key] = fill.markout_5s
+            else:
+                # EWMA update
+                self._side_markout_ewma[key] = (
+                    self._ewma_alpha * fill.markout_5s
+                    + (1 - self._ewma_alpha) * old_ewma
+                )
 
         if not fill.is_toxic:
             return
@@ -285,6 +312,20 @@ class FillTracker:
         if not tox:
             return False
         return time.time() < tox.disabled_until
+
+    def get_side_markout_ewma(self, coin: str, side: str) -> tuple[float, int]:
+        """V2: Get per-side EWMA markout for EV gating.
+
+        Returns (ewma_bps, fill_count) for this coin+side.
+        Convention: favorable = positive, adverse = negative.
+        EV formula converts: markout_cost = max(0, -ewma)
+
+        Returns (0.0, 0) if no fills yet for this side.
+        """
+        key = (coin, side)
+        ewma = self._side_markout_ewma.get(key, 0.0)
+        count = self._side_fill_count.get(key, 0)
+        return ewma, count
 
     def get_widen_ticks(self, coin: str) -> int:
         """Get number of extra ticks to widen quotes (decays after clean fills)."""

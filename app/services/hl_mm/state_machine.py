@@ -198,7 +198,7 @@ class StateMachine:
         # trigger exit when there's nothing to exit (Bug fix: 0-inventory exit)
         if old_state in (PairState.QUOTING_BOTH, PairState.QUOTING_ONE_SIDE):
             if abs(ctx.inventory_usd) >= 1.0 and (
-                abs(ctx.inventory_usd) >= ctx.q_soft or ctx.inventory_age_s > 30
+                abs(ctx.inventory_usd) >= ctx.q_soft or ctx.inventory_age_s > 20  # V2: tightened from 30s
             ):
                 self._enter_state(info, PairState.INVENTORY_EXIT, now,
                                   f"|q|={abs(ctx.inventory_usd):.0f} >= Q_soft={ctx.q_soft:.0f} "
@@ -307,20 +307,24 @@ class StateMachine:
         return "stale HL data with inventory"
 
     def _should_emergency_flatten(self, ctx: PairContext) -> bool:
-        """Bug #9: Check if emergency flatten is needed.
+        """V2: Emergency flatten with tighter age limit.
 
-        Triggers when: inventory age > 180s, OR loss > 12bps and no hedge available.
+        Was 180s -- way too long. At 3-8bps adverse markout per minute,
+        holding for 180s loses 9-24bps. HL taker close costs only 3.5bps.
+        45s is the breakeven: 45s * ~4bps/min adverse = ~3bps < 3.5bps taker fee.
+
+        Triggers when: age > 45s, OR adverse > 8bps (was 12bps).
         """
         if abs(ctx.inventory_usd) < 5.0:
             return False
-        if ctx.inventory_age_s > 180:
+        if ctx.inventory_age_s > 45:
             return True
-        if ctx.adverse_move_bps > 12.0 and not ctx.bybit_hedge_available:
+        if ctx.adverse_move_bps > 8.0:
             return True
         return False
 
     def _emergency_flatten_reason(self, ctx: PairContext) -> str:
-        if ctx.inventory_age_s > 180:
+        if ctx.inventory_age_s > 45:
             return f"age={ctx.inventory_age_s:.0f}s > 180s emergency limit"
         return f"adverse={ctx.adverse_move_bps:.1f}bps > 12bps, no hedge available"
 
