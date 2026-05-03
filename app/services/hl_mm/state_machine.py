@@ -213,8 +213,13 @@ class StateMachine:
                                       "only one side EV+")
 
         # --- QUOTING_BOTH -> QUOTING_ONE_SIDE ---
+        # Hysteresis: require QUOTING_BOTH to be held for at least 3s before
+        # allowing EV-based demotion. Without this, spread oscillating around
+        # the EV threshold causes rapid flapping (BOTH↔ONE_SIDE every tick),
+        # burning the entire rate budget on cancel/place cycles.
         if info.state == PairState.QUOTING_BOTH:
-            if not ctx.bid_side_ev_positive or not ctx.ask_side_ev_positive:
+            held_s = now - info.entered_at
+            if (not ctx.bid_side_ev_positive or not ctx.ask_side_ev_positive) and held_s >= 3.0:
                 self._enter_state(info, PairState.QUOTING_ONE_SIDE, now,
                                   "one side EV dropped")
             elif abs(ctx.inventory_usd) >= ctx.q_soft * 0.5:

@@ -812,10 +812,17 @@ class HLMarketMaker:
             # isn't, cancel that side's order RIGHT NOW instead of waiting for
             # next tick's execute_quotes. Without this, stale orders get filled
             # in the 0.5-1s window between state change and next requote cycle.
-            # This was causing double fills on every state transition.
+            #
+            # GUARD: Only fire if the previous state was held for >= 1.5s.
+            # Without this, rapid state oscillation (BIO flapping between
+            # QUOTING_BOTH and ONE_SIDE every tick) burns the entire rate
+            # budget on cancel calls, 429-ing everything else.
             bid_dropped = prev_quote_bid and not state_info.quote_bid
             ask_dropped = prev_quote_ask and not state_info.quote_ask
-            if (bid_dropped or ask_dropped) and not self.dry_run:
+            prev_held_long_enough = (
+                prev_state_info and (now - prev_state_info.entered_at) >= 1.5
+            )
+            if (bid_dropped or ask_dropped) and not self.dry_run and prev_held_long_enough:
                 bid_o, ask_o = self.quote_engine.get_active_orders(coin)
                 if bid_dropped and bid_o:
                     try:
