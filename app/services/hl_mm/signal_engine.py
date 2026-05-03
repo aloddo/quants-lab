@@ -74,6 +74,9 @@ class SignalState:
     touch_depletion: bool = False
     any_toxic_flag: bool = False
 
+    # V2: VPIN (Volume-Synchronized Probability of Informed Trading)
+    vpin: float = 0.0                 # 0..1, higher = more toxic flow
+
     # Data freshness
     book_age_ms: float = 999999.0
     is_stale: bool = True
@@ -110,6 +113,13 @@ class SignalEngine:
         # V2: store (ts, direction, notional_usd, price) per trade
         # Was: (ts, direction) only -- lost size info, couldn't do notional-weighted imbalance
         self._trade_sides: dict[str, deque] = {}
+
+        # V2: VPIN state per coin
+        self._vpin_buy_volume: dict[str, float] = {}   # accumulated buy volume in current bucket
+        self._vpin_sell_volume: dict[str, float] = {}   # accumulated sell volume in current bucket
+        self._vpin_bucket_size: dict[str, float] = {}   # target bucket size (daily_vol / 1000)
+        self._vpin_buckets: dict[str, deque] = {}        # completed bucket imbalances
+        self._vpin_default_bucket_size: float = 5000.0   # $5K default bucket
         self._sigma_ema: dict[str, float] = {}
 
         # Latest state
@@ -223,6 +233,7 @@ class SignalEngine:
             anchor_jump_detected=active_anchor_jump,
             touch_depletion=active_touch_depl,
             any_toxic_flag=any_toxic,
+            vpin=self.get_vpin(coin),
             book_age_ms=0.0,
             is_stale=False,
         )
@@ -249,6 +260,48 @@ class SignalEngine:
             size = float(trade.get("sz", 0) or 0)
             notional = price * size
             self._trade_sides[coin].append((now, direction, notional, price))
+
+            # V2: VPIN bucket accumulation
+            if notional > 0:
+                self._accumulate_vpin(coin, direction, notional)
+
+    def _accumulate_vpin(self, coin: str, direction: int, notional: float) -> None:
+        """Accumulate trade volume into VPIN buckets.
+
+        VPIN = rolling mean of |buy_vol - sell_vol| / total_vol over N buckets.
+        Buckets are VOLUME-synchronized (fixed $ size), not time-synchronized.
+        """
+        if coin not in self._vpin_buy_volume:
+            self._vpin_buy_volume[coin] = 0.0
+            self._vpin_sell_volume[coin] = 0.0
+            self._vpin_buckets[coin] = deque(maxlen=50)
+
+        if direction > 0:
+            self._vpin_buy_volume[coin] += notional
+        else:
+            self._vpin_sell_volume[coin] += notional
+
+        bucket_size = self._vpin_bucket_size.get(coin, self._vpin_default_bucket_size)
+        total = self._vpin_buy_volume[coin] + self._vpin_sell_volume[coin]
+
+        # Bucket complete when total volume reaches bucket_size
+        if total >= bucket_size:
+            imbalance = abs(self._vpin_buy_volume[coin] - self._vpin_sell_volume[coin]) / total
+            self._vpin_buckets[coin].append(imbalance)
+            self._vpin_buy_volume[coin] = 0.0
+            self._vpin_sell_volume[coin] = 0.0
+
+    def get_vpin(self, coin: str) -> float:
+        """Get current VPIN for a coin. Returns 0..1, higher = more informed flow."""
+        buckets = self._vpin_buckets.get(coin)
+        if not buckets or len(buckets) < 5:
+            return 0.0  # not enough data
+        return sum(buckets) / len(buckets)
+
+    def set_vpin_bucket_size(self, coin: str, daily_volume: float) -> None:
+        """Set VPIN bucket size from daily volume (daily_vol / 1000)."""
+        if daily_volume > 0:
+            self._vpin_bucket_size[coin] = max(100.0, daily_volume / 1000.0)
 
     def check_anchor_jump(self, coin: str, bybit_mid: float, prev_bybit_mid: float) -> bool:
         """Check if Bybit anchor jumped > 6bps in 1s (Spec Section 5).

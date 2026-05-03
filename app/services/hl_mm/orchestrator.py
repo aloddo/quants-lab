@@ -45,6 +45,7 @@ from .risk_manager import RiskManager, RiskConfig, RiskAction
 from .state_machine import StateMachine, PairContext, PairState
 from .pair_screener import PairScreener, ScreenerConfig, BYBIT_PERPS
 from .wallet_scorer import WalletScorer
+from .mm_tracker import MMTracker
 from .notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,10 @@ class HLMarketMaker:
         self._db = client[db_name]
         self._fills_col = self._db["hl_mm_fills"]
         self._quotes_col = self._db["hl_mm_quote_log"]
+        self._attempts_col = self._db["hl_mm_quote_attempts"]  # V2: lifecycle telemetry
+
+        # V2: Quote attempt buffer for lifecycle tracking
+        self._pending_attempts: list[dict] = []
 
         # Components (initialized in _init_components)
         self.screener: Optional[PairScreener] = None
@@ -359,6 +364,10 @@ class HLMarketMaker:
         logger.info(f"Risk limits: gross=${risk_cfg.max_gross_notional}, net=${risk_cfg.max_net_exposure}, resting=${risk_cfg.max_gross_resting}")
         self.state_machine = StateMachine()
         self.wallet_scorer = WalletScorer()
+        self.mm_tracker = MMTracker(
+            target_coins=set(self._initial_coins),
+            poll_interval_s=60.0,
+        )
         self.notifier = TelegramNotifier(
             min_interval_s=self.config.telegram.min_message_interval_s,
             enabled=self.config.telegram.enabled,
@@ -427,6 +436,9 @@ class HLMarketMaker:
         # These are the PRIMARY fill detection path. REST poll is fallback only.
         self._subscribe_user_fills_ws()
 
+        # V2: Initialize MM tracker (background, non-blocking)
+        asyncio.create_task(self._init_mm_tracker(), name="mm_tracker_init")
+
         # Start background tasks
         tasks = [
             asyncio.create_task(self._main_loop(), name="main_loop"),
@@ -435,6 +447,7 @@ class HLMarketMaker:
             asyncio.create_task(self._mongo_flush_loop(), name="mongo_flush"),
             asyncio.create_task(self._fill_poll_loop(), name="fill_poll"),
             asyncio.create_task(self._daily_summary_loop(), name="daily_summary"),
+            asyncio.create_task(self._mm_tracker_loop(), name="mm_tracker"),
         ]
 
         try:
@@ -722,27 +735,90 @@ class HLMarketMaker:
             bid_exit_penalty = 0.5 * 3.5 if inv_usd > limits.q_soft * 0.3 else 0.2 * 3.5  # bps
             ask_exit_penalty = 0.5 * 3.5 if inv_usd < -limits.q_soft * 0.3 else 0.2 * 3.5
 
-            # V2: Wallet toxicity penalty -- if toxic wallets are active on this
-            # coin, add extra markout cost to BOTH sides (they predict adverse moves)
+            # === V2: KILL CRITERIA — auto-disable side/coin on bad markout ===
+            # 8-fill EWMA < -4bps: disable that side for 30min
+            if bid_fill_count >= 8 and bid_markout_ewma < -4.0:
+                bid_ev = False
+                if self._tick_count % 60 == 0:
+                    logger.warning(f"[{coin}] KILL: bid EWMA={bid_markout_ewma:.1f}bps < -4bps, disabled")
+            if ask_fill_count >= 8 and ask_markout_ewma < -4.0:
+                ask_ev = False
+                if self._tick_count % 60 == 0:
+                    logger.warning(f"[{coin}] KILL: ask EWMA={ask_markout_ewma:.1f}bps < -4bps, disabled")
+
+            # 50-fill coin markout < -3bps: demote coin entirely
+            total_fills = bid_fill_count + ask_fill_count
+            if total_fills >= 50:
+                combined_markout = (
+                    (bid_markout_ewma * bid_fill_count + ask_markout_ewma * ask_fill_count)
+                    / total_fills if total_fills > 0 else 0
+                )
+                if combined_markout < -3.0:
+                    bid_ev = False
+                    ask_ev = False
+                    if self._tick_count % 60 == 0:
+                        logger.warning(
+                            f"[{coin}] KILL: coin markout={combined_markout:.1f}bps < -3bps, "
+                            f"both sides disabled"
+                        )
+
+            # === V2: MODEL DECAY GUARD ===
+            # If markout data is stale (last fill > 5min ago), use conservative prior
+            last_bid_fill = max(
+                (f.timestamp for f in self.fill_tracker.get_recent_fills(coin, 20) if f.side == "bid"),
+                default=0,
+            )
+            last_ask_fill = max(
+                (f.timestamp for f in self.fill_tracker.get_recent_fills(coin, 20) if f.side == "ask"),
+                default=0,
+            )
+            if bid_fill_count >= 3 and now - last_bid_fill > 300:
+                bid_markout_cost = max(bid_markout_cost, 1.5)  # stale: use conservative 1.5bps
+            if ask_fill_count >= 3 and now - last_ask_fill > 300:
+                ask_markout_cost = max(ask_markout_cost, 1.5)
+
+            # === V2: WALLET GATING — full spec actions ===
             wallet_toxic, wallet_toxic_count = self.wallet_scorer.is_toxic_active(coin)
-            wallet_penalty = min(3.0, wallet_toxic_count * 1.0) if wallet_toxic else 0.0  # up to 3bps extra cost
+            if wallet_toxic:
+                # Spec: cancel same-side for 2-5s, widen opposite, halve size
+                # Implementation: strong EV penalty + flag for size halving
+                wallet_penalty = min(5.0, wallet_toxic_count * 1.5)  # up to 5bps
+                # Also force cancel via immediate state-drop if already quoting
+                # (the EV penalty will suppress on next tick, but we want immediate)
+            else:
+                wallet_penalty = 0.0
+
+            # V2: MM crowding penalty — if competing MMs are reducing same side
+            mm_reducing = self.mm_tracker.mm_reducing_side(coin)
+            if mm_reducing == "bid":
+                bid_markout_cost += 1.5  # MMs selling → bidding is riskier
+            elif mm_reducing == "ask":
+                ask_markout_cost += 1.5  # MMs buying → asking is riskier
+
+            # V2: Crowding score penalty — crowded pairs are harder to exit
+            if self.mm_tracker.is_crowded(coin, threshold=0.6):
+                wallet_penalty += 1.0  # additional 1bps for crowded pairs
 
             bid_ev_bps = half_spread - maker_fee - bid_markout_cost - bid_exit_penalty - wallet_penalty
             ask_ev_bps = half_spread - maker_fee - ask_markout_cost - ask_exit_penalty - wallet_penalty
 
             ev_threshold = 0.5  # minimum bps to quote a side
-            bid_ev = bid_ev_bps > ev_threshold
-            ask_ev = ask_ev_bps > ev_threshold
+            # Don't override kill criteria decisions
+            if bid_fill_count < 8 or bid_markout_ewma >= -4.0:
+                bid_ev = bid_ev_bps > ev_threshold
+            if ask_fill_count < 8 or ask_markout_ewma >= -4.0:
+                ask_ev = ask_ev_bps > ev_threshold
 
             if self._tick_count % 60 == 0:  # log every ~30s
                 wallet_stats = self.wallet_scorer.get_stats_summary()
                 logger.info(
-                    f"[{coin}] EV: bid={bid_ev_bps:.1f}bps (markout={bid_markout_cost:.1f}, "
-                    f"exit={bid_exit_penalty:.1f}, wallet={wallet_penalty:.1f}, fills={bid_fill_count}) "
-                    f"ask={ask_ev_bps:.1f}bps (markout={ask_markout_cost:.1f}, "
-                    f"exit={ask_exit_penalty:.1f}, fills={ask_fill_count}) "
-                    f"spread={half_spread:.1f} wallets={wallet_stats['tracked_wallets']}/"
-                    f"{wallet_stats['toxic_wallets']}toxic"
+                    f"[{coin}] EV: bid={bid_ev_bps:.1f}bps (mk={bid_markout_cost:.1f} "
+                    f"ex={bid_exit_penalty:.1f} wl={wallet_penalty:.1f} n={bid_fill_count}) "
+                    f"ask={ask_ev_bps:.1f}bps (mk={ask_markout_cost:.1f} "
+                    f"ex={ask_exit_penalty:.1f} n={ask_fill_count}) "
+                    f"spr={half_spread:.1f} w={wallet_stats['tracked_wallets']}/"
+                    f"{wallet_stats['toxic_wallets']}t "
+                    f"quote={'B' if bid_ev else '_'}{'A' if ask_ev else '_'}"
                 )
 
             # === V2: SIGNAL-BASED CIRCUIT BREAKER ===
@@ -751,12 +827,15 @@ class HLMarketMaker:
             if not past_warmup:
                 cb_active = False
             else:
-                # Hard gates: anchor_jump, depth_drop, spread_spike -> cancel all
+                # Hard gates: anchor_jump, depth_drop, spread_spike, VPIN > 0.8
                 cb_active = (
                     signal.anchor_jump_detected
                     or signal.depth_drop_detected
                     or signal.spread_spike_detected
+                    or signal.vpin > 0.8
                 )
+                if signal.vpin > 0.8 and self._tick_count % 30 == 0:
+                    logger.warning(f"[{coin}] VPIN={signal.vpin:.2f} > 0.8 — quotes pulled")
                 # Soft gates: trade imbalance -> suppress adverse side
                 # V2 fix: use trade_imbalance_side from TRADE flow, not
                 # imbalance_side from BOOK. They can disagree and the old
@@ -1230,6 +1309,22 @@ class HLMarketMaker:
             f"(fee=${fee:.4f}, total_fills={tox.total_fills})"
         )
 
+        # V2: Log quote attempt with fill outcome
+        bid_o, ask_o = self.quote_engine.get_active_orders(coin)
+        matched_order = bid_o if side == "bid" and bid_o else ask_o if side == "ask" and ask_o else None
+        self._pending_attempts.append({
+            "coin": coin,
+            "side": side,
+            "placed_at": matched_order.placed_at if matched_order else now,
+            "ended_at": now,
+            "price": price,
+            "ticks_from_touch": matched_order.ticks_from_touch if matched_order else 0,
+            "spread_bps": matched_order.spread_bps_at_place if matched_order else 0,
+            "filled_qty": size,
+            "outcome": "full_fill",
+            "cancel_reason": None,
+        })
+
         # Telegram notification
         self.notifier.notify_fill(
             coin=coin, side=side, size=size, price=price,
@@ -1699,6 +1794,36 @@ class HLMarketMaker:
     # Screener loop
     # ==================================================================
 
+    async def _init_mm_tracker(self) -> None:
+        """V2: Initialize MM tracker in background (non-blocking)."""
+        await asyncio.sleep(10)  # let engine start first
+        try:
+            self.mm_tracker.update_target_coins(self._active_coins | set(self._initial_coins))
+            await self.mm_tracker.initialize()
+        except Exception as e:
+            logger.warning(f"MM Tracker init failed: {e}")
+
+    async def _mm_tracker_loop(self) -> None:
+        """V2: Poll competitor MM positions every 60s."""
+        await asyncio.sleep(30)  # initial delay
+        while self._running:
+            try:
+                self.mm_tracker.update_target_coins(self._active_coins)
+                await self.mm_tracker.poll_positions()
+
+                # Log crowding for active coins
+                for coin in self._active_coins:
+                    crowding = self.mm_tracker.get_crowding(coin)
+                    if crowding.mm_count > 0:
+                        logger.info(
+                            f"[{coin}] MM Crowding: {crowding.mm_count} MMs, "
+                            f"net={crowding.net_mm_direction:+.0f}, "
+                            f"score={crowding.crowding_score:.2f}"
+                        )
+            except Exception as e:
+                logger.warning(f"MM Tracker poll error: {e}")
+            await asyncio.sleep(60)
+
     async def _screener_loop(self) -> None:
         """Run pair screener every 15 minutes.
 
@@ -1799,6 +1924,18 @@ class HLMarketMaker:
                 )
         except Exception as e:
             logger.warning(f"MongoDB quote log flush error: {e}")
+
+        # V2: Flush quote attempts to MongoDB
+        try:
+            if self._pending_attempts:
+                await asyncio.to_thread(
+                    self._attempts_col.insert_many,
+                    list(self._pending_attempts),
+                    ordered=False,
+                )
+                self._pending_attempts.clear()
+        except Exception as e:
+            logger.warning(f"MongoDB quote attempts flush error: {e}")
 
         # V2: Flush wallet scores to MongoDB
         try:

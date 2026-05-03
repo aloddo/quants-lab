@@ -320,11 +320,24 @@ class PairScreener:
         from .quote_engine import DEFAULT_TOX_BUFFERS
         tox_buffer = DEFAULT_TOX_BUFFERS.get(coin, cfg.default_tox_buffer_bps)
 
-        # Edge room per side
+        # V2: EV-based scoring instead of edge-room ranking.
+        # score = E[net_capture] * sqrt(volume) * depth_factor * anchor_bonus
+        # E[net_capture] accounts for fees, estimated markout, and exit penalty.
         edge_room = native_half_spread - cfg.maker_fee_bps - tox_buffer
+        estimated_markout = 1.0  # conservative 1bps prior for unknown coins
+        estimated_exit_penalty = 0.2 * 3.5  # 20% taker exit probability * 3.5bps fee
+        net_capture = edge_room - estimated_markout - estimated_exit_penalty
+
+        # V2: Hard pair filters
+        # Pairs below 8bps median spread are filtered (incentive-only, not core edge)
+        if spread_bps < 8.0:
+            net_capture *= 0.3  # heavy penalty, not excluded (may have good counterparties)
+        # No anchor = heavy penalty (blind quoting)
+        if anchor_type == "none":
+            net_capture *= 0.4
 
         # Score components
-        edge_component = max(0, edge_room)
+        edge_component = max(0, net_capture)
         volume_component = np.sqrt(daily_vol)
         depth_factor = min(1.0, min(depth_bid_usd, depth_ask_usd) / (10 * cfg.depth_factor_notional))
         anchor_bonus = {"direct": 1.5, "sparse": 1.0, "none": 0.6}.get(anchor_type, 0.6)

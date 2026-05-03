@@ -340,12 +340,18 @@ class StateMachine:
 
         elif state == PairState.QUOTING_BOTH:
             # V2 fix: state machine MUST respect per-side EV from context.
-            # Was: unconditionally True for both sides, ignoring EV gate.
-            # Now: only quote sides where context says EV is positive.
             info.quote_bid = ctx.bid_side_ev_positive
             info.quote_ask = ctx.ask_side_ev_positive
             info.exit_mode = False
             info.hedge_requested = False
+
+            # V2: Half-life inventory suppression (applies in ALL quoting states)
+            # 0.33 Q_soft: suppress entry side (exit-only)
+            # 0.50 Q_soft: already handled below in ONE_SIDE (boost exit)
+            if ctx.inventory_usd > ctx.q_soft * 0.33:
+                info.quote_bid = False  # long inventory: don't add more
+            elif ctx.inventory_usd < -ctx.q_soft * 0.33:
+                info.quote_ask = False  # short inventory: don't add more
 
         elif state == PairState.QUOTING_ONE_SIDE:
             # Contrarian: bid-heavy -> improve ASK, widen BID
