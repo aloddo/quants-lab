@@ -169,7 +169,10 @@ class HLMarketMaker:
 
         # Bug #8 fix: Coalescing buffers for WS messages — store latest, process in _tick()
         self._latest_book: dict[str, dict] = {}       # coin -> latest book data
-        self._latest_trades: dict[str, list] = {}     # coin -> latest trades batch
+        self._latest_trades: dict[str, list] = {}     # coin -> accumulated trades (V2: ring buffer)
+        # V2 fix: threading.Lock for WS buffers (WS callbacks run on SDK thread,
+        # tick loop runs on asyncio thread -- asyncio.Lock doesn't protect cross-thread)
+        self._ws_buffer_lock = threading.Lock()
 
         # Bug #9 fix: WS watchdog timestamps
         self._last_hl_ws_time: dict[str, float] = {}  # coin -> last HL WS message time
@@ -545,14 +548,19 @@ class HLMarketMaker:
                             logger.error(f"Hedge cleanup failed for {hc_coin}: {e}")
                             self._pending_hedge_close.add(hc_coin)
 
-        # Bug #8 fix: Drain coalescing WS buffers under signal lock
-        async with self._signal_lock:
-            for ws_coin, book_data in self._latest_book.items():
-                self.signal_engine.update_book(ws_coin, book_data)
+        # V2 fix: Drain WS buffers under BOTH locks:
+        # _ws_buffer_lock (threading.Lock) protects against WS callback writes
+        # _signal_lock (asyncio.Lock) protects signal engine reads
+        with self._ws_buffer_lock:
+            book_snapshot = dict(self._latest_book)
+            trade_snapshot = dict(self._latest_trades)
             self._latest_book.clear()
-            for ws_coin, trade_data in self._latest_trades.items():
-                self.signal_engine.update_trades(ws_coin, trade_data)
             self._latest_trades.clear()
+        async with self._signal_lock:
+            for ws_coin, book_data in book_snapshot.items():
+                self.signal_engine.update_book(ws_coin, book_data)
+            for ws_coin, trade_data in trade_snapshot.items():
+                self.signal_engine.update_trades(ws_coin, trade_data)
 
         # === STEP 1: Sync positions from exchange (every 30s, not every tick) ===
         now = time.time()
@@ -740,15 +748,15 @@ class HLMarketMaker:
                     or signal.depth_drop_detected
                     or signal.spread_spike_detected
                 )
-                # Soft gates: trade imbalance, touch depletion -> suppress adverse side
+                # Soft gates: trade imbalance -> suppress adverse side
+                # V2 fix: use trade_imbalance_side from TRADE flow, not
+                # imbalance_side from BOOK. They can disagree and the old
+                # code suppressed the safe side when they diverged.
                 if signal.trade_imbalance_toxic and not cb_active:
-                    # Trade flow is one-sided: suppress the side getting hit
-                    # (If buys dominate, asking is safe but bidding is toxic)
-                    # Check which side is dominant from the signal
-                    if signal.imbalance_side > 0:  # bid-heavy (lots of buying)
-                        bid_ev = False  # suppress bid (adverse to buy into buying pressure)
-                    elif signal.imbalance_side < 0:  # ask-heavy
-                        ask_ev = False  # suppress ask
+                    if signal.trade_imbalance_side > 0:  # buy-heavy trade flow
+                        bid_ev = False  # suppress bid (toxic to buy into buying pressure)
+                    elif signal.trade_imbalance_side < 0:  # sell-heavy trade flow
+                        ask_ev = False  # suppress ask (toxic to sell into selling pressure)
 
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,
@@ -1294,8 +1302,8 @@ class HLMarketMaker:
                 book_data = data["data"]
 
             if book_data:
-                # Overwrite-latest: we only care about most recent book state
-                self._latest_book[coin] = book_data
+                with self._ws_buffer_lock:
+                    self._latest_book[coin] = book_data
                 # Bug #9 fix: track last WS message time for watchdog
                 self._last_hl_ws_time[coin] = time.time()
         except Exception as e:
@@ -1328,11 +1336,10 @@ class HLMarketMaker:
 
             if trades:
                 # V2: APPEND trades to buffer instead of overwriting.
-                # Old behavior lost trades between ticks. New behavior
-                # accumulates all trades so signal_engine gets full fidelity.
-                if coin not in self._latest_trades:
-                    self._latest_trades[coin] = []
-                self._latest_trades[coin].extend(trades)
+                with self._ws_buffer_lock:
+                    if coin not in self._latest_trades:
+                        self._latest_trades[coin] = []
+                    self._latest_trades[coin].extend(trades)
                 # Bug #9 fix: track last WS message time for watchdog
                 self._last_hl_ws_time[coin] = time.time()
         except Exception as e:

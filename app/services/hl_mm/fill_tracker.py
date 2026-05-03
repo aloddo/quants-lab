@@ -14,6 +14,7 @@ Circuit breaker rules (Spec Section 5):
   - 3 toxic fills in 30m: disable pair for rest of UTC day
 """
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -99,6 +100,7 @@ class FillTracker:
 
         self._fills: deque[Fill] = deque(maxlen=max_history)
         self._pending_markouts: list[Fill] = []
+        self._markout_lock = threading.Lock()  # V2 fix: protects _pending_markouts from WS thread race
         self._toxicity: dict[str, PairToxicity] = {}
 
         # V2: Per-side EWMA markout for side-specific EV gating.
@@ -170,7 +172,8 @@ class FillTracker:
             spread_at_fill_bps=fill_spread,
         )
         self._fills.append(fill)
-        self._pending_markouts.append(fill)
+        with self._markout_lock:
+            self._pending_markouts.append(fill)
 
         if coin not in self._toxicity:
             self._toxicity[coin] = PairToxicity()
@@ -196,11 +199,16 @@ class FillTracker:
         """Update markouts for pending fills. Call every tick.
 
         Positive markout = price moved in our favor after fill.
+        V2 fix: Lock protects against WS thread appending to _pending_markouts
+        while we iterate and replace it.
         """
         now = time.time()
         still_pending = []
 
-        for fill in self._pending_markouts:
+        with self._markout_lock:
+            pending_snapshot = list(self._pending_markouts)
+
+        for fill in pending_snapshot:
             mid = current_mids.get(fill.coin)
             if not mid or mid <= 0:
                 still_pending.append(fill)
@@ -228,7 +236,13 @@ class FillTracker:
             if fill.markout_60s is None:
                 still_pending.append(fill)
 
-        self._pending_markouts = still_pending
+        with self._markout_lock:
+            # Keep fills that were appended DURING iteration (not in our snapshot)
+            # plus fills from our snapshot that still need processing
+            new_fills_during_iteration = [
+                f for f in self._pending_markouts if f not in pending_snapshot
+            ]
+            self._pending_markouts = still_pending + new_fills_during_iteration
 
     def _update_toxicity(self, fill: Fill) -> None:
         """Update toxicity stats + circuit breakers after 5s markout computed.

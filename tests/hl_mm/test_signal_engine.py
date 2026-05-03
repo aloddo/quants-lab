@@ -70,8 +70,9 @@ class TestTradeImbalance:
 
         # Count-based: 1 buy / 10 total = 10% buy (would NOT trigger)
         # Notional: $100 / $109 = 91.7% buy (SHOULD trigger at 70%)
-        result = engine._check_trade_imbalance("BIO")
-        assert result is True
+        is_toxic, side = engine._check_trade_imbalance("BIO")
+        assert is_toxic is True
+        assert side == 1  # buy-heavy
 
     def test_balanced_flow_no_trigger(self, engine):
         engine._ensure_coin("BIO")
@@ -79,15 +80,16 @@ class TestTradeImbalance:
         for _ in range(10):
             engine._trade_sides["BIO"].append((now, 1, 10.0, 1.0))
             engine._trade_sides["BIO"].append((now, -1, 10.0, 1.0))
-        result = engine._check_trade_imbalance("BIO")
-        assert result is False
+        is_toxic, side = engine._check_trade_imbalance("BIO")
+        assert is_toxic is False
+        assert side == 0
 
     def test_too_few_trades_no_trigger(self, engine):
         engine._ensure_coin("BIO")
         now = time.time()
         engine._trade_sides["BIO"].append((now, 1, 100.0, 1.0))
-        result = engine._check_trade_imbalance("BIO")
-        assert result is False  # < 5 trades
+        is_toxic, side = engine._check_trade_imbalance("BIO")
+        assert is_toxic is False
 
     def test_old_trades_excluded(self, engine):
         """Trades older than 3s should not count."""
@@ -101,8 +103,8 @@ class TestTradeImbalance:
         for _ in range(5):
             engine._trade_sides["BIO"].append((now, 1, 10.0, 1.0))
             engine._trade_sides["BIO"].append((now, -1, 10.0, 1.0))
-        result = engine._check_trade_imbalance("BIO")
-        assert result is False
+        is_toxic, side = engine._check_trade_imbalance("BIO")
+        assert is_toxic is False
 
 
 class TestRealL2OFI:

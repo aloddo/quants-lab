@@ -339,8 +339,11 @@ class StateMachine:
             info.hedge_requested = False
 
         elif state == PairState.QUOTING_BOTH:
-            info.quote_bid = True
-            info.quote_ask = True
+            # V2 fix: state machine MUST respect per-side EV from context.
+            # Was: unconditionally True for both sides, ignoring EV gate.
+            # Now: only quote sides where context says EV is positive.
+            info.quote_bid = ctx.bid_side_ev_positive
+            info.quote_ask = ctx.ask_side_ev_positive
             info.exit_mode = False
             info.hedge_requested = False
 

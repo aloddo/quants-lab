@@ -69,6 +69,7 @@ class SignalState:
     depth_drop_detected: bool = False
     spread_spike_detected: bool = False
     trade_imbalance_toxic: bool = False
+    trade_imbalance_side: int = 0     # V2: +1 = buy-heavy TRADE flow, -1 = sell-heavy
     anchor_jump_detected: bool = False
     touch_depletion: bool = False
     any_toxic_flag: bool = False
@@ -165,7 +166,7 @@ class SignalEngine:
         # Toxic flow detection — record new triggers with timestamps
         depth_drop = self._check_depth_drop(coin, prev_depth, book)
         spread_spike = self._check_spread_spike(coin, book.spread_bps)
-        trade_imbalance = self._check_trade_imbalance(coin)
+        trade_imbalance, trade_imb_side = self._check_trade_imbalance(coin)
         touch_depl = False  # requires time-series logic, tracked via depth_drop
 
         # Bug #11: Set toxic flag timestamps when triggered (don't just use booleans)
@@ -218,6 +219,7 @@ class SignalEngine:
             depth_drop_detected=active_depth_drop,
             spread_spike_detected=active_spread_spike,
             trade_imbalance_toxic=active_trade_imbalance,
+            trade_imbalance_side=trade_imb_side if active_trade_imbalance else 0,
             anchor_jump_detected=active_anchor_jump,
             touch_depletion=active_touch_depl,
             any_toxic_flag=any_toxic,
@@ -495,15 +497,17 @@ class SignalEngine:
         factor = 1.5 if median < 2.0 else (2.0 if median < 5.0 else 2.5)
         return current_spread > median * factor
 
-    def _check_trade_imbalance(self, coin: str) -> bool:
+    def _check_trade_imbalance(self, coin: str) -> tuple[bool, int]:
         """V2: 3s NOTIONAL-weighted trade imbalance > 70/30.
 
         Was count-based (each print = 1 vote regardless of size).
         Now weighted by USD notional: a $500 trade counts 50x more than $10.
+
+        Returns (is_toxic, side) where side is +1 (buy-heavy) or -1 (sell-heavy).
         """
         trades = self._trade_sides[coin]
         if not trades:
-            return False
+            return False, 0
 
         now = time.time()
         buy_notional = 0.0
@@ -521,7 +525,11 @@ class SignalEngine:
             count += 1
 
         if count < 5 or total_notional < 1.0:
-            return False
+            return False, 0
 
         buy_ratio = buy_notional / total_notional
-        return buy_ratio > self.trade_imbalance_threshold or buy_ratio < (1 - self.trade_imbalance_threshold)
+        if buy_ratio > self.trade_imbalance_threshold:
+            return True, 1   # buy-heavy
+        elif buy_ratio < (1 - self.trade_imbalance_threshold):
+            return True, -1  # sell-heavy
+        return False, 0
