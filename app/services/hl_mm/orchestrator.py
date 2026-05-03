@@ -44,6 +44,7 @@ from .fill_tracker import FillTracker, QuoteLog
 from .risk_manager import RiskManager, RiskConfig, RiskAction
 from .state_machine import StateMachine, PairContext, PairState
 from .pair_screener import PairScreener, ScreenerConfig, BYBIT_PERPS
+from .wallet_scorer import WalletScorer
 from .notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -357,6 +358,7 @@ class HLMarketMaker:
         self.risk_manager = RiskManager(risk_cfg)
         logger.info(f"Risk limits: gross=${risk_cfg.max_gross_notional}, net=${risk_cfg.max_net_exposure}, resting=${risk_cfg.max_gross_resting}")
         self.state_machine = StateMachine()
+        self.wallet_scorer = WalletScorer()
         self.notifier = TelegramNotifier(
             min_interval_s=self.config.telegram.min_message_interval_s,
             enabled=self.config.telegram.enabled,
@@ -720,20 +722,27 @@ class HLMarketMaker:
             bid_exit_penalty = 0.5 * 3.5 if inv_usd > limits.q_soft * 0.3 else 0.2 * 3.5  # bps
             ask_exit_penalty = 0.5 * 3.5 if inv_usd < -limits.q_soft * 0.3 else 0.2 * 3.5
 
-            bid_ev_bps = half_spread - maker_fee - bid_markout_cost - bid_exit_penalty
-            ask_ev_bps = half_spread - maker_fee - ask_markout_cost - ask_exit_penalty
+            # V2: Wallet toxicity penalty -- if toxic wallets are active on this
+            # coin, add extra markout cost to BOTH sides (they predict adverse moves)
+            wallet_toxic, wallet_toxic_count = self.wallet_scorer.is_toxic_active(coin)
+            wallet_penalty = min(3.0, wallet_toxic_count * 1.0) if wallet_toxic else 0.0  # up to 3bps extra cost
+
+            bid_ev_bps = half_spread - maker_fee - bid_markout_cost - bid_exit_penalty - wallet_penalty
+            ask_ev_bps = half_spread - maker_fee - ask_markout_cost - ask_exit_penalty - wallet_penalty
 
             ev_threshold = 0.5  # minimum bps to quote a side
             bid_ev = bid_ev_bps > ev_threshold
             ask_ev = ask_ev_bps > ev_threshold
 
             if self._tick_count % 60 == 0:  # log every ~30s
+                wallet_stats = self.wallet_scorer.get_stats_summary()
                 logger.info(
-                    f"[{coin}] EV: bid={bid_ev_bps:.1f}bps (markout_cost={bid_markout_cost:.1f}, "
-                    f"exit_pen={bid_exit_penalty:.1f}, fills={bid_fill_count}) "
-                    f"ask={ask_ev_bps:.1f}bps (markout_cost={ask_markout_cost:.1f}, "
-                    f"exit_pen={ask_exit_penalty:.1f}, fills={ask_fill_count}) "
-                    f"half_spread={half_spread:.1f}"
+                    f"[{coin}] EV: bid={bid_ev_bps:.1f}bps (markout={bid_markout_cost:.1f}, "
+                    f"exit={bid_exit_penalty:.1f}, wallet={wallet_penalty:.1f}, fills={bid_fill_count}) "
+                    f"ask={ask_ev_bps:.1f}bps (markout={ask_markout_cost:.1f}, "
+                    f"exit={ask_exit_penalty:.1f}, fills={ask_fill_count}) "
+                    f"spread={half_spread:.1f} wallets={wallet_stats['tracked_wallets']}/"
+                    f"{wallet_stats['toxic_wallets']}toxic"
                 )
 
             # === V2: SIGNAL-BASED CIRCUIT BREAKER ===
@@ -1066,8 +1075,18 @@ class HLMarketMaker:
                         except Exception as e:
                             logger.warning(f"Fill detection error for {coin}: {e}")
 
-        # === STEP 4: Update markouts ===
+        # === STEP 4: Update markouts + wallet attribution ===
         self.fill_tracker.update_markouts(current_mids)
+
+        # V2: Attribute completed markouts to counterparty wallets
+        for fill in self.fill_tracker.get_recent_fills(last_n=20):
+            if fill.markout_5s is not None and not getattr(fill, '_wallet_attributed', False):
+                self.wallet_scorer.attribute_markout(
+                    coin=fill.coin, fill_side=fill.side,
+                    fill_price=fill.price, fill_time=fill.timestamp,
+                    markout_5s=fill.markout_5s,
+                )
+                fill._wallet_attributed = True  # don't re-attribute
 
         # === STEP 5: Orphan cleanup (every 30s) ===
         # Bug #5 (Codex R4): Acquire OMS lock for orphan cleanup
@@ -1322,8 +1341,8 @@ class HLMarketMaker:
     def _on_hl_trades(self, coin: str, data: dict) -> None:
         """Callback for HL WS trade updates.
 
-        Bug #8 fix: Store latest trades into coalescing buffer instead of
-        creating a task per message.
+        V2: Extracts wallet addresses from `users` field and feeds to
+        WalletScorer. Also appends trades to ring buffer for signal engine.
         """
         try:
             trades = []
@@ -1335,11 +1354,28 @@ class HLMarketMaker:
                 trades = [data]
 
             if trades:
-                # V2: APPEND trades to buffer instead of overwriting.
+                # V2: APPEND trades to buffer for signal engine
                 with self._ws_buffer_lock:
                     if coin not in self._latest_trades:
                         self._latest_trades[coin] = []
                     self._latest_trades[coin].extend(trades)
+
+                # V2: Feed wallet addresses to WalletScorer
+                # HL trade format: {side, px, sz, hash, time, users: [buyer, seller]}
+                for trade in trades:
+                    users = trade.get("users", [])
+                    if users and len(users) >= 2:
+                        buyer = users[0] if isinstance(users[0], str) else ""
+                        seller = users[1] if isinstance(users[1], str) else ""
+                        side = trade.get("side", "")
+                        price = float(trade.get("px", 0) or 0)
+                        size = float(trade.get("sz", 0) or 0)
+                        if price > 0 and size > 0 and (buyer or seller):
+                            self.wallet_scorer.record_trade(
+                                coin=coin, side=side, price=price,
+                                size=size, buyer=buyer, seller=seller,
+                            )
+
                 # Bug #9 fix: track last WS message time for watchdog
                 self._last_hl_ws_time[coin] = time.time()
         except Exception as e:
@@ -1763,6 +1799,25 @@ class HLMarketMaker:
                 )
         except Exception as e:
             logger.warning(f"MongoDB quote log flush error: {e}")
+
+        # V2: Flush wallet scores to MongoDB
+        try:
+            wallet_docs = self.wallet_scorer.to_mongo_docs()
+            if wallet_docs:
+                wallet_col = self._db["hl_mm_wallet_scores"]
+                ops = []
+                for doc in wallet_docs:
+                    ops.append(UpdateOne(
+                        {"address": doc["address"]},
+                        {"$set": doc},
+                        upsert=True,
+                    ))
+                if ops:
+                    await asyncio.to_thread(
+                        wallet_col.bulk_write, ops, ordered=False
+                    )
+        except Exception as e:
+            logger.warning(f"MongoDB wallet scores flush error: {e}")
 
         self._last_mongo_flush = time.time()
 
