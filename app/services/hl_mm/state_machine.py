@@ -280,20 +280,16 @@ class StateMachine:
     def _should_hedge(self, ctx: PairContext) -> bool:
         """Check if hedge is needed (Spec Section 4).
 
-        Codex R2 #7: Only hedge when native spread > 10bps. Below that,
-        the hedge cost (~12bps for Bybit taker + slippage) exceeds the
-        total round-trip edge, making HL taker-close cheaper.
+        DISABLED: Bybit hedge round-trip costs ~23bps (taker fee + slippage
+        on open AND close). On 5-10bps shitcoin spreads this destroys 5-6
+        good round-trips of spread capture. HL taker-close at 3.5bps is
+        strictly cheaper for ALL pairs we trade.
+
+        Math: hedge cost = 2*(5.5bps fee + 6bps slippage) = 23bps
+              HL taker close = 3.5bps
+              Break-even spread for hedge: >26bps (none of our pairs)
         """
-        if not ctx.bybit_hedge_available:
-            return False
-        # Codex R2 #7: Skip Bybit hedge for narrow spreads — taker-close on HL is cheaper
-        if ctx.native_spread_bps < 10.0:
-            return False
-        return (
-            abs(ctx.inventory_usd) >= ctx.q_hard
-            or (ctx.inventory_age_s > 60 and ctx.adverse_move_bps > 4.0)
-            or (not ctx.hl_book_fresh and abs(ctx.inventory_usd) > 0)
-        )
+        return False
 
     def _hedge_reason(self, ctx: PairContext) -> str:
         if abs(ctx.inventory_usd) >= ctx.q_hard:

@@ -278,6 +278,11 @@ class QuoteEngine:
             bid_sz_usd = self._compute_child_size(
                 coin, depth20_bid_usd, free_equity_usd, q_soft, vol_scale, anchor_scale
             )
+            # EXIT SIZE CAP: When closing inventory, don't overshoot.
+            # Without this, a $10 short gets a $26 buy order → flips to $16 long.
+            if exit_mode and inventory_usd < 0 and fair_value > 0:
+                max_exit_usd = abs(inventory_usd) * 1.05  # 5% buffer for rounding
+                bid_sz_usd = min(bid_sz_usd, max_exit_usd)
             bid_sz = bid_sz_usd / fair_value if fair_value > 0 else 0
             bid_sz = self._round_size(coin, bid_sz)
             bid_px = self._round_price(coin, bid_px)
@@ -312,6 +317,10 @@ class QuoteEngine:
             ask_sz_usd = self._compute_child_size(
                 coin, depth20_ask_usd, free_equity_usd, q_soft, vol_scale, anchor_scale
             )
+            # EXIT SIZE CAP: When closing inventory, don't overshoot.
+            if exit_mode and inventory_usd > 0 and fair_value > 0:
+                max_exit_usd = abs(inventory_usd) * 1.05  # 5% buffer for rounding
+                ask_sz_usd = min(ask_sz_usd, max_exit_usd)
             ask_sz = ask_sz_usd / fair_value if fair_value > 0 else 0
             ask_sz = self._round_size(coin, ask_sz)
             ask_px = self._round_price(coin, ask_px)
@@ -816,7 +825,16 @@ class QuoteEngine:
         return 0 (don't quote) instead of overriding to $10.
         """
         notional_target = DEFAULT_NOTIONAL.get(coin, 50.0)
-        eq_limit = 0.20 * free_equity_usd
+        # For small accounts (<$200 equity), 20% is too restrictive — a single
+        # $10 position prevents all subsequent quoting. Scale up to 50% for
+        # accounts under $100 to ensure minimum notional is always reachable.
+        if free_equity_usd < 100:
+            eq_frac = 0.50
+        elif free_equity_usd < 200:
+            eq_frac = 0.35
+        else:
+            eq_frac = 0.20
+        eq_limit = eq_frac * free_equity_usd
         depth_limit = 0.003 * depth20_usd if depth20_usd > 0 else notional_target
         inv_limit = 0.75 * q_soft
         size = min(notional_target, eq_limit, depth_limit, inv_limit)

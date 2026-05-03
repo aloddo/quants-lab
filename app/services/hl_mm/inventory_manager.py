@@ -136,7 +136,7 @@ class InventoryManager:
         # HL unified accounts report $0 accountValue in clearinghouse when all
         # funds are in spot USDC. Use a flag to track if we've ever gotten a
         # real equity reading. If not, disable PnL-based stops.
-        self._equity: float = 54.0  # default to known HL capital
+        self._equity: float = 51.73  # default to known HL spot USDC (updated 2026-05-03)
         self._equity_ever_confirmed: bool = False
         self._session_start_equity: Optional[float] = None
         self._peak_equity: float = 0.0
@@ -385,11 +385,27 @@ class InventoryManager:
             account_value = float(margin.get("accountValue", 0) or 0)
             total_margin = float(margin.get("totalMarginUsed", 0) or 0)
 
-            # HL unified accounts: total equity = perps accountValue + spot USDC.
-            # When flat: accountValue=0, all in spot. When position open:
-            # accountValue has margin+uPnL, spot has the rest. Must sum BOTH.
+            # HL UNIFIED ACCOUNT EQUITY MODEL (verified 2026-05-03):
+            #
+            # When FLAT:  accountValue=0, spot USDC = full balance.
+            # When HOLDING: accountValue = marginUsed + uPnL (perps sub-account equity)
+            #               spot USDC = UNCHANGED (HL does NOT deduct margin from spot)
+            #
+            # Therefore: equity = spot_USDC + uPnL (NOT spot + accountValue)
+            #
+            # The old formula (spot + accountValue) double-counted the margin:
+            #   spot=51.73, accountValue=3.67 → reported 55.40
+            #   real equity was 51.73 + (-0.01 uPnL) = 51.72
+            #
+            # accountValue = totalRawUsd + totalNtlPos = (margin - borrowed) + notional
+            # Since margin comes from spot USDC but spot balance isn't reduced,
+            # adding both double-counts the margin amount.
             spot_equity = self._query_spot_equity()
-            combined_equity = account_value + spot_equity
+            total_upnl = sum(
+                float(p.get("position", {}).get("unrealizedPnl", 0) or 0)
+                for p in state.get("assetPositions", [])
+            )
+            combined_equity = spot_equity + total_upnl
 
             if combined_equity > 0:
                 self._equity = combined_equity
@@ -510,9 +526,14 @@ class InventoryManager:
                 margin = state.get("marginSummary", {})
                 account_value = float(margin.get("accountValue", 0) or 0)
 
-                # HL unified accounts: total equity = perps accountValue + spot USDC
+                # HL unified account: equity = spot USDC + unrealized PnL
+                # (spot balance is NOT reduced by margin — see sync_positions for full explanation)
                 spot_equity = self._query_spot_equity()
-                combined_equity = account_value + spot_equity
+                total_upnl = sum(
+                    float(p.get("position", {}).get("unrealizedPnl", 0) or 0)
+                    for p in state.get("assetPositions", [])
+                )
+                combined_equity = spot_equity + total_upnl
 
                 if combined_equity > 0:
                     self._equity = combined_equity

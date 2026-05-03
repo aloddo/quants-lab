@@ -159,9 +159,11 @@ class HLMarketMaker:
         # HL /exchange rate limit is ~12 calls/8s = 1.5/sec (undocumented, volume-gated)
         # Screener no longer uses REST calls (MongoDB), so more budget for orders.
         # Increased: 1.8/sec refill, burst 4 — allows faster tick response.
-        self._rate_tokens: float = 4.0
-        self._rate_max: float = 4.0
-        self._rate_refill_per_sec: float = 1.8
+        # HL rate limit: ~12 calls/8s = 1.5/sec. Previous 1.8/sec was too aggressive
+        # and caused persistent 429 storms. Set to 1.2/sec with burst 3 for safety margin.
+        self._rate_tokens: float = 3.0
+        self._rate_max: float = 3.0
+        self._rate_refill_per_sec: float = 1.2
         self._rate_last_refill: float = 0.0
 
         # Bug #12: asyncio.Lock for signal state access
@@ -626,12 +628,10 @@ class HLMarketMaker:
             await asyncio.to_thread(self.quote_engine.cancel_all)
             return
 
-        # Bug #4: Handle HEDGE_IMMEDIATELY BEFORE state machine pause.
-        # If risk manager says hedge immediately and we have inventory, do it now
-        # regardless of state machine state.
-        # Bug #1 (Codex R4): Also check _hedge_in_progress and _hedge_positions
-        # to prevent stacking multiple hedges for the same coin.
-        if RiskAction.HEDGE_IMMEDIATELY in risk_state.actions and not self.dry_run:
+        # HEDGE DISABLED: Bybit hedge costs ~23bps round-trip, destroying all
+        # spread capture on 5-10bps shitcoin pairs. HL taker-close is 3.5bps.
+        # Keeping code for future use on wider-spread venues.
+        if False and RiskAction.HEDGE_IMMEDIATELY in risk_state.actions and not self.dry_run:
             for coin in list(self._active_coins):
                 if has_inventory.get(coin, False) and coin in BYBIT_PERPS:
                     # Skip if already hedged or hedge in flight for this coin
@@ -1027,8 +1027,13 @@ class HLMarketMaker:
 
         # === STEP 3b: Batch fill detection (Codex R2 #5) ===
         # Query open_orders ONCE for all coins instead of per-coin.
-        # At 5 coins this saves 4 REST calls/tick = 80% of fill detection budget.
-        if not self.dry_run and self._active_coins:
+        # Skip when we have WS fills working and no active quotes — saves rate budget.
+        any_quoting = any(
+            self.state_machine.get_state(c) and
+            self.state_machine.get_state(c).state.value in ("QUOTING_BOTH", "QUOTING_ONE_SIDE", "INVENTORY_EXIT")
+            for c in self._active_coins
+        )
+        if not self.dry_run and self._active_coins and any_quoting:
             async with self._oms_lock:
                 try:
                     if self._consume_rate_token():
