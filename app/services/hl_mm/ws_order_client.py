@@ -71,7 +71,28 @@ class WSOrderClient:
     def start(self) -> bool:
         """Start WS connection with reconnect support."""
         self._running = True
-        return self._connect()
+        ok = self._connect()
+        if ok:
+            # Start keepalive thread — sends HL-native ping every 30s
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, daemon=True
+            )
+            self._keepalive_thread.start()
+        return ok
+
+    def _keepalive_loop(self):
+        """Send HL-native heartbeat {"method": "ping"} every 30s.
+        HL WS doesn't respond to WebSocket protocol pings, so we use their
+        application-level heartbeat to keep the connection alive.
+        """
+        while self._running:
+            time.sleep(30)
+            if self.is_connected and self._ws:
+                try:
+                    self._ws.send(json.dumps({"method": "ping"}))
+                    self._last_ping = time.time()
+                except Exception:
+                    pass  # reconnect loop will handle
 
     def _connect(self) -> bool:
         """Establish WS connection."""
@@ -88,7 +109,10 @@ class WSOrderClient:
             self._connected.clear()
             self._ws_thread = threading.Thread(
                 target=self._ws.run_forever,
-                kwargs={"ping_interval": 30, "ping_timeout": 10},
+                # Disable protocol-level ping — HL WS doesn't respond to them
+                # and the timeout causes disconnects every 60s. Instead we send
+                # HL's native {"method": "ping"} in _keepalive_loop().
+                kwargs={"ping_interval": 0},
                 daemon=True,
             )
             self._ws_thread.start()

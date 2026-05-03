@@ -118,6 +118,41 @@ class RiskManager:
         if eth_mid > 0:
             self._eth_prices.append((now, eth_mid))
 
+    def get_btc_momentum_1m(self) -> float:
+        """Get BTC 1-minute momentum in bps.
+
+        Returns the BTC price change over the last 60s in basis points.
+        Positive = BTC moving up, negative = BTC moving down.
+
+        Used as immediate quoting gate:
+          - BTC momentum > +10bps/min → suppress alt bids (don't buy alts in BTC uptrend)
+          - BTC momentum < -10bps/min → suppress alt asks (don't sell alts in BTC downtrend)
+          - Between -10 and +10 → quote both sides normally
+
+        This is the fastest regime filter — reacts in real-time to BTC moves
+        without waiting for adverse fills to accumulate.
+        """
+        if len(self._btc_prices) < 10:
+            return 0.0  # not enough data
+
+        now = time.time()
+        # Find price ~60s ago
+        target_time = now - 60.0
+        old_price = None
+        for ts, px in self._btc_prices:
+            if ts >= target_time:
+                old_price = px
+                break
+
+        if old_price is None or old_price <= 0:
+            return 0.0
+
+        current_price = self._btc_prices[-1][1]
+        if current_price <= 0:
+            return 0.0
+
+        return (current_price - old_price) / old_price * 10000  # bps
+
     def evaluate(
         self,
         daily_pnl: float,

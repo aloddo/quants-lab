@@ -101,6 +101,9 @@ class FillTracker:
         self._fills: deque[Fill] = deque(maxlen=max_history)
         self._pending_markouts: list[Fill] = []
         self._markout_lock = threading.Lock()  # V2 fix: protects _pending_markouts from WS thread race
+        # Bug #9 fix: single lock for all mutable state accessed from multiple threads
+        # (_fills, _toxicity, _quote_logs are accessed from WS callbacks and tick loop)
+        self._state_lock = threading.Lock()
         self._toxicity: dict[str, PairToxicity] = {}
 
         # V2: Per-side EWMA markout for side-specific EV gating.
@@ -171,7 +174,9 @@ class FillTracker:
             timestamp=time.time(),
             spread_at_fill_bps=fill_spread,
         )
-        self._fills.append(fill)
+        # Bug #9 fix: protect _fills under state_lock
+        with self._state_lock:
+            self._fills.append(fill)
         with self._markout_lock:
             self._pending_markouts.append(fill)
 
@@ -188,8 +193,12 @@ class FillTracker:
     # ------------------------------------------------------------------
 
     def log_quote(self, log: QuoteLog) -> None:
-        """Log a quote decision. Called every tick regardless of fills."""
-        self._quote_logs.append(log)
+        """Log a quote decision. Called every tick regardless of fills.
+
+        Bug #9 fix: protect _quote_logs under state_lock.
+        """
+        with self._state_lock:
+            self._quote_logs.append(log)
 
     # ------------------------------------------------------------------
     # Markout computation
@@ -371,11 +380,13 @@ class FillTracker:
 
     def get_toxicity(self, coin: str) -> PairToxicity:
         """Get toxicity stats for a coin."""
-        return self._toxicity.get(coin, PairToxicity())
+        with self._state_lock:
+            return self._toxicity.get(coin, PairToxicity())
 
     def get_recent_fills(self, coin: Optional[str] = None, last_n: int = 20) -> list[Fill]:
         """Get recent fills, optionally filtered by coin."""
-        fills = list(self._fills)
+        with self._state_lock:
+            fills = list(self._fills)
         if coin:
             fills = [f for f in fills if f.coin == coin]
         return fills[-last_n:]

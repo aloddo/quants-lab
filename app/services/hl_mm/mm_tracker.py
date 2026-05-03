@@ -49,8 +49,8 @@ class CoinCrowding:
     coin: str
     mm_count: int = 0             # how many tracked MMs have a position
     net_mm_direction: float = 0.0  # sum of MM position signs (-1/0/+1)
-    total_mm_notional: float = 0.0
-    position_change_velocity: float = 0.0  # bps change in aggregate MM position per minute
+    total_mm_notional: float = 0.0  # Bug #20: in BASE units (abs sum of MM sizes), not USD
+    position_change_velocity: float = 0.0  # change in aggregate MM base position per poll
     crowding_score: float = 0.0   # normalized 0..1, higher = more crowded
 
 

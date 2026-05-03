@@ -77,6 +77,11 @@ class SignalState:
     # V2: VPIN (Volume-Synchronized Probability of Informed Trading)
     vpin: float = 0.0                 # 0..1, higher = more toxic flow
 
+    # Per-coin momentum (mid price change over 5 minutes, in bps)
+    # Positive = coin trending up, negative = trending down.
+    # Used by the coin momentum regime filter to suppress the adverse side.
+    mid_momentum_5m: float = 0.0
+
     # Data freshness
     book_age_ms: float = 999999.0
     is_stale: bool = True
@@ -93,7 +98,7 @@ class SignalEngine:
         vol_ema_alpha: float = 0.05,
         depth_drop_threshold: float = 0.40,
         spread_spike_factor: float = 1.5,
-        trade_imbalance_threshold: float = 0.70,
+        trade_imbalance_threshold: float = 0.60,
         anchor_jump_bps: float = 6.0,
     ):
         self.z_window = z_window
@@ -270,6 +275,9 @@ class SignalEngine:
 
         VPIN = rolling mean of |buy_vol - sell_vol| / total_vol over N buckets.
         Buckets are VOLUME-synchronized (fixed $ size), not time-synchronized.
+
+        Bug #12 fix: When a single trade exceeds bucket size, carry over excess
+        volume into the next bucket instead of dropping it.
         """
         if coin not in self._vpin_buy_volume:
             self._vpin_buy_volume[coin] = 0.0
@@ -285,11 +293,21 @@ class SignalEngine:
         total = self._vpin_buy_volume[coin] + self._vpin_sell_volume[coin]
 
         # Bucket complete when total volume reaches bucket_size
-        if total >= bucket_size:
+        # Bug #12: Loop to handle large trades that overflow multiple buckets
+        while total >= bucket_size:
             imbalance = abs(self._vpin_buy_volume[coin] - self._vpin_sell_volume[coin]) / total
             self._vpin_buckets[coin].append(imbalance)
-            self._vpin_buy_volume[coin] = 0.0
-            self._vpin_sell_volume[coin] = 0.0
+            # Carry over excess volume proportionally
+            overflow = total - bucket_size
+            if overflow > 0 and total > 0:
+                # Distribute overflow in the same buy/sell ratio as current bucket
+                buy_ratio = self._vpin_buy_volume[coin] / total
+                self._vpin_buy_volume[coin] = overflow * buy_ratio
+                self._vpin_sell_volume[coin] = overflow * (1 - buy_ratio)
+            else:
+                self._vpin_buy_volume[coin] = 0.0
+                self._vpin_sell_volume[coin] = 0.0
+            total = self._vpin_buy_volume[coin] + self._vpin_sell_volume[coin]
 
     def get_vpin(self, coin: str) -> float:
         """Get current VPIN for a coin. Returns 0..1, higher = more informed flow."""
@@ -336,6 +354,23 @@ class SignalEngine:
             last = self._last_book_time.get(coin, 0)
             signal.book_age_ms = (now - last) * 1000 if last > 0 else 999999.0
             signal.is_stale = signal.book_age_ms > 1500
+
+            # Compute per-coin 5-minute mid momentum (bps)
+            mid_hist = self._mid_history.get(coin)
+            if mid_hist and len(mid_hist) >= 60:
+                # _mid_history stores (timestamp, mid_price) tuples
+                current_mid = mid_hist[-1][1] if isinstance(mid_hist[-1], tuple) else mid_hist[-1]
+                # Find price ~300s ago (5 min). History is at ~1/sec, so index -300
+                lookback_idx = max(0, len(mid_hist) - 300)
+                old_entry = mid_hist[lookback_idx]
+                old_mid = old_entry[1] if isinstance(old_entry, tuple) else old_entry
+                if old_mid > 0 and current_mid > 0:
+                    signal.mid_momentum_5m = (current_mid - old_mid) / old_mid * 10000
+                else:
+                    signal.mid_momentum_5m = 0.0
+            else:
+                signal.mid_momentum_5m = 0.0
+
         return signal
 
     # ------------------------------------------------------------------
@@ -365,41 +400,53 @@ class SignalEngine:
     def _parse_book(
         self, coin: str, bids: list, asks: list, now: float
     ) -> Optional[BookSnapshot]:
-        """Parse raw L2 levels into BookSnapshot."""
-        best_bid = float(bids[0]["px"])
-        best_ask = float(asks[0]["px"])
+        """Parse raw L2 levels into BookSnapshot.
+
+        Bug #7 fix: Gracefully handle malformed HL payloads (missing keys,
+        wrong types) instead of crashing the entire signal processing loop.
+        """
+        try:
+            best_bid = float(bids[0]["px"])
+            best_ask = float(asks[0]["px"])
+        except (KeyError, TypeError, ValueError, IndexError) as e:
+            logger.debug(f"[{coin}] _parse_book: malformed L2 data: {e}")
+            return None
         if best_bid <= 0 or best_ask <= 0:
             return None
 
-        mid = (best_bid + best_ask) / 2.0
-        spread_bps = (best_ask - best_bid) / best_bid * 10000
+        try:
+            mid = (best_bid + best_ask) / 2.0
+            spread_bps = (best_ask - best_bid) / best_bid * 10000
 
-        bid_qty1 = float(bids[0]["sz"])
-        ask_qty1 = float(asks[0]["sz"])
+            bid_qty1 = float(bids[0]["sz"])
+            ask_qty1 = float(asks[0]["sz"])
 
-        # Top-5 and top-20 depth
-        n5 = min(5, len(bids), len(asks))
-        n20 = min(20, len(bids), len(asks))
+            # Top-5 and top-20 depth
+            n5 = min(5, len(bids), len(asks))
+            n20 = min(20, len(bids), len(asks))
 
-        bid_usd5 = sum(float(bids[i]["sz"]) * float(bids[i]["px"]) for i in range(n5))
-        ask_usd5 = sum(float(asks[i]["sz"]) * float(asks[i]["px"]) for i in range(n5))
-        bid_usd20 = sum(float(bids[i]["sz"]) * float(bids[i]["px"]) for i in range(n20))
-        ask_usd20 = sum(float(asks[i]["sz"]) * float(asks[i]["px"]) for i in range(n20))
+            bid_usd5 = sum(float(bids[i]["sz"]) * float(bids[i]["px"]) for i in range(n5))
+            ask_usd5 = sum(float(asks[i]["sz"]) * float(asks[i]["px"]) for i in range(n5))
+            bid_usd20 = sum(float(bids[i]["sz"]) * float(bids[i]["px"]) for i in range(n20))
+            ask_usd20 = sum(float(asks[i]["sz"]) * float(asks[i]["px"]) for i in range(n20))
 
-        # Imbalance over top-N
-        n = min(self.top_n_imbalance, len(bids), len(asks))
-        bid_sz = sum(float(bids[i]["sz"]) * float(bids[i]["px"]) for i in range(n))
-        ask_sz = sum(float(asks[i]["sz"]) * float(asks[i]["px"]) for i in range(n))
-        total = bid_sz + ask_sz
-        imbalance = bid_sz / total if total > 0 else 0.5
+            # Imbalance over top-N
+            n = min(self.top_n_imbalance, len(bids), len(asks))
+            bid_sz = sum(float(bids[i]["sz"]) * float(bids[i]["px"]) for i in range(n))
+            ask_sz = sum(float(asks[i]["sz"]) * float(asks[i]["px"]) for i in range(n))
+            total = bid_sz + ask_sz
+            imbalance = bid_sz / total if total > 0 else 0.5
 
-        # Microprice
-        total_qty1 = bid_qty1 + ask_qty1
-        if total_qty1 > 0:
-            I = bid_qty1 / total_qty1
-            microprice = best_ask * I + best_bid * (1.0 - I)
-        else:
-            microprice = mid
+            # Microprice
+            total_qty1 = bid_qty1 + ask_qty1
+            if total_qty1 > 0:
+                I = bid_qty1 / total_qty1
+                microprice = best_ask * I + best_bid * (1.0 - I)
+            else:
+                microprice = mid
+        except (KeyError, TypeError, ValueError, IndexError) as e:
+            logger.debug(f"[{coin}] _parse_book: error parsing depth levels: {e}")
+            return None
 
         return BookSnapshot(
             coin=coin, timestamp=now,
@@ -461,6 +508,7 @@ class SignalEngine:
         """Compute per-second volatility and 30s realized vol.
 
         Returns (sigma_1s, rv_30s).
+        Bug #15 fix: Guard against zero/negative prices and empty arrays.
         """
         mids = self._mid_history[coin]
         if len(mids) < 5:
@@ -468,6 +516,10 @@ class SignalEngine:
 
         prices = [p for _, p in mids]
         times = [t for t, _ in mids]
+
+        # Bug #15: Guard against zero/negative prices (would cause log domain error)
+        if min(prices) <= 0:
+            return 1.5e-5, 0.0
 
         returns = np.diff(np.log(prices))
         dts = np.diff(times)

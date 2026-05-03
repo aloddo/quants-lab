@@ -14,6 +14,7 @@ This module does NOT own the WS connection or the event loop. It exposes
 synchronous methods called by the orchestrator.
 """
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -73,6 +74,17 @@ class QuoteState:
     last_fv: float = 0.0
     last_spread_bucket: int = 0       # quantized spread for change detection
     batch_in_flight: bool = False
+    # Ghost order fix: OIDs that were cancel-requested but not yet confirmed dead.
+    # Don't place new orders on a side with pending cancels — wait for WS
+    # orderUpdate or REST open_orders poll to confirm the cancel landed.
+    pending_cancel_bids: set = None
+    pending_cancel_asks: set = None
+
+    def __post_init__(self):
+        if self.pending_cancel_bids is None:
+            self.pending_cancel_bids = set()
+        if self.pending_cancel_asks is None:
+            self.pending_cancel_asks = set()
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +165,8 @@ class QuoteEngine:
         self._event_loop = None  # set by orchestrator after event loop starts
 
         self._states: dict[str, QuoteState] = {}
+        # Bug #13 fix: Lock for _states access from tick loop and WS callbacks
+        self._states_lock = threading.Lock()
         self._last_orphan_check: float = 0.0
 
         # Bug #1: Track orders that failed to cancel so reconciliation can clean them up
@@ -445,7 +459,10 @@ class QuoteEngine:
     def execute_quotes(self, quotes: QuotePair) -> None:
         """Place/replace quotes on HL. Cancel existing first, then place new.
 
-        One batch in flight per pair. If dry_run, just log.
+        GHOST ORDER FIX: Never place a new order on a side that has pending
+        (unconfirmed) cancels. Wait for WS orderUpdate or REST poll to confirm
+        the prior order is dead before placing. This prevents stacking multiple
+        orders on the same side which causes overshoot on market sweeps.
         """
         coin = quotes.coin
         state = self._states.get(coin, QuoteState())
@@ -455,17 +472,55 @@ class QuoteEngine:
             return
 
         # Cancel existing orders — if cancel fails, don't place new orders
-        # to avoid ghost order accumulation (Bug #1)
         cancel_ok = self._cancel_coin_orders(coin, state)
         if not cancel_ok:
             logger.warning(f"{coin}: cancel failed, skipping new quote placement — retry next tick")
             return
 
+        # GHOST ORDER FIX v3: ALWAYS query open_orders before placement.
+        # Don't trust WS confirmations, don't trust pending_cancel sets.
+        # Just ask the exchange: "do I have ANY resting orders on this side?"
+        # If yes: DON'T PLACE. Period. One REST call (~370ms), zero ghosts.
+        bid_blocked = False
+        ask_blocked = False
+        if not self.dry_run:
+            try:
+                if self._consume_rate_token():
+                    open_orders = self.info.open_orders(self.address)
+                    for o in (open_orders or []):
+                        if o.get("coin") == coin:
+                            if o.get("side") == "B":
+                                bid_blocked = True
+                            elif o.get("side") == "A":
+                                ask_blocked = True
+                    if bid_blocked or ask_blocked:
+                        logger.info(
+                            f"{coin}: BLOCKED — resting orders in book "
+                            f"({'bid ' if bid_blocked else ''}{'ask' if ask_blocked else ''})"
+                        )
+                    # Also clear pending_cancel for any OIDs not in open_orders
+                    our_open_oids = {o["oid"] for o in (open_orders or [])}
+                    state.pending_cancel_bids -= (state.pending_cancel_bids - our_open_oids)
+                    state.pending_cancel_asks -= (state.pending_cancel_asks - our_open_oids)
+                else:
+                    # Rate limited — block both sides to be safe
+                    bid_blocked = True
+                    ask_blocked = True
+            except Exception as e:
+                logger.warning(f"{coin}: open_orders check failed: {e} — blocking placement")
+                bid_blocked = True
+                ask_blocked = True
+
         # Place new orders
         now = time.time()
-        new_state = QuoteState(last_action_time=now, last_fv=quotes.fair_value)
+        new_state = QuoteState(
+            last_action_time=now, last_fv=quotes.fair_value,
+            # Carry forward pending cancels from old state
+            pending_cancel_bids=set(state.pending_cancel_bids),
+            pending_cancel_asks=set(state.pending_cancel_asks),
+        )
 
-        if quotes.bid and quotes.bid.size > 0:
+        if quotes.bid and quotes.bid.size > 0 and not bid_blocked:
             if self.dry_run:
                 logger.info(
                     f"[DRY] {coin} BID {quotes.bid.size:.6f} @ {quotes.bid.price:.6f} "
@@ -478,9 +533,11 @@ class QuoteEngine:
                         oid=oid, coin=coin, is_buy=True,
                         price=quotes.bid.price, size=quotes.bid.size,
                         placed_at=now,
+                        ticks_from_touch=1 if quotes.bid.is_improvement else 0,
+                        spread_bps_at_place=quotes.spread_bps,
                     )
 
-        if quotes.ask and quotes.ask.size > 0:
+        if quotes.ask and quotes.ask.size > 0 and not ask_blocked:
             if self.dry_run:
                 logger.info(
                     f"[DRY] {coin} ASK {quotes.ask.size:.6f} @ {quotes.ask.price:.6f} "
@@ -493,6 +550,8 @@ class QuoteEngine:
                         oid=oid, coin=coin, is_buy=False,
                         price=quotes.ask.price, size=quotes.ask.size,
                         placed_at=now,
+                        ticks_from_touch=1 if quotes.ask.is_improvement else 0,
+                        spread_bps_at_place=quotes.spread_bps,
                     )
 
         self._states[coin] = new_state
@@ -578,18 +637,27 @@ class QuoteEngine:
     def clear_order_by_oid(self, coin: str, oid: int) -> None:
         """Clear a tracked order by OID (called when WS orderUpdates reports
         the order is filled/cancelled). This avoids stale order state that
-        would otherwise persist until the next detect_fills() REST call."""
-        state = self._states.get(coin)
-        if not state:
-            return
-        for attr in ("bid_order", "ask_order"):
-            order = getattr(state, attr)
-            if order and order.oid == oid:
-                logger.debug(f"Cleared {coin} {attr} oid={oid} via WS orderUpdate")
-                setattr(state, attr, None)
-                # Also remove from pending fill check if present
-                self._pending_fill_check.pop(oid, None)
+        would otherwise persist until the next detect_fills() REST call.
+
+        Bug #13 fix: Protected by _states_lock since this is called from WS
+        callback thread while tick loop accesses _states concurrently.
+        """
+        with self._states_lock:
+            state = self._states.get(coin)
+            if not state:
                 return
+            for attr in ("bid_order", "ask_order"):
+                order = getattr(state, attr)
+                if order and order.oid == oid:
+                    logger.debug(f"Cleared {coin} {attr} oid={oid} via WS orderUpdate")
+                    setattr(state, attr, None)
+                    self._pending_fill_check.pop(oid, None)
+                    return
+            # GHOST ORDER FIX: Also clear from pending_cancel sets.
+            # This is the PRIMARY confirmation path — WS orderUpdate says
+            # "this OID is dead" so it's safe to place new orders on that side.
+            state.pending_cancel_bids.discard(oid)
+            state.pending_cancel_asks.discard(oid)
 
     def detect_fills(self, coin: str) -> list[dict]:
         """Detect fills by checking order status changes.
@@ -671,9 +739,16 @@ class QuoteEngine:
                     )
             else:
                 # Order disappeared — could be fill OR cancel (Bug #6)
+                # Bug #2 fix: order.size may have been reduced by a partial fill
+                # detected in a previous tick. The remaining fill for this chunk
+                # is exactly order.size (the reduced remaining). Do NOT use
+                # fill_info.get("size") which returns the TOTAL order size and
+                # would double-count the already-emitted partial.
+                remaining_size = order.size  # this IS the final chunk size
+
                 # First check pending fill check buffer
                 if order.oid in self._pending_fill_check:
-                    disappeared_at, _, _ = self._pending_fill_check[order.oid]
+                    disappeared_at, _, orig_remaining = self._pending_fill_check[order.oid]
                     if now - disappeared_at < 5.0:
                         # Still within grace period — query for fill confirmation
                         fill_info = self._query_fill(order.oid)
@@ -681,7 +756,7 @@ class QuoteEngine:
                             fills.append({
                                 "side": side,
                                 "price": fill_info.get("price", order.price),
-                                "size": fill_info.get("size", order.size),
+                                "size": orig_remaining,
                                 "fee": fill_info.get("fee", 0),
                                 "oid": order.oid,
                             })
@@ -692,7 +767,7 @@ class QuoteEngine:
                         # 5s passed with no fill confirmation — assume cancel
                         logger.info(
                             f"{coin} order {order.oid} ({side}) disappeared with no fill "
-                            f"after 5s — treating as cancel"
+                            f"after 5s ��� treating as cancel"
                         )
                         setattr(state, attr, None)
                         del self._pending_fill_check[order.oid]
@@ -700,18 +775,18 @@ class QuoteEngine:
                     # First time we notice it disappeared — query immediately
                     fill_info = self._query_fill(order.oid)
                     if fill_info and fill_info.get("size", 0) > 0:
-                        # Confirmed fill
+                        # Confirmed fill — use remaining_size, not exchange total
                         fills.append({
                             "side": side,
                             "price": fill_info.get("price", order.price),
-                            "size": fill_info.get("size", order.size),
+                            "size": remaining_size,
                             "fee": fill_info.get("fee", 0),
                             "oid": order.oid,
                         })
                         setattr(state, attr, None)
                     else:
                         # No fill found yet — add to pending check buffer
-                        self._pending_fill_check[order.oid] = (now, coin, order.size)
+                        self._pending_fill_check[order.oid] = (now, coin, remaining_size)
                         logger.debug(
                             f"{coin} order {order.oid} ({side}) disappeared, "
                             f"queued for fill confirmation"
@@ -724,6 +799,19 @@ class QuoteEngine:
         ]
         for oid in stale_pending:
             del self._pending_fill_check[oid]
+
+        # GHOST ORDER FIX: Clear pending_cancel OIDs that are NOT in open_orders.
+        # This is the REST confirmation path — if an OID isn't resting anymore,
+        # it's confirmed dead (cancelled or filled). Safe to place new orders.
+        if open_orders is not None:
+            confirmed_dead_bids = state.pending_cancel_bids - set(open_oids.keys())
+            confirmed_dead_asks = state.pending_cancel_asks - set(open_oids.keys())
+            if confirmed_dead_bids:
+                state.pending_cancel_bids -= confirmed_dead_bids
+                logger.debug(f"{coin}: confirmed {len(confirmed_dead_bids)} bid cancels via REST poll")
+            if confirmed_dead_asks:
+                state.pending_cancel_asks -= confirmed_dead_asks
+                logger.debug(f"{coin}: confirmed {len(confirmed_dead_asks)} ask cancels via REST poll")
 
         return fills
 
@@ -875,8 +963,12 @@ class QuoteEngine:
     def _cancel_coin_orders(self, coin: str, state: QuoteState) -> bool:
         """Cancel all tracked orders for a coin.
 
-        Returns True if cancel succeeded (safe to clear local state).
-        Returns False if cancel failed (orders kept in tracking + stale set).
+        GHOST ORDER FIX: On success, OIDs move to pending_cancel (not cleared).
+        They stay there until confirmed dead by WS orderUpdate or REST poll.
+        This prevents placing new orders while old ones might still be live.
+
+        Returns True if cancel request was sent (ok to proceed with caution).
+        Returns False if cancel failed to send (orders kept in stale set).
         """
         if self.dry_run:
             if state.bid_order or state.ask_order:
@@ -905,12 +997,17 @@ class QuoteEngine:
             cancels = [CancelRequest(coin=c, oid=o) for c, o in oids_to_cancel]
             self._consume_rate_token(priority=True)
             self.exchange.bulk_cancel(cancels)
+            # GHOST ORDER FIX: Move to pending_cancel, don't assume dead yet.
+            # WS orderUpdate or next REST poll will confirm and clear.
+            if state.bid_order:
+                state.pending_cancel_bids.add(state.bid_order.oid)
+            if state.ask_order:
+                state.pending_cancel_asks.add(state.ask_order.oid)
             state.bid_order = None
             state.ask_order = None
             return True
         except Exception as e:
             logger.warning(f"Cancel {coin} failed: {e} — orders kept in stale tracking")
-            # Bug #1: Do NOT clear local state. Add to stale set for reconciliation.
             if state.bid_order:
                 self._stale_orders.add(state.bid_order.oid)
             if state.ask_order:
@@ -920,7 +1017,11 @@ class QuoteEngine:
     def _cancel_coin_orders_ws(
         self, coin: str, state, oids_to_cancel: list[tuple[str, int]]
     ) -> bool:
-        """V2: Cancel orders via WS transport."""
+        """V2: Cancel orders via WS transport.
+
+        Bug #6 fix: Validate the response before clearing local state.
+        If bulk_cancel returns None or a response with errors, treat as failure.
+        """
         import asyncio
         if not self._event_loop:
             return False
@@ -930,9 +1031,33 @@ class QuoteEngine:
                 self._event_loop,
             )
             result = future.result(timeout=5.0)
+            # Bug #6: Validate response — None means no ack received
+            if result is None:
+                logger.warning(f"WS cancel {coin}: no response received")
+                if state.bid_order:
+                    self._stale_orders.add(state.bid_order.oid)
+                if state.ask_order:
+                    self._stale_orders.add(state.ask_order.oid)
+                return False
+            # Check for error statuses in response
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            if statuses and any("error" in str(s) for s in statuses):
+                logger.warning(f"WS cancel {coin}: partial failure in response: {statuses}")
+                if state.bid_order:
+                    self._stale_orders.add(state.bid_order.oid)
+                if state.ask_order:
+                    self._stale_orders.add(state.ask_order.oid)
+                return False
+            # GHOST ORDER FIX: Move to pending_cancel even on "success".
+            # WS cancel ACK means "request received", not "order dead".
+            # Wait for orderUpdate "cancelled" to confirm.
+            if state.bid_order:
+                state.pending_cancel_bids.add(state.bid_order.oid)
+            if state.ask_order:
+                state.pending_cancel_asks.add(state.ask_order.oid)
             state.bid_order = None
             state.ask_order = None
-            logger.debug(f"{coin}: cancelled {len(oids_to_cancel)} orders (WS)")
+            logger.debug(f"{coin}: cancelled {len(oids_to_cancel)} orders (WS), awaiting confirmation")
             return True
         except Exception as e:
             logger.warning(f"WS cancel {coin} failed: {e}")

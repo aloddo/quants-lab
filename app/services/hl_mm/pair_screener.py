@@ -110,8 +110,12 @@ class PairScreener:
         self._db = client[db_name]
         self._l2_col: Collection = self._db["hyperliquid_l2_snapshots_1s"]
         self._rankings_col: Collection = self._db["hl_mm_pair_rankings"]
-        self._rankings_col.create_index([("timestamp", DESCENDING)])
-        self._rankings_col.create_index([("coin", 1), ("timestamp", DESCENDING)])
+        # Bug #8 fix: Don't crash engine initialization if MongoDB is unreachable
+        try:
+            self._rankings_col.create_index([("timestamp", DESCENDING)])
+            self._rankings_col.create_index([("coin", 1), ("timestamp", DESCENDING)])
+        except Exception as e:
+            logger.warning(f"Screener: MongoDB index creation failed (will retry on first write): {e}")
 
         # State
         self._last_scan: float = 0.0
@@ -119,6 +123,7 @@ class PairScreener:
         self._shadow_start: dict[str, float] = {}   # legacy, unused
         self._demotion_count: dict[str, int] = {}    # legacy, unused
         self._active_pairs: set[str] = set()
+        self._force_active_coins: set[str] = set()   # manually forced, immune to demotion
         self._pending_idle_close: set[str] = set()   # demoted pairs needing maker inventory close
         self._sz_decimals: dict[str, int] = {}
         self._max_leverage: dict[str, int] = {}
@@ -250,6 +255,8 @@ class PairScreener:
                                avg_mid_px, count}
         Only includes coins with >= 30 snapshots in the window.
         """
+        # Bug #19 fix: timestamp_utc in hyperliquid_l2_snapshots_1s is stored as
+        # epoch milliseconds (HL convention). Ensure we query in the same unit.
         now_ms = int(time.time() * 1000)
         one_hour_ago_ms = now_ms - 3_600_000
 
@@ -324,8 +331,12 @@ class PairScreener:
         # score = E[net_capture] * sqrt(volume) * depth_factor * anchor_bonus
         # E[net_capture] accounts for fees, estimated markout, and exit penalty.
         edge_room = native_half_spread - cfg.maker_fee_bps - tox_buffer
-        estimated_markout = 1.0  # conservative 1bps prior for unknown coins
-        estimated_exit_penalty = 0.2 * 3.5  # 20% taker exit probability * 3.5bps fee
+        # Priors: zero until we have real markout data. The per-tick EV gate
+        # (orchestrator kill criteria: 8-fill EWMA < -4bps) is the safety net.
+        # Using pessimistic priors here killed ALL pairs at 6-8bps spreads,
+        # preventing us from ever collecting the markout data needed to learn.
+        estimated_markout = 0.0
+        estimated_exit_penalty = 0.0
         net_capture = edge_room - estimated_markout - estimated_exit_penalty
 
         # V2: Hard pair filters
@@ -450,8 +461,14 @@ class PairScreener:
         """
         cfg = self.config
 
-        # All pairs with positive edge in top N are immediately ACTIVE
-        top_coins = {r.coin for r in rankings[:cfg.max_live_pairs] if r.edge_room_bps > 0}
+        # All pairs with positive EV (score > 0) in top N are immediately ACTIVE.
+        # score = net_capture * sqrt(vol) * depth * anchor — zero priors mean
+        # this effectively gates on edge_room > 0 while ranking by liquidity.
+        top_coins = {r.coin for r in rankings[:cfg.max_live_pairs] if r.score > 0}
+
+        # Force-activated coins are immune to screener demotion
+        # (they were manually selected, don't demote until Alberto says so)
+        top_coins |= (self._active_pairs & self._force_active_coins)
 
         # Track demotions for inventory close signaling
         newly_demoted = self._active_pairs - top_coins
@@ -525,11 +542,14 @@ class PairScreener:
         logger.info(f"Screener: {coin} inventory close confirmed, fully IDLE")
 
     def force_active(self, coin: str) -> None:
-        """Force a pair to ACTIVE (bypass screener). For manual override."""
+        """Force a pair to ACTIVE (bypass screener). For manual override.
+        Force-activated coins are immune to screener demotion.
+        """
         self._active_pairs.add(coin)
+        self._force_active_coins.add(coin)
         self._shadow_start.pop(coin, None)
         self._pending_idle_close.discard(coin)
-        logger.info(f"Screener: {coin} forced to ACTIVE")
+        logger.info(f"Screener: {coin} forced to ACTIVE (immune to demotion)")
 
     def force_block(self, coin: str) -> None:
         """Block a pair permanently."""

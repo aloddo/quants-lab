@@ -118,6 +118,9 @@ class WalletScorer:
             self._recent_trades.append(trade)
 
             # Track the aggressor wallet (the one who crossed the spread)
+            # Bug #11 note: trade_count tracks total observed trades for confidence
+            # gating (min_trades threshold). attribute_markout does NOT increment
+            # trade_count — it only updates markout statistics. No double-counting.
             aggressor = buyer if side == "B" else seller
             self._ensure_wallet(aggressor)
             ws = self._wallets[aggressor]
@@ -262,13 +265,27 @@ class WalletScorer:
         if address not in self._wallets:
             self._wallets[address] = WalletStats(address=address)
 
+    def _apply_decay(self, ws: WalletStats) -> float:
+        """Bug #10 fix: Apply time-based decay to EWMA markout score.
+
+        Returns the decayed EWMA. Decay pulls the score toward 0 (neutral)
+        with a half-life of decay_halflife_s (default 24h).
+        """
+        if ws.last_trade_time <= 0 or self.decay_halflife_s <= 0:
+            return ws.ewma_markout
+        elapsed = time.time() - ws.last_trade_time
+        if elapsed <= 0:
+            return ws.ewma_markout
+        decay_factor = math.pow(0.5, elapsed / self.decay_halflife_s)
+        return ws.ewma_markout * decay_factor
+
     def _is_wallet_toxic(self, ws: WalletStats) -> bool:
         """Determine if a wallet is toxic based on accumulated evidence.
 
         Requires:
         1. Minimum trade count (default 20)
         2. Minimum notional volume (default $500)
-        3. EWMA markout below threshold (default -1.5bps)
+        3. EWMA markout below threshold (default -1.5bps) after decay
         4. Mean markout with confidence: lower bound of 95% CI < threshold
         """
         if ws.trade_count < self.min_trades:
@@ -276,8 +293,11 @@ class WalletScorer:
         if ws.total_notional < self.min_notional:
             return False
 
+        # Bug #10 fix: Apply time-based decay before checking threshold
+        decayed_ewma = self._apply_decay(ws)
+
         # EWMA check (fast, responsive to recent behavior)
-        if ws.ewma_markout >= self.toxic_threshold_bps:
+        if decayed_ewma >= self.toxic_threshold_bps:
             return False
 
         # Statistical check: mean markout with confidence interval

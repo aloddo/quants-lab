@@ -160,15 +160,14 @@ class HLMarketMaker:
         self._hedge_positions: dict[str, float] = {}
         self._hedge_in_progress: dict[str, float] = {}
 
-        # Bug #8: Shared rate limiter (token bucket)
-        # HL /exchange rate limit is ~12 calls/8s = 1.5/sec (undocumented, volume-gated)
-        # Screener no longer uses REST calls (MongoDB), so more budget for orders.
-        # Increased: 1.8/sec refill, burst 4 — allows faster tick response.
-        # HL rate limit: ~12 calls/8s = 1.5/sec. Previous 1.8/sec was too aggressive
-        # and caused persistent 429 storms. Set to 1.2/sec with burst 3 for safety margin.
-        self._rate_tokens: float = 3.0
-        self._rate_max: float = 3.0
-        self._rate_refill_per_sec: float = 1.2
+        # Shared rate limiter (token bucket) for HL /exchange endpoint.
+        # HL rate limit is ~12 calls/8s = 1.5/sec (undocumented, volume-gated).
+        # We use 1.0/sec refill with burst 6 to allow startup burst while
+        # staying safely under the limit during steady-state operation.
+        # The higher burst (6 vs 3) absorbs startup reconciliation without 429s.
+        self._rate_tokens: float = 6.0
+        self._rate_max: float = 6.0
+        self._rate_refill_per_sec: float = 1.0
         self._rate_last_refill: float = 0.0
 
         # Bug #12: asyncio.Lock for signal state access
@@ -436,26 +435,47 @@ class HLMarketMaker:
         # Load existing positions into inventory manager
         await self._sync_positions_on_startup()
 
-        # Set leverage for initial coins
-        for coin in self._initial_coins:
-            await self._set_leverage(coin)
-
-        # Force initial coins to active (bypass screener shadow period)
-        for coin in self._initial_coins:
-            self.screener.force_active(coin)
-            self._activate_coin(coin)
+        # Determine which coins to activate:
+        # If coins specified via --coins: force-activate them (immune to demotion)
+        # If empty: run screener immediately to auto-select from MongoDB L2 stats
+        if self._initial_coins:
+            for coin in self._initial_coins:
+                await self._set_leverage(coin)
+            for coin in self._initial_coins:
+                self.screener.force_active(coin)
+                self._activate_coin(coin)
+            logger.info(f"Manual coin selection: {self._initial_coins} (immune to demotion)")
+        else:
+            # Auto-select: run screener scan using existing MongoDB L2 data
+            logger.info("No coins specified — screener auto-selecting from MongoDB L2 stats...")
+            try:
+                rankings = await self.screener.scan()
+                auto_coins = [r.coin for r in rankings if r.score > 0][:self.screener.config.max_live_pairs]
+                if auto_coins:
+                    for coin in auto_coins:
+                        await self._set_leverage(coin)
+                        self._activate_coin(coin)
+                    logger.info(f"Screener auto-selected: {auto_coins}")
+                else:
+                    logger.warning(
+                        "Screener found 0 viable pairs — will retry on first screener loop. "
+                        "Check MongoDB L2 data freshness."
+                    )
+            except Exception as e:
+                logger.error(f"Screener auto-select failed: {e} — will retry on first screener loop")
 
         # Bug #2: If startup reconciliation couldn't verify clean state, pause all coins
+        active_list = list(self._active_coins)
         if getattr(self, '_startup_pause_required', False):
-            for coin in self._initial_coins:
+            for coin in active_list:
                 self.state_machine.force_pause(coin, 60, "startup: unverified order state")
             logger.warning("All coins starting in PAUSE due to unverified startup state")
 
         # Notify engine start
         self.notifier.notify_engine_event(
             "STARTED",
-            f"Coins: {self._initial_coins}, Leverage: {self.leverage}x, "
-            f"Dry run: {self.dry_run}",
+            f"Coins: {list(self._active_coins) or 'awaiting screener'}, "
+            f"Leverage: {self.leverage}x, Dry run: {self.dry_run}",
         )
 
         # === FILL DETECTION HARDENING: Subscribe to WS userFills + orderUpdates ===
@@ -473,6 +493,7 @@ class HLMarketMaker:
             asyncio.create_task(self._mongo_flush_loop(), name="mongo_flush"),
             asyncio.create_task(self._fill_poll_loop(), name="fill_poll"),
             asyncio.create_task(self._daily_summary_loop(), name="daily_summary"),
+            asyncio.create_task(self._periodic_stats_loop(), name="periodic_stats"),
             asyncio.create_task(self._mm_tracker_loop(), name="mm_tracker"),
         ]
 
@@ -688,10 +709,30 @@ class HLMarketMaker:
         current_mids: dict[str, float] = {}
 
         for coin in list(self._active_coins):
-            # Skip if circuit breaker disabled this pair
-            # Bug #7 fix: wrap cancel in to_thread
+            # Skip if circuit breaker disabled this pair — BUT still check for
+            # emergency flatten. A CB-disabled pair with inventory MUST still be
+            # able to taker-close. Without this, positions held during CB sit
+            # indefinitely (the 20-min ORDI bug).
             if self.fill_tracker.is_pair_disabled(coin):
                 await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
+                # Still run emergency flatten check for positions that need closing
+                pos = self.inventory.get_position(coin)
+                if abs(pos.size) > 1e-10:
+                    inv_age = self.inventory.get_inventory_age_s(coin)
+                    inv_usd = pos.size * (pos.mark_price or 1.0)
+                    if abs(inv_usd) >= 5.0 and (inv_age > 120 or pos.adverse_move_bps > 20):
+                        logger.critical(
+                            f"EMERGENCY_FLATTEN (CB-disabled): {coin} pos={pos.size:.6f}, "
+                            f"age={inv_age:.0f}s adverse={pos.adverse_move_bps:.1f}bps"
+                        )
+                        if not self.dry_run:
+                            try:
+                                result = await asyncio.to_thread(
+                                    self.exchange.market_close, coin
+                                )
+                                logger.info(f"Emergency flatten {coin} (CB-disabled): {result}")
+                            except Exception as e:
+                                logger.error(f"Emergency flatten {coin} failed: {e}")
                 continue
 
             # Get signal (Bug #12: under lock)
@@ -762,30 +803,32 @@ class HLMarketMaker:
             ask_exit_penalty = 0.5 * 3.5 if inv_usd < -limits.q_soft * 0.3 else 0.2 * 3.5
 
             # === V2: KILL CRITERIA — auto-disable side/coin on bad markout ===
-            # 8-fill EWMA < -4bps: disable that side for 30min
-            if bid_fill_count >= 8 and bid_markout_ewma < -4.0:
+            # 3-fill EWMA < -3bps: disable that side immediately.
+            # Previous: 8 fills / -4bps — too slow, loses $0.15 before triggering.
+            # In a trending market, 3 adverse fills = clear signal, don't wait.
+            if bid_fill_count >= 3 and bid_markout_ewma < -3.0:
                 bid_ev = False
                 if self._tick_count % 60 == 0:
-                    logger.warning(f"[{coin}] KILL: bid EWMA={bid_markout_ewma:.1f}bps < -4bps, disabled")
-            if ask_fill_count >= 8 and ask_markout_ewma < -4.0:
+                    logger.warning(f"[{coin}] KILL: bid EWMA={bid_markout_ewma:.1f}bps < -3bps (n={bid_fill_count}), disabled")
+            if ask_fill_count >= 3 and ask_markout_ewma < -3.0:
                 ask_ev = False
                 if self._tick_count % 60 == 0:
-                    logger.warning(f"[{coin}] KILL: ask EWMA={ask_markout_ewma:.1f}bps < -4bps, disabled")
+                    logger.warning(f"[{coin}] KILL: ask EWMA={ask_markout_ewma:.1f}bps < -3bps (n={ask_fill_count}), disabled")
 
-            # 50-fill coin markout < -3bps: demote coin entirely
+            # 20-fill coin markout < -2bps: demote coin entirely
             total_fills = bid_fill_count + ask_fill_count
-            if total_fills >= 50:
+            if total_fills >= 20:
                 combined_markout = (
                     (bid_markout_ewma * bid_fill_count + ask_markout_ewma * ask_fill_count)
                     / total_fills if total_fills > 0 else 0
                 )
-                if combined_markout < -3.0:
+                if combined_markout < -2.0:
                     bid_ev = False
                     ask_ev = False
                     if self._tick_count % 60 == 0:
                         logger.warning(
-                            f"[{coin}] KILL: coin markout={combined_markout:.1f}bps < -3bps, "
-                            f"both sides disabled"
+                            f"[{coin}] KILL: coin markout={combined_markout:.1f}bps < -2bps, "
+                            f"both sides disabled (n={total_fills})"
                         )
 
             # === V2: MODEL DECAY GUARD ===
@@ -825,14 +868,39 @@ class HLMarketMaker:
             if self.mm_tracker.is_crowded(coin, threshold=0.6):
                 wallet_penalty += 1.0  # additional 1bps for crowded pairs
 
+            # === COIN MOMENTUM REGIME FILTER ===
+            # The coin's OWN recent mid trend is the strongest adverse selection
+            # signal. Data shows: when a coin's mid moves >5bps in 5min, fills
+            # on the adverse side have -3 to -7bps markout.
+            # BTC momentum is secondary (alts pump independently of BTC).
+            coin_mom_5m = signal.mid_momentum_5m if hasattr(signal, 'mid_momentum_5m') else 0.0
+            btc_mom = self.risk_manager.get_btc_momentum_1m()
+
+            # Per-coin momentum: suppress the side getting run over
+            coin_mom_penalty = 0.0
+            if coin_mom_5m > 5.0:
+                # Coin trending UP → suppress asks (selling into uptrend = adverse)
+                coin_mom_penalty = min(8.0, (coin_mom_5m - 5.0) * 1.0)
+                ask_markout_cost += coin_mom_penalty
+            elif coin_mom_5m < -5.0:
+                # Coin trending DOWN → suppress bids (buying into downtrend = adverse)
+                coin_mom_penalty = min(8.0, (abs(coin_mom_5m) - 5.0) * 1.0)
+                bid_markout_cost += coin_mom_penalty
+
+            # BTC momentum: secondary signal (smaller penalty)
+            if btc_mom > 10.0:
+                bid_markout_cost += min(3.0, (btc_mom - 10.0) * 0.3)
+            elif btc_mom < -10.0:
+                ask_markout_cost += min(3.0, (abs(btc_mom) - 10.0) * 0.3)
+
             bid_ev_bps = half_spread - maker_fee - bid_markout_cost - bid_exit_penalty - wallet_penalty
             ask_ev_bps = half_spread - maker_fee - ask_markout_cost - ask_exit_penalty - wallet_penalty
 
             ev_threshold = 0.5  # minimum bps to quote a side
             # Don't override kill criteria decisions
-            if bid_fill_count < 8 or bid_markout_ewma >= -4.0:
+            if bid_fill_count < 3 or bid_markout_ewma >= -3.0:
                 bid_ev = bid_ev_bps > ev_threshold
-            if ask_fill_count < 8 or ask_markout_ewma >= -4.0:
+            if ask_fill_count < 3 or ask_markout_ewma >= -3.0:
                 ask_ev = ask_ev_bps > ev_threshold
 
             if self._tick_count % 60 == 0:  # log every ~30s
@@ -842,7 +910,8 @@ class HLMarketMaker:
                     f"ex={bid_exit_penalty:.1f} wl={wallet_penalty:.1f} n={bid_fill_count}) "
                     f"ask={ask_ev_bps:.1f}bps (mk={ask_markout_cost:.1f} "
                     f"ex={ask_exit_penalty:.1f} n={ask_fill_count}) "
-                    f"spr={half_spread:.1f} w={wallet_stats['tracked_wallets']}/"
+                    f"spr={half_spread:.1f} mom={coin_mom_5m:.1f}/{btc_mom:.1f}bps "
+                    f"w={wallet_stats['tracked_wallets']}/"
                     f"{wallet_stats['toxic_wallets']}t "
                     f"quote={'B' if bid_ev else '_'}{'A' if ask_ev else '_'}"
                 )
@@ -858,10 +927,10 @@ class HLMarketMaker:
                     signal.anchor_jump_detected
                     or signal.depth_drop_detected
                     or signal.spread_spike_detected
-                    or signal.vpin > 0.8
+                    or signal.vpin > 0.6  # was 0.8 — too lenient, missed momentum
                 )
-                if signal.vpin > 0.8 and self._tick_count % 30 == 0:
-                    logger.warning(f"[{coin}] VPIN={signal.vpin:.2f} > 0.8 — quotes pulled")
+                if signal.vpin > 0.6 and self._tick_count % 30 == 0:
+                    logger.warning(f"[{coin}] VPIN={signal.vpin:.2f} > 0.6 — quotes pulled")
                 # Soft gates: trade imbalance -> suppress adverse side
                 # V2 fix: use trade_imbalance_side from TRADE flow, not
                 # imbalance_side from BOOK. They can disagree and the old
@@ -958,13 +1027,13 @@ class HLMarketMaker:
             # BUT: don't freeze if hedge failed (no Bybit hedge) — let age accumulate
             # so emergency flatten can trigger and close the stuck position.
             bybit_hedged_coin = abs(self._hedge_positions.get(coin, 0)) > 1e-10
-            hedge_pending = coin in self._hedge_in_progress
-            if state_info.state == PairState.PAUSE and abs(pos.size) > 1e-10:
-                if not (hedge_pending and not bybit_hedged_coin):
-                    # Normal pause: freeze age
-                    # Bug #10 fix: match tick interval (1.0s, not 1.5s)
-                    self.inventory.pause_inventory_age(coin, 1.0)
-                # else: failed hedge — let age accumulate toward emergency flatten
+            # REMOVED: inventory age freeze during PAUSE.
+            # With the 120s emergency flatten threshold, a 60s CB pause no longer
+            # triggers spurious flattens. And freezing the age PREVENTS the safety
+            # net from working — positions held 8+ minutes in PAUSE never reach
+            # the 120s effective age because the freeze keeps resetting the clock.
+            # Let age accumulate naturally. Emergency flatten is the last-resort
+            # safety net and must always fire when the position is genuinely old.
 
             # Bug #9: Handle EMERGENCY_FLATTEN state
             # Bug #2 (Codex R4): Verify close, retry up to 3x, fallback to Bybit hedge
@@ -1049,9 +1118,13 @@ class HLMarketMaker:
                 gross = snapshot.total_gross_notional if snapshot else 0
                 net = snapshot.total_net_exposure if snapshot else 0
                 if not self.risk_manager.check_notional_limit(gross, proposed_notional):
-                    logger.debug(f"{coin}: gross notional limit hit, skipping quotes")
-                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
-                    continue
+                    # Gross limit hit — but ALWAYS allow exit-side orders.
+                    # Without this, a position above the limit can never close.
+                    if not state_info.exit_mode:
+                        logger.debug(f"{coin}: gross notional limit hit, skipping quotes")
+                        await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
+                        continue
+                    # else: exit mode — let it through to place reducing orders
                 # Bug #2 fix: Pass side context so exit-side orders are always allowed.
                 # If we have inventory, determine whether the quote sides would reduce exposure.
                 coin_has_inv = has_inventory.get(coin, False)
@@ -1149,14 +1222,21 @@ class HLMarketMaker:
             pass  # Moved to batch fill detection below
 
         # === STEP 3b: Batch fill detection (Codex R2 #5) ===
-        # Query open_orders ONCE for all coins instead of per-coin.
-        # Skip when we have WS fills working and no active quotes — saves rate budget.
+        # Query open_orders as REST FALLBACK only — WS userFills is primary.
+        # Throttled to every 5s to save rate budget. Was every tick (1/sec) which
+        # alone consumed our entire 1.0/sec budget leaving nothing for orders.
         any_quoting = any(
             self.state_machine.get_state(c) and
             self.state_machine.get_state(c).state.value in ("QUOTING_BOTH", "QUOTING_ONE_SIDE", "INVENTORY_EXIT")
             for c in self._active_coins
         )
-        if not self.dry_run and self._active_coins and any_quoting:
+        should_poll_fills = (
+            not self.dry_run
+            and self._active_coins
+            and any_quoting
+            and self._tick_count % 5 == 0  # every 5 ticks (~5s)
+        )
+        if should_poll_fills:
             async with self._oms_lock:
                 try:
                     if self._consume_rate_token():
@@ -1280,9 +1360,15 @@ class HLMarketMaker:
             # Bug #4 fix: Generate the same hash used by _poll_fills_rest and add
             # to _known_fill_hashes so fills detected via detect_fills() are deduped
             # against the REST poll fallback.
+            # Bug #3 (P0) fix: Normalize keys to "sz"/"px" format before hashing.
+            # Fills from detect_fills_from_snapshot use "size"/"price" keys while
+            # REST/WS fills use "sz"/"px". The _fill_hash method handles both via
+            # get() fallbacks, but we normalize here for consistency.
             fill_hash_data = {
                 "oid": oid, "time": fill.get("time", ""), "hash": fill.get("hash", ""),
-                "coin": coin, "side": side, "sz": size, "px": price,
+                "coin": coin, "side": side,
+                "sz": fill.get("sz", fill.get("size", size)),
+                "px": fill.get("px", fill.get("price", price)),
             }
             fh = self._fill_hash(fill_hash_data)
             if fh in self._known_fill_hashes:
@@ -1338,11 +1424,12 @@ class HLMarketMaker:
         # V2: Log quote attempt with fill outcome
         bid_o, ask_o = self.quote_engine.get_active_orders(coin)
         matched_order = bid_o if side == "bid" and bid_o else ask_o if side == "ask" and ask_o else None
+        fill_time = time.time()
         self._pending_attempts.append({
             "coin": coin,
             "side": side,
-            "placed_at": matched_order.placed_at if matched_order else now,
-            "ended_at": now,
+            "placed_at": matched_order.placed_at if matched_order else fill_time,
+            "ended_at": fill_time,
             "price": price,
             "ticks_from_touch": matched_order.ticks_from_touch if matched_order else 0,
             "spread_bps": matched_order.spread_bps_at_place if matched_order else 0,
@@ -1476,10 +1563,15 @@ class HLMarketMaker:
 
             if trades:
                 # V2: APPEND trades to buffer for signal engine
+                # Bug #18 fix: Cap accumulated trades per coin to prevent
+                # unbounded memory growth between ticks during high-activity periods
                 with self._ws_buffer_lock:
                     if coin not in self._latest_trades:
                         self._latest_trades[coin] = []
                     self._latest_trades[coin].extend(trades)
+                    # Keep only last 500 trades per coin (enough for signal engine)
+                    if len(self._latest_trades[coin]) > 500:
+                        self._latest_trades[coin] = self._latest_trades[coin][-500:]
 
                 # V2: Feed wallet addresses to WalletScorer
                 # HL trade format: {side, px, sz, hash, time, users: [buyer, seller]}
@@ -1864,6 +1956,11 @@ class HLMarketMaker:
             try:
                 if self.screener.should_rescan():
                     rankings = await self.screener.scan()
+
+                    # Bug #16 fix: Set per-coin VPIN bucket sizes from daily volume
+                    for r in rankings:
+                        if r.daily_volume_usd > 0:
+                            self.signal_engine.set_vpin_bucket_size(r.coin, r.daily_volume_usd)
 
                     # H2-style instant rotation: sync active coins with screener
                     screener_active = self.screener.active_pairs
@@ -2273,7 +2370,13 @@ class HLMarketMaker:
                 if diff > 1e-10:
                     # Check if this is a meaningful discrepancy
                     # (ignore dust from rounding)
-                    mid = self.fv_engine.get_mid(coin) if self.fv_engine else 0
+                    # Bug #5 fix: FairValueEngine has no get_mid(). Use signal
+                    # engine's book snapshot for mid price estimation.
+                    mid = 0.0
+                    if self.signal_engine:
+                        sig = self.signal_engine.get_signal(coin)
+                        if sig and sig.book:
+                            mid = sig.book.mid
                     diff_usd = diff * mid if mid > 0 else diff
                     if diff_usd > 1.0:  # $1 threshold
                         discrepancies.append({
@@ -2334,6 +2437,70 @@ class HLMarketMaker:
                 if time.time() - self._last_daily_summary > 3500:  # avoid double-send
                     self._send_daily_summary()
                     self._last_daily_summary = time.time()
+
+    async def _periodic_stats_loop(self) -> None:
+        """Send stats summary via Telegram every 30 minutes."""
+        while self._running:
+            await asyncio.sleep(1800)  # 30 minutes
+            if not self._running:
+                break
+            try:
+                self._send_periodic_stats()
+            except Exception as e:
+                logger.warning(f"Periodic stats failed: {e}")
+
+    def _send_periodic_stats(self) -> None:
+        """Build and send 30-min performance summary."""
+        snapshot = self.inventory._get_snapshot()
+        uptime_min = (time.time() - self._start_time) / 60.0
+        start_equity = getattr(self.inventory, '_session_start_equity', None) or 50.0
+
+        # Collect open positions
+        open_positions = []
+        for coin in self._active_coins:
+            pos = self.inventory.get_position(coin)
+            if abs(pos.size) > 1e-10:
+                usd = abs(pos.size * pos.mark_price) if pos.mark_price > 0 else 0
+                open_positions.append({
+                    "coin": coin,
+                    "size": pos.size,
+                    "usd": usd,
+                    "upnl": pos.unrealized_pnl,
+                })
+
+        # Compute win/loss stats from fill tracker
+        all_fills = self.fill_tracker.get_recent_fills(last_n=500)
+        # A "win" is a fill where the 5s markout is positive (favorable)
+        wins_long = sum(1 for f in all_fills if f.side == "bid" and f.markout_5s is not None and f.markout_5s > 0)
+        losses_long = sum(1 for f in all_fills if f.side == "bid" and f.markout_5s is not None and f.markout_5s <= 0)
+        wins_short = sum(1 for f in all_fills if f.side == "ask" and f.markout_5s is not None and f.markout_5s > 0)
+        losses_short = sum(1 for f in all_fills if f.side == "ask" and f.markout_5s is not None and f.markout_5s <= 0)
+
+        total_long = wins_long + losses_long
+        total_short = wins_short + losses_short
+        wr_long = wins_long / total_long if total_long > 0 else 0
+        wr_short = wins_short / total_short if total_short > 0 else 0
+
+        total_fills = len(all_fills)
+        wins = wins_long + wins_short
+        losses = losses_long + losses_short
+        avg_pnl = snapshot.realized_pnl / total_fills if total_fills > 0 else 0
+
+        self.notifier.notify_periodic_stats(
+            uptime_min=uptime_min,
+            total_fills=total_fills,
+            rpnl=snapshot.realized_pnl,
+            upnl=snapshot.unrealized_pnl,
+            equity=self.inventory._equity,
+            start_equity=start_equity,
+            open_positions=open_positions,
+            win_rate_long=wr_long,
+            win_rate_short=wr_short,
+            wins=wins,
+            losses=losses,
+            avg_pnl_per_trade=avg_pnl,
+            fees=snapshot.total_fees,
+        )
 
     def _send_daily_summary(self) -> None:
         """Build and send daily PnL summary via Telegram."""

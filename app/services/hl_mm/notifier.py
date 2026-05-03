@@ -182,6 +182,48 @@ class TelegramNotifier:
         )
         self._send_raw(text)
 
+    def notify_periodic_stats(
+        self,
+        uptime_min: float,
+        total_fills: int,
+        rpnl: float,
+        upnl: float,
+        equity: float,
+        start_equity: float,
+        open_positions: list[dict],  # [{coin, size, usd, upnl}]
+        win_rate_long: float,
+        win_rate_short: float,
+        wins: int,
+        losses: int,
+        avg_pnl_per_trade: float,
+        fees: float,
+    ) -> None:
+        """Send periodic stats summary (every 30min)."""
+        equity_change = equity - start_equity
+        eq_emoji = "📈" if equity_change >= 0 else "📉"
+        pnl_emoji = "🟢" if rpnl >= 0 else "🔴"
+
+        pos_lines = ""
+        if open_positions:
+            for p in open_positions[:5]:
+                side = "L" if p["size"] > 0 else "S"
+                pos_lines += f"  {p['coin']}: {side} ${abs(p['usd']):.1f} ({'+' if p['upnl']>=0 else ''}{p['upnl']:.3f})\n"
+        else:
+            pos_lines = "  FLAT\n"
+
+        text = (
+            f"{eq_emoji} <b>HL MM — {uptime_min:.0f}min</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"{pnl_emoji} rPnL: ${rpnl:+.3f} | uPnL: ${upnl:+.3f}\n"
+            f"💰 Equity: ${equity:.2f} ({'+' if equity_change>=0 else ''}{equity_change:.2f})\n"
+            f"📊 Fills: {total_fills} | W/L: {wins}/{losses}\n"
+            f"📈 WR: L={win_rate_long:.0%} S={win_rate_short:.0%}\n"
+            f"💵 Avg/trade: ${avg_pnl_per_trade:.4f} | Fees: ${fees:.3f}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>Positions:</b>\n{pos_lines}"
+        )
+        self._send_raw(text)
+
     def notify_engine_event(self, event: str, details: str = "") -> None:
         """Notify about engine start/stop/error events."""
         text = f"<b>HL MM</b> {event}"

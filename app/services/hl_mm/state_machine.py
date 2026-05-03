@@ -127,26 +127,47 @@ class StateMachine:
         old_state = info.state
         now = time.time()
 
-        # --- ANY -> PAUSE (highest priority EXCEPT hedge/emergency) ---
-        # Codex #2 fix: PAUSE must NOT preempt HEDGE or EMERGENCY_FLATTEN.
-        # If HL data goes stale while we have inventory in HEDGE or EMERGENCY_FLATTEN,
-        # we MUST stay in those states so the hedge/flatten completes. Otherwise,
-        # PAUSE freezes inventory age and the 180s emergency timer never matures,
-        # leaving positions unhedged indefinitely.
+        # --- EMERGENCY FLATTEN (highest priority — fires from ANY state) ---
+        # Must check BEFORE pause logic. A position at 120s age or 20bps adverse
+        # MUST be taker-closed regardless of data freshness or CB state.
+        should_flatten = self._should_emergency_flatten(ctx)
+        if old_state not in (PairState.EMERGENCY_FLATTEN,) and should_flatten:
+            self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
+                              self._emergency_flatten_reason(ctx))
+            info.quote_bid = False
+            info.quote_ask = False
+            info.exit_mode = True
+            info.hedge_requested = False
+            return info
+        # Debug: log if age > 120 but flatten not firing (should never happen)
+        if ctx.inventory_age_s > 120 and abs(ctx.inventory_usd) >= 5.0 and not should_flatten:
+            logger.warning(
+                f"[{info.coin}] FLATTEN BUG: age={ctx.inventory_age_s:.0f}s inv=${ctx.inventory_usd:.1f} "
+                f"adverse={ctx.adverse_move_bps:.1f}bps but _should_emergency_flatten=False"
+            )
+
+        # --- ANY -> PAUSE (EXCEPT when holding inventory) ---
+        # PAUSE must NOT preempt HEDGE or EMERGENCY_FLATTEN.
+        # CRITICAL: Also must NOT pause when we have inventory >= $5.
+        # Pausing with inventory = can't post exit quotes = position ages
+        # toward emergency flatten = guaranteed taker loss.
+        # Instead: allow fall-through so INVENTORY_EXIT transition fires and
+        # exit quotes keep posting even during stale data / CB conditions.
         if self._should_pause(ctx):
-            if old_state not in (PairState.HEDGE, PairState.EMERGENCY_FLATTEN):
+            exempt_from_pause = (
+                old_state in (PairState.HEDGE, PairState.EMERGENCY_FLATTEN)
+                or abs(ctx.inventory_usd) >= 5.0  # ANY state with inventory
+            )
+            if not exempt_from_pause:
                 if old_state != PairState.PAUSE:
                     self._enter_state(info, PairState.PAUSE, now,
                                       self._pause_reason(ctx))
                 info.quote_bid = False
                 info.quote_ask = False
                 info.exit_mode = False
-                # Hedging disabled: costs ~23bps round-trip, destroys PnL on
-                # all sub-25bps spread pairs. Let inventory age toward
-                # EMERGENCY_FLATTEN (HL taker close at 3.5bps) instead.
                 info.hedge_requested = False
                 return info
-            # else: in HEDGE/EMERGENCY_FLATTEN — fall through, don't pause
+            # else: have inventory — fall through, keep exit quotes active
 
         # --- PAUSE -> IDLE (cooldown expired + fresh data) ---
         if old_state == PairState.PAUSE:
@@ -171,17 +192,6 @@ class StateMachine:
             else:
                 self._enter_state(info, PairState.INVENTORY_EXIT, now,
                                   "hedge done but inventory remains")
-
-        # --- INVENTORY_EXIT -> EMERGENCY_FLATTEN (Bug #9) ---
-        if old_state == PairState.INVENTORY_EXIT:
-            if self._should_emergency_flatten(ctx):
-                self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
-                                  self._emergency_flatten_reason(ctx))
-                info.quote_bid = False
-                info.quote_ask = False
-                info.exit_mode = True
-                info.hedge_requested = False
-                return info
 
         # --- INVENTORY_EXIT -> HEDGE (escalation) ---
         if old_state == PairState.INVENTORY_EXIT:
@@ -307,26 +317,37 @@ class StateMachine:
         return "stale HL data with inventory"
 
     def _should_emergency_flatten(self, ctx: PairContext) -> bool:
-        """V2: Emergency flatten with tighter age limit.
+        """Emergency flatten — last resort taker close.
 
-        Was 180s -- way too long. At 3-8bps adverse markout per minute,
-        holding for 180s loses 9-24bps. HL taker close costs only 3.5bps.
-        45s is the breakeven: 45s * ~4bps/min adverse = ~3bps < 3.5bps taker fee.
+        Taker close costs 3.5bps fee PLUS whatever adverse move has accumulated.
+        At 8bps adverse + 3.5bps fee = 11.5bps loss — that's 2-3 good round trips
+        destroyed. Only flatten when holding is clearly worse than the taker cost.
 
-        Triggers when: age > 45s, OR adverse > 8bps (was 12bps).
+        Triggers:
+          - age > 120s (2min — enough time for 4+ maker close attempts at 1s tick)
+          - adverse > 20bps (position is definitively wrong, cut losses)
+          - position < $10 AND age > 10s (below HL minimum, can't maker close)
+
+        Before this fires, INVENTORY_EXIT mode tries passive maker close for up
+        to 120s. The maker close costs ~1.44bps (fee only). Only if that fails
+        do we eat the 3.5bps taker fee.
         """
         if abs(ctx.inventory_usd) < 5.0:
             return False
-        if ctx.inventory_age_s > 45:
+        # Sub-$10 positions can't post maker orders (HL minimum $10 notional).
+        # Don't waste 120s waiting — just taker close after 10s.
+        if abs(ctx.inventory_usd) < 10.0 and ctx.inventory_age_s > 10:
             return True
-        if ctx.adverse_move_bps > 8.0:
+        if ctx.inventory_age_s > 120:
+            return True
+        if ctx.adverse_move_bps > 20.0:
             return True
         return False
 
     def _emergency_flatten_reason(self, ctx: PairContext) -> str:
-        if ctx.inventory_age_s > 45:
-            return f"age={ctx.inventory_age_s:.0f}s > 180s emergency limit"
-        return f"adverse={ctx.adverse_move_bps:.1f}bps > 12bps, no hedge available"
+        if ctx.inventory_age_s > 120:
+            return f"age={ctx.inventory_age_s:.0f}s > 120s emergency limit"
+        return f"adverse={ctx.adverse_move_bps:.1f}bps > 20bps"
 
     def _set_output_flags(self, info: PairStateInfo, ctx: PairContext) -> None:
         """Set quote_bid/quote_ask/exit_mode based on state + context."""
