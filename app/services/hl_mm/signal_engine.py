@@ -106,7 +106,9 @@ class SignalEngine:
         self._mid_history: dict[str, deque] = {}   # (timestamp, mid)
         self._spread_history: dict[str, deque] = {}
         self._depth5_history: dict[str, deque] = {}  # (ts, bid_usd5, ask_usd5)
-        self._trade_sides: dict[str, deque] = {}     # (ts, +1 or -1)
+        # V2: store (ts, direction, notional_usd, price) per trade
+        # Was: (ts, direction) only -- lost size info, couldn't do notional-weighted imbalance
+        self._trade_sides: dict[str, deque] = {}
         self._sigma_ema: dict[str, float] = {}
 
         # Latest state
@@ -229,14 +231,22 @@ class SignalEngine:
     def update_trades(self, coin: str, trades: list[dict]) -> None:
         """Process trade events from HL WS.
 
-        Each trade dict should have: {side: "B"|"S", px: float, sz: float}
+        V2: Stores full trade data (direction, notional, price) for:
+        - Notional-weighted trade imbalance (not count-based)
+        - VPIN computation (volume-bucketed)
+        - Future wallet tracking (users field)
+
+        Each trade dict: {side: "B"|"S", px: str/float, sz: str/float}
         """
         self._ensure_coin(coin)
         now = time.time()
         for trade in trades:
             side_str = trade.get("side", "")
             direction = 1 if side_str == "B" else -1
-            self._trade_sides[coin].append((now, direction))
+            price = float(trade.get("px", 0) or 0)
+            size = float(trade.get("sz", 0) or 0)
+            notional = price * size
+            self._trade_sides[coin].append((now, direction, notional, price))
 
     def check_anchor_jump(self, coin: str, bybit_mid: float, prev_bybit_mid: float) -> bool:
         """Check if Bybit anchor jumped > 6bps in 1s (Spec Section 5).
@@ -293,7 +303,7 @@ class SignalEngine:
             self._mid_history[coin] = deque(maxlen=600)  # 10 min at 1/sec
             self._spread_history[coin] = deque(maxlen=300)  # 5 min
             self._depth5_history[coin] = deque(maxlen=60)  # 1 min
-            self._trade_sides[coin] = deque(maxlen=200)
+            self._trade_sides[coin] = deque(maxlen=2000)  # V2: larger buffer for VPIN + notional imbalance
             self._sigma_ema[coin] = 0.0
             self._toxic_flag_timestamps[coin] = {}
 
@@ -361,28 +371,36 @@ class SignalEngine:
         return (history[-1] - mean) / std
 
     def _compute_ofi(self, coin: str) -> float:
-        """Compute order flow imbalance in bps from recent mid changes.
+        """V2: Real L2 Order Flow Imbalance from book size changes.
 
-        OFI positive = buying pressure, negative = selling pressure.
+        OLD (V1): Summed mid-price changes. That's price momentum, not order flow.
+        NEW (V2): Delta of bid vs ask sizes at top 5 levels between consecutive
+        book snapshots. Positive = bid size increasing relative to ask (buying pressure).
+
+        OFI = Σ (Δbid_size@level_i - Δask_size@level_i) for i in [1..5]
+        Normalized to bps using mid price.
         """
-        mids = self._mid_history[coin]
-        if len(mids) < 5:
+        depth_hist = self._depth5_history.get(coin)
+        if not depth_hist or len(depth_hist) < 2:
             return 0.0
 
-        # Use last 10 mid changes
-        recent = list(mids)[-11:]
+        # Use last 10 snapshots (5s rolling at ~2 updates/sec)
+        recent = list(depth_hist)[-11:]
         if len(recent) < 2:
             return 0.0
 
-        # Sum of signed mid changes (bps)
-        ofi = 0.0
+        ofi_raw = 0.0
         for i in range(1, len(recent)):
-            _, prev_mid = recent[i - 1]
-            _, curr_mid = recent[i]
-            if prev_mid > 0:
-                ofi += (curr_mid - prev_mid) / prev_mid * 10000
+            _, prev_bid_usd, prev_ask_usd = recent[i - 1]
+            _, curr_bid_usd, curr_ask_usd = recent[i]
+            # Delta of bid depth minus delta of ask depth
+            ofi_raw += (curr_bid_usd - prev_bid_usd) - (curr_ask_usd - prev_ask_usd)
 
-        return ofi
+        # Normalize: express as bps relative to average depth
+        avg_depth = sum(b + a for _, b, a in recent) / len(recent) / 2
+        if avg_depth > 0:
+            return ofi_raw / avg_depth * 10000
+        return 0.0
 
     def _compute_volatility(self, coin: str) -> tuple[float, float]:
         """Compute per-second volatility and 30s realized vol.
@@ -478,18 +496,32 @@ class SignalEngine:
         return current_spread > median * factor
 
     def _check_trade_imbalance(self, coin: str) -> bool:
-        """3s trade imbalance > 70/30."""
+        """V2: 3s NOTIONAL-weighted trade imbalance > 70/30.
+
+        Was count-based (each print = 1 vote regardless of size).
+        Now weighted by USD notional: a $500 trade counts 50x more than $10.
+        """
         trades = self._trade_sides[coin]
         if not trades:
             return False
 
         now = time.time()
-        recent = [(t, d) for t, d in trades if now - t <= 3.0]
-        if len(recent) < 5:
+        buy_notional = 0.0
+        total_notional = 0.0
+        count = 0
+        for entry in trades:
+            ts = entry[0]
+            if now - ts > 3.0:
+                continue
+            direction = entry[1]
+            notional = entry[2] if len(entry) > 2 else 1.0  # backward compat
+            total_notional += notional
+            if direction > 0:
+                buy_notional += notional
+            count += 1
+
+        if count < 5 or total_notional < 1.0:
             return False
 
-        buys = sum(1 for _, d in recent if d > 0)
-        total = len(recent)
-        buy_ratio = buys / total
-
+        buy_ratio = buy_notional / total_notional
         return buy_ratio > self.trade_imbalance_threshold or buy_ratio < (1 - self.trade_imbalance_threshold)

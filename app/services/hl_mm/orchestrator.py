@@ -1286,8 +1286,12 @@ class HLMarketMaker:
                 trades = [data]
 
             if trades:
-                # Overwrite-latest: only most recent batch matters
-                self._latest_trades[coin] = trades
+                # V2: APPEND trades to buffer instead of overwriting.
+                # Old behavior lost trades between ticks. New behavior
+                # accumulates all trades so signal_engine gets full fidelity.
+                if coin not in self._latest_trades:
+                    self._latest_trades[coin] = []
+                self._latest_trades[coin].extend(trades)
                 # Bug #9 fix: track last WS message time for watchdog
                 self._last_hl_ws_time[coin] = time.time()
         except Exception as e:
