@@ -801,7 +801,40 @@ class HLMarketMaker:
                     ctx.ask_side_ev_positive = False  # don't add to short
 
             # Run state machine
+            # Capture previous quoting sides to detect changes
+            prev_state_info = self.state_machine.get_state(coin)
+            prev_quote_bid = prev_state_info.quote_bid if prev_state_info else False
+            prev_quote_ask = prev_state_info.quote_ask if prev_state_info else False
+
             state_info = self.state_machine.transition(coin, ctx)
+
+            # IMMEDIATE CANCEL on state transition: if a side was quoting and now
+            # isn't, cancel that side's order RIGHT NOW instead of waiting for
+            # next tick's execute_quotes. Without this, stale orders get filled
+            # in the 0.5-1s window between state change and next requote cycle.
+            # This was causing double fills on every state transition.
+            bid_dropped = prev_quote_bid and not state_info.quote_bid
+            ask_dropped = prev_quote_ask and not state_info.quote_ask
+            if (bid_dropped or ask_dropped) and not self.dry_run:
+                bid_o, ask_o = self.quote_engine.get_active_orders(coin)
+                if bid_dropped and bid_o:
+                    try:
+                        await asyncio.to_thread(
+                            self.exchange.cancel, coin, bid_o.oid
+                        )
+                        self.quote_engine.clear_order_by_oid(coin, bid_o.oid)
+                        logger.info(f"[{coin}] Immediate cancel BID oid={bid_o.oid} (state: {state_info.state.value})")
+                    except Exception as e:
+                        logger.warning(f"[{coin}] Immediate cancel BID failed: {e}")
+                if ask_dropped and ask_o:
+                    try:
+                        await asyncio.to_thread(
+                            self.exchange.cancel, coin, ask_o.oid
+                        )
+                        self.quote_engine.clear_order_by_oid(coin, ask_o.oid)
+                        logger.info(f"[{coin}] Immediate cancel ASK oid={ask_o.oid} (state: {state_info.state.value})")
+                    except Exception as e:
+                        logger.warning(f"[{coin}] Immediate cancel ASK failed: {e}")
 
             # Codex #6: If demoted and inventory cleared, finalize idle close
             if coin_demoted and abs(ctx.inventory_usd) < 1.0:
@@ -1826,8 +1859,19 @@ class HLMarketMaker:
             self._fill_poll_consecutive_failures = 0
             self._update_fill_sync_health()
 
-            # Process recent fills (last 50)
+            # Process recent fills — ONLY those with timestamp after engine start.
+            # Without this filter, the REST poll re-processes old fills from prior
+            # sessions when their hashes get evicted from the bounded dedup set.
+            # This caused 50 ghost fills on 2026-05-03 that corrupted inventory.
             for fill_data in fills[-50:]:
+                # TIMESTAMP GATE: reject any fill from before this engine started
+                fill_time = fill_data.get("time", 0)
+                if isinstance(fill_time, (int, float)) and fill_time > 0:
+                    # HL fill timestamps are in milliseconds
+                    fill_ts = fill_time / 1000.0 if fill_time > 1e12 else fill_time
+                    if fill_ts < self._start_time:
+                        continue
+
                 # Build a unique hash for dedup
                 fill_hash = self._fill_hash(fill_data)
                 if fill_hash in self._known_fill_hashes:
