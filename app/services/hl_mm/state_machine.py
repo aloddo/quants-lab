@@ -141,7 +141,10 @@ class StateMachine:
                 info.quote_bid = False
                 info.quote_ask = False
                 info.exit_mode = False
-                info.hedge_requested = ctx.circuit_breaker_active and abs(ctx.inventory_usd) > 0
+                # Hedging disabled: costs ~23bps round-trip, destroys PnL on
+                # all sub-25bps spread pairs. Let inventory age toward
+                # EMERGENCY_FLATTEN (HL taker close at 3.5bps) instead.
+                info.hedge_requested = False
                 return info
             # else: in HEDGE/EMERGENCY_FLATTEN — fall through, don't pause
 

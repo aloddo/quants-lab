@@ -1052,7 +1052,8 @@ class HLMarketMaker:
 
             # Execute Bybit hedge if requested (Gap 1)
             # Bug #1 (Codex R4): Check hedge_in_progress + hedge_positions before stacking
-            if state_info.hedge_requested and not self.dry_run:
+            # Hedging disabled — costs ~23bps, destroys PnL on shitcoin spreads.
+            if False and state_info.hedge_requested and not self.dry_run:
                 if coin in self._hedge_in_progress:
                     logger.debug(f"{coin}: hedge requested but already in progress, skipping")
                 elif abs(self._hedge_positions.get(coin, 0)) > 1e-10:
