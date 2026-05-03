@@ -35,6 +35,9 @@ class Fill:
     oid: int
     timestamp: float
 
+    # Codex #10: Snapshot spread at fill time for consistent toxicity evaluation
+    spread_at_fill_bps: float = 0.0
+
     # Post-fill markouts (bps, populated asynchronously)
     markout_1s: Optional[float] = None
     markout_5s: Optional[float] = None
@@ -85,7 +88,7 @@ class FillTracker:
     def __init__(
         self,
         max_history: int = 500,
-        toxicity_threshold_bps: float = -2.0,  # 5s markout worse than this = toxic
+        toxicity_threshold_bps: float = -2.0,  # default 5s markout threshold (fallback)
         circuit_breaker_2_window_s: float = 600.0,    # 10 min window
         circuit_breaker_3_window_s: float = 1800.0,   # 30 min window
     ):
@@ -98,8 +101,37 @@ class FillTracker:
         self._pending_markouts: list[Fill] = []
         self._toxicity: dict[str, PairToxicity] = {}
 
+        # Per-pair spread for calibrated CB thresholds.
+        # Updated by orchestrator from signal engine data.
+        self._pair_spread_bps: dict[str, float] = {}
+
         # Quote log (ring buffer, separate from fills)
         self._quote_logs: deque[QuoteLog] = deque(maxlen=2000)
+
+    def update_pair_spread(self, coin: str, spread_bps: float) -> None:
+        """Update the current spread for a pair (for calibrated CB thresholds)."""
+        self._pair_spread_bps[coin] = spread_bps
+
+    def get_toxicity_threshold(self, coin: str) -> float:
+        """Get spread-calibrated toxicity threshold for a pair (current spread).
+
+        Toxic = 5s markout worse than -1x half-spread.
+        E.g., BIO at 8bps spread → threshold = -4bps (half-spread).
+        Minimum threshold capped at -1.5bps to avoid being too permissive on tight pairs.
+        """
+        spread = self._pair_spread_bps.get(coin, 0)
+        return self._get_toxicity_threshold_for_spread(spread)
+
+    def _get_toxicity_threshold_for_spread(self, spread_bps: float) -> float:
+        """Codex #10: Compute toxicity threshold from a specific spread value.
+
+        Used by update_markouts() with the spread snapshotted at fill time,
+        ensuring a toxic fill can't be reclassified as non-toxic when the
+        spread widens after the fill.
+        """
+        if spread_bps > 0:
+            return max(-spread_bps / 2.0, -10.0)  # half-spread, cap at -10bps
+        return self.toxicity_threshold_bps  # fallback to default
 
     # ------------------------------------------------------------------
     # Fill recording
@@ -115,11 +147,19 @@ class FillTracker:
         fee: float,
         oid: int,
     ) -> None:
-        """Record a new fill. Markouts computed later via update_markouts()."""
+        """Record a new fill. Markouts computed later via update_markouts().
+
+        Codex #10: Snapshots current spread at fill time so toxicity
+        threshold uses the spread when the fill occurred, not the spread
+        at markout time (which can be very different).
+        """
+        # Codex #10: Snapshot spread at fill time
+        fill_spread = self._pair_spread_bps.get(coin, 0)
         fill = Fill(
             coin=coin, side=side, price=price, size=size,
             size_usd=size_usd, fee=fee, oid=oid,
             timestamp=time.time(),
+            spread_at_fill_bps=fill_spread,
         )
         self._fills.append(fill)
         self._pending_markouts.append(fill)
@@ -166,7 +206,10 @@ class FillTracker:
                 fill.markout_1s = move_bps
             if age >= 5.0 and fill.markout_5s is None:
                 fill.markout_5s = move_bps
-                fill.is_toxic = move_bps < self.toxicity_threshold_bps
+                # Codex #10: Use spread at fill time for toxicity threshold,
+                # not current spread (which may have widened/compressed since fill)
+                threshold = self._get_toxicity_threshold_for_spread(fill.spread_at_fill_bps)
+                fill.is_toxic = move_bps < threshold
                 self._update_toxicity(fill)
             if age >= 15.0 and fill.markout_15s is None:
                 fill.markout_15s = move_bps
@@ -307,6 +350,7 @@ class FillTracker:
                 "markout_15s_bps": f.markout_15s,
                 "markout_60s_bps": f.markout_60s,
                 "is_toxic": f.is_toxic,
+                "spread_at_fill_bps": f.spread_at_fill_bps,
             }
             for f in fills
             if f.markout_5s is not None

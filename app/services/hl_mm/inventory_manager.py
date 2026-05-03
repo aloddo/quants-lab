@@ -22,9 +22,11 @@ Exit decision tree:
 """
 import logging
 import math
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 from hyperliquid.info import Info
@@ -96,6 +98,9 @@ class InventorySnapshot:
     total_net_exposure: float = 0.0
     free_equity: float = 0.0
     daily_pnl: float = 0.0
+    realized_pnl: float = 0.0       # sum of closed round-trip PnL
+    unrealized_pnl: float = 0.0     # mark-to-market on open positions
+    total_fees: float = 0.0         # cumulative fees paid
     session_peak_equity: float = 0.0
 
 
@@ -116,6 +121,13 @@ class InventoryManager:
         self.rv_baseline_mult = rv_baseline_multiplier
         self.rv_high_mult = rv_high_multiplier
 
+        # Bug #1 fix: threading.RLock to protect against WS callback thread
+        # calling record_fill() while tick loop reads/writes positions.
+        # Codex R2 #1 fix: Must be RLock (reentrant) because internal methods
+        # like _get_snapshot_unlocked() call get_free_equity() which also
+        # acquires the lock. Plain Lock would deadlock every 30s.
+        self._lock = threading.RLock()
+
         # Per-coin state
         self._positions: dict[str, PositionState] = {}
         self._rv_baseline: dict[str, float] = {}  # baseline 30s realized vol per coin
@@ -129,12 +141,58 @@ class InventoryManager:
         self._session_start_equity: Optional[float] = None
         self._peak_equity: float = 0.0
         self._daily_pnl: float = 0.0
+        self._realized_pnl: float = 0.0       # cumulative realized PnL from closed fills
+        self._total_fees: float = 0.0          # cumulative fees
         self._last_position_sync: float = 0.0
+        self._last_daily_reset_date: Optional[object] = None  # tracks last UTC date we reset PnL
 
         # FILL DETECTION HARDENING: Track whether position sync has ever succeeded.
         # Never trust inventory=0 if sync hasn't completed at least once.
         self._sync_ever_succeeded: bool = False
         self._sync_consecutive_failures: int = 0
+
+    def reset_pnl_baseline(self) -> None:
+        """Reset PnL baseline to current equity.
+
+        Called after startup position sync so inherited positions' unrealized
+        PnL doesn't trigger daily stop. Only tracks PnL from new fills.
+        """
+        if self._equity > 0:
+            old = self._session_start_equity
+            self._session_start_equity = self._equity
+            self._daily_pnl = 0.0
+            self._peak_equity = self._equity
+            logger.info(
+                f"PnL baseline reset: {old} -> {self._equity:.2f} "
+                f"(inherited positions baked into baseline)"
+            )
+
+    def _maybe_reset_daily_pnl(self) -> None:
+        """Reset daily PnL baseline at UTC midnight.
+
+        Snapshots current equity as the new session_start_equity so that
+        daily_pnl = equity - session_start_equity starts fresh each UTC day.
+        """
+        today = datetime.now(timezone.utc).date()
+        if self._last_daily_reset_date is not None and self._last_daily_reset_date == today:
+            return  # already reset today
+        if self._last_daily_reset_date is None:
+            # First call — just record the date, don't reset (session just started)
+            self._last_daily_reset_date = today
+            return
+        # New UTC day — reset PnL baseline
+        if self._equity_ever_confirmed and self._equity > 0:
+            old_start = self._session_start_equity
+            self._session_start_equity = self._equity
+            self._daily_pnl = 0.0
+            self._peak_equity = self._equity
+            self._last_daily_reset_date = today
+            logger.info(
+                f"UTC midnight PnL reset: start_equity {old_start:.2f} -> {self._equity:.2f}"
+            )
+        else:
+            # No confirmed equity yet — just update the date so we don't keep retrying
+            self._last_daily_reset_date = today
 
     def get_limits(self, coin: str) -> PairLimits:
         """Get inventory limits for a coin."""
@@ -157,14 +215,22 @@ class InventoryManager:
 
         Gamma is calibrated so that at q_norm=1, the shift equals
         gamma_target_shift_bps for that pair.
+
+        Codex #9: Acquires lock to read position state atomically,
+        preventing half-updated reads during concurrent record_fill().
         """
-        pos = self._positions.get(coin)
+        with self._lock:
+            pos = self._positions.get(coin)
+            if not pos or pos.size == 0:
+                return fair_value
+            # Copy fields we need under lock
+            q_usd = pos.size * fair_value
+            pos_size = pos.size
         limits = self.get_limits(coin)
 
-        if not pos or pos.size == 0 or fair_value <= 0 or sigma_1s <= 0:
+        if fair_value <= 0 or sigma_1s <= 0:
             return fair_value
 
-        q_usd = pos.size * fair_value
         q_norm = q_usd / limits.q_soft if limits.q_soft > 0 else 0
 
         # Gamma calibration: gamma = target_shift / (sigma_1s^2 * tau)
@@ -228,25 +294,30 @@ class InventoryManager:
         return ExitMode.NONE
 
     def get_inventory_age_s(self, coin: str) -> float:
-        """Get how long we have held inventory for this coin."""
-        pos = self._positions.get(coin)
-        if not pos or pos.size == 0 or pos.opened_at <= 0:
-            return 0.0
-        return time.time() - pos.opened_at
+        """Get how long we have held inventory for this coin.
+        Codex #9: Lock protects against half-updated position reads.
+        """
+        with self._lock:
+            pos = self._positions.get(coin)
+            if not pos or pos.size == 0 or pos.opened_at <= 0:
+                return 0.0
+            return time.time() - pos.opened_at
 
     def pause_inventory_age(self, coin: str, pause_duration_s: float) -> None:
         """Shift opened_at forward to freeze inventory age during CB pause.
 
         Without this, a 5min CB pause always exceeds the 180s emergency
         flatten limit, causing every paused position to be market-closed.
+        Codex #9: Lock protects against concurrent modification.
         """
-        pos = self._positions.get(coin)
-        if pos and pos.size != 0 and pos.opened_at > 0:
-            pos.opened_at += pause_duration_s
-            logger.debug(
-                f"{coin}: inventory age paused {pause_duration_s:.0f}s "
-                f"(effective age now {time.time() - pos.opened_at:.0f}s)"
-            )
+        with self._lock:
+            pos = self._positions.get(coin)
+            if pos and pos.size != 0 and pos.opened_at > 0:
+                pos.opened_at += pause_duration_s
+                logger.debug(
+                    f"{coin}: inventory age paused {pause_duration_s:.0f}s "
+                    f"(effective age now {time.time() - pos.opened_at:.0f}s)"
+                )
 
     # ------------------------------------------------------------------
     # Spot equity fallback (HL unified account fix)
@@ -296,14 +367,19 @@ class InventoryManager:
 
         Returns portfolio-level snapshot.
         """
+        with self._lock:
+            return self._sync_positions_unlocked()
+
+    def _sync_positions_unlocked(self) -> InventorySnapshot:
+        """Internal sync_positions without lock (caller must hold self._lock)."""
         now = time.time()
         if now - self._last_position_sync < 1.0:
-            return self._get_snapshot()
+            return self._get_snapshot_unlocked()
 
         try:
             state = self.info.user_state(self.address)
             if not state:
-                return self._get_snapshot()
+                return self._get_snapshot_unlocked()
 
             margin = state.get("marginSummary", {})
             account_value = float(margin.get("accountValue", 0) or 0)
@@ -320,11 +396,15 @@ class InventoryManager:
                 self._equity_ever_confirmed = True
             # else: keep existing _equity (default 54.0 or last known good)
 
+            # Reset PnL baseline at UTC midnight
+            self._maybe_reset_daily_pnl()
+
             if self._session_start_equity is None and self._equity > 0:
                 self._session_start_equity = self._equity
                 self._peak_equity = self._equity
             else:
-                self._peak_equity = max(self._peak_equity, account_value)
+                # Bug #2 fix: track _equity not account_value for peak
+                self._peak_equity = max(self._peak_equity, self._equity)
 
             # Only compute daily PnL if we have a real equity reading
             if self._equity_ever_confirmed and self._session_start_equity:
@@ -390,7 +470,7 @@ class InventoryManager:
                 f"Position sync failed ({self._sync_consecutive_failures}x): {e}"
             )
 
-        return self._get_snapshot()
+        return self._get_snapshot_unlocked()
 
     def sync_positions_safe(self, timeout_s: float = 2.0) -> InventorySnapshot:
         """Bug #10 fix: sync_positions with internal timeout.
@@ -402,101 +482,120 @@ class InventoryManager:
         """
         import requests as _requests
 
-        now = time.time()
-        if now - self._last_position_sync < 1.0:
-            return self._get_snapshot()
+        with self._lock:
+            now = time.time()
+            if now - self._last_position_sync < 1.0:
+                return self._get_snapshot_unlocked()
 
-        try:
-            # Use info.user_state with internal timeout via the session
-            # HL SDK doesn't expose timeout param, so we patch the session
-            original_timeout = getattr(self.info.session, 'timeout', None)
-            self.info.session.timeout = timeout_s
             try:
-                state = self.info.user_state(self.address)
-            finally:
-                # Restore original timeout
-                if original_timeout is not None:
-                    self.info.session.timeout = original_timeout
-                else:
-                    try:
-                        del self.info.session.timeout
-                    except AttributeError:
-                        pass
-
-            if not state:
-                return self._get_snapshot()
-
-            margin = state.get("marginSummary", {})
-            account_value = float(margin.get("accountValue", 0) or 0)
-
-            # HL unified accounts: total equity = perps accountValue + spot USDC
-            spot_equity = self._query_spot_equity()
-            combined_equity = account_value + spot_equity
-
-            if combined_equity > 0:
-                self._equity = combined_equity
-                self._equity_ever_confirmed = True
-
-            if self._session_start_equity is None and self._equity > 0:
-                self._session_start_equity = self._equity
-                self._peak_equity = self._equity
-            elif self._equity > 0:
-                self._peak_equity = max(self._peak_equity, self._equity)
-
-            # Only compute daily PnL with confirmed equity
-            if self._equity_ever_confirmed and self._session_start_equity:
-                self._daily_pnl = self._equity - self._session_start_equity
-
-            # Update per-coin positions (same logic as sync_positions)
-            returned_coins = set()
-            for pos_data in state.get("assetPositions", []):
-                p = pos_data.get("position", {})
-                coin = p.get("coin", "")
-                size = float(p.get("szi", 0))
-                entry = float(p.get("entryPx", 0) or 0)
-                unrealized = float(p.get("unrealizedPnl", 0) or 0)
-                returned_coins.add(coin)
-
-                existing = self._positions.get(coin)
-                if size != 0:
-                    mark = entry + unrealized / size if size != 0 else entry
-                    opened_at = existing.opened_at if existing and existing.size != 0 else now
-
-                    if entry > 0:
-                        if size > 0:
-                            adverse = max(0, (entry - mark) / entry * 10000)
-                        else:
-                            adverse = max(0, (mark - entry) / entry * 10000)
+                # Use info.user_state with internal timeout via the session
+                # HL SDK doesn't expose timeout param, so we patch the session
+                original_timeout = getattr(self.info.session, 'timeout', None)
+                self.info.session.timeout = timeout_s
+                try:
+                    state = self.info.user_state(self.address)
+                finally:
+                    # Restore original timeout
+                    if original_timeout is not None:
+                        self.info.session.timeout = original_timeout
                     else:
-                        adverse = 0.0
+                        try:
+                            del self.info.session.timeout
+                        except AttributeError:
+                            pass
 
-                    self._positions[coin] = PositionState(
-                        coin=coin, size=size, entry_price=entry,
-                        mark_price=mark, notional_usd=abs(size * mark),
-                        unrealized_pnl=unrealized, opened_at=opened_at,
-                        last_fill_at=existing.last_fill_at if existing else 0.0,
-                        adverse_move_bps=adverse,
-                    )
-                else:
-                    self._positions[coin] = PositionState(coin=coin)
+                if not state:
+                    return self._get_snapshot_unlocked()
 
-            for coin in list(self._positions.keys()):
-                if coin not in returned_coins and coin in self._positions:
-                    if self._sync_ever_succeeded:
+                margin = state.get("marginSummary", {})
+                account_value = float(margin.get("accountValue", 0) or 0)
+
+                # HL unified accounts: total equity = perps accountValue + spot USDC
+                spot_equity = self._query_spot_equity()
+                combined_equity = account_value + spot_equity
+
+                if combined_equity > 0:
+                    self._equity = combined_equity
+                    self._equity_ever_confirmed = True
+
+                # Reset PnL baseline at UTC midnight
+                self._maybe_reset_daily_pnl()
+
+                if self._session_start_equity is None and self._equity > 0:
+                    self._session_start_equity = self._equity
+                    self._peak_equity = self._equity
+                elif self._equity > 0:
+                    self._peak_equity = max(self._peak_equity, self._equity)
+
+                # Only compute daily PnL with confirmed equity
+                if self._equity_ever_confirmed and self._session_start_equity:
+                    self._daily_pnl = self._equity - self._session_start_equity
+
+                # Update per-coin positions (same logic as sync_positions)
+                returned_coins = set()
+                for pos_data in state.get("assetPositions", []):
+                    p = pos_data.get("position", {})
+                    coin = p.get("coin", "")
+                    size = float(p.get("szi", 0))
+                    entry = float(p.get("entryPx", 0) or 0)
+                    unrealized = float(p.get("unrealizedPnl", 0) or 0)
+                    returned_coins.add(coin)
+
+                    existing = self._positions.get(coin)
+                    if size != 0:
+                        mark = entry + unrealized / size if size != 0 else entry
+                        opened_at = existing.opened_at if existing and existing.size != 0 else now
+
+                        if entry > 0:
+                            if size > 0:
+                                adverse = max(0, (entry - mark) / entry * 10000)
+                            else:
+                                adverse = max(0, (mark - entry) / entry * 10000)
+                        else:
+                            adverse = 0.0
+
+                        self._positions[coin] = PositionState(
+                            coin=coin, size=size, entry_price=entry,
+                            mark_price=mark, notional_usd=abs(size * mark),
+                            unrealized_pnl=unrealized, opened_at=opened_at,
+                            last_fill_at=existing.last_fill_at if existing else 0.0,
+                            adverse_move_bps=adverse,
+                        )
+                    else:
                         self._positions[coin] = PositionState(coin=coin)
 
-            self._last_position_sync = now
-            self._sync_ever_succeeded = True
-            self._sync_consecutive_failures = 0
+                for coin in list(self._positions.keys()):
+                    if coin not in returned_coins and coin in self._positions:
+                        if self._sync_ever_succeeded:
+                            self._positions[coin] = PositionState(coin=coin)
 
-        except Exception as e:
-            self._sync_consecutive_failures += 1
-            logger.warning(f"Position sync (safe) failed ({self._sync_consecutive_failures}x): {e}")
+                self._last_position_sync = now
+                self._sync_ever_succeeded = True
+                self._sync_consecutive_failures = 0
 
-        return self._get_snapshot()
+            except Exception as e:
+                self._sync_consecutive_failures += 1
+                logger.warning(f"Position sync (safe) failed ({self._sync_consecutive_failures}x): {e}")
 
-    def record_fill(self, coin: str, side: str, price: float, size: float) -> None:
-        """Record a fill. Update position tracking."""
+            return self._get_snapshot_unlocked()
+
+    def record_fill(self, coin: str, side: str, price: float, size: float,
+                    fee: float = 0.0) -> None:
+        """Record a fill. Update position tracking INCLUDING size and realized PnL.
+
+        This is critical for preventing the overbuy bug: when REST position
+        sync is 429'd, the engine must still know its actual position from
+        WS fills. Without this, the engine places new orders based on stale
+        position data and overshoots.
+
+        Also computes realized PnL when a fill reduces an existing position.
+        """
+        with self._lock:
+            self._record_fill_unlocked(coin, side, price, size, fee)
+
+    def _record_fill_unlocked(self, coin: str, side: str, price: float, size: float,
+                              fee: float = 0.0) -> None:
+        """Internal record_fill without lock (caller must hold self._lock)."""
         pos = self._positions.get(coin)
         if not pos:
             pos = PositionState(coin=coin)
@@ -504,37 +603,119 @@ class InventoryManager:
 
         now = time.time()
         pos.last_fill_at = now
+        self._total_fees += fee
 
         # If this opens a new position, track the open time
         was_flat = abs(pos.size) < 1e-10
         if was_flat:
             pos.opened_at = now
 
+        # Compute realized PnL BEFORE updating position size
+        old_size = pos.size
+        realized_this_fill = 0.0
+
+        # Check if this fill REDUCES the position (closing trade)
+        is_reducing = (
+            (old_size > 0 and side == "ask") or   # long position, selling
+            (old_size < 0 and side == "bid")       # short position, buying
+        )
+        if is_reducing and abs(old_size) > 1e-10:
+            # How many units are being closed (min of fill size and position size)
+            closed_qty = min(size, abs(old_size))
+            if old_size > 0:
+                # Closing long: PnL = (sell_price - entry_price) * qty
+                realized_this_fill = (price - pos.entry_price) * closed_qty
+            else:
+                # Closing short: PnL = (entry_price - buy_price) * qty
+                realized_this_fill = (pos.entry_price - price) * closed_qty
+            self._realized_pnl += realized_this_fill
+
+        # Update position size from fill (bid = buy = +size, ask = sell = -size)
+        if side == "bid":
+            pos.size += size
+        elif side == "ask":
+            pos.size -= size
+
+        # Update entry price: weighted average for adds, fill price on flip, unchanged on reduce
+        new_size = pos.size
+        if abs(new_size) < 1e-10:
+            # Position is flat — entry price is irrelevant, reset to 0
+            pos.entry_price = 0.0
+        elif (old_size > 0 and new_size < 0) or (old_size < 0 and new_size > 0):
+            # Position FLIPPED direction — new entry is the fill price
+            # (the portion that opened the new side entered at this price)
+            pos.entry_price = price
+        elif abs(new_size) > abs(old_size) and abs(old_size) > 1e-10:
+            # Position INCREASED (same direction) — weighted average entry
+            old_cost = abs(old_size) * pos.entry_price
+            new_cost = size * price
+            pos.entry_price = (old_cost + new_cost) / abs(new_size)
+        elif abs(old_size) < 1e-10:
+            # Opened from flat — entry is fill price
+            pos.entry_price = price
+        # else: position REDUCED but not flipped — entry price unchanged
+
+        # If position crossed zero, reset open time
+        if (old_size > 0 and pos.size <= 0) or (old_size < 0 and pos.size >= 0):
+            if abs(pos.size) > 1e-10:
+                pos.opened_at = now
+
+        # Bug #7 fix: update notional_usd and mark_price after fill
+        pos.notional_usd = abs(pos.size * price)
+        pos.mark_price = price
+
+        logger.debug(
+            f"Fill-adjusted {coin}: {old_size:.0f} -> {pos.size:.0f} "
+            f"(side={side} size={size:.0f} rpnl=${realized_this_fill:.4f})"
+        )
+
     def get_position(self, coin: str) -> PositionState:
-        """Get current position for a coin."""
-        return self._positions.get(coin, PositionState(coin=coin))
+        """Get current position for a coin.
+        Codex #9: Returns a COPY to prevent callers from reading
+        half-updated fields while record_fill() runs concurrently.
+        """
+        with self._lock:
+            pos = self._positions.get(coin)
+            if not pos:
+                return PositionState(coin=coin)
+            # Return a shallow copy so callers can't mutate the original
+            from dataclasses import asdict
+            return PositionState(**asdict(pos))
 
     def get_free_equity(self) -> float:
-        """Get available equity for new positions."""
-        total_margin = sum(
-            pos.notional_usd / 5.0  # assuming 5x leverage
-            for pos in self._positions.values()
-            if pos.notional_usd > 0
-        )
-        return max(0.0, self._equity - total_margin)
+        """Get available equity for new positions.
+        Codex #9: Lock protects against concurrent position mutations.
+        """
+        with self._lock:
+            total_margin = sum(
+                pos.notional_usd / 5.0  # assuming 5x leverage
+                for pos in self._positions.values()
+                if pos.notional_usd > 0
+            )
+            return max(0.0, self._equity - total_margin)
 
     def _get_snapshot(self) -> InventorySnapshot:
-        """Build portfolio-level snapshot."""
+        """Build portfolio-level snapshot (thread-safe)."""
+        with self._lock:
+            return self._get_snapshot_unlocked()
+
+    def _get_snapshot_unlocked(self) -> InventorySnapshot:
+        """Build portfolio-level snapshot (caller must hold self._lock)."""
         gross = sum(pos.notional_usd for pos in self._positions.values())
         net = sum(
             pos.size * pos.mark_price
             for pos in self._positions.values()
             if pos.mark_price > 0
         )
+        # Bug #3 fix: populate realized_pnl, unrealized_pnl, total_fees
+        unrealized = sum(pos.unrealized_pnl for pos in self._positions.values())
         return InventorySnapshot(
             total_gross_notional=gross,
             total_net_exposure=net,
             free_equity=self.get_free_equity(),
             daily_pnl=self._daily_pnl,
+            realized_pnl=self._realized_pnl,
+            unrealized_pnl=unrealized,
+            total_fees=self._total_fees,
             session_peak_equity=self._peak_equity,
         )

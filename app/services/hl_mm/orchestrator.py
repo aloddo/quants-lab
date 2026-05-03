@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -140,6 +141,10 @@ class HLMarketMaker:
         from collections import OrderedDict
         self._known_fill_hashes: OrderedDict = OrderedDict()
         self._known_fill_hashes_maxlen: int = 5000
+        # Codex #1: threading.Lock for fill path — protects _known_fill_hashes,
+        # _pending_cancel_coins, _pair_fill_counts, _fill_timestamps from
+        # concurrent access by WS callback thread and async REST fallback.
+        self._fill_lock = threading.Lock()
         self._prev_bybit_mids: dict[str, float] = {}
         self._bybit_anchor_stale: bool = False
         self._bybit_ws_backoff: float = 1.0
@@ -152,10 +157,11 @@ class HLMarketMaker:
 
         # Bug #8: Shared rate limiter (token bucket)
         # HL /exchange rate limit is ~12 calls/8s = 1.5/sec (undocumented, volume-gated)
-        # Set conservative: 1.2/sec refill, burst 3 to avoid 429 storms
-        self._rate_tokens: float = 3.0
-        self._rate_max: float = 3.0
-        self._rate_refill_per_sec: float = 1.2
+        # Screener no longer uses REST calls (MongoDB), so more budget for orders.
+        # Increased: 1.8/sec refill, burst 4 — allows faster tick response.
+        self._rate_tokens: float = 4.0
+        self._rate_max: float = 4.0
+        self._rate_refill_per_sec: float = 1.8
         self._rate_last_refill: float = 0.0
 
         # Bug #12: asyncio.Lock for signal state access
@@ -175,6 +181,20 @@ class HLMarketMaker:
 
         # Bug #13: Pair fill counts for lifecycle gating
         self._pair_fill_counts: dict[str, int] = {}
+
+        # Bug #4 (adversarial): Pending cancel coins after fill — processed in tick loop
+        self._pending_cancel_coins: set[str] = set()
+
+        # Bug #6 (adversarial): Cached last valid snapshot for risk eval when sync skipped
+        self._cached_snapshot: Optional[object] = None
+
+        # Bug #8 (adversarial): Pending hedge close — HL flat but Bybit hedge remains
+        self._pending_hedge_close: set[str] = set()
+
+        # Codex #3: Cooling coins — recently deactivated but still monitored for
+        # late fills. Keeps processing fills for 30s after deactivation to prevent
+        # orphaned positions from cancel-race with late fills.
+        self._cooling_coins: dict[str, float] = {}  # coin -> deactivation timestamp
 
         # Bug #14: Sticky daily stop — tracks the UTC date when stopped
         self._daily_stop_sticky: bool = False
@@ -367,6 +387,8 @@ class HLMarketMaker:
         self._init_components()
         self._running = True
         self._start_time = time.time()
+        # Codex R2 #3: Store event loop reference for WS thread -> async bridge
+        self._event_loop = asyncio.get_running_loop()
 
         # === STARTUP RECONCILIATION (Gap 2 + 3) ===
         # Cancel any stale open orders from prior sessions
@@ -426,7 +448,7 @@ class HLMarketMaker:
                 await self._tick()
             except Exception as e:
                 logger.error(f"Tick error: {e}", exc_info=True)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)  # tightened from 1.5s — faster quote adjustment
 
     async def _tick(self) -> None:
         """Single iteration of the main loop.
@@ -443,6 +465,85 @@ class HLMarketMaker:
         if self._check_daily_stop_sticky():
             await asyncio.to_thread(self.quote_engine.cancel_all)
             return
+
+        # Bug #4 fix: Process pending cancel coins (flagged by _handle_fill from WS thread)
+        # Codex #1: Acquire fill_lock to safely copy+clear the set
+        with self._fill_lock:
+            coins_to_cancel = list(self._pending_cancel_coins)
+            self._pending_cancel_coins.clear()
+        if coins_to_cancel:
+            for cancel_coin in coins_to_cancel:
+                try:
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, cancel_coin)
+                    logger.info(f"Post-fill cancel: {cancel_coin} orders cancelled")
+                except Exception as e:
+                    logger.warning(f"Post-fill cancel failed for {cancel_coin}: {e}")
+
+        # Bug #8 fix: Process pending hedge closes (HL flat but Bybit hedge remains)
+        if self._pending_hedge_close:
+            coins_to_close = list(self._pending_hedge_close)
+            self._pending_hedge_close.clear()
+            for hc_coin in coins_to_close:
+                hedge_delta = self._hedge_positions.get(hc_coin, 0)
+                if abs(hedge_delta) > 1e-10:
+                    logger.warning(
+                        f"Hedge cleanup: {hc_coin} HL flat but Bybit hedge "
+                        f"delta={hedge_delta:.6f} — closing Bybit position"
+                    )
+                    bybit_side = "Sell" if hedge_delta > 0 else "Buy"
+                    mid = self._prev_bybit_mids.get(hc_coin, 0)
+                    if mid > 0:
+                        try:
+                            offset = mid * 0.001  # 10bps crossing
+                            px = mid + offset if bybit_side == "Buy" else mid - offset
+                            result = await asyncio.to_thread(
+                                self._bybit_place_order,
+                                symbol=f"{hc_coin}USDT",
+                                side=bybit_side,
+                                qty=f"{abs(hedge_delta):.4f}",
+                                price=f"{px:.2f}",
+                                order_type="Limit",
+                                time_in_force="IOC",
+                                reduce_only=True,
+                            )
+                            # Codex #7: Verify fill before zeroing hedge position.
+                            # A partially filled or rejected close leaves Bybit exposure
+                            # that the engine must not forget about.
+                            if result and result.get("retCode") == 0:
+                                order_id = result.get("result", {}).get("orderId", "")
+                                filled_qty = 0.0
+                                if order_id:
+                                    try:
+                                        fill_result = await asyncio.to_thread(
+                                            self._bybit_query_order,
+                                            f"{hc_coin}USDT", order_id,
+                                        )
+                                        if fill_result:
+                                            filled_qty = float(fill_result.get("cumExecQty", 0) or 0)
+                                    except Exception:
+                                        pass
+                                remaining = abs(hedge_delta) - filled_qty
+                                if remaining < 1e-10:
+                                    self._hedge_positions[hc_coin] = 0
+                                    logger.info(f"Hedge cleanup: {hc_coin} Bybit close VERIFIED flat")
+                                else:
+                                    # Partial fill — update remaining hedge delta
+                                    sign = 1 if hedge_delta > 0 else -1
+                                    self._hedge_positions[hc_coin] = sign * remaining
+                                    logger.warning(
+                                        f"Hedge cleanup: {hc_coin} partial close, "
+                                        f"remaining={remaining:.4f} — will retry"
+                                    )
+                                    self._pending_hedge_close.add(hc_coin)
+                            else:
+                                logger.error(
+                                    f"Hedge cleanup: {hc_coin} close rejected — "
+                                    f"keeping hedge position, will retry"
+                                )
+                                self._pending_hedge_close.add(hc_coin)
+                        except Exception as e:
+                            logger.error(f"Hedge cleanup failed for {hc_coin}: {e}")
+                            self._pending_hedge_close.add(hc_coin)
 
         # Bug #8 fix: Drain coalescing WS buffers under signal lock
         async with self._signal_lock:
@@ -464,11 +565,28 @@ class HLMarketMaker:
                             self.inventory.sync_positions_safe, 2.0
                         )
                         self._last_position_sync = now
+                        # Bug #6 fix: cache last valid snapshot
+                        self._cached_snapshot = snapshot
                     except Exception as e:
                         logger.warning(f"Position sync failed: {e}")
                         snapshot = None
                 else:
                     snapshot = None
+        # Bug #6 fix: use cached snapshot when sync is skipped
+        # Codex #8: Reject stale snapshots — if cached snapshot is >120s old,
+        # treat as None so risk checks use zero (conservative) rather than
+        # allowing quoting under a possibly-breached portfolio state.
+        if snapshot is None:
+            if (self._cached_snapshot is not None
+                    and hasattr(self, '_last_position_sync')
+                    and now - self._last_position_sync < 120.0):
+                snapshot = self._cached_snapshot
+            elif self._cached_snapshot is not None:
+                logger.warning(
+                    f"Cached snapshot too old ({now - getattr(self, '_last_position_sync', 0):.0f}s) "
+                    f"— using zero values for risk checks"
+                )
+                snapshot = None
 
         # Bug #14: Include Bybit hedge PnL in daily PnL
         bybit_hedge_pnl = self._compute_bybit_hedge_pnl()
@@ -556,12 +674,26 @@ class HLMarketMaker:
             if hl_flat:
                 logger.info(f"{hcoin}: hedge_in_progress cleared — HL inventory is flat")
                 del self._hedge_in_progress[hcoin]
-            elif now - self._hedge_in_progress[hcoin] > 60.0:
-                # 60s passed but HL still has inventory — do NOT expire, just log
-                logger.warning(
-                    f"{hcoin}: hedge_in_progress >60s but HL inventory "
-                    f"still {hl_pos.size:.6f} — keeping hedge active"
-                )
+                # Bug #8 fix: if Bybit hedge still open, queue close
+                if abs(self._hedge_positions.get(hcoin, 0)) > 1e-10:
+                    self._pending_hedge_close.add(hcoin)
+            elif now - self._hedge_in_progress[hcoin] > 120.0:
+                # 120s passed, HL still has inventory. Check if Bybit hedge actually filled.
+                bybit_hedged = abs(self._hedge_positions.get(hcoin, 0)) > 1e-10
+                if not bybit_hedged:
+                    # Hedge FAILED — clear flag and force emergency flatten
+                    logger.critical(
+                        f"{hcoin}: hedge_in_progress >120s, HL inventory "
+                        f"still {hl_pos.size:.6f}, NO Bybit hedge — forcing EMERGENCY_FLATTEN"
+                    )
+                    del self._hedge_in_progress[hcoin]
+                    self.state_machine.force_state(hcoin, PairState.EMERGENCY_FLATTEN,
+                                                   "failed hedge timeout — market close")
+                else:
+                    logger.warning(
+                        f"{hcoin}: hedge_in_progress >120s but HL inventory "
+                        f"still {hl_pos.size:.6f} — Bybit hedge active, keeping"
+                    )
 
         for coin in list(self._active_coins):
             # Skip if circuit breaker disabled this pair
@@ -607,6 +739,9 @@ class HLMarketMaker:
             limits = self.inventory.get_limits(coin)
             inv_age = self.inventory.get_inventory_age_s(coin)
 
+            # Update fill tracker with current spread for calibrated CB
+            self.fill_tracker.update_pair_spread(coin, book.spread_bps)
+
             # Build state machine context
             edge_room = (book.spread_bps / 2.0) - 1.44  # maker fee
             from .quote_engine import DEFAULT_TOX_BUFFERS
@@ -651,16 +786,39 @@ class HLMarketMaker:
                 imbalance_side=signal.imbalance_side,
                 hedge_in_progress=hedge_active,
                 bybit_hedge_available=coin in BYBIT_PERPS,
+                native_spread_bps=book.spread_bps,  # Codex R2 #7
             )
+
+            # Codex #6: If pair is demoted (pending idle close), override to exit-only.
+            # The screener flags demoted pairs via _pending_idle_close but the state
+            # machine never consulted it — demoted pairs kept adding fresh inventory.
+            coin_demoted = coin in self.screener.get_pending_idle_close()
+            if coin_demoted and abs(ctx.inventory_usd) >= 1.0:
+                # Force exit-only: suppress entry side in EV flags
+                if ctx.inventory_usd > 0:
+                    ctx.bid_side_ev_positive = False  # don't add to long
+                else:
+                    ctx.ask_side_ev_positive = False  # don't add to short
 
             # Run state machine
             state_info = self.state_machine.transition(coin, ctx)
 
+            # Codex #6: If demoted and inventory cleared, finalize idle close
+            if coin_demoted and abs(ctx.inventory_usd) < 1.0:
+                self.screener.clear_idle_close(coin)
+
             # Freeze inventory age during CB pause to prevent automatic
             # emergency flatten (180s age limit < 300s CB pause = always taker exit)
+            # BUT: don't freeze if hedge failed (no Bybit hedge) — let age accumulate
+            # so emergency flatten can trigger and close the stuck position.
+            bybit_hedged_coin = abs(self._hedge_positions.get(coin, 0)) > 1e-10
+            hedge_pending = coin in self._hedge_in_progress
             if state_info.state == PairState.PAUSE and abs(pos.size) > 1e-10:
-                # Shift opened_at forward by tick interval to freeze age
-                self.inventory.pause_inventory_age(coin, 1.5)
+                if not (hedge_pending and not bybit_hedged_coin):
+                    # Normal pause: freeze age
+                    # Bug #10 fix: match tick interval (1.0s, not 1.5s)
+                    self.inventory.pause_inventory_age(coin, 1.0)
+                # else: failed hedge — let age accumulate toward emergency flatten
 
             # Bug #9: Handle EMERGENCY_FLATTEN state
             # Bug #2 (Codex R4): Verify close, retry up to 3x, fallback to Bybit hedge
@@ -864,16 +1022,35 @@ class HLMarketMaker:
                     # Mark hedge as in progress
                     self._hedge_in_progress[coin] = now
 
-            # Detect fills
-            # Bug #5 (Codex R4): Acquire OMS lock for fill detection + recording
-            if not self.dry_run:
-                async with self._oms_lock:
-                    try:
-                        fills = await asyncio.to_thread(self.quote_engine.detect_fills, coin)
-                        for fill in fills:
-                            self._handle_fill(coin, fill)
-                    except Exception as e:
-                        logger.warning(f"Fill detection error for {coin}: {e}")
+            # Detect fills — uses shared open_orders snapshot (Codex R2 #5)
+            pass  # Moved to batch fill detection below
+
+        # === STEP 3b: Batch fill detection (Codex R2 #5) ===
+        # Query open_orders ONCE for all coins instead of per-coin.
+        # At 5 coins this saves 4 REST calls/tick = 80% of fill detection budget.
+        if not self.dry_run and self._active_coins:
+            async with self._oms_lock:
+                try:
+                    if self._consume_rate_token():
+                        all_open = await asyncio.to_thread(
+                            self.info.open_orders, self.address
+                        )
+                    else:
+                        all_open = None
+                except Exception as e:
+                    logger.warning(f"Batch open_orders query failed: {e}")
+                    all_open = None
+
+                if all_open is not None:
+                    for coin in list(self._active_coins):
+                        try:
+                            fills = self.quote_engine.detect_fills_from_snapshot(
+                                coin, all_open
+                            )
+                            for fill in fills:
+                                self._handle_fill(coin, fill)
+                        except Exception as e:
+                            logger.warning(f"Fill detection error for {coin}: {e}")
 
         # === STEP 4: Update markouts ===
         self.fill_tracker.update_markouts(current_mids)
@@ -913,6 +1090,30 @@ class HLMarketMaker:
         if self._tick_count % 600 == 0 and not self.dry_run:
             await self._hypercare_position_check()
 
+        # === STEP 5d: Cooling coin cleanup (Codex #3) ===
+        # Coins in cooling state for >30s with no inventory — fully deactivate
+        expired_cooling = [
+            c for c, t in self._cooling_coins.items()
+            if now - t > 30.0
+        ]
+        for cool_coin in expired_cooling:
+            pos = self.inventory.get_position(cool_coin)
+            if abs(pos.size) > 1e-10:
+                # Still has inventory after cooling — re-activate for emergency close
+                logger.warning(
+                    f"Cooling {cool_coin}: still has position {pos.size:.6f} after 30s "
+                    f"— re-activating for emergency close"
+                )
+                self._activate_coin(cool_coin)
+                self.state_machine.force_state(
+                    cool_coin, PairState.EMERGENCY_FLATTEN,
+                    "late fill during deactivation cooling"
+                )
+            else:
+                self._unsubscribe_hl_ws(cool_coin)
+                logger.info(f"Cooling {cool_coin}: expired, fully deactivated")
+            del self._cooling_coins[cool_coin]
+
         # === STEP 6: Status log (every 60s) ===
         if self._tick_count % 120 == 0:
             self._log_status()
@@ -922,38 +1123,65 @@ class HLMarketMaker:
     # ==================================================================
 
     def _handle_fill(self, coin: str, fill: dict) -> None:
-        """Process a detected fill."""
+        """Process a detected fill.
+
+        Codex #1 fix: All mutations to shared state (_known_fill_hashes,
+        _pending_cancel_coins, _pair_fill_counts, _fill_timestamps) are
+        protected by _fill_lock. This method is called from both the WS
+        callback thread and the async REST fallback — without the lock,
+        concurrent calls can double-count fills or lose cancel signals.
+        """
         side = fill["side"]
         price = fill["price"]
         size = fill["size"]
         fee = fill.get("fee", 0)
         oid = fill.get("oid", 0)
 
-        # Bug #4 fix: Generate the same hash used by _poll_fills_rest and add
-        # to _known_fill_hashes so fills detected via detect_fills() are deduped
-        # against the REST poll fallback.
-        fill_hash_data = {"oid": oid, "time": fill.get("time", ""), "hash": fill.get("hash", "")}
-        fh = self._fill_hash(fill_hash_data)
-        if fh in self._known_fill_hashes:
-            return  # already processed
-        self._known_fill_hashes[fh] = True
-        # Evict oldest entries if over max length
-        while len(self._known_fill_hashes) > self._known_fill_hashes_maxlen:
-            self._known_fill_hashes.popitem(last=False)
+        # Codex #1: Acquire fill lock for all shared state mutations
+        with self._fill_lock:
+            # Bug #4 fix: Generate the same hash used by _poll_fills_rest and add
+            # to _known_fill_hashes so fills detected via detect_fills() are deduped
+            # against the REST poll fallback.
+            fill_hash_data = {
+                "oid": oid, "time": fill.get("time", ""), "hash": fill.get("hash", ""),
+                "coin": coin, "side": side, "sz": size, "px": price,
+            }
+            fh = self._fill_hash(fill_hash_data)
+            if fh in self._known_fill_hashes:
+                return  # already processed
+            self._known_fill_hashes[fh] = True
+            # Evict oldest entries if over max length
+            while len(self._known_fill_hashes) > self._known_fill_hashes_maxlen:
+                self._known_fill_hashes.popitem(last=False)
+
+            # Bug #13: Track fill counts for pair lifecycle gating
+            self._pair_fill_counts[coin] = self._pair_fill_counts.get(coin, 0) + 1
+
+            # FILL DETECTION HARDENING: Record fill timestamp for rate breaker
+            self._fill_timestamps.append(time.time())
+
+            # Bug #4 fix: flag coin for immediate cancel in next tick to prevent
+            # stale orders from filling after this fill changes position
+            self._pending_cancel_coins.add(coin)
+
+        # Codex R2 #3: Fire cancel immediately from WS thread via event loop,
+        # don't wait for next tick (~1s delay = stale exposure after fill)
+        if hasattr(self, '_event_loop') and self._event_loop and self._event_loop.is_running():
+            async def _cancel_now():
+                try:
+                    await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
+                except Exception:
+                    pass  # _pending_cancel_coins is backup
+            asyncio.run_coroutine_threadsafe(_cancel_now(), self._event_loop)
 
         # Bug #3: Clear hedge_in_progress if HL inventory is now flat
+        # (outside fill_lock — reads inventory which has its own lock)
         pos = self.inventory.get_position(coin)
         post_fill_flat = abs(pos.size) < 1e-10  # will be updated by record_fill
         if post_fill_flat and coin in self._hedge_in_progress:
             del self._hedge_in_progress[coin]
 
-        # Bug #13: Track fill counts for pair lifecycle gating
-        self._pair_fill_counts[coin] = self._pair_fill_counts.get(coin, 0) + 1
-
-        # FILL DETECTION HARDENING: Record fill timestamp for rate breaker
-        self._fill_timestamps.append(time.time())
-
-        self.inventory.record_fill(coin, side, price, size)
+        self.inventory.record_fill(coin, side, price, size, fee=fee)
         self.fill_tracker.record_fill(
             coin=coin, side=side, price=price, size=size,
             size_usd=size * price, fee=fee, oid=oid,
@@ -1001,12 +1229,17 @@ class HLMarketMaker:
     async def _deactivate_coin(self, coin: str) -> None:
         """Remove a coin from active quoting.
         Bug #7 fix: made async, cancel wrapped in to_thread.
+
+        Codex #3 fix: Don't immediately drop the coin — move it to cooling
+        set for 30s so late fills from cancel-race are still processed.
+        WS subscriptions stay alive during cooling.
         """
         await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
         self.state_machine.unregister_pair(coin)
         self._active_coins.discard(coin)
-        self._unsubscribe_hl_ws(coin)
-        logger.info(f"Deactivated coin: {coin}")
+        # Don't unsubscribe WS yet — move to cooling for late fill detection
+        self._cooling_coins[coin] = time.time()
+        logger.info(f"Deactivated coin: {coin} (cooling for 30s)")
 
     # ==================================================================
     # HL WebSocket subscriptions
@@ -1175,7 +1408,8 @@ class HLMarketMaker:
 
             for fill_data in fills_data:
                 coin = fill_data.get("coin", "")
-                if coin not in self._active_coins:
+                # Codex #3: Also process fills for cooling coins (recently deactivated)
+                if coin not in self._active_coins and coin not in self._cooling_coins:
                     continue
 
                 # Build fill dict matching _handle_fill format
@@ -1194,7 +1428,10 @@ class HLMarketMaker:
                 # Skip snapshot fills (historical) — only process live fills
                 if is_snapshot:
                     # Still add to known hashes to avoid REST re-processing
-                    fh = self._fill_hash({"oid": oid, "time": fill_time, "hash": fill_hash})
+                    fh = self._fill_hash({
+                        "oid": oid, "time": fill_time, "hash": fill_hash,
+                        "coin": coin, "side": side, "sz": size, "px": price,
+                    })
                     self._known_fill_hashes[fh] = True
                     while len(self._known_fill_hashes) > self._known_fill_hashes_maxlen:
                         self._known_fill_hashes.popitem(last=False)
@@ -1424,38 +1661,32 @@ class HLMarketMaker:
                 if self.screener.should_rescan():
                     rankings = await self.screener.scan()
 
-                    # Sync active coins with screener
+                    # H2-style instant rotation: sync active coins with screener
                     screener_active = self.screener.active_pairs
                     for coin in screener_active - self._active_coins:
                         if not self.risk_manager.can_add_pair(len(self._active_coins)):
                             continue
-
-                        # Bug #13: Second-tier coins need first-tier fill gate
-                        # If any initial coin hasn't reached 100 fills, new coins stay shadow
-                        first_tier_ready = all(
-                            self._pair_fill_counts.get(c, 0) >= 100
-                            for c in self._initial_coins
-                            if c in self._active_coins
-                        )
-                        if not first_tier_ready and coin not in self._initial_coins:
-                            logger.debug(
-                                f"Screener: {coin} waiting for first-tier fill gate "
-                                f"(fills: {self._pair_fill_counts})"
-                            )
-                            continue
-
                         await self._set_leverage(coin)
                         self._activate_coin(coin)
+                        logger.info(f"Screener: activated {coin} (instant rotation)")
 
-                    # Bug #13: Deactivate demoted pairs (not in screener active set)
-                    # Only if they have no inventory (inventory exit handled by state machine)
+                    # Deactivate demoted pairs — instant, no grace period.
+                    # Initial coins are NOT exempt: if screener says IDLE, they go IDLE.
+                    # If pair has inventory, state machine handles maker-only close.
                     for coin in list(self._active_coins):
-                        if coin in screener_active or coin in self._initial_coins:
+                        if coin in screener_active:
                             continue
                         pos = self.inventory.get_position(coin)
                         if abs(pos.size) < 1e-10:
-                            logger.info(f"Screener: deactivating demoted pair {coin}")
+                            logger.info(f"Screener: deactivating {coin} (no inventory)")
                             await self._deactivate_coin(coin)
+                            self.screener.clear_idle_close(coin)
+                        else:
+                            # Has inventory — keep active for maker-only close
+                            logger.info(
+                                f"Screener: {coin} demoted but has inventory "
+                                f"({pos.size:.0f}), keeping for maker close"
+                            )
 
             except Exception as e:
                 logger.error(f"Screener error: {e}", exc_info=True)
@@ -1600,8 +1831,9 @@ class HLMarketMaker:
                 self._known_fill_hashes[fill_hash] = True
 
                 # Only process if it is a coin we are actively tracking
+                # Codex #3: Also process fills for cooling coins
                 coin = fill_data.get("coin", "")
-                if coin not in self._active_coins:
+                if coin not in self._active_coins and coin not in self._cooling_coins:
                     continue
 
                 side = "bid" if fill_data.get("side", "").upper() == "B" else "ask"
@@ -1655,11 +1887,18 @@ class HLMarketMaker:
 
         was_healthy = self._fill_sync_healthy
 
+        # Codex #5 fix: "WS subscribed but no fills ever" is only healthy for
+        # the first 30s after subscription. After that, if REST is also dead,
+        # we have no proof WS is actually delivering fills.
+        ws_grace_period = (now - self._start_time) < 30.0
+
         if rest_ok:
             self._fill_sync_healthy = True
-        elif ws_subscribed and (ws_alive or self._ws_fills_received == 0):
-            # WS is subscribed. If no fills yet, give benefit of doubt
-            # (maybe no fills have occurred — that's fine)
+        elif ws_alive:
+            # WS delivered a fill recently — it's working
+            self._fill_sync_healthy = True
+        elif ws_subscribed and self._ws_fills_received == 0 and ws_grace_period:
+            # WS just started, no fills yet but within grace period — OK
             self._fill_sync_healthy = True
         elif self._fill_poll_consecutive_failures >= self._fill_poll_max_failures:
             self._fill_sync_healthy = False
@@ -1727,8 +1966,21 @@ class HLMarketMaker:
 
     @staticmethod
     def _fill_hash(fill_data: dict) -> str:
-        """Create unique hash for a fill record."""
-        key = f"{fill_data.get('oid', '')}-{fill_data.get('time', '')}-{fill_data.get('hash', '')}"
+        """Create unique hash for a fill record.
+
+        Includes coin, side, size, price alongside oid/time/hash to prevent
+        collisions when any field is missing or empty (bug #11 fix).
+        """
+        parts = [
+            str(fill_data.get("oid", "")),
+            str(fill_data.get("time", "")),
+            str(fill_data.get("hash", "")),
+            str(fill_data.get("coin", "")),
+            str(fill_data.get("side", "")),
+            str(fill_data.get("sz", fill_data.get("size", ""))),
+            str(fill_data.get("px", fill_data.get("price", ""))),
+        ]
+        key = "|".join(parts)
         return hashlib.md5(key.encode()).hexdigest()
 
     # ==================================================================
@@ -2003,6 +2255,10 @@ class HLMarketMaker:
                 f"entering INVENTORY_EXIT"
             )
 
+            # Reset PnL baseline AFTER loading inherited positions so their
+            # unrealized PnL doesn't trigger daily stop on restart.
+            self.inventory.reset_pnl_baseline()
+
         except Exception as e:
             logger.error(f"Startup position sync failed: {e}")
 
@@ -2120,20 +2376,30 @@ class HLMarketMaker:
                 logger.info(f"HEDGE ACCEPTED: {coin} orderId={order_id}")
 
                 # Bug #3 fix: IOC accept != fill. Query actual filled quantity.
+                # Codex #7: Retry query up to 3 times with 1s delay — accepted IOC
+                # may not be immediately visible in order history.
                 actual_filled_qty = 0.0
                 actual_fill_price = limit_price
                 if order_id and order_id != "?":
-                    try:
-                        fill_result = await asyncio.to_thread(
-                            self._bybit_query_order, symbol, order_id
-                        )
-                        if fill_result:
-                            actual_filled_qty = float(fill_result.get("cumExecQty", 0) or 0)
-                            avg_price = float(fill_result.get("avgPrice", 0) or 0)
-                            if avg_price > 0:
-                                actual_fill_price = avg_price
-                    except Exception as e:
-                        logger.warning(f"HEDGE: failed to query fill for {coin} orderId={order_id}: {e}")
+                    for query_attempt in range(3):
+                        try:
+                            if query_attempt > 0:
+                                await asyncio.sleep(1.0)
+                            fill_result = await asyncio.to_thread(
+                                self._bybit_query_order, symbol, order_id
+                            )
+                            if fill_result:
+                                actual_filled_qty = float(fill_result.get("cumExecQty", 0) or 0)
+                                avg_price = float(fill_result.get("avgPrice", 0) or 0)
+                                if avg_price > 0:
+                                    actual_fill_price = avg_price
+                            if actual_filled_qty > 1e-10:
+                                break  # got the fill, stop retrying
+                        except Exception as e:
+                            logger.warning(
+                                f"HEDGE: fill query attempt {query_attempt+1}/3 for "
+                                f"{coin} orderId={order_id}: {e}"
+                            )
 
                 if actual_filled_qty > 1e-10:
                     hedge_delta = -actual_filled_qty if bybit_side == "Sell" else actual_filled_qty
@@ -2298,7 +2564,8 @@ class HLMarketMaker:
     async def _emergency_shutdown(self, reason: str) -> None:
         """Emergency: cancel all orders, flatten positions, stop."""
         logger.critical(f"EMERGENCY SHUTDOWN: {reason}")
-        self.quote_engine.cancel_all()
+        # Bug #9 fix: wrap cancel_all in to_thread (sync HL REST call)
+        await asyncio.to_thread(self.quote_engine.cancel_all)
 
         if not self.dry_run:
             for coin in list(self._active_coins):
@@ -2325,7 +2592,8 @@ class HLMarketMaker:
             # Bug #2: Second SIGINT — still cancel orders, just skip verify
             logger.warning("Second shutdown request — cancelling orders without verify")
             if self.quote_engine and not self.dry_run:
-                self.quote_engine.cancel_all()
+                # Bug #9 fix: wrap in to_thread
+                await asyncio.to_thread(self.quote_engine.cancel_all)
             self._running = False
             return
         self._shutting_down = True
@@ -2339,7 +2607,8 @@ class HLMarketMaker:
         verified_clean = False
         if self.quote_engine and not self.dry_run:
             logger.info("Shutdown: cancelling all resting orders...")
-            self.quote_engine.cancel_all()
+            # Bug #9 fix: wrap in to_thread
+            await asyncio.to_thread(self.quote_engine.cancel_all)
 
             deadline = time.time() + 60.0
             backoff = 1.0
@@ -2384,7 +2653,8 @@ class HLMarketMaker:
                 except OSError:
                     pass
         elif self.quote_engine:
-            self.quote_engine.cancel_all()
+            # Bug #9 fix: wrap in to_thread
+            await asyncio.to_thread(self.quote_engine.cancel_all)
 
         # Bug #3: Close Bybit hedge positions
         if self._hedge_positions and not self.dry_run:
@@ -2475,15 +2745,17 @@ class HLMarketMaker:
         rest_fail_str = f"rest_fail={self._fill_poll_consecutive_failures}"
         rate_breaker = "ACTIVE" if time.time() < self._fill_rate_breaker_until else "off"
 
+        rpnl = self.inventory._realized_pnl
+        fees = self.inventory._total_fees
+        upnl = snapshot.daily_pnl - rpnl  # unrealized = total mark-to-market minus realized
+
         logger.info(
             f"STATUS: uptime={uptime/60:.0f}m ticks={self._tick_count} "
             f"coins={list(self._active_coins)} "
             f"gross=${snapshot.total_gross_notional:.2f} "
             f"net=${snapshot.total_net_exposure:.2f} "
-            f"pnl=${snapshot.daily_pnl:.2f} "
+            f"rpnl=${rpnl:.2f} upnl=${upnl:.2f} fees=${fees:.4f} "
             f"equity=${self.inventory._equity:.2f} "
-            f"(spot=${getattr(self.inventory, '_cached_spot_equity', 0):.2f} "
-            f"start=${self.inventory._session_start_equity or 0:.2f}) "
             f"fill_sync={fill_sync_str} {ws_fills_str} {rest_fail_str} "
             f"rate_breaker={rate_breaker}"
         )

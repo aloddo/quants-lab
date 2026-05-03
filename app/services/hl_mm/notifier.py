@@ -52,7 +52,12 @@ class TelegramNotifier:
         return self._enabled
 
     def _send_raw(self, text: str) -> bool:
-        """Send a message via Telegram Bot API. Returns True on success."""
+        """Send a message via Telegram Bot API. Fire-and-forget in background thread.
+
+        Codex R2 #4: Never blocks the calling thread. The WS fill callback
+        runs on the HL SDK's WS thread — a synchronous HTTP call here blocks
+        ALL fill and order-update processing for up to 5s.
+        """
         if not self._enabled:
             return False
 
@@ -62,27 +67,31 @@ class TelegramNotifier:
             self._queue.append(text)
             return False
 
-        try:
-            url = f"{TELEGRAM_API_BASE}/bot{self._token}/sendMessage"
-            resp = requests.post(
-                url,
-                json={
-                    "chat_id": self._chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=5,
-            )
-            self._last_send = time.time()
-            if resp.status_code == 200:
-                return True
-            else:
-                logger.warning(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
-                return False
-        except Exception as e:
-            logger.warning(f"Telegram send error: {e}")
-            return False
+        # Mark send time immediately to prevent concurrent sends
+        self._last_send = now
+
+        def _do_send():
+            try:
+                url = f"{TELEGRAM_API_BASE}/bot{self._token}/sendMessage"
+                resp = requests.post(
+                    url,
+                    json={
+                        "chat_id": self._chat_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=5,
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                logger.warning(f"Telegram send error: {e}")
+
+        # Fire-and-forget in daemon thread
+        t = threading.Thread(target=_do_send, daemon=True)
+        t.start()
+        return True
 
     def flush_queue(self) -> int:
         """Send queued messages (one per call, respects rate limit). Returns sent count."""

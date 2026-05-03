@@ -4,22 +4,20 @@ Pair Screener — Scan all 230 HL pairs every 15min (Spec Section 0).
 Pipeline:
   1. Fetch meta + asset contexts for all pairs (1 REST call)
   2. Filter pairs with dayNtlVlm > $100K
-  3. For each: fetch L2 book (200ms stagger), compute spread, depth, microprice
+  3. Query MongoDB `hyperliquid_l2_snapshots_1s` for rolling 1h spread/depth stats
+     (no per-pair REST calls — uses pre-collected L2 data)
   4. Score = edge_room_per_side * sqrt(daily_volume) * depth_factor * anchor_bonus
   5. Rank by score. Top N = ACTIVE.
   6. Store rankings in MongoDB: hl_mm_pair_rankings
 
 Pair lifecycle:
   - ACTIVE:  top N pairs, actively quoting
-  - SHADOW:  newly promoted, 1h data collection before quoting
   - IDLE:    not in top N, no quoting, may be finishing inventory exit
   - BLOCKED: permanent ban (manipulation, delisting, broken feed)
 
 Rate limiting:
-  - HL REST is IP-level, ~5-6 rapid calls before 429
-  - meta_and_asset_ctxs is 1 call (always safe)
-  - L2 fetches staggered at 200ms
-  - Full scan of 50 qualifying pairs takes ~10s
+  - Only 1 REST call per scan (meta_and_asset_ctxs)
+  - L2 data comes from MongoDB, no per-pair REST calls
 """
 import asyncio
 import logging
@@ -73,9 +71,9 @@ class ScreenerConfig:
     default_tox_buffer_bps: float = 1.0
     min_edge_room_bps: float = 1.0       # minimum edge to consider
     depth_factor_notional: float = 500.0  # median_depth / (10 * notional_per_order)
-    max_live_pairs: int = 2
-    shadow_duration_s: float = 3600.0    # 1 hour in shadow
-    demotion_grace_periods: int = 2      # must fail 2 consecutive scans
+    max_live_pairs: int = 5               # up to 5 active pairs simultaneously
+    shadow_duration_s: float = 0.0       # instant rotation, no shadow
+    demotion_grace_periods: int = 1      # instant demotion, no grace
     l2_fetch_stagger_s: float = 0.2      # 200ms between L2 calls
     rescore_interval_s: float = 900.0    # 15 minutes
     depth_levels: int = 20               # top-20 depth
@@ -110,6 +108,7 @@ class PairScreener:
         client = MongoClient(mongo_uri)
         db_name = mongo_uri.split("/")[-1]
         self._db = client[db_name]
+        self._l2_col: Collection = self._db["hyperliquid_l2_snapshots_1s"]
         self._rankings_col: Collection = self._db["hl_mm_pair_rankings"]
         self._rankings_col.create_index([("timestamp", DESCENDING)])
         self._rankings_col.create_index([("coin", 1), ("timestamp", DESCENDING)])
@@ -117,9 +116,10 @@ class PairScreener:
         # State
         self._last_scan: float = 0.0
         self._rankings: list[PairRanking] = []
-        self._shadow_start: dict[str, float] = {}   # coin -> when entered SHADOW
-        self._demotion_count: dict[str, int] = {}    # coin -> consecutive failed scans
+        self._shadow_start: dict[str, float] = {}   # legacy, unused
+        self._demotion_count: dict[str, int] = {}    # legacy, unused
         self._active_pairs: set[str] = set()
+        self._pending_idle_close: set[str] = set()   # demoted pairs needing maker inventory close
         self._sz_decimals: dict[str, int] = {}
         self._max_leverage: dict[str, int] = {}
 
@@ -129,11 +129,8 @@ class PairScreener:
 
     @property
     def shadow_pairs(self) -> set[str]:
-        now = time.time()
-        return {
-            coin for coin, start in self._shadow_start.items()
-            if now - start < self.config.shadow_duration_s
-        }
+        """Legacy — SHADOW state removed. Always returns empty set."""
+        return set()
 
     def get_sz_decimals(self) -> dict[str, int]:
         """Return cached sz_decimals from last meta fetch."""
@@ -176,8 +173,9 @@ class PairScreener:
             self._sz_decimals[name] = pair_info.get("szDecimals", 4)
             self._max_leverage[name] = pair_info.get("maxLeverage", 5)
 
-        # Step 2: Filter by volume
+        # Step 2: Filter by volume, build coin→(pair_info, ctx, daily_vol) map
         candidates = []
+        candidate_map: dict[str, tuple[dict, dict, float]] = {}
         for pair_info, ctx in zip(universe, contexts):
             coin = pair_info.get("name", "")
             if coin in BLOCKED_PAIRS:
@@ -188,64 +186,28 @@ class PairScreener:
                 continue
 
             candidates.append((coin, pair_info, ctx, daily_vol))
+            candidate_map[coin] = (pair_info, ctx, daily_vol)
 
         logger.info(f"Screener: {len(candidates)} pairs above ${cfg.min_daily_volume_usd/1000:.0f}K volume")
 
-        # Step 3: Fetch L2 for a smart subset of candidates
-        # Strategy: top 10 by volume (for anchor coverage) + top 15 by funding rate
-        # (high funding = volatile = likely wider spreads). Dedup. Max 25 L2 fetches.
-        MAX_L2_FETCHES = 25
-        L2_STAGGER_MS = 300  # 300ms spacing between fetches
-
-        # Sort by volume for one bucket
-        by_vol = sorted(candidates, key=lambda x: x[3], reverse=True)[:10]
-        # Sort by abs(funding) as a proxy for volatility/wider spreads
-        by_funding = sorted(
-            candidates,
-            key=lambda x: abs(float(x[2].get("funding", 0) or 0)),
-            reverse=True
-        )[:15]
-        # Merge + dedup, preserving order
-        seen = set()
-        l2_candidates = []
-        for c in by_vol + by_funding:
-            if c[0] not in seen:
-                seen.add(c[0])
-                l2_candidates.append(c)
-        l2_candidates = l2_candidates[:MAX_L2_FETCHES]
-
-        logger.info(
-            f"Screener: {len(candidates)} candidates, fetching L2 for "
-            f"{len(l2_candidates)} (top vol + high funding)"
-        )
+        # Step 3: Query MongoDB for rolling L2 spread/depth stats (no REST calls)
+        l2_stats = await self._fetch_l2_stats_from_mongo()
+        logger.info(f"Screener: MongoDB L2 stats for {len(l2_stats)} pairs")
 
         rankings = []
-        for coin, pair_info, ctx, daily_vol in l2_candidates:
-            try:
-                # Bug #3 (Codex R4): Gate through shared rate limiter
-                if self._rate_limit_fn and not self._rate_limit_fn():
-                    await asyncio.sleep(0.5)  # back off if rate limited
-                    if self._rate_limit_fn and not self._rate_limit_fn():
-                        continue  # still limited, skip this coin
-                l2 = await asyncio.to_thread(self.info.l2_snapshot, coin)
-                await asyncio.sleep(L2_STAGGER_MS / 1000.0)
-            except Exception as e:
-                if "429" in str(e):
-                    logger.debug(f"Screener: rate limited on {coin}, backing off 2s")
-                    await asyncio.sleep(2.0)
-                    continue
-                logger.debug(f"Screener: L2 fetch failed for {coin}: {e}")
-                continue
-
-            ranking = self._score_pair(coin, pair_info, ctx, daily_vol, l2)
+        scored_coins: set[str] = set()
+        for coin, stats in l2_stats.items():
+            if coin not in candidate_map:
+                continue  # not a volume-qualifying candidate
+            pair_info, ctx, daily_vol = candidate_map[coin]
+            ranking = self._score_pair_from_stats(coin, daily_vol, stats)
             if ranking:
                 rankings.append(ranking)
+                scored_coins.add(coin)
 
-        # Also include non-L2 candidates with score=0 for ranking completeness
-        l2_coins = {r.coin for r in rankings}
+        # Include candidates without MongoDB L2 data at score=0
         for coin, pair_info, ctx, daily_vol in candidates:
-            if coin not in l2_coins:
-                # Score without L2 data: just volume-based, low priority
+            if coin not in scored_coins:
                 rankings.append(PairRanking(
                     coin=coin, timestamp=time.time(), score=0.0,
                     spread_bps=0.0, edge_room_bps=0.0,
@@ -280,6 +242,112 @@ class PairScreener:
             )
 
         return rankings
+
+    async def _fetch_l2_stats_from_mongo(self) -> dict[str, dict]:
+        """Query hyperliquid_l2_snapshots_1s for rolling 1h spread/depth stats.
+
+        Returns dict[coin] → {avg_spread_bps, median_spread_bps, avg_depth_usd,
+                               avg_mid_px, count}
+        Only includes coins with >= 30 snapshots in the window.
+        """
+        now_ms = int(time.time() * 1000)
+        one_hour_ago_ms = now_ms - 3_600_000
+
+        pipeline = [
+            {"$match": {"timestamp_utc": {"$gte": one_hour_ago_ms}}},
+            {"$group": {
+                "_id": "$coin",
+                "avg_spread_bps": {"$avg": "$spread_bps"},
+                "avg_depth_bid": {"$avg": "$bid_sz_topn"},
+                "avg_depth_ask": {"$avg": "$ask_sz_topn"},
+                "avg_mid_px": {"$avg": "$mid_px"},
+                "spread_values": {"$push": "$spread_bps"},
+                "count": {"$sum": 1},
+            }},
+            {"$match": {"count": {"$gte": 30}}},
+        ]
+
+        try:
+            results = await asyncio.to_thread(
+                lambda: list(self._l2_col.aggregate(pipeline))
+            )
+        except Exception as e:
+            logger.error(f"Screener: MongoDB L2 aggregation failed: {e}")
+            return {}
+
+        stats: dict[str, dict] = {}
+        for doc in results:
+            coin = doc["_id"]
+            spread_vals = doc.get("spread_values", [])
+            median_spread = float(np.median(spread_vals)) if spread_vals else doc["avg_spread_bps"]
+            mid_px = doc["avg_mid_px"] or 1.0
+            # Convert depth from base units to USD using avg mid price
+            depth_bid_usd = doc["avg_depth_bid"] * mid_px
+            depth_ask_usd = doc["avg_depth_ask"] * mid_px
+            stats[coin] = {
+                "avg_spread_bps": doc["avg_spread_bps"],
+                "median_spread_bps": median_spread,
+                "depth_bid_usd": depth_bid_usd,
+                "depth_ask_usd": depth_ask_usd,
+                "avg_mid_px": mid_px,
+                "count": doc["count"],
+            }
+
+        return stats
+
+    def _score_pair_from_stats(
+        self,
+        coin: str,
+        daily_vol: float,
+        stats: dict,
+    ) -> Optional[PairRanking]:
+        """Score a pair using pre-aggregated MongoDB L2 stats."""
+        cfg = self.config
+
+        spread_bps = stats["median_spread_bps"]
+        native_half_spread = spread_bps / 2.0
+        depth_bid_usd = stats["depth_bid_usd"]
+        depth_ask_usd = stats["depth_ask_usd"]
+        mid_px = stats["avg_mid_px"]
+
+        # Anchor type
+        if coin in BYBIT_PERPS:
+            anchor_type = "direct" if daily_vol > 1_000_000 else "sparse"
+        else:
+            anchor_type = "none"
+
+        # Tox buffer
+        from .quote_engine import DEFAULT_TOX_BUFFERS
+        tox_buffer = DEFAULT_TOX_BUFFERS.get(coin, cfg.default_tox_buffer_bps)
+
+        # Edge room per side
+        edge_room = native_half_spread - cfg.maker_fee_bps - tox_buffer
+
+        # Score components
+        edge_component = max(0, edge_room)
+        volume_component = np.sqrt(daily_vol)
+        depth_factor = min(1.0, min(depth_bid_usd, depth_ask_usd) / (10 * cfg.depth_factor_notional))
+        anchor_bonus = {"direct": 1.5, "sparse": 1.0, "none": 0.6}.get(anchor_type, 0.6)
+
+        score = edge_component * volume_component * depth_factor * anchor_bonus
+
+        return PairRanking(
+            coin=coin,
+            timestamp=time.time(),
+            score=score,
+            spread_bps=spread_bps,
+            edge_room_bps=edge_room,
+            daily_volume_usd=daily_vol,
+            depth_bid_usd=depth_bid_usd,
+            depth_ask_usd=depth_ask_usd,
+            anchor_type=anchor_type,
+            tox_estimate=tox_buffer,
+            status="IDLE",
+            native_half_spread=native_half_spread,
+            trade_count_hint=daily_vol / (mid_px * 0.5) if mid_px > 0 else 0,
+            sz_decimals=self._sz_decimals.get(coin, 4),
+            leverage_available=self._max_leverage.get(coin, 5),
+        )
 
     def _score_pair(
         self,
@@ -361,52 +429,42 @@ class PairScreener:
         )
 
     def _manage_pair_lifecycle(self, rankings: list[PairRanking]) -> None:
-        """Promote/demote pairs based on rankings.
+        """Promote/demote pairs based on rankings — H2-style instant rotation.
 
-        Top N -> ACTIVE (or SHADOW if new)
-        Dropped pairs -> IDLE after grace period
+        Any pair with positive edge in the top N → ACTIVE instantly.
+        Any pair that drops out of top N → IDLE instantly (no grace period).
+        Demoted pairs are flagged for maker-only inventory close by the orchestrator.
         """
         cfg = self.config
-        now = time.time()
 
+        # All pairs with positive edge in top N are immediately ACTIVE
         top_coins = {r.coin for r in rankings[:cfg.max_live_pairs] if r.edge_room_bps > 0}
 
-        # Promotions: new pairs entering top N go to SHADOW first
-        for coin in top_coins:
-            if coin not in self._active_pairs:
-                if coin not in self._shadow_start:
-                    self._shadow_start[coin] = now
-                    logger.info(f"Screener: {coin} entering SHADOW (1h before ACTIVE)")
-                elif now - self._shadow_start[coin] >= cfg.shadow_duration_s:
-                    self._active_pairs.add(coin)
-                    del self._shadow_start[coin]
-                    self._demotion_count.pop(coin, None)
-                    logger.info(f"Screener: {coin} promoted to ACTIVE")
+        # Track demotions for inventory close signaling
+        newly_demoted = self._active_pairs - top_coins
+        newly_promoted = top_coins - self._active_pairs
 
-        # Demotions: pairs dropping out of top N
-        for coin in list(self._active_pairs):
-            if coin not in top_coins:
-                self._demotion_count[coin] = self._demotion_count.get(coin, 0) + 1
-                if self._demotion_count[coin] >= cfg.demotion_grace_periods:
-                    self._active_pairs.discard(coin)
-                    self._demotion_count.pop(coin, None)
-                    logger.info(f"Screener: {coin} demoted to IDLE (failed {cfg.demotion_grace_periods} scans)")
-            else:
-                self._demotion_count.pop(coin, None)
+        for coin in newly_promoted:
+            logger.info(f"Screener: {coin} → ACTIVE (instant rotation)")
+        for coin in newly_demoted:
+            logger.info(f"Screener: {coin} → IDLE (instant rotation, needs inventory close)")
+            self._pending_idle_close.add(coin)
 
-        # Clean shadow for coins no longer in top N
-        for coin in list(self._shadow_start.keys()):
-            if coin not in top_coins:
-                del self._shadow_start[coin]
+        # Replace active set wholesale — stateless like H2 tier engine
+        self._active_pairs = top_coins.copy()
+
+        # Clean stale shadow/demotion state (legacy, no longer used)
+        self._shadow_start.clear()
+        self._demotion_count.clear()
 
         # Update status in rankings
         for r in rankings:
             if r.coin in self._active_pairs:
                 r.status = "ACTIVE"
-            elif r.coin in self._shadow_start:
-                r.status = "SHADOW"
             elif r.coin in BLOCKED_PAIRS:
                 r.status = "BLOCKED"
+            elif r.coin in self._pending_idle_close:
+                r.status = "CLOSING"  # has inventory, needs maker close
             else:
                 r.status = "IDLE"
 
@@ -444,10 +502,20 @@ class PairScreener:
         except Exception as e:
             logger.warning(f"Screener: MongoDB write failed: {e}")
 
+    def get_pending_idle_close(self) -> set[str]:
+        """Return pairs that were demoted and need maker-only inventory close."""
+        return self._pending_idle_close.copy()
+
+    def clear_idle_close(self, coin: str) -> None:
+        """Mark a demoted pair's inventory as closed."""
+        self._pending_idle_close.discard(coin)
+        logger.info(f"Screener: {coin} inventory close confirmed, fully IDLE")
+
     def force_active(self, coin: str) -> None:
         """Force a pair to ACTIVE (bypass screener). For manual override."""
         self._active_pairs.add(coin)
         self._shadow_start.pop(coin, None)
+        self._pending_idle_close.discard(coin)
         logger.info(f"Screener: {coin} forced to ACTIVE")
 
     def force_block(self, coin: str) -> None:

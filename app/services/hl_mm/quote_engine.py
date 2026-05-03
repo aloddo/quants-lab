@@ -81,7 +81,7 @@ class QuoteConfig:
     """Quoting parameters from spec."""
     maker_fee_bps: float = 1.44
     min_edge_target_bps: float = 1.0    # minimum realized edge per side after fees
-    requote_min_interval_s: float = 1.2  # minimum time between requotes
+    requote_min_interval_s: float = 0.5  # Codex R2 #2: tightened from 1.2s — was creating effective 2s cadence
     hard_refresh_s: float = 5.0          # unconditional refresh interval
     fv_move_threshold_bps: float = 0.8   # requote if FV moved this much
     max_quote_age_s: float = 4.0         # requote if quote older than this
@@ -149,6 +149,13 @@ class QuoteEngine:
 
         # Bug #1: Track orders that failed to cancel so reconciliation can clean them up
         self._stale_orders: set[int] = set()
+
+        # Exponential backoff for orphan cleanup on 429 errors
+        self._orphan_backoff_s: float = 30.0       # current backoff (starts at normal 30s)
+        self._orphan_max_backoff_s: float = 600.0   # max 10 minutes between retries
+        self._orphan_consecutive_failures: int = 0
+        self._cancel_all_skip_orphan_query: bool = False  # skip orphan query in cancel_all after repeated 429s
+        self._cancel_all_consecutive_429s: int = 0
 
         # Bug #6/#7: Pending fill checks — OID -> (timestamp, original_size)
         self._pending_fill_check: dict[int, tuple[float, str, float]] = {}
@@ -261,9 +268,11 @@ class QuoteEngine:
                 # We are short, buying to exit -> more aggressive bid
                 bid_px = min(bid_px + improve_price + exit_extra, hl_ask - tick_sz)
 
-            # MAKER ENFORCEMENT: Never place bid above best bid (would cross and pay taker)
-            # Allow joining the touch (bid_px == hl_bid) but never improving past it
-            bid_px = min(bid_px, hl_bid)
+            # MAKER ENFORCEMENT: Codex R2 #6 — allow 1-tick improvement inside the
+            # touch for queue priority, but never cross the opposite side.
+            # Old rule (bid <= hl_bid) meant join-only = weakest queue position.
+            # New: bid <= hl_bid + 1 tick, but still < hl_ask (no crossing).
+            bid_px = min(bid_px, hl_bid + tick_sz)
 
             # Bug #6 (Codex R4): Round to tick size FIRST, then check crosses
             bid_sz_usd = self._compute_child_size(
@@ -295,9 +304,9 @@ class QuoteEngine:
                 # We are long, selling to exit -> more aggressive ask
                 ask_px = max(ask_px - improve_price - exit_extra, hl_bid + tick_sz)
 
-            # MAKER ENFORCEMENT: Never place ask below best ask (would cross and pay taker)
-            # Allow joining the touch (ask_px == hl_ask) but never improving past it
-            ask_px = max(ask_px, hl_ask)
+            # MAKER ENFORCEMENT: Codex R2 #6 — allow 1-tick improvement inside the
+            # touch for queue priority, but never cross the opposite side.
+            ask_px = max(ask_px, hl_ask - tick_sz)
 
             # Bug #6 (Codex R4): Round to tick size FIRST, then check crosses
             ask_sz_usd = self._compute_child_size(
@@ -457,12 +466,24 @@ class QuoteEngine:
         self._states[coin] = new_state
 
     def cancel_all(self) -> None:
-        """Emergency: cancel all tracked orders + query for orphans."""
+        """Emergency: cancel all tracked orders + query for orphans.
+
+        If orphan query hits 429 repeatedly, skip it to avoid infinite retry loops.
+        After 3 consecutive 429s, skip orphan query for 10 minutes.
+
+        Codex #4 fix: Only clear local state for coins whose cancels succeeded.
+        Previously cleared all states unconditionally, which made ghost orders
+        invisible when cancels 429'd — the engine believed it was flat while
+        exchange orders kept filling.
+        """
+        # Codex #4: Track which coins had successful cancels
+        successfully_cancelled: set[str] = set()
         for coin in list(self._states.keys()):
             state = self._states[coin]
-            self._cancel_coin_orders(coin, state)
+            if self._cancel_coin_orders(coin, state):
+                successfully_cancelled.add(coin)
 
-        if not self.dry_run:
+        if not self.dry_run and not self._cancel_all_skip_orphan_query:
             try:
                 # Bug #3 (Codex R4): Gate through shared rate limiter (priority: cancel)
                 if self._consume_rate_token(priority=True):
@@ -472,12 +493,47 @@ class QuoteEngine:
                             try:
                                 self._consume_rate_token(priority=True)
                                 self.exchange.cancel(order["coin"], order["oid"])
+                                successfully_cancelled.add(order["coin"])
                             except Exception:
                                 pass
+                    else:
+                        # No open orders — all coins are safe to clear
+                        successfully_cancelled = set(self._states.keys())
+                    # Success — reset 429 counter
+                    self._cancel_all_consecutive_429s = 0
             except Exception as e:
-                logger.warning(f"Orphan cleanup failed: {e}")
+                err_str = str(e)
+                if "429" in err_str or "rate" in err_str.lower():
+                    self._cancel_all_consecutive_429s += 1
+                    if self._cancel_all_consecutive_429s >= 3:
+                        self._cancel_all_skip_orphan_query = True
+                        # Schedule re-enable after 10 minutes
+                        self._cancel_all_skip_until = time.time() + 600.0
+                        logger.warning(
+                            f"Orphan query in cancel_all disabled for 10min after "
+                            f"{self._cancel_all_consecutive_429s} consecutive 429s"
+                        )
+                    else:
+                        logger.warning(f"Orphan cleanup 429 ({self._cancel_all_consecutive_429s}/3): {e}")
+                else:
+                    logger.warning(f"Orphan cleanup failed: {e}")
+        elif self._cancel_all_skip_orphan_query:
+            # Check if skip period has expired
+            if time.time() >= getattr(self, '_cancel_all_skip_until', 0):
+                self._cancel_all_skip_orphan_query = False
+                self._cancel_all_consecutive_429s = 0
+                logger.info("Orphan query in cancel_all re-enabled after cooldown")
 
-        self._states.clear()
+        # Codex #4: Only clear state for successfully cancelled coins
+        for coin in successfully_cancelled:
+            self._states.pop(coin, None)
+        # Log any coins with failed cancels that remain tracked
+        remaining = set(self._states.keys()) - successfully_cancelled
+        if remaining:
+            logger.warning(
+                f"cancel_all: {len(remaining)} coins still tracked after failed cancels: "
+                f"{remaining} — orphan cleanup will retry"
+            )
 
     def cancel_coin(self, coin: str) -> None:
         """Cancel all orders for a specific coin."""
@@ -513,6 +569,33 @@ class QuoteEngine:
         still-resting orders.
 
         Returns list of fill dicts: {side, price, size, fee, oid}
+
+        NOTE: Prefer detect_fills_from_snapshot() to avoid per-coin REST calls.
+        """
+        state = self._states.get(coin)
+        if not state:
+            return []
+
+        if self.dry_run:
+            return []
+
+        try:
+            # Bug #3 (Codex R4): Gate through shared rate limiter
+            if not self._consume_rate_token():
+                return []
+            open_orders = self.info.open_orders(self.address)
+        except Exception:
+            return []
+
+        return self.detect_fills_from_snapshot(coin, open_orders)
+
+    def detect_fills_from_snapshot(
+        self, coin: str, open_orders: list[dict]
+    ) -> list[dict]:
+        """Codex R2 #5: Detect fills using a pre-fetched open_orders snapshot.
+
+        Same logic as detect_fills() but uses a shared snapshot queried once
+        per tick instead of per-coin. Saves (N-1) REST calls per tick.
         """
         state = self._states.get(coin)
         if not state:
@@ -523,16 +606,9 @@ class QuoteEngine:
 
         fills = []
         now = time.time()
-        try:
-            # Bug #3 (Codex R4): Gate through shared rate limiter
-            if not self._consume_rate_token():
-                return []
-            open_orders = self.info.open_orders(self.address)
-            open_oids = {}
-            for o in (open_orders or []):
-                open_oids[o["oid"]] = o
-        except Exception:
-            return []
+        open_oids = {}
+        for o in (open_orders or []):
+            open_oids[o["oid"]] = o
 
         for attr, side in [("bid_order", "bid"), ("ask_order", "ask")]:
             order = getattr(state, attr)
@@ -620,15 +696,28 @@ class QuoteEngine:
         return fills
 
     def cleanup_orphans(self) -> None:
-        """Reconcile: cancel any open orders not tracked by us. Every 30s.
+        """Reconcile: cancel any open orders not tracked by us.
         Also retries cancellation of stale orders from failed cancels (Bug #1).
+
+        Uses exponential backoff on 429 errors: starts at 30s, doubles on each
+        consecutive failure up to 10 minutes. After 5 consecutive failures,
+        skip orphan cleanup entirely until backoff expires.
         """
         now = time.time()
-        if now - self._last_orphan_check < 30.0:
+        if now - self._last_orphan_check < self._orphan_backoff_s:
             return
         self._last_orphan_check = now
 
         if self.dry_run:
+            return
+
+        # After too many consecutive failures, skip this cycle entirely
+        if self._orphan_consecutive_failures >= 5:
+            logger.debug(
+                f"Orphan cleanup skipped: {self._orphan_consecutive_failures} consecutive "
+                f"failures, next retry in {self._orphan_backoff_s:.0f}s"
+            )
+            # Still count down — backoff timer will eventually allow a retry
             return
 
         try:
@@ -639,6 +728,9 @@ class QuoteEngine:
             if not all_orders:
                 # No open orders — clear all stale tracking
                 self._stale_orders.clear()
+                # Success — reset backoff
+                self._orphan_backoff_s = 30.0
+                self._orphan_consecutive_failures = 0
                 return
 
             tracked_oids = set()
@@ -677,8 +769,23 @@ class QuoteEngine:
                 if state.ask_order and state.ask_order.oid in cancelled_stale:
                     state.ask_order = None
 
+            # Success — reset backoff
+            self._orphan_backoff_s = 30.0
+            self._orphan_consecutive_failures = 0
+
         except Exception as e:
-            logger.warning(f"Orphan check failed: {e}")
+            err_str = str(e)
+            if "429" in err_str or "rate" in err_str.lower():
+                self._orphan_consecutive_failures += 1
+                self._orphan_backoff_s = min(
+                    self._orphan_backoff_s * 2, self._orphan_max_backoff_s
+                )
+                logger.warning(
+                    f"Orphan check 429 (attempt {self._orphan_consecutive_failures}): "
+                    f"backing off to {self._orphan_backoff_s:.0f}s"
+                )
+            else:
+                logger.warning(f"Orphan check failed: {e}")
 
     def get_active_orders(self, coin: str) -> tuple[Optional[ActiveOrder], Optional[ActiveOrder]]:
         """Return (bid_order, ask_order) for a coin."""

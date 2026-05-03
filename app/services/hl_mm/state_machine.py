@@ -68,6 +68,9 @@ class PairContext:
     hedge_in_progress: bool = False
     bybit_hedge_available: bool = False  # direct Bybit pair exists
 
+    # Codex R2 #7: Spread context for hedge vs taker-close decision
+    native_spread_bps: float = 0.0  # current HL spread
+
 
 @dataclass
 class PairStateInfo:
@@ -124,16 +127,23 @@ class StateMachine:
         old_state = info.state
         now = time.time()
 
-        # --- ANY -> PAUSE (highest priority) ---
+        # --- ANY -> PAUSE (highest priority EXCEPT hedge/emergency) ---
+        # Codex #2 fix: PAUSE must NOT preempt HEDGE or EMERGENCY_FLATTEN.
+        # If HL data goes stale while we have inventory in HEDGE or EMERGENCY_FLATTEN,
+        # we MUST stay in those states so the hedge/flatten completes. Otherwise,
+        # PAUSE freezes inventory age and the 180s emergency timer never matures,
+        # leaving positions unhedged indefinitely.
         if self._should_pause(ctx):
-            if old_state != PairState.PAUSE:
-                self._enter_state(info, PairState.PAUSE, now,
-                                  self._pause_reason(ctx))
-            info.quote_bid = False
-            info.quote_ask = False
-            info.exit_mode = False
-            info.hedge_requested = ctx.circuit_breaker_active and abs(ctx.inventory_usd) > 0
-            return info
+            if old_state not in (PairState.HEDGE, PairState.EMERGENCY_FLATTEN):
+                if old_state != PairState.PAUSE:
+                    self._enter_state(info, PairState.PAUSE, now,
+                                      self._pause_reason(ctx))
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = False
+                info.hedge_requested = ctx.circuit_breaker_active and abs(ctx.inventory_usd) > 0
+                return info
+            # else: in HEDGE/EMERGENCY_FLATTEN — fall through, don't pause
 
         # --- PAUSE -> IDLE (cooldown expired + fresh data) ---
         if old_state == PairState.PAUSE:
@@ -181,8 +191,12 @@ class StateMachine:
                 return info
 
         # --- QUOTING_* -> INVENTORY_EXIT ---
+        # Require actual inventory (|q| > 0) — age timer alone should not
+        # trigger exit when there's nothing to exit (Bug fix: 0-inventory exit)
         if old_state in (PairState.QUOTING_BOTH, PairState.QUOTING_ONE_SIDE):
-            if abs(ctx.inventory_usd) >= ctx.q_soft or ctx.inventory_age_s > 30:
+            if abs(ctx.inventory_usd) >= 1.0 and (
+                abs(ctx.inventory_usd) >= ctx.q_soft or ctx.inventory_age_s > 30
+            ):
                 self._enter_state(info, PairState.INVENTORY_EXIT, now,
                                   f"|q|={abs(ctx.inventory_usd):.0f} >= Q_soft={ctx.q_soft:.0f} "
                                   f"or age={ctx.inventory_age_s:.0f}s > 30s")
@@ -237,6 +251,14 @@ class StateMachine:
         self._enter_state(info, PairState.PAUSE, now, reason)
         info.pause_until = now + duration_s
 
+    def force_state(self, coin: str, state: PairState, reason: str) -> None:
+        """Force a pair into an arbitrary state (e.g. EMERGENCY_FLATTEN)."""
+        info = self._states.get(coin)
+        if not info:
+            return
+        now = time.time()
+        self._enter_state(info, state, now, reason)
+
     def _should_pause(self, ctx: PairContext) -> bool:
         """Check if ANY pause trigger is active."""
         return (
@@ -256,8 +278,16 @@ class StateMachine:
         return f"stale HL data ({ctx.hl_book_age_ms:.0f}ms)"
 
     def _should_hedge(self, ctx: PairContext) -> bool:
-        """Check if hedge is needed (Spec Section 4)."""
+        """Check if hedge is needed (Spec Section 4).
+
+        Codex R2 #7: Only hedge when native spread > 10bps. Below that,
+        the hedge cost (~12bps for Bybit taker + slippage) exceeds the
+        total round-trip edge, making HL taker-close cheaper.
+        """
         if not ctx.bybit_hedge_available:
+            return False
+        # Codex R2 #7: Skip Bybit hedge for narrow spreads — taker-close on HL is cheaper
+        if ctx.native_spread_bps < 10.0:
             return False
         return (
             abs(ctx.inventory_usd) >= ctx.q_hard
