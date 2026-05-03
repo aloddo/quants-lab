@@ -17,14 +17,12 @@ This is the top-level module. It creates and wires all components.
 """
 import asyncio
 import hashlib
-import hmac
 import json
 import logging
 import math
 import os
 import threading
 import time
-import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -150,10 +148,10 @@ class HLMarketMaker:
         self._bybit_ws_backoff: float = 1.0
         self._last_daily_summary: float = 0.0
 
-        # Bug #3: Bybit hedge position tracking {coin: delta_size}
+        # Hedge tracking — DISABLED (V2: costs ~23bps, destroys PnL)
+        # Kept as empty dicts so references don't crash during cleanup
         self._hedge_positions: dict[str, float] = {}
-        self._hedge_entry_prices: dict[str, float] = {}
-        self._hedge_in_progress: dict[str, float] = {}  # coin -> timestamp when hedge placed
+        self._hedge_in_progress: dict[str, float] = {}
 
         # Bug #8: Shared rate limiter (token bucket)
         # HL /exchange rate limit is ~12 calls/8s = 1.5/sec (undocumented, volume-gated)
@@ -481,8 +479,8 @@ class HLMarketMaker:
                 except Exception as e:
                     logger.warning(f"Post-fill cancel failed for {cancel_coin}: {e}")
 
-        # Bug #8 fix: Process pending hedge closes (HL flat but Bybit hedge remains)
-        if self._pending_hedge_close:
+        # Hedge close processing — DISABLED (V2: no hedging)
+        if False and self._pending_hedge_close:
             coins_to_close = list(self._pending_hedge_close)
             self._pending_hedge_close.clear()
             for hc_coin in coins_to_close:
@@ -590,9 +588,7 @@ class HLMarketMaker:
                 )
                 snapshot = None
 
-        # Bug #14: Include Bybit hedge PnL in daily PnL
-        bybit_hedge_pnl = self._compute_bybit_hedge_pnl()
-        effective_daily_pnl = (snapshot.daily_pnl if snapshot else 0) + bybit_hedge_pnl
+        effective_daily_pnl = snapshot.daily_pnl if snapshot else 0
 
         # === STEP 2: Portfolio risk check ===
         hl_book_ages = {}
@@ -628,29 +624,6 @@ class HLMarketMaker:
             await asyncio.to_thread(self.quote_engine.cancel_all)
             return
 
-        # HEDGE DISABLED: Bybit hedge costs ~23bps round-trip, destroying all
-        # spread capture on 5-10bps shitcoin pairs. HL taker-close is 3.5bps.
-        # Keeping code for future use on wider-spread venues.
-        if False and RiskAction.HEDGE_IMMEDIATELY in risk_state.actions and not self.dry_run:
-            for coin in list(self._active_coins):
-                if has_inventory.get(coin, False) and coin in BYBIT_PERPS:
-                    # Skip if already hedged or hedge in flight for this coin
-                    if coin in self._hedge_in_progress:
-                        logger.debug(f"HEDGE_IMMEDIATELY: {coin} skipped — hedge already in progress")
-                        continue
-                    if abs(self._hedge_positions.get(coin, 0)) > 1e-10:
-                        logger.debug(f"HEDGE_IMMEDIATELY: {coin} skipped — Bybit hedge position exists")
-                        continue
-                    pos = self.inventory.get_position(coin)
-                    sig = self.signal_engine.get_signal(coin)
-                    fv = sig.book.mid if sig and sig.book else 0
-                    if abs(pos.size) > 0 and fv > 0:
-                        logger.warning(
-                            f"HEDGE_IMMEDIATELY: {coin} stale HL data with inventory, "
-                            f"hedging before state machine runs"
-                        )
-                        await self._execute_bybit_hedge(coin, pos, fv)
-
         if RiskAction.CANCEL_ALL_QUOTES in risk_state.actions:
             # Bug #7 fix: wrap cancel in to_thread
             await asyncio.to_thread(self.quote_engine.cancel_all)
@@ -664,36 +637,6 @@ class HLMarketMaker:
 
         # === STEP 3: Per-pair processing ===
         current_mids: dict[str, float] = {}
-
-        # Bug #1 (Codex R4): hedge_in_progress TTL should only expire when
-        # HL inventory is flat OR a Bybit close-hedge was confirmed — not on
-        # a blind 60s timer. Check actual HL position before expiring.
-        for hcoin in list(self._hedge_in_progress.keys()):
-            hl_pos = self.inventory.get_position(hcoin)
-            hl_flat = abs(hl_pos.size) < 1e-10
-            if hl_flat:
-                logger.info(f"{hcoin}: hedge_in_progress cleared — HL inventory is flat")
-                del self._hedge_in_progress[hcoin]
-                # Bug #8 fix: if Bybit hedge still open, queue close
-                if abs(self._hedge_positions.get(hcoin, 0)) > 1e-10:
-                    self._pending_hedge_close.add(hcoin)
-            elif now - self._hedge_in_progress[hcoin] > 120.0:
-                # 120s passed, HL still has inventory. Check if Bybit hedge actually filled.
-                bybit_hedged = abs(self._hedge_positions.get(hcoin, 0)) > 1e-10
-                if not bybit_hedged:
-                    # Hedge FAILED — clear flag and force emergency flatten
-                    logger.critical(
-                        f"{hcoin}: hedge_in_progress >120s, HL inventory "
-                        f"still {hl_pos.size:.6f}, NO Bybit hedge — forcing EMERGENCY_FLATTEN"
-                    )
-                    del self._hedge_in_progress[hcoin]
-                    self.state_machine.force_state(hcoin, PairState.EMERGENCY_FLATTEN,
-                                                   "failed hedge timeout — market close")
-                else:
-                    logger.warning(
-                        f"{hcoin}: hedge_in_progress >120s but HL inventory "
-                        f"still {hl_pos.size:.6f} — Bybit hedge active, keeping"
-                    )
 
         for coin in list(self._active_coins):
             # Skip if circuit breaker disabled this pair
@@ -896,32 +839,18 @@ class HLMarketMaker:
                             )
 
                     if not flatten_success:
-                        # Fallback: Bybit hedge if available
-                        if coin in BYBIT_PERPS and abs(self._hedge_positions.get(coin, 0)) < 1e-10:
-                            logger.critical(
-                                f"EMERGENCY_FLATTEN: {coin} failed 3 close attempts, "
-                                f"falling back to Bybit hedge"
-                            )
-                            verify_pos = self.inventory.get_position(coin)
-                            sig = self.signal_engine.get_signal(coin)
-                            fv = sig.book.mid if sig and sig.book else fair_value
-                            if fv > 0:
-                                await self._execute_bybit_hedge(coin, verify_pos, fv)
-                                self._hedge_in_progress[coin] = now
-                        else:
-                            logger.critical(
-                                f"EMERGENCY_FLATTEN: {coin} failed 3 close attempts and "
-                                f"no Bybit hedge available — MANUAL INTERVENTION REQUIRED"
-                            )
-                            self.notifier.notify_engine_event(
-                                "EMERGENCY FLATTEN FAILED",
-                                f"{coin}: 3 close attempts failed, no hedge. Manual intervention required.",
-                            )
+                        logger.critical(
+                            f"EMERGENCY_FLATTEN: {coin} failed 3 close attempts "
+                            f"— MANUAL INTERVENTION REQUIRED"
+                        )
+                        self.notifier.notify_engine_event(
+                            "EMERGENCY FLATTEN FAILED",
+                            f"{coin}: 3 close attempts failed. Manual intervention required.",
+                        )
 
-                    # Only pause 10min if actually flat or hedged
+                    # Only pause 10min if actually flat
                     verify_pos = self.inventory.get_position(coin)
-                    hedged = abs(self._hedge_positions.get(coin, 0)) > 1e-10
-                    if abs(verify_pos.size) < 1e-10 or hedged:
+                    if abs(verify_pos.size) < 1e-10:
                         self.state_machine.force_pause(coin, 600, "post-emergency-flatten cooldown")
                     else:
                         # Don't pause — keep retrying next tick
@@ -1052,16 +981,6 @@ class HLMarketMaker:
 
             # Execute Bybit hedge if requested (Gap 1)
             # Bug #1 (Codex R4): Check hedge_in_progress + hedge_positions before stacking
-            # Hedging disabled — costs ~23bps, destroys PnL on shitcoin spreads.
-            if False and state_info.hedge_requested and not self.dry_run:
-                if coin in self._hedge_in_progress:
-                    logger.debug(f"{coin}: hedge requested but already in progress, skipping")
-                elif abs(self._hedge_positions.get(coin, 0)) > 1e-10:
-                    logger.debug(f"{coin}: hedge requested but Bybit position exists, skipping")
-                else:
-                    await self._execute_bybit_hedge(coin, pos, fair_value)
-                    # Mark hedge as in progress
-                    self._hedge_in_progress[coin] = now
 
             # Detect fills — uses shared open_orders snapshot (Codex R2 #5)
             pass  # Moved to batch fill detection below
@@ -2335,267 +2254,10 @@ class HLMarketMaker:
         return total
 
     # ==================================================================
-    # Bug #14: Bybit hedge PnL tracking
+    # Bybit hedge — DELETED (V2: hedge costs ~23bps, destroys PnL)
+    # Preserved in git history: commit 630e58e
     # ==================================================================
 
-    def _compute_bybit_hedge_pnl(self) -> float:
-        """Compute unrealized PnL from Bybit hedge positions."""
-        total_pnl = 0.0
-        for coin, delta in self._hedge_positions.items():
-            if abs(delta) < 1e-10:
-                continue
-            entry = self._hedge_entry_prices.get(coin, 0)
-            current = self._prev_bybit_mids.get(coin, 0)
-            if entry > 0 and current > 0:
-                # delta > 0 means we are long on Bybit (short on HL)
-                total_pnl += delta * (current - entry)
-        return total_pnl
-
-    # ==================================================================
-    # Bybit hedge execution (Gap 1)
-    # ==================================================================
-
-    async def _execute_bybit_hedge(
-        self,
-        coin: str,
-        pos,
-        fair_value: float,
-    ) -> None:
-        """Execute an emergency delta hedge on Bybit mainnet via REST (Gap 1).
-
-        Places an IOC limit order on Bybit at mid +/- max(1 tick, 1bp).
-        Hedges 80-100% of the HL delta.
-        Uses raw REST (pybit not available in this env).
-        """
-        if not self._bybit_api_key or not self._bybit_api_secret:
-            logger.error(f"HEDGE BLOCKED: {coin} - no Bybit API credentials")
-            return
-
-        if abs(pos.size) < 1e-10 or fair_value <= 0:
-            return
-
-        # Determine hedge direction: if we are long on HL, sell on Bybit
-        is_long_hl = pos.size > 0
-        bybit_side = "Sell" if is_long_hl else "Buy"
-
-        # Hedge size: 80-100% of delta
-        hedge_cfg = self.config.hedge
-        hedge_pct = (hedge_cfg.hedge_pct_min + hedge_cfg.hedge_pct_max) / 2.0
-        hedge_size = abs(pos.size) * hedge_pct
-
-        # Determine slippage budget
-        is_direct = coin in BYBIT_PERPS
-        slippage_bps = (
-            hedge_cfg.direct_slippage_budget_bps if is_direct
-            else hedge_cfg.proxy_slippage_budget_bps
-        )
-
-        # Compute limit price: mid +/- max(1 tick, slippage_budget)
-        slip_offset = fair_value * (slippage_bps / 10000.0)
-        tick_size = fair_value * 0.0001  # 1bp as minimum tick
-        offset = max(tick_size, slip_offset)
-
-        if bybit_side == "Buy":
-            limit_price = fair_value + offset
-        else:
-            limit_price = fair_value - offset
-
-        # Round for Bybit: floor to whole number (most shitcoin perps have qtyStep=1)
-        # TODO: query instrument info for exact qtyStep per symbol
-        hedge_size = math.floor(hedge_size)
-        if hedge_size < 1:
-            logger.warning(f"HEDGE SKIP: {coin} hedge_size={hedge_size} < 1 after rounding")
-            return
-
-        sz_str = f"{hedge_size:.0f}"
-        px_str = f"{limit_price:.4f}"
-        symbol = f"{coin}USDT"
-
-        logger.warning(
-            f"HEDGE: {coin} {bybit_side} {sz_str} @ {px_str} on Bybit "
-            f"(HL delta={pos.size:.6f}, hedge_pct={hedge_pct:.0%})"
-        )
-
-        try:
-            result = await asyncio.to_thread(
-                self._bybit_place_order,
-                symbol=symbol,
-                side=bybit_side,
-                qty=sz_str,
-                price=px_str,
-                order_type="Limit",
-                time_in_force="IOC",
-            )
-
-            if result and result.get("retCode") == 0:
-                order_result = result.get("result", {})
-                order_id = order_result.get("orderId", "?")
-                logger.info(f"HEDGE ACCEPTED: {coin} orderId={order_id}")
-
-                # Bug #3 fix: IOC accept != fill. Query actual filled quantity.
-                # Codex #7: Retry query up to 3 times with 1s delay — accepted IOC
-                # may not be immediately visible in order history.
-                actual_filled_qty = 0.0
-                actual_fill_price = limit_price
-                if order_id and order_id != "?":
-                    for query_attempt in range(3):
-                        try:
-                            if query_attempt > 0:
-                                await asyncio.sleep(1.0)
-                            fill_result = await asyncio.to_thread(
-                                self._bybit_query_order, symbol, order_id
-                            )
-                            if fill_result:
-                                actual_filled_qty = float(fill_result.get("cumExecQty", 0) or 0)
-                                avg_price = float(fill_result.get("avgPrice", 0) or 0)
-                                if avg_price > 0:
-                                    actual_fill_price = avg_price
-                            if actual_filled_qty > 1e-10:
-                                break  # got the fill, stop retrying
-                        except Exception as e:
-                            logger.warning(
-                                f"HEDGE: fill query attempt {query_attempt+1}/3 for "
-                                f"{coin} orderId={order_id}: {e}"
-                            )
-
-                if actual_filled_qty > 1e-10:
-                    hedge_delta = -actual_filled_qty if bybit_side == "Sell" else actual_filled_qty
-                    self._hedge_positions[coin] = self._hedge_positions.get(coin, 0) + hedge_delta
-                    self._hedge_entry_prices[coin] = actual_fill_price
-
-                    actual_slippage_bps = abs(actual_fill_price - fair_value) / fair_value * 10000
-                    logger.info(
-                        f"HEDGE FILLED: {coin} filled={actual_filled_qty:.6f} "
-                        f"@ ${actual_fill_price:.6f} (slippage={actual_slippage_bps:.1f}bps)"
-                    )
-                    self.notifier.notify_hedge(
-                        coin=coin, side=bybit_side, size=actual_filled_qty,
-                        price=actual_fill_price, slippage_bps=actual_slippage_bps,
-                    )
-                else:
-                    logger.warning(
-                        f"HEDGE: {coin} IOC order accepted but fill qty=0 — "
-                        f"not updating hedge position"
-                    )
-            else:
-                ret_code = result.get("retCode", "?") if result else "no response"
-                ret_msg = result.get("retMsg", "") if result else ""
-                logger.error(f"HEDGE FAILED: {coin} retCode={ret_code} msg={ret_msg}")
-                self.notifier.notify_engine_event(
-                    "HEDGE FAILED",
-                    f"{coin} {bybit_side} {sz_str}: {ret_msg}",
-                )
-
-        except Exception as e:
-            logger.error(f"HEDGE ERROR: {coin}: {e}", exc_info=True)
-            self.notifier.notify_engine_event("HEDGE ERROR", f"{coin}: {e}")
-
-    def _bybit_place_order(
-        self,
-        symbol: str,
-        side: str,
-        qty: str,
-        price: str,
-        order_type: str = "Limit",
-        time_in_force: str = "IOC",
-        reduce_only: bool = False,
-    ) -> Optional[dict]:
-        """Place an order on Bybit mainnet via raw REST API.
-
-        No pybit dependency. Uses HMAC-SHA256 signing per Bybit V5 API spec.
-        """
-        api_url = "https://api.bybit.com"
-        endpoint = "/v5/order/create"
-        timestamp = str(int(time.time() * 1000))
-        recv_window = "5000"
-
-        payload = {
-            "category": "linear",
-            "symbol": symbol,
-            "side": side,
-            "orderType": order_type,
-            "qty": qty,
-            "price": price,
-            "timeInForce": time_in_force,
-            "reduceOnly": reduce_only,
-        }
-
-        payload_str = json.dumps(payload, separators=(",", ":"))
-
-        # Bybit V5 signature: timestamp + api_key + recv_window + payload
-        sign_str = f"{timestamp}{self._bybit_api_key}{recv_window}{payload_str}"
-        signature = hmac.new(
-            self._bybit_api_secret.encode("utf-8"),
-            sign_str.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-        headers = {
-            "X-BAPI-API-KEY": self._bybit_api_key,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-TIMESTAMP": timestamp,
-            "X-BAPI-RECV-WINDOW": recv_window,
-            "Content-Type": "application/json",
-        }
-
-        resp = sync_requests.post(
-            f"{api_url}{endpoint}",
-            headers=headers,
-            data=payload_str,
-            timeout=5,
-        )
-
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            logger.error(f"Bybit REST error: HTTP {resp.status_code}: {resp.text[:300]}")
-            return {"retCode": resp.status_code, "retMsg": resp.text[:200]}
-
-    def _bybit_query_order(self, symbol: str, order_id: str) -> Optional[dict]:
-        """Query Bybit order status to get actual fill quantity (Bug #3 fix).
-
-        Uses GET /v5/order/realtime to check cumExecQty for IOC orders.
-        """
-        api_url = "https://api.bybit.com"
-        endpoint = "/v5/order/realtime"
-        timestamp = str(int(time.time() * 1000))
-        recv_window = "5000"
-
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "orderId": order_id,
-        }
-        query_string = urllib.parse.urlencode(params)
-
-        # Bybit V5 GET signature: timestamp + api_key + recv_window + query_string
-        sign_str = f"{timestamp}{self._bybit_api_key}{recv_window}{query_string}"
-        signature = hmac.new(
-            self._bybit_api_secret.encode("utf-8"),
-            sign_str.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-        headers = {
-            "X-BAPI-API-KEY": self._bybit_api_key,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-TIMESTAMP": timestamp,
-            "X-BAPI-RECV-WINDOW": recv_window,
-        }
-
-        resp = sync_requests.get(
-            f"{api_url}{endpoint}?{query_string}",
-            headers=headers,
-            timeout=5,
-        )
-
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("retCode") == 0:
-                order_list = data.get("result", {}).get("list", [])
-                if order_list:
-                    return order_list[0]
-        return None
 
     # ==================================================================
     # Leverage management
@@ -2768,7 +2430,7 @@ class HLMarketMaker:
         try:
             snapshot = self.inventory._get_snapshot() if self.inventory else None
             uptime = (time.time() - self._start_time) / 3600.0 if self._start_time > 0 else 0
-            pnl = (snapshot.daily_pnl if snapshot else 0) + self._compute_bybit_hedge_pnl()
+            pnl = snapshot.daily_pnl if snapshot else 0
             logger.info(
                 f"FINAL SUMMARY: uptime={uptime:.1f}h pnl=${pnl:.2f} "
                 f"coins={list(self._active_coins)}"
