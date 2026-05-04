@@ -89,6 +89,10 @@ class WalletScorer:
         # coin -> list of (timestamp, wallet_addr) for toxic wallets seen in last 10s
         self._toxic_activity: dict[str, list[tuple[float, str]]] = {}
 
+        # V3: Active metaorder detection state
+        # coin -> MetaorderSignal (or None)
+        self._active_metaorders: dict[str, Optional["MetaorderSignal"]] = {}
+
     def record_trade(
         self,
         coin: str,
@@ -311,3 +315,131 @@ class WalletScorer:
                     return False  # not enough confidence
 
         return mean < self.toxic_threshold_bps
+
+    # ------------------------------------------------------------------
+    # V3: Metaorder Detection
+    # ------------------------------------------------------------------
+
+    def detect_metaorders(self, coin: str) -> None:
+        """Scan recent trades for active metaorder patterns.
+
+        A metaorder is: same wallet, same direction, >= 3 clips in <= 90s,
+        with regular cadence (CV < 0.6) and meaningful notional (>= $1K).
+
+        Called every tick. Updates self._active_metaorders[coin].
+        """
+        with self._lock:
+            now = time.time()
+            cutoff = now - 90.0
+
+            # Group recent trades by (coin, aggressor, direction)
+            # Only look at trades on this coin in the last 90s
+            wallet_clips: dict[tuple[str, str], list[WalletTrade]] = {}
+            for trade in reversed(list(self._recent_trades)):
+                if trade.timestamp < cutoff:
+                    break
+                if trade.coin != coin:
+                    continue
+                aggressor = trade.buyer if trade.side == "B" else trade.seller
+                direction = "buy" if trade.side == "B" else "sell"
+                key = (aggressor, direction)
+                if key not in wallet_clips:
+                    wallet_clips[key] = []
+                wallet_clips[key].append(trade)
+
+            # Check each wallet's clips for metaorder signature
+            best_signal: Optional[MetaorderSignal] = None
+            best_confidence = 0.0
+
+            for (wallet, direction), clips in wallet_clips.items():
+                if len(clips) < 3:
+                    continue
+
+                # Sort by time (oldest first)
+                clips.sort(key=lambda t: t.timestamp)
+
+                # Total notional
+                total_notional = sum(t.notional for t in clips)
+                if total_notional < 1000.0:  # $1K minimum
+                    continue
+
+                # Same-side share (should be >= 80% — all clips are same direction by construction)
+                # Check if this wallet also had opposite-direction trades
+                opp_key = (wallet, "sell" if direction == "buy" else "buy")
+                opp_clips = wallet_clips.get(opp_key, [])
+                opp_notional = sum(t.notional for t in opp_clips)
+                if opp_notional > 0:
+                    same_share = total_notional / (total_notional + opp_notional)
+                    if same_share < 0.80:
+                        continue  # too much opposing flow, not a clean metaorder
+                else:
+                    same_share = 1.0
+
+                # Cadence regularity (coefficient of variation of inter-trade intervals)
+                intervals = [
+                    clips[i + 1].timestamp - clips[i].timestamp
+                    for i in range(len(clips) - 1)
+                ]
+                if len(intervals) >= 2:
+                    mean_interval = sum(intervals) / len(intervals)
+                    if mean_interval > 0:
+                        std_interval = (
+                            sum((iv - mean_interval) ** 2 for iv in intervals) / len(intervals)
+                        ) ** 0.5
+                        cv = std_interval / mean_interval
+                    else:
+                        cv = 999.0
+                else:
+                    cv = 0.0  # only 1 interval, can't measure regularity
+
+                # Confidence: combines clip count, notional, and regularity
+                clip_conf = min(1.0, len(clips) / 5.0)  # 5 clips = max confidence
+                notional_conf = min(1.0, total_notional / 5000.0)  # $5K = max
+                regularity_conf = max(0.0, 1.0 - cv) if cv < 1.0 else 0.0
+                confidence = clip_conf * 0.4 + notional_conf * 0.3 + regularity_conf * 0.3
+
+                if confidence > best_confidence and cv < 0.6:
+                    best_confidence = confidence
+                    avg_interval = sum(intervals) / len(intervals) if intervals else 30.0
+                    best_signal = MetaorderSignal(
+                        wallet=wallet,
+                        coin=coin,
+                        direction=direction,
+                        clip_count=len(clips),
+                        total_notional=total_notional,
+                        avg_interval_s=avg_interval,
+                        cv=cv,
+                        confidence=confidence,
+                        first_seen=clips[0].timestamp,
+                        last_seen=clips[-1].timestamp,
+                    )
+
+            self._active_metaorders[coin] = best_signal
+
+    def get_active_metaorder(self, coin: str) -> Optional["MetaorderSignal"]:
+        """Get the currently detected metaorder for a coin (or None)."""
+        signal = self._active_metaorders.get(coin)
+        if signal is None:
+            return None
+        # Expire if last clip was > 2 expected intervals ago
+        now = time.time()
+        expiry = signal.last_seen + signal.avg_interval_s * 2.5
+        if now > expiry:
+            self._active_metaorders[coin] = None
+            return None
+        return signal
+
+
+@dataclass
+class MetaorderSignal:
+    """Detected metaorder (TWAP/iceberg) from wallet trade stream."""
+    wallet: str
+    coin: str
+    direction: str           # "buy" or "sell"
+    clip_count: int          # number of clips observed
+    total_notional: float    # cumulative $ aggressed
+    avg_interval_s: float    # average seconds between clips
+    cv: float                # coefficient of variation of intervals
+    confidence: float        # 0..1 composite confidence score
+    first_seen: float        # timestamp of first clip
+    last_seen: float         # timestamp of most recent clip

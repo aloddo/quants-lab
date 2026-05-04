@@ -941,6 +941,10 @@ class HLMarketMaker:
                     elif signal.trade_imbalance_side < 0:  # sell-heavy trade flow
                         ask_ev = False  # suppress ask (toxic to sell into selling pressure)
 
+            # V3: Detect metaorders from wallet trade stream
+            self.wallet_scorer.detect_metaorders(coin)
+            metaorder = self.wallet_scorer.get_active_metaorder(coin)
+
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,
                 bybit_anchor_healthy=fv_est.anchor_weight > 0,
@@ -961,7 +965,12 @@ class HLMarketMaker:
                 imbalance_side=signal.imbalance_side,
                 hedge_in_progress=hedge_active,
                 bybit_hedge_available=coin in BYBIT_PERPS,
-                native_spread_bps=book.spread_bps,  # Codex R2 #7
+                native_spread_bps=book.spread_bps,
+                # V3: Metaorder context
+                metaorder_active=metaorder is not None,
+                metaorder_direction=metaorder.direction if metaorder else "",
+                metaorder_confidence=metaorder.confidence if metaorder else 0.0,
+                metaorder_expired=False,  # set by get_active_metaorder returning None after expiry
             )
 
             # Codex #6: If pair is demoted (pending idle close), override to exit-only.
@@ -1410,6 +1419,16 @@ class HLMarketMaker:
             coin=coin, side=side, price=price, size=size,
             size_usd=size * price, fee=fee, oid=oid,
         )
+
+        # V3: Episode state transition on fill
+        # If in EPISODE_ENTRY and we got filled → move to EPISODE_EXIT
+        state_info = self.state_machine.get_state(coin)
+        if state_info and state_info.state == PairState.EPISODE_ENTRY:
+            self.state_machine.force_state(
+                coin, PairState.EPISODE_EXIT,
+                f"episode fill: {side} {size:.2f} @ ${price:.6f}"
+            )
+            logger.info(f"[{coin}] EPISODE: entry filled → exit mode (riding flow)")
 
         # Decay widen ticks on non-toxic recent history
         tox = self.fill_tracker.get_toxicity(coin)

@@ -32,6 +32,9 @@ class PairState(Enum):
     HEDGE = "HEDGE"
     EMERGENCY_FLATTEN = "EMERGENCY_FLATTEN"  # Bug #9: taker flatten + pause
     PAUSE = "PAUSE"
+    # V3: Episode states for metaorder riding
+    EPISODE_ENTRY = "EPISODE_ENTRY"     # one-sided passive entry, waiting for fill
+    EPISODE_EXIT = "EPISODE_EXIT"       # one-sided passive exit, riding the flow
 
 
 @dataclass
@@ -70,6 +73,12 @@ class PairContext:
 
     # Codex R2 #7: Spread context for hedge vs taker-close decision
     native_spread_bps: float = 0.0  # current HL spread
+
+    # V3: Metaorder episode context
+    metaorder_active: bool = False       # is there a detected metaorder?
+    metaorder_direction: str = ""        # "buy" or "sell"
+    metaorder_confidence: float = 0.0    # 0..1
+    metaorder_expired: bool = False      # did the metaorder disappear (2 clips missed)?
 
 
 @dataclass
@@ -177,6 +186,96 @@ class StateMachine:
                 info.quote_bid = False
                 info.quote_ask = False
                 return info
+
+        # === V3: EPISODE-BASED METAORDER RIDING ===
+
+        # --- IDLE -> EPISODE_ENTRY (metaorder detected + conditions met) ---
+        if old_state == PairState.IDLE and ctx.metaorder_active:
+            if (ctx.spread_threshold_met
+                    and ctx.hl_book_fresh
+                    and ctx.metaorder_confidence >= 0.5
+                    and ctx.native_spread_bps >= 8.0):
+                reason = (
+                    f"metaorder detected: {ctx.metaorder_direction} "
+                    f"conf={ctx.metaorder_confidence:.2f} spread={ctx.native_spread_bps:.1f}bps"
+                )
+                self._enter_state(info, PairState.EPISODE_ENTRY, now, reason)
+
+        # --- EPISODE_ENTRY: waiting for passive fill aligned with metaorder ---
+        if info.state == PairState.EPISODE_ENTRY:
+            # Buy metaorder → we bid (buy dips in the uptrend)
+            # Sell metaorder → we ask (sell rallies in the downtrend)
+            if ctx.metaorder_direction == "buy":
+                info.quote_bid = True
+                info.quote_ask = False
+            else:
+                info.quote_bid = False
+                info.quote_ask = True
+            info.exit_mode = False
+            info.hedge_requested = False
+
+            # Cancel entry if metaorder disappears or confidence drops
+            if ctx.metaorder_expired or not ctx.metaorder_active:
+                self._enter_state(info, PairState.IDLE, now,
+                                  "metaorder expired before fill")
+                info.quote_bid = False
+                info.quote_ask = False
+
+            # Cancel entry if we've been waiting too long (30s)
+            elif now - info.entered_at > 30.0:
+                self._enter_state(info, PairState.IDLE, now,
+                                  "entry timeout (30s)")
+                info.quote_bid = False
+                info.quote_ask = False
+
+            return info
+
+        # --- EPISODE_EXIT: have inventory, exit passively into the same flow ---
+        if info.state == PairState.EPISODE_EXIT:
+            # Long position → ask-only (let the buy flow lift our ask)
+            # Short position → bid-only (let the sell flow hit our bid)
+            if ctx.inventory_usd > 0:
+                info.quote_bid = False
+                info.quote_ask = True
+            else:
+                info.quote_bid = True
+                info.quote_ask = False
+            info.exit_mode = True
+            info.hedge_requested = False
+
+            # Exit triggers (check in priority order):
+            # 1. Position closed → IDLE
+            if abs(ctx.inventory_usd) < 5.0:
+                self._enter_state(info, PairState.IDLE, now, "episode exit complete")
+                info.quote_bid = False
+                info.quote_ask = False
+                return info
+
+            # 2. Metaorder disappeared (flow dried up) → aggressive exit
+            if ctx.metaorder_expired:
+                # Flow is gone — exit urgently but still maker
+                # If still not filled in 10s, emergency flatten will catch it
+                pass  # keep exit quotes active, just note it
+
+            # 3. Hard stop: adverse > 6bps
+            if ctx.adverse_move_bps > 6.0:
+                self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
+                                  f"episode stop: adverse={ctx.adverse_move_bps:.1f}bps > 6bps")
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = True
+                return info
+
+            # 4. Max hold 60s
+            if now - info.entered_at > 60.0:
+                self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
+                                  f"episode timeout: held {now - info.entered_at:.0f}s > 60s")
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = True
+                return info
+
+            return info
 
         # --- HEDGE state handling ---
         # Bug #3: Stay in HEDGE while hedge_in_progress is True
