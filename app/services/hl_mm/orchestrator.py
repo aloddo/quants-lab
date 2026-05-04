@@ -944,6 +944,8 @@ class HLMarketMaker:
             # V3: Detect metaorders from wallet trade stream
             self.wallet_scorer.detect_metaorders(coin)
             metaorder = self.wallet_scorer.get_active_metaorder(coin)
+            # Get current state for metaorder_expired check
+            _current_state = self.state_machine.get_state(coin)
 
             ctx = PairContext(
                 hl_book_fresh=not signal.is_stale,
@@ -967,10 +969,16 @@ class HLMarketMaker:
                 bybit_hedge_available=coin in BYBIT_PERPS,
                 native_spread_bps=book.spread_bps,
                 # V3: Metaorder context
+                # metaorder_expired = True when we WERE in an episode but the
+                # metaorder has now disappeared (get_active_metaorder returns None)
                 metaorder_active=metaorder is not None,
                 metaorder_direction=metaorder.direction if metaorder else "",
                 metaorder_confidence=metaorder.confidence if metaorder else 0.0,
-                metaorder_expired=False,  # set by get_active_metaorder returning None after expiry
+                metaorder_expired=(
+                    metaorder is None
+                    and _current_state is not None
+                    and _current_state.state in (PairState.EPISODE_ENTRY, PairState.EPISODE_EXIT)
+                ),
             )
 
             # Codex #6: If pair is demoted (pending idle close), override to exit-only.
@@ -1101,7 +1109,8 @@ class HLMarketMaker:
 
             # Compute and execute quotes
             if state_info.state in (PairState.QUOTING_BOTH, PairState.QUOTING_ONE_SIDE,
-                                     PairState.INVENTORY_EXIT):
+                                     PairState.INVENTORY_EXIT,
+                                     PairState.EPISODE_ENTRY, PairState.EPISODE_EXIT):
                 # FILL DETECTION HARDENING: Block new quotes if fill detection is blind
                 if not self._fill_sync_healthy:
                     if self._tick_count % 20 == 0:  # log every ~10s
@@ -1236,7 +1245,7 @@ class HLMarketMaker:
         # alone consumed our entire 1.0/sec budget leaving nothing for orders.
         any_quoting = any(
             self.state_machine.get_state(c) and
-            self.state_machine.get_state(c).state.value in ("QUOTING_BOTH", "QUOTING_ONE_SIDE", "INVENTORY_EXIT")
+            self.state_machine.get_state(c).state.value in ("QUOTING_BOTH", "QUOTING_ONE_SIDE", "INVENTORY_EXIT", "EPISODE_ENTRY", "EPISODE_EXIT")
             for c in self._active_coins
         )
         should_poll_fills = (

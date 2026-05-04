@@ -97,9 +97,15 @@ class PairStateInfo:
 
 
 class StateMachine:
-    """Per-pair state machine. One instance manages all pairs."""
+    """Per-pair state machine. One instance manages all pairs.
+
+    Thread-safe: force_state() can be called from WS fill thread while
+    transition() runs on the async tick loop. Lock protects _states dict.
+    """
 
     def __init__(self, pause_cooldown_s: float = 60.0):
+        import threading
+        self._lock = threading.Lock()
         self._states: dict[str, PairStateInfo] = {}
         self._pause_cooldown_s = pause_cooldown_s
 
@@ -120,14 +126,21 @@ class StateMachine:
 
     def get_state(self, coin: str) -> Optional[PairStateInfo]:
         """Get current state info for a pair."""
-        return self._states.get(coin)
+        with self._lock:
+            return self._states.get(coin)
 
     def transition(self, coin: str, ctx: PairContext) -> PairStateInfo:
         """Evaluate transition rules and return updated state.
 
         This is the core decision function. It is called every tick for each
         active pair. All transitions are logged.
+        Thread-safe via self._lock.
         """
+        with self._lock:
+            return self._transition_unlocked(coin, ctx)
+
+    def _transition_unlocked(self, coin: str, ctx: PairContext) -> PairStateInfo:
+        """Internal transition logic (caller must hold self._lock)."""
         info = self._states.get(coin)
         if not info:
             self.register_pair(coin)
@@ -216,15 +229,19 @@ class StateMachine:
 
             # Cancel entry if metaorder disappears or confidence drops
             if ctx.metaorder_expired or not ctx.metaorder_active:
-                self._enter_state(info, PairState.IDLE, now,
+                # Go to PAUSE with 30s cooldown to prevent immediate re-entry
+                self._enter_state(info, PairState.PAUSE, now,
                                   "metaorder expired before fill")
+                info.pause_until = now + 30.0
                 info.quote_bid = False
                 info.quote_ask = False
 
             # Cancel entry if we've been waiting too long (30s)
+            # Use PAUSE with cooldown to prevent immediate re-entry on same signal
             elif now - info.entered_at > 30.0:
-                self._enter_state(info, PairState.IDLE, now,
+                self._enter_state(info, PairState.PAUSE, now,
                                   "entry timeout (30s)")
+                info.pause_until = now + 30.0
                 info.quote_bid = False
                 info.quote_ask = False
 
@@ -361,20 +378,24 @@ class StateMachine:
 
     def force_pause(self, coin: str, duration_s: float, reason: str) -> None:
         """Force a pair into PAUSE for a specific duration."""
-        info = self._states.get(coin)
-        if not info:
-            return
-        now = time.time()
-        self._enter_state(info, PairState.PAUSE, now, reason)
-        info.pause_until = now + duration_s
+        with self._lock:
+            info = self._states.get(coin)
+            if not info:
+                return
+            now = time.time()
+            self._enter_state(info, PairState.PAUSE, now, reason)
+            info.pause_until = now + duration_s
 
     def force_state(self, coin: str, state: PairState, reason: str) -> None:
-        """Force a pair into an arbitrary state (e.g. EMERGENCY_FLATTEN)."""
-        info = self._states.get(coin)
-        if not info:
-            return
-        now = time.time()
-        self._enter_state(info, state, now, reason)
+        """Force a pair into an arbitrary state (e.g. EMERGENCY_FLATTEN).
+        Thread-safe: called from WS fill callback thread.
+        """
+        with self._lock:
+            info = self._states.get(coin)
+            if not info:
+                return
+            now = time.time()
+            self._enter_state(info, state, now, reason)
 
     def _should_pause(self, ctx: PairContext) -> bool:
         """Check if ANY pause trigger is active."""

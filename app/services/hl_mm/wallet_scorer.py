@@ -398,6 +398,11 @@ class WalletScorer:
                 regularity_conf = max(0.0, 1.0 - cv) if cv < 1.0 else 0.0
                 confidence = clip_conf * 0.4 + notional_conf * 0.3 + regularity_conf * 0.3
 
+                # Max gap check: no single interval > 45s (reject slow discretionary)
+                max_gap = max(intervals) if intervals else 0
+                if max_gap > 45.0:
+                    continue
+
                 if confidence > best_confidence and cv < 0.6:
                     best_confidence = confidence
                     avg_interval = sum(intervals) / len(intervals) if intervals else 30.0
