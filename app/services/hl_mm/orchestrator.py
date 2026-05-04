@@ -1431,12 +1431,23 @@ class HLMarketMaker:
 
         # V3: Episode state transition on fill
         # If in EPISODE_ENTRY and we got filled → move to EPISODE_EXIT
-        state_info = self.state_machine.get_state(coin)
-        if state_info and state_info.state == PairState.EPISODE_ENTRY:
+        # Fix #1 (R2): Also update quote flags to prevent stale entry-side quoting
+        _fill_state = self.state_machine.get_state(coin)
+        if _fill_state and _fill_state.state == PairState.EPISODE_ENTRY:
             self.state_machine.force_state(
                 coin, PairState.EPISODE_EXIT,
                 f"episode fill: {side} {size:.2f} @ ${price:.6f}"
             )
+            # Fix #1 (R2): Immediately flip flags so tick loop sees exit-side only
+            _exit_state = self.state_machine.get_state(coin)
+            if _exit_state:
+                if side == "bid":  # we bought → now need to sell (ask-only)
+                    _exit_state.quote_bid = False
+                    _exit_state.quote_ask = True
+                else:  # we sold → now need to buy (bid-only)
+                    _exit_state.quote_bid = True
+                    _exit_state.quote_ask = False
+                _exit_state.exit_mode = True
             logger.info(f"[{coin}] EPISODE: entry filled → exit mode (riding flow)")
 
         # Decay widen ticks on non-toxic recent history

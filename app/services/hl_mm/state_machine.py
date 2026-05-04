@@ -203,9 +203,16 @@ class StateMachine:
         # === V3: EPISODE-BASED METAORDER RIDING ===
 
         # --- IDLE -> EPISODE_ENTRY (metaorder detected + conditions met) ---
+        # Fix #3 (R2): Also require EV-positive on the entry side + anchor healthy
         if old_state == PairState.IDLE and ctx.metaorder_active:
+            entry_side_ev = (
+                ctx.bid_side_ev_positive if ctx.metaorder_direction == "buy"
+                else ctx.ask_side_ev_positive
+            )
             if (ctx.spread_threshold_met
                     and ctx.hl_book_fresh
+                    and ctx.bybit_anchor_healthy
+                    and entry_side_ev
                     and ctx.metaorder_confidence >= 0.5
                     and ctx.native_spread_bps >= 8.0):
                 reason = (
@@ -268,11 +275,18 @@ class StateMachine:
                 info.quote_ask = False
                 return info
 
-            # 2. Metaorder disappeared (flow dried up) → aggressive exit
+            # 2. Metaorder disappeared (flow dried up) → tighter timeout
             if ctx.metaorder_expired:
-                # Flow is gone — exit urgently but still maker
-                # If still not filled in 10s, emergency flatten will catch it
-                pass  # keep exit quotes active, just note it
+                # Flow is gone — if we've been in EXIT > 10s with no fill, flatten
+                exit_age = now - info.entered_at
+                if exit_age > 10.0:
+                    self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
+                                      f"metaorder expired + exit stale ({exit_age:.0f}s)")
+                    info.quote_bid = False
+                    info.quote_ask = False
+                    info.exit_mode = True
+                    return info
+                # else: keep exit quotes active for up to 10s hoping for one last fill
 
             # 3. Hard stop: adverse > 6bps
             if ctx.adverse_move_bps > 6.0:
@@ -389,6 +403,8 @@ class StateMachine:
     def force_state(self, coin: str, state: PairState, reason: str) -> None:
         """Force a pair into an arbitrary state (e.g. EMERGENCY_FLATTEN).
         Thread-safe: called from WS fill callback thread.
+        Also resets quote flags to safe defaults for the new state to prevent
+        stale flags from a prior state being acted on by the tick loop.
         """
         with self._lock:
             info = self._states.get(coin)
@@ -396,6 +412,20 @@ class StateMachine:
                 return
             now = time.time()
             self._enter_state(info, state, now, reason)
+            # Reset flags to safe defaults for the forced state
+            if state == PairState.EPISODE_EXIT:
+                info.exit_mode = True
+                info.hedge_requested = False
+            elif state == PairState.EMERGENCY_FLATTEN:
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = True
+                info.hedge_requested = False
+            elif state in (PairState.IDLE, PairState.PAUSE):
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = False
+                info.hedge_requested = False
 
     def _should_pause(self, ctx: PairContext) -> bool:
         """Check if ANY pause trigger is active."""
