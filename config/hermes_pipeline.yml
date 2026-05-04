@@ -149,7 +149,7 @@ tasks:
     tags: [data, funding, hyperliquid, exotic]
 
   hyperliquid_microstructure_1s:
-    enabled: true
+    enabled: false  # DISABLED: competes with MM engine for HL rate limit
     task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
     schedule:
       type: cron
@@ -175,7 +175,7 @@ tasks:
 
   # MM target shitcoins — wide spreads, potential MM edge
   hyperliquid_microstructure_mm_targets:
-    enabled: true
+    enabled: false  # DISABLED: competes with MM engine for HL rate limit
     task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
     schedule:
       type: cron
