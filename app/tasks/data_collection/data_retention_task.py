@@ -28,38 +28,31 @@ logger = logging.getLogger(__name__)
 # unit: "ms" (Int64 millis), "s" (float seconds), "datetime" (Python datetime)
 # days: how many days of data to keep
 RETENTION_CONFIG: Dict[str, Dict[str, Any]] = {
-    # Bybit derivatives — 730 days (2 years). Backtests run up to 365d and need
-    # buffer for walk-forward + ffill anchor. DO NOT reduce below 400d.
-    "bybit_funding_rates":          {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    "bybit_open_interest":          {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    "bybit_ls_ratio":               {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    # Binance funding — same reasoning as Bybit
-    "binance_funding_rates":        {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    # Hyperliquid funding (730 days — matches Bybit for cross-venue strategies)
-    "hyperliquid_funding_rates":    {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    # Hyperliquid candles — 730 days (X12 needs max history, HL API only keeps ~6mo rolling)
-    "hyperliquid_candles_1h":       {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    # Hyperliquid microstructure (7 days — high volume, low shelf life)
-    "hyperliquid_l2_snapshots_1s":  {"field": "timestamp_utc", "unit": "ms", "days": 7},
-    "hyperliquid_recent_trades_1s": {"field": "time",          "unit": "ms", "days": 7},
-    # Deribit (180 days options, 365 days DVol)
-    "deribit_options_surface":      {"field": "timestamp_utc", "unit": "ms", "days": 180},
-    "deribit_dvol":                 {"field": "timestamp_utc", "unit": "ms", "days": 365},
-    # Coinalyze — 730 days (X10 does 365d backtests, need buffer)
-    "coinalyze_liquidations":       {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    "coinalyze_oi":                 {"field": "timestamp_utc", "unit": "ms", "days": 730},
-    # Signal candidates (365 days)
+    # ─────────────────────────────────────────────────────────────────────
+    # POLICY (Alberto directive 2026-05-22): RAW DATA NEVER DELETES.
+    # Painfully acquired over days — must never auto-purge.
+    # Only DERIVED / OPERATIONAL data has retention rules.
+    # ─────────────────────────────────────────────────────────────────────
+    #
+    # REMOVED ENTRIES (raw, no retention — keep forever):
+    #   - bybit_funding_rates, bybit_open_interest, bybit_ls_ratio
+    #   - binance_funding_rates
+    #   - hyperliquid_funding_rates, hyperliquid_candles_1h
+    #   - hyperliquid_l2_snapshots_1s, hyperliquid_recent_trades_1s
+    #     (L2/trades: 7d rule was the bug that purged previously collected data)
+    #   - deribit_options_surface, deribit_dvol
+    #   - coinalyze_liquidations, coinalyze_oi
+    #   - arb_hl_bybit_perp_snapshots (HL/Bybit top-of-book — RAW)
+    #
+    # If disk pressure ever requires retention on raw collections,
+    # archive to remote DB / cold storage FIRST, then prune.
+
+    # Derived / operational data only (safe to purge):
     "candidates":                   {"field": "timestamp_utc", "unit": "ms", "days": 365},
-    # Arb tick-level data (90 days — enough for spread analysis + strategy dev)
-    "arb_hl_bybit_perp_snapshots":  {"field": "timestamp",     "unit": "datetime", "days": 90},
-    # Arb operational data (shorter retention)
     "arb_opportunities":            {"field": "timestamp",     "unit": "s",  "days": 30},
     "arb_h2_inventory_drift":       {"field": "timestamp",     "unit": "s",  "days": 30},
     "arb_h2_tier_history":          {"field": "timestamp",     "unit": "s",  "days": 90},
-    # Task executions (90 days)
     "task_executions":              {"field": "started_at",    "unit": "datetime", "days": 90},
-    # Fear & Greed — keep forever (small, daily)
-    # fear_greed_index: intentionally excluded
 }
 
 

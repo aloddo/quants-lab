@@ -117,6 +117,21 @@ tasks:
       collection_name: "deribit_options_surface"
     tags: [data, options, deribit, exotic]
 
+  bybit_options:
+    enabled: true
+    task_class: app.tasks.data_collection.bybit_options_task.BybitOptionsSurfaceTask
+    schedule:
+      type: cron
+      cron: "*/15 * * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+    config:
+      base_coins: ["BTC", "ETH"]
+      collection_name: "bybit_options_surface"
+    tags: [data, options, bybit]
+
   deribit_dvol:
     enabled: true
     task_class: app.tasks.data_collection.deribit_dvol_task.DeribitDvolTask
@@ -149,7 +164,7 @@ tasks:
     tags: [data, funding, hyperliquid, exotic]
 
   hyperliquid_microstructure_1s:
-    enabled: false  # DISABLED: competes with MM engine for HL rate limit
+    enabled: true  # RE-ENABLED 2026-05-22 per Alberto: collecting L2 for V13 slippage modeling; retention removed from raw collections
     task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
     schedule:
       type: cron
@@ -159,8 +174,8 @@ tasks:
     retry_delay_seconds: 10
     timeout_seconds: 58
     config:
-      pairs: ["BTC-USDT", "ETH-USDT", "SOL-USDT", "HYPE-USDT", "ZEC-USDT"]
-      max_pairs: 5
+      pairs: ["BTC-USDT", "ETH-USDT", "SOL-USDT", "HYPE-USDT", "LINK-USDT", "BNB-USDT", "CRV-USDT", "ADA-USDT", "DOGE-USDT", "AVAX-USDT"]
+      max_pairs: 10
       restrict_to_bybit_pairs: false
       bybit_collection: "bybit_funding_rates"
       duration_seconds: 50
@@ -175,7 +190,7 @@ tasks:
 
   # MM target shitcoins — wide spreads, potential MM edge
   hyperliquid_microstructure_mm_targets:
-    enabled: false  # DISABLED: competes with MM engine for HL rate limit
+    enabled: false  # DISABLED May 9: MM deprioritized, copy trader uses WS not REST
     task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
     schedule:
       type: cron
@@ -185,8 +200,8 @@ tasks:
     retry_delay_seconds: 10
     timeout_seconds: 58
     config:
-      pairs: ["MEGA-USDT", "APE-USDT", "BIO-USDT", "ORDI-USDT", "DASH-USDT", "PENDLE-USDT", "AXS-USDT", "PNUT-USDT"]
-      max_pairs: 8
+      pairs: ["PNUT-USDT", "ORDI-USDT", "DASH-USDT", "AXS-USDT", "TON-USDT", "JTO-USDT", "DYDX-USDT", "NIL-USDT", "VVV-USDT", "FIL-USDT", "DOT-USDT", "ICP-USDT", "OP-USDT", "BIO-USDT", "AZTEC-USDT"]
+      max_pairs: 15
       restrict_to_bybit_pairs: false
       bybit_collection: "bybit_funding_rates"
       duration_seconds: 50
@@ -234,6 +249,22 @@ tasks:
       liquidation_limit: 24
       oi_limit: 24
     tags: [data, liquidations, oi, coinglass, exotic]
+
+  defillama:
+    enabled: true
+    task_class: app.tasks.data_collection.defillama_task.DefiLlamaTask
+    schedule:
+      type: cron
+      cron: "30 0 * * *"
+      timezone: UTC
+    max_retries: 2
+    retry_delay_seconds: 120
+    timeout_seconds: 120
+    config:
+      stable_collection: "defillama_stablecoins"
+      tvl_collection: "defillama_tvl"
+      backfill_days: 730
+    tags: [data, onchain, stablecoins, tvl, defillama, exotic]
 
   fear_greed:
     enabled: true
@@ -366,7 +397,26 @@ tasks:
       telegram_chat_id: "-1003576397888"
     tags: [screening, signals]
 
-  # ═══════ Layer 3b: Real-Time Breakout Monitor ═══════════
+  # ═══════ Layer 3b: X9 Funding Extreme Alerts (disabled — live executor handles X9 now) ════════════
+  funding_extreme_alert:
+    enabled: false
+    task_class: app.tasks.screening.funding_extreme_alert_task.FundingExtremeAlertTask
+    schedule:
+      type: cron
+      cron: "15 * * * *"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 120
+    config:
+      z_threshold: 1.5
+      streak_min: 2
+      oi_z_min: 0.0
+      z_window: 30
+      min_pf: 1.0
+      # Uses TELEGRAM_CHAT_ID env var (Alberto's DM). Trading bot not in quant group.
+    tags: [screening, alerts, x9]
+
+  # ═══════ Layer 3c: Real-Time Breakout Monitor ═══════════
   # DISABLED: E1 uses HB-native bot with WebSocket feeds
   breakout_monitor:
     enabled: false
@@ -944,7 +994,7 @@ tasks:
     config:
       engine: "X9"
       connector_name: "bybit_perpetual"
-      backtest_days: 1460
+      backtest_days: 365  # was 1460, reduced to match 1m data availability
       trade_cost: 0.000375
     tags: [backtesting, x9, exotic, weekly]
 
@@ -1100,10 +1150,10 @@ tasks:
     config:
       engine: "X14"
       connector_name: "bybit_perpetual"
-      total_days: 90
-      train_days: 60
-      test_days: 30
-      step_days: 15
+      total_days: 365
+      train_days: 240
+      test_days: 60
+      step_days: 30
       trade_cost: 0.000375
     tags: [backtesting, x14, crowd-fade, walk-forward, weekly]
 
@@ -1143,3 +1193,38 @@ tasks:
       trade_cost: 0.000375
       pairs: ["BTC-USDT"]
     tags: [backtesting, x16, vol-fear-fade, walk-forward]
+
+  x17_bulk_backtest:
+    enabled: false
+    task_class: app.tasks.backtesting.bulk_backtest_task.BulkBacktestTask
+    schedule:
+      type: cron
+      cron: "0 3 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X17"
+      connector_name: "bybit_perpetual"
+      backtest_days: 365
+      trade_cost: 0.000375
+    tags: [backtesting, x17, oi-flush-recovery]
+
+  x17_walk_forward:
+    enabled: false
+    task_class: app.tasks.backtesting.walk_forward_task.WalkForwardBacktestTask
+    schedule:
+      type: cron
+      cron: "0 5 * * 0"
+      timezone: UTC
+    max_retries: 1
+    timeout_seconds: 14400
+    config:
+      engine: "X17"
+      connector_name: "bybit_perpetual"
+      total_days: 365
+      train_days: 270
+      test_days: 90
+      step_days: 45
+      trade_cost: 0.000375
+    tags: [backtesting, x17, oi-flush-recovery, walk-forward]
