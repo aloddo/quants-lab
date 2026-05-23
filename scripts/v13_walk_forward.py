@@ -225,28 +225,50 @@ def advance_wallet_state(
 # ---------------------------------------------------------------------------
 
 def load_price_grid(coins: list[str], start: datetime, end: datetime, interval: str) -> pd.DataFrame:
-    """Pull candles at the requested interval, pivot wide. Falls back if requested
-    interval has no data for the window.
+    """Pull candles at the requested interval, pivot wide, forward-fill within
+    each coin to populate no-trade minutes.
 
-    interval: "1m" or "1h". When 1m data is unavailable for the window, the
-    caller should explicitly choose 1h via --price-interval and accept that
-    sub-hour cadences will be APPROXIMATED.
+    interval: "1m" (production; uses S3-reconstructed candles, filtered by
+    source="s3_reconstructed" to avoid mixing with stale API rows) or "1h"
+    (fallback; flags results as APPROXIMATED).
+
+    For 1m, we forward-fill within each coin's price series so the walk-
+    forward simulator always has a price at every minute, even if a given
+    coin had no fills in that minute. This matches HL's own UI behavior of
+    holding the last traded price until a new trade.
     """
     db = MongoClient("mongodb://localhost:27017")["quants_lab"]
     coll_name = "hyperliquid_candles" if interval == "1m" else "hyperliquid_candles_1h"
     c = db[coll_name]
     start_ms = int(start.timestamp() * 1000)
     end_ms = int((end + timedelta(days=1)).timestamp() * 1000)
-    docs = list(c.find(
-        {"coin": {"$in": list(coins)}, "interval": interval, "timestamp_utc": {"$gte": start_ms, "$lte": end_ms}},
-        {"coin": 1, "timestamp_utc": 1, "close": 1, "_id": 0},
-    ))
+    query = {
+        "coin": {"$in": list(coins)},
+        "interval": interval,
+        "timestamp_utc": {"$gte": start_ms, "$lte": end_ms},
+    }
+    if interval == "1m":
+        # Production 1m data MUST come from S3 reconstruction; never mix in
+        # stale API-backfilled 1m rows (which only cover ~5 days anyway).
+        query["source"] = "s3_reconstructed"
+    docs = list(c.find(query, {"coin": 1, "timestamp_utc": 1, "close": 1, "_id": 0}))
     if not docs:
         return pd.DataFrame()
     df = pd.DataFrame(docs)
     df["dt"] = pd.to_datetime(df["timestamp_utc"], unit="ms", utc=True)
     pivot = df.pivot_table(index="dt", columns="coin", values="close", aggfunc="last")
     pivot = pivot.sort_index()
+    if interval == "1m" and not pivot.empty:
+        # Reindex onto a complete 1-minute grid covering the window, then
+        # forward-fill within each coin so no-trade minutes carry forward
+        # the last-known price.
+        full_idx = pd.date_range(
+            start=pd.Timestamp(start, tz="UTC"),
+            end=pd.Timestamp(end + timedelta(days=1), tz="UTC"),
+            freq="1min",
+            inclusive="left",
+        )
+        pivot = pivot.reindex(full_idx).ffill()
     return pivot
 
 
@@ -1258,8 +1280,10 @@ def main():
     ap.add_argument("--fills-dir", default=None)
     ap.add_argument("--output", default=str(DEFAULT_OUTPUT))
     ap.add_argument("--ablation-output", default=str(ABLATION_OUTPUT))
-    ap.add_argument("--price-interval", choices=["1m", "1h"], default="1h",
-                    help="Price granularity. 1m validates spec cadences; 1h is APPROXIMATED.")
+    ap.add_argument("--price-interval", choices=["1m", "1h"], default="1m",
+                    help="Price granularity. 1m is the production default "
+                         "(S3-reconstructed; spec Section 5.7). 1h is a "
+                         "fallback that flags results as APPROXIMATED.")
     args = ap.parse_args()
     import sys
 

@@ -169,7 +169,10 @@ def main():
     ap.add_argument("--walk-forward-results", required=True)
     ap.add_argument("--wallet-metrics", required=False)
     ap.add_argument("--ablation-results", required=False)
-    ap.add_argument("--price-interval", default="1h", choices=["1m", "1h"])
+    ap.add_argument("--price-interval", default="1m", choices=["1m", "1h"],
+                    help="Production default is 1m (S3-reconstructed). 1h "
+                         "is a fallback that forces overall FAIL via the "
+                         "cadence-not-validated pending blocker.")
     ap.add_argument("--output", default=str(DEFAULT_OUTPUT))
     args = ap.parse_args()
 
