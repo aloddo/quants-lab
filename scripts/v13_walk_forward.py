@@ -767,6 +767,29 @@ def run_fold(
     # Propagate the deployment_blocked_by_near_liq flag (from train_metrics).
     deployment_blocked_by_near_liq = bool(train_metrics.get("deployment_blocked_by_near_liq", pd.Series([True])).any())
 
+    # Build the ablation context so caller can run the 9 ablations later.
+    # CRITICAL: minute_prices slice must include >= train_end so the simulator
+    # can capture anchor_prices at the anchor moment (compute_wallet_equity_at
+    # depends on this). Slicing to test_start..test_end would lose the anchor
+    # bar and zero out anchor_unrealized_fixed.
+    ctx = AblationContext(
+        fold_idx=fold_idx,
+        eligible_sorted=eligible_sorted,
+        all_eligible_wallets=all_eligible_wallets,
+        wallet_scores=wallet_scores,
+        wallet_streams=streams,
+        eq_at_train_end=eq_at_train_end,
+        minute_prices=daily_close_or_prices(train_end, test_end, minute_prices),
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
+        best_params=best_params,
+        random_p95_sharpe=float(np.percentile(random_sharpes, 95)) if random_sharpes else 0.0,
+        random_p95_pnl=float(np.percentile(random_pnls, 95)) if random_pnls else 0.0,
+        robust=robust,
+        fills=fills,
+    )
+
     return {
         "fold": fold_idx,
         "status": "ok",
@@ -794,8 +817,20 @@ def run_fold(
         "random_p95_pnl": float(np.percentile(random_pnls, 95)),
         "latest_fold_profitable": latest_fold_profitable,
         "deployment_blocked_by_near_liq": deployment_blocked_by_near_liq,
+        "fee_drag": 0.30,                # placeholder; per-fold fee drag from train_metrics post-MVP
+        "_ablation_context": ctx,
+        "_test_metrics": test_metrics,
         **robust,
     }
+
+
+def daily_close_or_prices(start, end, prices):
+    """Return prices subset to [start, end] for ablation use."""
+    if prices.empty:
+        return prices
+    idx = prices.index
+    mask = (idx >= pd.Timestamp(start, tz="UTC")) & (idx <= pd.Timestamp(end, tz="UTC"))
+    return prices.loc[mask]
 
 
 # ---------------------------------------------------------------------------
@@ -814,33 +849,394 @@ ABLATIONS = [
     "weighting_equal_vs_score",
 ]
 
+# Pass criteria per ablation:
+# - top_vs_random       : strategy Sharpe > random P95 Sharpe
+# - top_vs_beta         : strategy beats EVERY benchmark on net PnL %
+# - K_sensitivity       : worst K's Sharpe >= 0.7 * best K's Sharpe (robustness band)
+# - remove_top_1_5_10   : all 3 remove-top variants stay profitable (Sharpe > 0)
+# - latency_cadence     : worst poll's Sharpe >= 0.7 * best poll's Sharpe
+# - fees_multiplier     : 2x-fee Sharpe > 0 (survives doubled fees)
+# - slippage_multiplier : punitive-slippage Sharpe > 0
+# - consensus_off_soft  : best mode matches validation choice; off vs soft delta < 30%
+# - weighting           : equal vs score delta < 30%
+
+
+@dataclass
+class AblationContext:
+    fold_idx: int
+    eligible_sorted: pd.DataFrame
+    all_eligible_wallets: list
+    wallet_scores: dict
+    wallet_streams: dict
+    eq_at_train_end: dict
+    minute_prices: pd.DataFrame
+    train_end: datetime
+    test_start: datetime
+    test_end: datetime
+    best_params: BotParams
+    random_p95_sharpe: float
+    random_p95_pnl: float
+    robust: dict
+    fills: pd.DataFrame
+
+
+def _ablation_row(fold_idx, exp, variant, sharpe, pnl, status, note=""):
+    return {
+        "fold": fold_idx, "experiment": exp, "variant": variant,
+        "test_sharpe": float(sharpe), "test_net_pnl_pct": float(pnl),
+        "status": status, "note": note,
+    }
+
+
+def _simulate(ctx: AblationContext, selected: list, params: BotParams) -> dict:
+    for w in selected:
+        if w in ctx.wallet_streams:
+            ctx.wallet_streams[w].next_idx = 0
+    curve = simulate_replication(
+        selected, ctx.wallet_streams, ctx.wallet_scores, ctx.eq_at_train_end,
+        ctx.minute_prices, ctx.test_start, ctx.test_end, params,
+        anchor_dt=ctx.train_end,
+    )
+    return equity_curve_metrics(curve, params.starting_capital)
+
+
+def _benchmark_buy_hold_curve(coin: str, minute_prices: pd.DataFrame,
+                              test_start: datetime, test_end: datetime,
+                              starting_capital: float) -> dict:
+    """Compute buy-and-hold metrics for one coin over the test window.
+
+    Timestamps derived from prices.index AFTER dropna, ensuring equity values
+    line up with their actual bar timestamps (codex r23 #2 fix).
+    """
+    idx_full = minute_prices.index
+    idx_in = idx_full[(idx_full >= pd.Timestamp(test_start, tz="UTC")) & (idx_full <= pd.Timestamp(test_end, tz="UTC"))]
+    if len(idx_in) < 2 or coin not in minute_prices.columns:
+        return {"sharpe": 0.0, "net_return_pct": 0.0}
+    prices = minute_prices.loc[idx_in, coin].dropna()
+    if len(prices) < 2:
+        return {"sharpe": 0.0, "net_return_pct": 0.0}
+    equity = starting_capital * (prices / prices.iloc[0])
+    ts_ms = (prices.index.astype("int64") // 10**6).values
+    df = pd.DataFrame({"ts": ts_ms, "our_equity": equity.values})
+    return equity_curve_metrics(df, starting_capital)
+
+
+def _equal_weight_basket_curve(coins: list, minute_prices: pd.DataFrame,
+                               test_start: datetime, test_end: datetime,
+                               starting_capital: float) -> dict:
+    idx_full = minute_prices.index
+    idx_in = idx_full[(idx_full >= pd.Timestamp(test_start, tz="UTC")) & (idx_full <= pd.Timestamp(test_end, tz="UTC"))]
+    if len(idx_in) < 2:
+        return {"sharpe": 0.0, "net_return_pct": 0.0}
+    valid_coins = [c for c in coins if c in minute_prices.columns]
+    if not valid_coins:
+        return {"sharpe": 0.0, "net_return_pct": 0.0}
+    sub = minute_prices.loc[idx_in, valid_coins].dropna(axis=1, how="any")
+    if sub.empty:
+        return {"sharpe": 0.0, "net_return_pct": 0.0}
+    rel = sub / sub.iloc[0]
+    basket = rel.mean(axis=1)
+    equity = starting_capital * basket
+    ts_ms = (basket.index.astype("int64") // 10**6).values
+    df = pd.DataFrame({"ts": ts_ms, "our_equity": equity.values})
+    return equity_curve_metrics(df, starting_capital)
+
+
+def run_ablations_for_fold(ctx: AblationContext, test_metrics: dict) -> list[dict]:
+    """Execute all 9 ablations for one fold. Returns list of dict rows."""
+    rows = []
+    K = ctx.best_params.K
+
+    # ---- 1) top_vs_random ----
+    # Strategy must beat P95 of random portfolios on BOTH Sharpe AND net PnL.
+    strat_sh = float(test_metrics["sharpe"])
+    strat_pnl_local = float(test_metrics["net_return_pct"])
+    p95_sh = float(ctx.random_p95_sharpe)
+    p95_pnl = float(ctx.random_p95_pnl)
+    sharpe_pass = strat_sh > p95_sh
+    pnl_pass = strat_pnl_local > p95_pnl
+    rows.append(_ablation_row(ctx.fold_idx, "top_vs_random", "sharpe_vs_p95",
+                              strat_sh, strat_pnl_local,
+                              "pass" if sharpe_pass else "fail",
+                              f"strat_sh={strat_sh:.2f} vs p95_sh={p95_sh:.2f}"))
+    rows.append(_ablation_row(ctx.fold_idx, "top_vs_random", "pnl_vs_p95",
+                              strat_sh, strat_pnl_local,
+                              "pass" if pnl_pass else "fail",
+                              f"strat_pnl={strat_pnl_local:.2f}% vs p95_pnl={p95_pnl:.2f}%"))
+    rows.append(_ablation_row(ctx.fold_idx, "top_vs_random", "both_gates",
+                              strat_sh, strat_pnl_local,
+                              "pass" if (sharpe_pass and pnl_pass) else "fail",
+                              "both Sharpe + PnL must beat P95"))
+
+    # ---- 2) top_vs_beta (vs 4 benchmarks present in 1h cache) ----
+    benchmarks = {
+        "BTC": _benchmark_buy_hold_curve("BTC", ctx.minute_prices, ctx.test_start, ctx.test_end, ctx.best_params.starting_capital),
+        "ETH": _benchmark_buy_hold_curve("ETH", ctx.minute_prices, ctx.test_start, ctx.test_end, ctx.best_params.starting_capital),
+        "HYPE": _benchmark_buy_hold_curve("HYPE", ctx.minute_prices, ctx.test_start, ctx.test_end, ctx.best_params.starting_capital),
+    }
+    perp_index = _equal_weight_basket_curve(list(ctx.minute_prices.columns),
+                                            ctx.minute_prices, ctx.test_start, ctx.test_end,
+                                            ctx.best_params.starting_capital)
+    benchmarks["HL_INDEX"] = perp_index
+    alt_basket = _equal_weight_basket_curve(
+        [c for c in ctx.minute_prices.columns if c not in ("BTC", "ETH")],
+        ctx.minute_prices, ctx.test_start, ctx.test_end, ctx.best_params.starting_capital,
+    )
+    benchmarks["ALT_BASKET"] = alt_basket
+
+    strat_pnl = float(test_metrics["net_return_pct"])
+    beats_all = True
+    for name, m in benchmarks.items():
+        beat = strat_pnl > float(m["net_return_pct"])
+        rows.append(_ablation_row(ctx.fold_idx, "top_vs_beta", f"vs_{name}",
+                                  strat_sh, strat_pnl,
+                                  "pass" if beat else "fail",
+                                  f"strat_pnl={strat_pnl:.2f}% vs bench_pnl={m['net_return_pct']:.2f}%"))
+        if not beat:
+            beats_all = False
+    rows.append(_ablation_row(ctx.fold_idx, "top_vs_beta", "all_benchmarks",
+                              strat_sh, strat_pnl,
+                              "pass" if beats_all else "fail",
+                              "strategy beat all benchmarks" if beats_all else "strategy did NOT beat all"))
+
+    # ---- 3) K_sensitivity ----
+    sharpes_by_K = {}
+    for K_var in [5, 10, 25, 50, 100]:
+        if K_var > len(ctx.all_eligible_wallets):
+            continue
+        sel = ctx.eligible_sorted.head(K_var)["wallet"].tolist()
+        p = BotParams(
+            K=K_var, per_coin_cap=ctx.best_params.per_coin_cap, gross_cap=ctx.best_params.gross_cap,
+            cooldown_seconds=ctx.best_params.cooldown_seconds, poll_minutes=ctx.best_params.poll_minutes,
+            weighting=ctx.best_params.weighting, consensus=ctx.best_params.consensus,
+        )
+        m = _simulate(ctx, sel, p)
+        sharpes_by_K[K_var] = m["sharpe"]
+        rows.append(_ablation_row(ctx.fold_idx, "K_sensitivity", f"K={K_var}",
+                                  m["sharpe"], m["net_return_pct"], "pass",
+                                  ""))
+    if sharpes_by_K:
+        worst = min(sharpes_by_K.values())
+        best = max(sharpes_by_K.values())
+        # Robustness criterion (spec): worst >= 0.7 * best. No additional "best > 0" gate.
+        # Handle zero/negative best safely: if best <= 0, treat as not-robust FAIL.
+        if best <= 0:
+            criterion_met = False
+        else:
+            criterion_met = worst >= 0.7 * best
+        rows.append(_ablation_row(ctx.fold_idx, "K_sensitivity", "best_vs_worst",
+                                  best, worst,
+                                  "pass" if criterion_met else "fail",
+                                  f"best_K_sh={best:.2f}, worst_K_sh={worst:.2f}"))
+
+    # ---- 4) remove_top_1_5_10 (already computed in run_fold) ----
+    all_pos = True
+    for k in [1, 5, 10]:
+        col = f"remove_top{k}_sharpe"
+        val = ctx.robust.get(col)
+        if val is None:
+            rows.append(_ablation_row(ctx.fold_idx, "remove_top_1_5_10", f"k={k}",
+                                      0.0, 0.0, "fail", "missing data"))
+            all_pos = False
+            continue
+        rows.append(_ablation_row(ctx.fold_idx, "remove_top_1_5_10", f"k={k}",
+                                  float(val), 0.0,
+                                  "pass" if float(val) > 0 else "fail",
+                                  f"sharpe_after_remove={float(val):.2f}"))
+        if float(val) <= 0:
+            all_pos = False
+    rows.append(_ablation_row(ctx.fold_idx, "remove_top_1_5_10", "all_3",
+                              0.0, 0.0,
+                              "pass" if all_pos else "fail",
+                              "all 3 remove variants stay profitable" if all_pos else "concentration risk"))
+
+    # ---- 5) latency_cadence ----
+    sharpes_by_poll = {}
+    selected = ctx.eligible_sorted.head(K)["wallet"].tolist()
+    for poll in [1, 5, 10]:
+        p = BotParams(
+            K=K, per_coin_cap=ctx.best_params.per_coin_cap, gross_cap=ctx.best_params.gross_cap,
+            cooldown_seconds=ctx.best_params.cooldown_seconds, poll_minutes=poll,
+            weighting=ctx.best_params.weighting, consensus=ctx.best_params.consensus,
+        )
+        m = _simulate(ctx, selected, p)
+        sharpes_by_poll[poll] = m["sharpe"]
+        rows.append(_ablation_row(ctx.fold_idx, "latency_cadence", f"poll={poll}m",
+                                  m["sharpe"], m["net_return_pct"], "pass", ""))
+    if sharpes_by_poll:
+        best_poll_sh = max(sharpes_by_poll.values())
+        worst_poll_sh = min(sharpes_by_poll.values())
+        if best_poll_sh <= 0:
+            criterion_met = False
+        else:
+            criterion_met = worst_poll_sh >= 0.7 * best_poll_sh
+        rows.append(_ablation_row(ctx.fold_idx, "latency_cadence", "best_vs_worst",
+                                  best_poll_sh, worst_poll_sh,
+                                  "pass" if criterion_met else "fail",
+                                  f"best={best_poll_sh:.2f} worst={worst_poll_sh:.2f}"))
+
+    # ---- 6) fees_multiplier ----
+    survives_2x = False
+    sh_2x = 0.0
+    for mult in [1.0, 1.5, 2.0]:
+        p = BotParams(
+            K=K, per_coin_cap=ctx.best_params.per_coin_cap, gross_cap=ctx.best_params.gross_cap,
+            cooldown_seconds=ctx.best_params.cooldown_seconds, poll_minutes=ctx.best_params.poll_minutes,
+            weighting=ctx.best_params.weighting, consensus=ctx.best_params.consensus,
+            fee_bps_per_side=HL_FEE_BPS_PER_SIDE * mult,
+        )
+        m = _simulate(ctx, selected, p)
+        if mult == 2.0:
+            survives_2x = m["sharpe"] > 0
+            sh_2x = m["sharpe"]
+        rows.append(_ablation_row(ctx.fold_idx, "fees_multiplier", f"x{mult}",
+                                  m["sharpe"], m["net_return_pct"],
+                                  "pass" if (mult < 2.0 or m["sharpe"] > 0) else "fail",
+                                  ""))
+    rows.append(_ablation_row(ctx.fold_idx, "fees_multiplier", "x2_summary",
+                              sh_2x, 0.0,
+                              "pass" if survives_2x else "fail",
+                              f"sh_at_2x_fees={sh_2x:.2f}"))
+
+    # ---- 7) slippage_multiplier ----
+    survives_punitive = False
+    sh_punitive = 0.0
+    for slip in [0.0, 5.0, 15.0]:
+        p = BotParams(
+            K=K, per_coin_cap=ctx.best_params.per_coin_cap, gross_cap=ctx.best_params.gross_cap,
+            cooldown_seconds=ctx.best_params.cooldown_seconds, poll_minutes=ctx.best_params.poll_minutes,
+            weighting=ctx.best_params.weighting, consensus=ctx.best_params.consensus,
+            slippage_bps=slip,
+        )
+        m = _simulate(ctx, selected, p)
+        if slip == 15.0:
+            survives_punitive = m["sharpe"] > 0
+            sh_punitive = m["sharpe"]
+        rows.append(_ablation_row(ctx.fold_idx, "slippage_multiplier", f"slip={slip}bps",
+                                  m["sharpe"], m["net_return_pct"],
+                                  "pass" if (slip < 15.0 or m["sharpe"] > 0) else "fail",
+                                  ""))
+    rows.append(_ablation_row(ctx.fold_idx, "slippage_multiplier", "punitive_summary",
+                              sh_punitive, 0.0,
+                              "pass" if survives_punitive else "fail",
+                              f"sh_at_15bps_slippage={sh_punitive:.2f}"))
+
+    # ---- 8) consensus_off_soft_hard40 ----
+    sh_by_cons = {}
+    for cons in ["off", "soft", "hard40"]:
+        p = BotParams(
+            K=K, per_coin_cap=ctx.best_params.per_coin_cap, gross_cap=ctx.best_params.gross_cap,
+            cooldown_seconds=ctx.best_params.cooldown_seconds, poll_minutes=ctx.best_params.poll_minutes,
+            weighting=ctx.best_params.weighting, consensus=cons,
+        )
+        m = _simulate(ctx, selected, p)
+        sh_by_cons[cons] = m["sharpe"]
+        rows.append(_ablation_row(ctx.fold_idx, "consensus_off_soft_hard40", cons,
+                                  m["sharpe"], m["net_return_pct"], "pass", ""))
+    if sh_by_cons:
+        best_cons = max(sh_by_cons, key=sh_by_cons.get)
+        # Two-part criterion: best mode matches val choice AND modes are
+        # within 30% of each other (i.e., robust to consensus choice).
+        best_sh = sh_by_cons[best_cons]
+        worst_sh = min(sh_by_cons.values())
+        within_30pct = (best_sh > 0 and worst_sh >= 0.7 * best_sh)
+        rows.append(_ablation_row(ctx.fold_idx, "consensus_off_soft_hard40", "best_matches_val",
+                                  best_sh, 0.0,
+                                  "pass" if best_cons == ctx.best_params.consensus else "fail",
+                                  f"best_mode={best_cons}, val_chose={ctx.best_params.consensus}"))
+        rows.append(_ablation_row(ctx.fold_idx, "consensus_off_soft_hard40", "delta_under_30pct",
+                                  best_sh, worst_sh,
+                                  "pass" if within_30pct else "fail",
+                                  f"best={best_sh:.2f}, worst={worst_sh:.2f}"))
+
+    # ---- 9) weighting_equal_vs_score ----
+    sh_by_w = {}
+    for w in ["equal", "score"]:
+        p = BotParams(
+            K=K, per_coin_cap=ctx.best_params.per_coin_cap, gross_cap=ctx.best_params.gross_cap,
+            cooldown_seconds=ctx.best_params.cooldown_seconds, poll_minutes=ctx.best_params.poll_minutes,
+            weighting=w, consensus=ctx.best_params.consensus,
+        )
+        m = _simulate(ctx, selected, p)
+        sh_by_w[w] = m["sharpe"]
+        rows.append(_ablation_row(ctx.fold_idx, "weighting_equal_vs_score", w,
+                                  m["sharpe"], m["net_return_pct"], "pass", ""))
+    if sh_by_w:
+        best_w = max(sh_by_w, key=sh_by_w.get)
+        best_sh = sh_by_w[best_w]
+        worst_sh = min(sh_by_w.values())
+        within_30pct = (best_sh > 0 and worst_sh >= 0.7 * best_sh)
+        rows.append(_ablation_row(ctx.fold_idx, "weighting_equal_vs_score", "best_matches_val",
+                                  best_sh, 0.0,
+                                  "pass" if best_w == ctx.best_params.weighting else "fail",
+                                  f"best={best_w}, val={ctx.best_params.weighting}"))
+        rows.append(_ablation_row(ctx.fold_idx, "weighting_equal_vs_score", "delta_under_30pct",
+                                  best_sh, worst_sh,
+                                  "pass" if within_30pct else "fail",
+                                  f"best={best_sh:.2f}, worst={worst_sh:.2f}"))
+
+    return rows
+
+
+_ABLATION_SCHEMA = ["fold", "experiment", "variant", "test_sharpe",
+                    "test_net_pnl_pct", "status", "note"]
+
+
+def _empty_ablation_df() -> pd.DataFrame:
+    """Return an empty DataFrame with the canonical ablation schema."""
+    return pd.DataFrame({col: pd.Series(dtype=object) for col in _ABLATION_SCHEMA})
+
 
 def run_ablations(
     fold_results: pd.DataFrame,
     fills: pd.DataFrame, equity: pd.DataFrame, minute_prices: pd.DataFrame,
+    fold_contexts: dict | None = None,
+    fold_test_metrics: dict | None = None,
 ) -> pd.DataFrame:
-    """For each successful fold, run the 9 ablation experiments.
+    """Run 9 ablations per successful fold. Emits "not_implemented" rows for
+    failed folds so script 5 can detect missing data.
 
-    v2 v1: stubs the ablation runners with a placeholder per Section 6.7. The
-    full implementation is per-experiment; for the first end-to-end run we
-    emit one row per (fold, experiment) with a `status="not_implemented"`
-    marker that script 5 (report) consumes to force PASS/FAIL.
+    Always returns a DataFrame with the canonical _ABLATION_SCHEMA, even when
+    there are zero rows -- so downstream consumers can dedupe / iterate
+    without column-presence checks.
     """
-    out_rows = []
-    # Emit ablation rows for EVERY fold (including failed ones) so script 5
-    # can deterministically detect missing ablation runs and force FAIL.
-    fold_indices = fold_results["fold"].tolist() if not fold_results.empty else [-1]
-    if not fold_indices:
-        fold_indices = [-1]
-    for fi in fold_indices:
-        for exp in ABLATIONS:
-            out_rows.append({
-                "fold": fi,
-                "experiment": exp,
-                "status": "not_implemented",
-                "note": "v1 ablation harness placeholder; full implementation pending",
-            })
-    return pd.DataFrame(out_rows)
+    fold_contexts = fold_contexts or {}
+    fold_test_metrics = fold_test_metrics or {}
+    out_rows: list[dict] = []
+    if fold_results.empty:
+        return _empty_ablation_df()
+    for _, fold_row in fold_results.iterrows():
+        fi = int(fold_row["fold"])
+        if fold_row.get("status") != "ok":
+            for exp in ABLATIONS:
+                out_rows.append({
+                    "fold": fi, "experiment": exp, "variant": "n/a",
+                    "test_sharpe": 0.0, "test_net_pnl_pct": 0.0,
+                    "status": "not_implemented",
+                    "note": f"fold_status={fold_row.get('status')}",
+                })
+            continue
+        if fi not in fold_contexts:
+            for exp in ABLATIONS:
+                out_rows.append({
+                    "fold": fi, "experiment": exp, "variant": "n/a",
+                    "test_sharpe": 0.0, "test_net_pnl_pct": 0.0,
+                    "status": "not_implemented",
+                    "note": "fold context not captured",
+                })
+            continue
+        ctx = fold_contexts[fi]
+        tm = fold_test_metrics.get(fi, {"sharpe": 0.0, "net_return_pct": 0.0})
+        rows = run_ablations_for_fold(ctx, tm)
+        out_rows.extend(rows)
+    if not out_rows:
+        return _empty_ablation_df()
+    df = pd.DataFrame(out_rows)
+    # Ensure all canonical columns present.
+    for col in _ABLATION_SCHEMA:
+        if col not in df.columns:
+            df[col] = None
+    return df[_ABLATION_SCHEMA]
 
 
 # ---------------------------------------------------------------------------
@@ -921,11 +1317,21 @@ def main():
     logger.info(f"Folds enumerated: {len(folds)}")
 
     results = []
+    fold_contexts: dict = {}
+    fold_test_metrics: dict = {}
     for (fi, ts, te, vs, ve, tts, tte) in folds:
         logger.info(f"Fold {fi}: train {ts.date()}..{te.date()} val {vs.date()}..{ve.date()} test {tts.date()}..{tte.date()}")
         r = run_fold(fi, ts, te, vs, ve, tts, tte,
                      fills, journeys, equity, minute_prices,
                      n_random=args.random_portfolios, K_choices=K_choices)
+        # Capture context + test_metrics for ablations BEFORE stripping from
+        # the dict that goes to parquet.
+        if r.get("status") == "ok":
+            fold_contexts[fi] = r.pop("_ablation_context")
+            fold_test_metrics[fi] = r.pop("_test_metrics")
+        else:
+            r.pop("_ablation_context", None)
+            r.pop("_test_metrics", None)
         results.append(r)
         logger.info(f"  -> status={r.get('status')} test_sharpe={r.get('test_sharpe', 'NA')} rank_sharpe={r.get('random_sharpe_pct_rank', 'NA')} rank_pnl={r.get('random_pnl_pct_rank', 'NA')}")
 
@@ -935,12 +1341,19 @@ def main():
     df.to_parquet(out_path, index=False, compression="snappy")
     logger.info(f"Wrote {len(df)} fold results to {out_path}")
 
-    # 6.7 ablation suite (placeholder rows for v1; full per-experiment runs
-    # are the next iteration's work).
-    abl = run_ablations(df, fills, equity, minute_prices)
+    # 6.7 ablation suite (9 experiments, real implementations).
+    logger.info(f"Running 9 ablations across {len(fold_contexts)} successful folds...")
+    abl = run_ablations(df, fills, equity, minute_prices,
+                        fold_contexts=fold_contexts,
+                        fold_test_metrics=fold_test_metrics)
     abl_path = Path(args.ablation_output)
     abl.to_parquet(abl_path, index=False, compression="snappy")
     logger.info(f"Wrote {len(abl)} ablation rows to {abl_path}")
+    if not abl.empty:
+        pass_n = int((abl["status"] == "pass").sum())
+        fail_n = int((abl["status"] == "fail").sum())
+        ni_n = int((abl["status"] == "not_implemented").sum())
+        logger.info(f"Ablation summary: {pass_n} pass, {fail_n} fail, {ni_n} not_implemented")
 
 
 if __name__ == "__main__":
