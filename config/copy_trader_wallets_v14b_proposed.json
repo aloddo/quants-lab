@@ -1,0 +1,206 @@
+{
+  "global": {
+    "max_margin_util": 0.95,
+    "max_daily_loss": -15.0,
+    "order_size_usd": 11.0,
+    "max_leverage_cap": 10,
+    "cooldown_s": 30,
+    "exit_poll_s": 10,
+    "exit_min_trim_pct": 0.05,
+    "exit_min_trim_usd": 3.0,
+    "max_chase_bps": 15,
+    "max_spread_bps": 20,
+    "min_book_depth_usd": 3000
+  },
+  "defaults": {
+    "group": "v14b_top25",
+    "entry_mode": "twap",
+    "twap_window_s": 120,
+    "min_twap_notional": 100,
+    "max_addon_multiplier": 15,
+    "max_coin_concentration": 0.3,
+    "exit_type": "FIRST_CLOSE",
+    "sl_bps": -500,
+    "trail_activate_bps": 100,
+    "trail_bps": 200,
+    "max_hold_s": 604800,
+    "exit_twap_min_notional": 200
+  },
+  "wallets": {
+    "0x8a5cd8bd74ab3f205ddcb3b73b2f66deadc6827f": {
+      "group": "v14b_top25",
+      "v14b_score": 0.34665189872780894,
+      "v14b_train_win_rate": 0.8063660477453581,
+      "v14b_train_median_pct": 0.4298939665144209,
+      "v14b_train_n_journeys": 1131
+    },
+    "0x5d8265f9f86d0b354d24ce76146aa7b6054001f8": {
+      "group": "v14b_top25",
+      "v14b_score": 0.30782724895902397,
+      "v14b_train_win_rate": 0.8946171341925702,
+      "v14b_train_median_pct": 0.34408825540419713,
+      "v14b_train_n_journeys": 1319
+    },
+    "0xdea4faa3394bd40f32527d12df4bf04135fa5eee": {
+      "group": "v14b_top25",
+      "v14b_score": 0.2580354973777098,
+      "v14b_train_win_rate": 0.7637795275590551,
+      "v14b_train_median_pct": 0.33784029038112523,
+      "v14b_train_n_journeys": 127
+    },
+    "0xe49a765141e447864cd0f211811b93aac7d94901": {
+      "group": "v14b_top25",
+      "v14b_score": 0.2061112809934549,
+      "v14b_train_win_rate": 0.8169934640522876,
+      "v14b_train_median_pct": 0.2522802079359888,
+      "v14b_train_n_journeys": 153
+    },
+    "0x8dc34ec570b92888f77adc3edfe74c8e987fb655": {
+      "group": "v14b_top25",
+      "v14b_score": 0.18510389469440028,
+      "v14b_train_win_rate": 0.8887043189368771,
+      "v14b_train_median_pct": 0.20828513010472705,
+      "v14b_train_n_journeys": 602
+    },
+    "0xb6f909021c659738c415127cd3fd54783726906c": {
+      "group": "v14b_top25",
+      "v14b_score": 0.17721463001210613,
+      "v14b_train_win_rate": 0.6082004555808656,
+      "v14b_train_median_pct": 0.2913753654506165,
+      "v14b_train_n_journeys": 439
+    },
+    "0x00f8e1501fc14d78e1a562170898739884ed3833": {
+      "group": "v14b_top25",
+      "v14b_score": 0.1748253139392196,
+      "v14b_train_win_rate": 0.8261964735516373,
+      "v14b_train_median_pct": 0.2116025903471652,
+      "v14b_train_n_journeys": 397
+    },
+    "0xf2b359f73ab1818d2221b48e4221a05d131d812c": {
+      "group": "v14b_top25",
+      "v14b_score": 0.15406050158483012,
+      "v14b_train_win_rate": 0.7602179836512262,
+      "v14b_train_median_pct": 0.20265306122448978,
+      "v14b_train_n_journeys": 1101
+    },
+    "0x9b745bea23ab438b0b3b9527ad7ab637b52cfcb1": {
+      "group": "v14b_top25",
+      "v14b_score": 0.15260523800996637,
+      "v14b_train_win_rate": 0.5722855428914218,
+      "v14b_train_median_pct": 0.26665925761280285,
+      "v14b_train_n_journeys": 1667
+    },
+    "0x9d1792626cc8bfb29acc7e5e7a2f706bb6ada290": {
+      "group": "v14b_top25",
+      "v14b_score": 0.13478728546623736,
+      "v14b_train_win_rate": 0.7259552042160737,
+      "v14b_train_median_pct": 0.18566887417218542,
+      "v14b_train_n_journeys": 1518
+    },
+    "0x44a7bdb5188ec6c7dc83e739522d1569ba1d59c9": {
+      "group": "v14b_top25",
+      "v14b_score": 0.1311223773178187,
+      "v14b_train_win_rate": 0.6898395721925134,
+      "v14b_train_median_pct": 0.19007662448396975,
+      "v14b_train_n_journeys": 187
+    },
+    "0x6d7823cd5c3d9dcd63e6a8021b475e0c7c94b291": {
+      "group": "v14b_top25",
+      "v14b_score": 0.12322714994679458,
+      "v14b_train_win_rate": 0.7364644487932159,
+      "v14b_train_median_pct": 0.16732260484361036,
+      "v14b_train_n_journeys": 1533
+    },
+    "0x05a42708e46733da056d09e0a355bfd2c3054eba": {
+      "group": "v14b_top25",
+      "v14b_score": 0.11341486277709306,
+      "v14b_train_win_rate": 0.8090909090909091,
+      "v14b_train_median_pct": 0.14017567309528356,
+      "v14b_train_n_journeys": 110
+    },
+    "0xbbe9e1588a359337c3235de3b808da991cfc2efe": {
+      "group": "v14b_top25",
+      "v14b_score": 0.11135636847915419,
+      "v14b_train_win_rate": 0.6820276497695853,
+      "v14b_train_median_pct": 0.16327251324308417,
+      "v14b_train_n_journeys": 217
+    },
+    "0x9c9e1e712a0cf7147ab8472e2d8948f89e94bec8": {
+      "group": "v14b_top25",
+      "v14b_score": 0.10312535509808947,
+      "v14b_train_win_rate": 0.7795275590551181,
+      "v14b_train_median_pct": 0.13229212219653902,
+      "v14b_train_n_journeys": 127
+    },
+    "0x577ae91c7b74f04ddb3a5b399ded8318e9895fd2": {
+      "group": "v14b_top25",
+      "v14b_score": 0.0974963955124386,
+      "v14b_train_win_rate": 0.8422256097560976,
+      "v14b_train_median_pct": 0.11576042616499496,
+      "v14b_train_n_journeys": 1312
+    },
+    "0x115849ce84370f25cadcf0d348510d73837e1aa5": {
+      "group": "v14b_top25",
+      "v14b_score": 0.09662587686016985,
+      "v14b_train_win_rate": 0.7821297429620563,
+      "v14b_train_median_pct": 0.12354200531261153,
+      "v14b_train_n_journeys": 817
+    },
+    "0xf99a2f2d38384f00245f17024c8a9a7af7ef7f08": {
+      "group": "v14b_top25",
+      "v14b_score": 0.09656498859419821,
+      "v14b_train_win_rate": 0.7743589743589744,
+      "v14b_train_median_pct": 0.12470313096601755,
+      "v14b_train_n_journeys": 195
+    },
+    "0x65aee08c9235025355ac6c5ad020fb167ecef4fe": {
+      "group": "v14b_top25",
+      "v14b_score": 0.08241118900729491,
+      "v14b_train_win_rate": 0.869684499314129,
+      "v14b_train_median_pct": 0.09475986874813563,
+      "v14b_train_n_journeys": 729
+    },
+    "0x852f3ca4119cb466996a80f75227c65a90ed08f4": {
+      "group": "v14b_top25",
+      "v14b_score": 0.07719585990947711,
+      "v14b_train_win_rate": 0.6696428571428571,
+      "v14b_train_median_pct": 0.1152791507981525,
+      "v14b_train_n_journeys": 112
+    },
+    "0x2eb4e287f1cf4801ca3768104fc6253c626b3401": {
+      "group": "v14b_top25",
+      "v14b_score": 0.0728262406333946,
+      "v14b_train_win_rate": 0.7727272727272727,
+      "v14b_train_median_pct": 0.0942457231726283,
+      "v14b_train_n_journeys": 220
+    },
+    "0x43a5d46352272f67e7b071984f9ff5ab25ba4429": {
+      "group": "v14b_top25",
+      "v14b_score": 0.07120228942620035,
+      "v14b_train_win_rate": 0.7054794520547946,
+      "v14b_train_median_pct": 0.1009275170507306,
+      "v14b_train_n_journeys": 730
+    },
+    "0x82d7ebbd8106b08e91f8ac9f4ca97fbd98125c29": {
+      "group": "v14b_top25",
+      "v14b_score": 0.06790607152668544,
+      "v14b_train_win_rate": 0.8629032258064516,
+      "v14b_train_median_pct": 0.07869488662905602,
+      "v14b_train_n_journeys": 372
+    },
+    "0x31115e093856fcd2d0dbc774fd646b159bcb2127": {
+      "group": "v14b_top25",
+      "v14b_score": 0.06359127811025722,
+      "v14b_train_win_rate": 0.6905829596412556,
+      "v14b_train_median_pct": 0.09208347414667117,
+      "v14b_train_n_journeys": 223
+    },
+    "0x2837c128734ade71c55085cbe556699f064ea4a4": {
+      "group": "v14b_top25",
+      "v14b_score": 0.06062660911939498,
+      "v14b_train_win_rate": 0.8224043715846995,
+      "v14b_train_median_pct": 0.07371873401228758,
+      "v14b_train_n_journeys": 366
+    }
+  }
+}
