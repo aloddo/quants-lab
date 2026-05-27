@@ -576,11 +576,8 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
             # BTC regime filter disabled (Phase 0 shows edge in both directions)
             "btc_regime_enabled": False,
         },
-        pair_source="explicit",
-        pair_allowlist=[
-            "ADA-USDT", "BNB-USDT", "DOGE-USDT", "DOT-USDT",
-            "LINK-USDT", "NEAR-USDT", "XRP-USDT",
-        ],
+        pair_source="pair_historical",
+        pair_allowlist=[],
         total_amount_quote=300.0,
         cooldown_time=28800,  # 8h cooldown (1 funding interval — prevents re-entry churn)
     ),
@@ -678,6 +675,7 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         controller_file="x12_hl_price_lead.py",
         hb_connector="bybit_perpetual_testnet",
         deployment_mode="hb_native",
+        bot_image="quants-lab/hummingbot:demo-client-v2",  # pymongo + FARTCOIN/HYPE rate limiter
         default_config={
             "z_threshold": 1.5,
             "z_window": 24,
@@ -810,6 +808,48 @@ STRATEGY_REGISTRY: Dict[str, StrategyMetadata] = {
         pair_source="manual",  # BTC-USDT only
         total_amount_quote=600.0,  # 2x normal (high conviction, BTC-only)
         cooldown_time=86400,  # 24h cooldown (1 trade per day max)
+    ),
+    "X17": StrategyMetadata(
+        name="X17",
+        display_name="OI Flush Recovery",
+        controller_module="app.controllers.directional_trading.x17_oi_flush_recovery",
+        config_class_name="X17OiFlushRecoveryConfig",
+        intervals=["1h"],
+        backtesting_resolution="1m",
+        exit_params={
+            "time_limit": 86400,  # 24h
+        },
+        trailing_stop=None,
+        direction="LONG",  # LONG-only (buy the flush)
+        blocked_pairs=[
+            "XRP-USDT", "DOT-USDT", "SUI-USDT", "DOGE-USDT",  # negative t-stats
+        ],
+        required_features=["derivatives"],  # needs oi_value + funding_rate merged
+        max_concurrent=3,
+        controller_file="x17_oi_flush_recovery.py",
+        hb_connector="bybit_perpetual_testnet",
+        deployment_mode="hb_native",
+        bot_image="quants-lab/hummingbot:demo-client-x14",
+        default_config={
+            "oi_lookback": 24,
+            "oi_drop_threshold": -0.03,
+            "use_oi_zscore": True,
+            "oi_z_threshold": -1.5,
+            "oi_z_window": 168,
+            "funding_z_min": 0.0,
+            "funding_z_window": 30,
+            "funding_z_min_periods": 15,
+            "anti_signal_z": -1.0,
+            "atr_period": 14,
+            "tp_atr_mult": 2.0,
+            "sl_atr_mult": 3.0,
+            "trailing_act_atr_mult": 1.0,
+            "trailing_delta_atr_mult": 0.5,
+            "time_limit_seconds": 172800,
+        },
+        pair_source="pair_historical",
+        total_amount_quote=300.0,
+        cooldown_time=86400,  # 24h cooldown (flush events are infrequent)
     ),
 }
 

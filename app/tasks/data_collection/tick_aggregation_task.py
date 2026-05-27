@@ -48,6 +48,13 @@ from core.tasks import BaseTask, TaskContext
 logger = logging.getLogger(__name__)
 
 
+def _utc_naive(dt: datetime) -> datetime:
+    """Mongo stores datetimes as naive UTC; normalize before comparisons/upserts."""
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 # Source collection → (stats collection, spread field configs)
 # Each config: (src_field_a, src_field_b, best_field)
 # field_a = "hl premium" direction, field_b = "bb premium" direction
@@ -153,7 +160,7 @@ class TickAggregationTask(BaseTask):
     async def execute(self, context: TaskContext):
         client = MongoClient(self.mongo_uri)
         db = client[self.mongo_db]
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
         cutoff = now - timedelta(days=self.lookback_days)
 
         total_stats = 0
@@ -175,7 +182,7 @@ class TickAggregationTask(BaseTask):
             # Find the latest aggregated timestamp to avoid re-processing
             latest_agg = stats_coll.find_one(sort=[("timestamp", -1)])
             if latest_agg and latest_agg.get("timestamp"):
-                agg_cutoff = latest_agg["timestamp"] - timedelta(minutes=5)  # Small overlap
+                agg_cutoff = _utc_naive(latest_agg["timestamp"]) - timedelta(minutes=5)
             else:
                 agg_cutoff = cutoff
 
@@ -200,9 +207,7 @@ class TickAggregationTask(BaseTask):
 
                 total_processed += len(docs)
                 df = pd.DataFrame(docs)
-                df["_ts"] = pd.to_datetime(df[cfg["ts_field"]])
-                if df["_ts"].dt.tz is None:
-                    df["_ts"] = df["_ts"].dt.tz_localize("UTC")
+                df["_ts"] = pd.to_datetime(df[cfg["ts_field"]], utc=True)
                 df["_minute"] = df["_ts"].dt.floor("min")
 
                 for minute, group in df.groupby("_minute"):
@@ -210,7 +215,7 @@ class TickAggregationTask(BaseTask):
                     if stats is None:
                         continue
                     stats_docs.append({
-                        "timestamp": minute.to_pydatetime(),
+                        "timestamp": _utc_naive(minute.to_pydatetime()),
                         "pair": pair_val,
                         **stats,
                     })

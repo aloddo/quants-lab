@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 class X9FundingCrowdingConfig(DirectionalTradingControllerConfigBase):
     """Config for X9 Funding Crowding Reversion strategy."""
+    model_config = {"extra": "ignore"}  # Ignore injected env vars (coinalyze_api_key etc.)
     controller_name: str = "x9_funding_crowding"
 
     # ── Signal params ──────────────────────────────────────

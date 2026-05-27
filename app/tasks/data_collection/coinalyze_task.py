@@ -83,6 +83,7 @@ class CoinalyzeTask(NotifyingTaskMixin, BaseTask):
         resolution: str,
         from_ts: int,
         to_ts: int,
+        _retry_count: int = 0,
     ) -> List[Dict]:
         """Fetch one batch from Coinalyze API."""
         symbols_str = ",".join(symbols)
@@ -95,10 +96,24 @@ class CoinalyzeTask(NotifyingTaskMixin, BaseTask):
         )
         async with session.get(url) as resp:
             if resp.status == 429:
-                retry_after = int(float(resp.headers.get("Retry-After", "60")))
-                logger.warning(f"Coinalyze rate limited, waiting {retry_after}s")
-                await asyncio.sleep(retry_after)
-                return await self._fetch(session, endpoint, symbols, resolution, from_ts, to_ts)
+                # 2026-05-22: cap retries + enforce minimum backoff to avoid 600s timeout
+                # from repeated 0-second Retry-After responses.
+                if _retry_count >= 3:
+                    logger.warning(
+                        f"Coinalyze {endpoint}: 4 consecutive 429s, giving up on this batch"
+                    )
+                    return []
+                hdr_retry = int(float(resp.headers.get("Retry-After", "60")))
+                # Always wait at least 15s + 5s per prior retry (exponential-ish)
+                wait_s = max(hdr_retry, 15 + 5 * _retry_count)
+                logger.warning(
+                    f"Coinalyze rate limited (retry {_retry_count + 1}/3), waiting {wait_s}s"
+                )
+                await asyncio.sleep(wait_s)
+                return await self._fetch(
+                    session, endpoint, symbols, resolution, from_ts, to_ts,
+                    _retry_count=_retry_count + 1,
+                )
             if resp.status != 200:
                 text = await resp.text()
                 logger.warning(f"Coinalyze {endpoint}: HTTP {resp.status} — {text[:200]}")

@@ -50,8 +50,9 @@ class ThinExecutorTask(BaseTask):
                 self._last_signal_check = now
                 results["signal_check"] = "ok"
             except Exception as e:
-                logger.error(f"Signal check failed: {e}")
-                results["signal_check"] = str(e)
+                # 2026-05-22: log type + repr so empty exceptions are still attributable
+                logger.exception(f"Signal check failed: {type(e).__name__}: {e!r}")
+                results["signal_check"] = f"{type(e).__name__}: {e!r}"
 
         # Lifecycle check
         if now - self._last_lifecycle_check >= lifecycle_interval:
@@ -60,8 +61,9 @@ class ThinExecutorTask(BaseTask):
                 self._last_lifecycle_check = now
                 results["lifecycle_check"] = "ok"
             except Exception as e:
-                logger.error(f"Lifecycle check failed: {e}")
-                results["lifecycle_check"] = str(e)
+                # 2026-05-22: log type + repr so empty exceptions are still attributable
+                logger.exception(f"Lifecycle check failed: {type(e).__name__}: {e!r}")
+                results["lifecycle_check"] = f"{type(e).__name__}: {e!r}"
 
         # Count active executors
         active = self._executor.db.executor_state.count_documents(

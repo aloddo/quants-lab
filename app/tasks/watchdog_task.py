@@ -29,16 +29,31 @@ logger = logging.getLogger(__name__)
 
 # A task lock held longer than this is considered stale
 LOCK_STALE_MINUTES = 30
-# If no task has executed successfully in this window, alert.
+# Default silence threshold for tasks not in CRITICAL_TASK_THRESHOLDS below.
 TASK_SILENCE_MINUTES = 90
 # Minimum time between Telegram alerts (prevents spam)
 ALERT_COOLDOWN_MINUTES = 60
-# Critical tasks that must have recent successful executions
-# E1 runs as HB-native bot — signal_scan only needed for E2 (legacy)
-CRITICAL_TASKS = [
-    "candles_downloader_bybit",
-    "feature_computation",
-]
+# Per-task silence thresholds in minutes. Curated 2026-05-24 (HB13->HB14 fix):
+# match each threshold to the task's real cadence; alert when miss > 2x cadence.
+# Earlier flat 90m threshold spuriously flagged daily/weekly tasks as STALE for
+# ~22h each day.
+CRITICAL_TASK_THRESHOLDS = {
+    "candles_downloader_bybit":      150,    # hourly (cron `5 * * * *`)
+    "candles_downloader_hyperliquid": 150,   # hourly (cron `10 * * * *`)
+    "deribit_dvol":                   45,    # every 15min
+    "deribit_options":                45,    # every 15min
+    "bybit_options":                  45,    # every 15min
+    "hyperliquid_funding":            180,   # every 2h (cron `5 */2 * * *`)
+    "tick_aggregation":              1500,   # daily 04:00 UTC -> 25h tolerance
+    "data_retention":                1500,   # daily 05:30 UTC -> 25h tolerance
+    # feature_computation skipped: frequency_hours=999 (manual trigger only)
+}
+CRITICAL_TASKS = list(CRITICAL_TASK_THRESHOLDS.keys())
+
+# V11 process health monitoring (live strategy)
+V11_LOG_PATH = "/private/tmp/ql-v12-copy-trader-launchd.log"
+V11_STATS_STALE_MINUTES = 5  # V11 emits STATS every minute; >5min = sync issue
+V11_PROCESS_NAME = "hl_copy_trader_v11.py"
 
 # Self-healing limits
 HB_MAX_RESTARTS_PER_6H = 2
@@ -116,6 +131,11 @@ class WatchdogTask(BaseTask):
         stuck = await self._check_stuck_executors(db)
         if stuck:
             healed.extend([f"Stopped stuck: {s}" for s in stuck])
+
+        # ── 6a. V11 LIVE STRATEGY HEALTH (added 2026-05-24) ────
+        v11_issues = self._check_v11_health()
+        if v11_issues:
+            issues.extend(v11_issues)
 
         # ── 6b. Exchange reconciliation (3-way) ────────────────
         try:
@@ -431,10 +451,75 @@ class WatchdogTask(BaseTask):
 
     # ── Heal 5: Consecutive failure streak detection ─────────
 
+    # ── V11 live strategy health ─────────────────────────────
+
+    def _check_v11_health(self) -> list:
+        """Check V11 copy trader process + sync recency.
+
+        Added 2026-05-24 per Alberto: V11 is the only live strategy; watchdog
+        must alert on V11 issues since pnl_tracker can't (it's a separate
+        process). Sources of truth:
+          - V11 launchd log emits STATS every ~60s; >5min silence = problem
+          - V11 self-emits "SYNC STALE" when HL API blocks entries
+        """
+        issues = []
+        try:
+            # Check 1: process alive (look for V11 PID via pgrep equivalent)
+            ps_out = subprocess.run(
+                ["pgrep", "-f", V11_PROCESS_NAME],
+                capture_output=True, text=True, timeout=5
+            )
+            if ps_out.returncode != 0 or not ps_out.stdout.strip():
+                issues.append(f"V11 PROCESS DOWN: {V11_PROCESS_NAME} not running")
+                return issues
+
+            # Check 2: V11 log fresh
+            log_path = Path(V11_LOG_PATH)
+            if not log_path.exists():
+                issues.append(f"V11 log file missing: {V11_LOG_PATH}")
+                return issues
+
+            log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime, tz=timezone.utc)
+            now = datetime.now(timezone.utc)
+            age_min = (now - log_mtime).total_seconds() / 60
+            if age_min > V11_STATS_STALE_MINUTES:
+                issues.append(
+                    f"V11 LOG STALE: last write {age_min:.0f}min ago (threshold {V11_STATS_STALE_MINUTES}min)"
+                )
+
+            # Check 3: SYNC STALE in last 10 minutes
+            try:
+                with open(log_path, "rb") as f:
+                    f.seek(-50_000, 2)  # last 50KB
+                    tail = f.read().decode("utf-8", errors="ignore")
+                lines = tail.splitlines()[-200:]
+                recent_sync_stale = [l for l in lines if "SYNC STALE" in l]
+                if len(recent_sync_stale) >= 3:
+                    issues.append(
+                        f"V11 SYNC STALE: {len(recent_sync_stale)} blocks in last log tail "
+                        f"- HL API rate-limit blocking new entries"
+                    )
+            except (OSError, ValueError):
+                pass
+        except Exception as e:
+            logger.error(f"V11 health check failed: {e}")
+            issues.append(f"V11 watchdog check failed: {e}")
+
+        return issues
+
     def _check_failure_streaks(self, db) -> list:
-        """Detect tasks failing 5+ times consecutively."""
+        """Detect tasks failing 5+ times consecutively.
+
+        Skips testnet_resolver per 2026-05-24 (Alberto direction "kill anything
+        hummingbot related"). The task is disabled in hermes_pipeline.yml; its
+        stale failure records in task_executions would otherwise generate
+        permanent alert spam.
+        """
         alerts = []
-        check_tasks = CRITICAL_TASKS + ["testnet_resolver"]
+        check_tasks = list(CRITICAL_TASKS)
+        # testnet_resolver explicitly excluded -- task disabled in pipeline config
+        if os.getenv("WATCHDOG_HB_API_ENABLED") == "1":
+            check_tasks.append("testnet_resolver")
 
         for task_name in check_tasks:
             recent = list(db.task_executions.find(
@@ -496,22 +581,30 @@ class WatchdogTask(BaseTask):
     # ── Task silence detection ──────────────────────────────
 
     def _check_task_silence(self, db) -> list:
-        """Alert if critical tasks haven't completed recently."""
-        issues = []
-        cutoff = datetime.utcnow() - timedelta(minutes=TASK_SILENCE_MINUTES)
+        """Alert if critical tasks haven't completed recently.
 
-        for task_name in CRITICAL_TASKS:
+        Uses per-task threshold (CRITICAL_TASK_THRESHOLDS) instead of one flat
+        90-min window. A daily task should not be flagged STALE 22 hours per day.
+        """
+        issues = []
+        now = datetime.utcnow()
+
+        for task_name, threshold_min in CRITICAL_TASK_THRESHOLDS.items():
             last = db.task_executions.find_one(
                 {"task_name": task_name, "status": "completed"},
                 sort=[("started_at", -1)],
             )
             if last is None:
                 issues.append(f"Task '{task_name}' has NEVER completed successfully")
-            elif last.get("started_at") and last["started_at"] < cutoff:
-                age_min = (datetime.utcnow() - last["started_at"]).total_seconds() / 60
+                continue
+            started = last.get("started_at")
+            if not started:
+                continue
+            age_min = (now - started).total_seconds() / 60
+            if age_min > threshold_min:
                 issues.append(
                     f"Task '{task_name}' last succeeded {age_min:.0f}m ago "
-                    f"(threshold: {TASK_SILENCE_MINUTES}m)"
+                    f"(threshold: {threshold_min}m)"
                 )
         return issues
 
@@ -570,13 +663,21 @@ class WatchdogTask(BaseTask):
     # ── API health checks ──────────────────────────────────
 
     async def _check_api_health(self) -> list:
-        """Check that HB API (:8000) and QL API (:8001) are reachable."""
+        """Check that QL API (:8001) is reachable.
+
+        HB API check DISABLED 2026-05-24 (Alberto direction: "kill anything
+        hummingbot related"). HB stack is intentionally stopped. To re-enable,
+        set env var WATCHDOG_HB_API_ENABLED=1 and unstop the HB containers
+        (docker compose up -d in ~/hummingbot/hummingbot-api).
+        """
         issues = []
         checks = [
-            ("HB API", "http://localhost:8000/", os.getenv("HUMMINGBOT_API_USERNAME", "admin"),
-             os.getenv("HUMMINGBOT_API_PASSWORD", "admin")),
             ("QL API", "http://localhost:8001/health", None, None),
         ]
+        if os.getenv("WATCHDOG_HB_API_ENABLED") == "1":
+            checks.append(("HB API", "http://localhost:8000/",
+                          os.getenv("HUMMINGBOT_API_USERNAME", "admin"),
+                          os.getenv("HUMMINGBOT_API_PASSWORD", "admin")))
         timeout = aiohttp.ClientTimeout(total=5)
         for label, url, user, pwd in checks:
             try:

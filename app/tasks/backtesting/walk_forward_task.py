@@ -185,6 +185,33 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
             provider.get_candles_feed = _patched_get_feed
             provider.initialize_candles_feed = lambda config: _patched_get_feed(config)
 
+        # Merge derivatives data (funding, OI, LS ratio) if strategy requires it
+        engine_meta = get_strategy(self.engine_name)
+        if engine_meta.required_features:
+            feed_key = f"{self.connector_name}_{pair}_1h"
+            provider = bt_engine._bt_engine.backtesting_data_provider
+            df = provider.candles_feeds.get(feed_key)
+            if df is not None and len(df) > 0:
+                from app.data_sources.merge import merge_all_for_engine_sync
+                from pymongo import MongoClient
+                db = MongoClient("mongodb://localhost:27017").quants_lab
+                start_ms = int(start_ts * 1000) if start_ts else None
+                end_ms = int(end_ts * 1000) if end_ts else None
+                provider.candles_feeds[feed_key] = merge_all_for_engine_sync(
+                    db, self.engine_name, df, pair, start_ts=start_ms, end_ts=end_ms
+                )
+
+        # Debug: check if buy_ratio survived into the feed
+        _dbg_key = f"{self.connector_name}_{pair}_1h"
+        _dbg_df = bt_engine._bt_engine.backtesting_data_provider.candles_feeds.get(_dbg_key)
+        if _dbg_df is not None:
+            _has_br = 'buy_ratio' in _dbg_df.columns
+            _non_05 = (_dbg_df['buy_ratio'] != 0.5).sum() if _has_br else 0
+            if _has_br and _non_05 > 0:
+                logger.info(f"  {pair} feed has buy_ratio: {_non_05} non-0.5 values out of {len(_dbg_df)}")
+            elif not _has_br:
+                logger.warning(f"  {pair} feed MISSING buy_ratio column!")
+
         config_instance = build_backtest_config(
             engine_name=self.engine_name,
             connector=self.connector_name,
@@ -310,7 +337,8 @@ class WalkForwardBacktestTask(NotifyingTaskMixin, BaseTask):
                         train_metrics["fold_index"] = fold_idx
                         stats["total_fold_runs"] += 1
                     except Exception as e:
-                        logger.warning(f"  {pair} fold {fold_idx} train failed: {e}")
+                        import traceback
+                        logger.warning(f"  {pair} fold {fold_idx} train failed: {e}\n{traceback.format_exc()}")
                         train_metrics = None
 
                     # --- Test period ---

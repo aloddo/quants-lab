@@ -150,18 +150,25 @@ def _enrich_positions(db, positions: list) -> list:
     return positions
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Mongo returns naive datetimes (stored as UTC). Localize before comparing to tz-aware now."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _clean_expired_reservations(reservations: dict) -> dict:
     """Remove reservations older than 5 minutes."""
     now = datetime.now(timezone.utc)
     cleaned = {}
     for key, res in reservations.items():
         expires = res.get("expires_at")
-        if isinstance(expires, datetime) and expires > now:
+        if isinstance(expires, datetime) and _as_utc(expires) > now:
             cleaned[key] = res
         elif isinstance(expires, str):
             try:
                 exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-                if exp_dt > now:
+                if _as_utc(exp_dt) > now:
                     cleaned[key] = res
             except (ValueError, TypeError):
                 pass
@@ -179,7 +186,7 @@ def _check_staleness_breaker(db):
         return
 
     now = datetime.now(timezone.utc)
-    age = (now - updated).total_seconds()
+    age = (now - _as_utc(updated)).total_seconds()
 
     if age > STALENESS_THRESHOLD_SECONDS:
         logger.warning(
