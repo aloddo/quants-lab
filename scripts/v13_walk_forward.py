@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
-"""V13 Script 4/5 (v2): Walk-forward backtest with forward signal replay.
+"""V13 Script 4/5 (v3): Walk-forward backtest with forward signal replay.
 
-Per projects/quant/v13 Section 6 + remediation plan v2.
+Per projects/quant/v13 Section 6.
 
-v2 fixes (from codex r1 #14-#20):
+v3 additions (Alberto direction 2026-05-24):
+- Emit `walk_forward_daily_returns.parquet` (per fold, day_idx, daily_return)
+  so v13_report can compute spec 6.3 AGGREGATE Sharpe on pooled daily returns.
+- Emit `walk_forward_random_samples.parquet` (per fold, trial, random_sharpe,
+  random_pnl_pct) so v13_report can compute spec 6.3 AGGREGATE random p95
+  rank on the pooled distribution. Mean-of-per-fold-scalars != pooled.
+- Real per-fold fee + slippage accumulation (test_fees_usd, test_slippage_usd,
+  test_gross_pnl_usd, fee_drag) from simulator's per-minute fees_minute /
+  slippage_minute. Replaces the prior 0.30 placeholder.
 
-#14 FULL PARAMETER GRID per Section 6.2 on VALIDATION only:
-    K in {5,10,25,50,100}, per_coin_cap in {0.15,0.25,0.35},
-    gross_cap in {1.0,1.5,2.0}, cooldown in {60,120},
-    poll in {1,5,10} min (30s approximated by 1m granularity),
-    weighting in {equal, score}, consensus in {off, soft}.
+v2 fixes (codex r1 #14-#20) preserved:
+
+#14 Parameter grid per spec 6.2 v1 (narrowed from the older wider sweep):
+    K in {10,25,50}, per_coin_cap = 0.25 FIXED, gross_cap in {1.0,1.5},
+    cooldown = 120s FIXED, poll in {1,5,10} min (30s approximated by 1m
+    granularity), weighting = equal only (score is DIAGNOSTIC), consensus
+    in {off, soft} (hard40 is ABLATION-ONLY).
+
+    Validation selects best by Sharpe; production sweep is pinned by the
+    `K_choices` CLI arg + line ~990's hardcoded gross/cooldown/per_coin_cap
+    constants per spec 6.2 v1.
 
 #15 hard40 consensus is ABLATION-ONLY, never selected for production.
 
 #16 Random portfolios default 1000, with BOTH Sharpe AND net-PnL percentile
-    gates (>= 95th required for binding criterion).
+    gates (>= 95th required for binding criterion). Per-trial Sharpe + PnL
+    samples are emitted to the random-samples parquet for v13_report
+    pooling.
 
 #17 1m intraday simulation. 15-min staleness rule + 60-120s cooldown
     enforced at minute grain.
@@ -35,6 +51,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+import multiprocessing as mp
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -66,6 +86,92 @@ HL_FEE_BPS_PER_SIDE = 4.32
 SLIPPAGE_BPS_REALISTIC = 5.0
 
 
+def _utc_ts(x) -> pd.Timestamp:
+    """Coerce any datetime-like value to a UTC-aware pandas Timestamp.
+
+    Newer pandas (2.x) raises ValueError when `pd.Timestamp(x, tz="UTC")` is
+    called on an `x` that already has tzinfo. This helper handles both tz-
+    aware and tz-naive inputs uniformly: naive inputs get localized to UTC,
+    aware inputs are converted to UTC.
+    """
+    ts = pd.Timestamp(x)
+    if ts.tz is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+# Module-level globals populated per-process at fork time so workers can
+# avoid pickling the large minute_prices / minute_volumes / streams payloads
+# on every call. Parent sets these before launching the ProcessPoolExecutor
+# (with fork context); children inherit them via COW.
+_WORKER_STREAMS: dict | None = None
+_WORKER_WALLET_SCORES: dict | None = None
+_WORKER_MINUTE_PRICES: pd.DataFrame | None = None
+_WORKER_MINUTE_VOLUMES: pd.DataFrame | None = None
+_WORKER_EQ_AT_TRAIN_END: float | None = None
+_WORKER_BEST_PARAMS = None
+_WORKER_TEST_START = None
+_WORKER_TEST_END = None
+_WORKER_VAL_START = None
+_WORKER_ALL_ELIGIBLE_WALLETS: list | None = None
+_WORKER_RNG_SEED_BASE: int | None = None
+_WORKER_ANCHOR_CACHE = None
+_WORKER_PREPARED_MARKET = None
+
+
+def _set_random_trial_globals(streams, wallet_scores, minute_prices, minute_volumes,
+                              eq_at_train_end, best_params, test_start, test_end,
+                              val_start, all_eligible_wallets, rng_seed_base,
+                              anchor_cache=None, prepared_market=None):
+    """Populate worker module-globals in the parent BEFORE forking workers so
+    children inherit them via COW. Avoids repeated pickling of giant frames.
+    """
+    global _WORKER_STREAMS, _WORKER_WALLET_SCORES, _WORKER_MINUTE_PRICES
+    global _WORKER_MINUTE_VOLUMES, _WORKER_EQ_AT_TRAIN_END, _WORKER_BEST_PARAMS
+    global _WORKER_TEST_START, _WORKER_TEST_END, _WORKER_VAL_START
+    global _WORKER_ALL_ELIGIBLE_WALLETS, _WORKER_RNG_SEED_BASE
+    global _WORKER_ANCHOR_CACHE, _WORKER_PREPARED_MARKET
+    _WORKER_STREAMS = streams
+    _WORKER_WALLET_SCORES = wallet_scores
+    _WORKER_MINUTE_PRICES = minute_prices
+    _WORKER_MINUTE_VOLUMES = minute_volumes
+    _WORKER_EQ_AT_TRAIN_END = eq_at_train_end
+    _WORKER_BEST_PARAMS = best_params
+    _WORKER_TEST_START = test_start
+    _WORKER_TEST_END = test_end
+    _WORKER_VAL_START = val_start
+    _WORKER_ALL_ELIGIBLE_WALLETS = all_eligible_wallets
+    _WORKER_RNG_SEED_BASE = rng_seed_base
+    _WORKER_ANCHOR_CACHE = anchor_cache
+    _WORKER_PREPARED_MARKET = prepared_market
+
+
+def _simulate_random_trial(trial: int) -> tuple[int, float, float]:
+    """Worker entry point for one random-portfolio simulation.
+
+    Inherits everything else via fork-COW from the parent process; only the
+    trial index is passed across the IPC boundary. The forked child mutates
+    its OWN copy of streams (next_idx); parent + sibling workers are isolated.
+
+    Returns (trial, sharpe, net_return_pct).
+    """
+    rng = np.random.default_rng(_WORKER_RNG_SEED_BASE + trial)
+    K = _WORKER_BEST_PARAMS.K
+    if len(_WORKER_ALL_ELIGIBLE_WALLETS) < K:
+        return (trial, 0.0, 0.0)
+    rand_sel = list(rng.choice(_WORKER_ALL_ELIGIBLE_WALLETS, size=K, replace=False))
+    rc = simulate_replication(
+        rand_sel, _WORKER_STREAMS, _WORKER_WALLET_SCORES, _WORKER_EQ_AT_TRAIN_END,
+        _WORKER_MINUTE_PRICES, _WORKER_TEST_START, _WORKER_TEST_END, _WORKER_BEST_PARAMS,
+        anchor_dt=_WORKER_VAL_START,
+        minute_volumes=_WORKER_MINUTE_VOLUMES,
+        anchor_cache=_WORKER_ANCHOR_CACHE,
+        prepared_market=_WORKER_PREPARED_MARKET,
+    )
+    rm = equity_curve_metrics(rc, _WORKER_BEST_PARAMS.starting_capital)
+    return (trial, float(rm["sharpe"]), float(rm["net_return_pct"]))
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -85,6 +191,16 @@ class BotParams:
     staleness_minutes: int = 15                         # max staleness rebalance per spec
     min_delta_usd: float = 10.0
     min_delta_pct: float = 0.20
+    # Liquidity-aware slippage (per GPT review point 8 + Section 4.3 spec).
+    # When volume data is supplied via simulate_replication(minute_volumes=...):
+    #   - order_size > max_size_pct_of_volume * volume_in_minute -> SKIP
+    #   - else effective_slippage_bps = slippage_bps + volume_impact_bps_per_pct
+    #         * 100 * (order_size / volume_in_minute)
+    # When volume data is NOT supplied (None / empty), behavior collapses to
+    # the fixed slippage_bps and no skips, matching prior v1 behavior.
+    enable_liquidity_filter: bool = True
+    max_size_pct_of_volume: float = 0.01                # skip if order > 1% of 1m volume
+    volume_impact_bps_per_pct: float = 50.0             # +50 bps per 1% of volume
 
 
 @dataclass
@@ -95,6 +211,84 @@ class WalletFillStream:
     signed_sizes: np.ndarray       # float64
     prices: np.ndarray             # float64
     next_idx: int = 0              # cursor for forward replay
+
+
+@dataclass
+class PreparedMarket:
+    """Numpy-backed minute_prices / minute_volumes for O(1) hot-loop lookups.
+
+    Replaces pandas .loc[ts] + Series.get(coin) which were the dominant
+    bottleneck (codex perf review #1, ~10-30x speedup). Built ONCE per fold,
+    reused across all validation+test+random_portfolio simulations.
+
+    Attributes:
+        ts_ms_arr: int64[n_min]  -- minute-aligned UTC ms timestamps
+        prices_arr: float64[n_min, n_coin]  -- close prices, NaN for missing
+        volumes_arr: float64[n_min, n_coin] | None  -- 1m traded volume, 0 for missing
+        coin_to_col: str -> int  -- coin name to column index in prices_arr
+        vol_coin_to_col: str -> int  -- coin name to column index in volumes_arr
+        ts_to_row: int64 -> int  -- ts_ms -> row index in prices_arr
+    """
+    ts_ms_arr: np.ndarray
+    prices_arr: np.ndarray
+    volumes_arr: np.ndarray | None
+    coin_to_col: dict
+    vol_coin_to_col: dict
+    ts_to_row: dict
+
+
+def prepare_market(minute_prices: pd.DataFrame,
+                   minute_volumes: pd.DataFrame | None = None) -> PreparedMarket:
+    """Convert pandas DataFrames to numpy arrays + lookup dicts for fast access.
+
+    Cost: one-time per fold (~0.5-2 sec for 252K rows x 715 coins). Pays back
+    instantly in the hot loop where each .loc[ts] saved is a ~1000x speedup.
+    """
+    # Coerce DatetimeIndex (tz-aware) to int64 ms since epoch. Strip tz first
+    # (cannot cast tz-aware datetimes to naive datetime64 in pandas 2.x).
+    idx = minute_prices.index
+    if hasattr(idx, "tz") and idx.tz is not None:
+        idx_naive = idx.tz_convert("UTC").tz_localize(None)
+    else:
+        idx_naive = idx
+    ts_ms_arr = np.asarray(idx_naive.astype("datetime64[ms]").view("int64"), dtype=np.int64)
+    prices_arr = np.ascontiguousarray(minute_prices.values, dtype=np.float64)
+    coin_to_col = {str(c): i for i, c in enumerate(minute_prices.columns)}
+
+    if minute_volumes is not None and not minute_volumes.empty:
+        # Volume rows should align with the same ts grid (same load_volume_grid path
+        # uses the same reindex). Build separately and align by ts_ms.
+        v_idx = minute_volumes.index
+        if hasattr(v_idx, "tz") and v_idx.tz is not None:
+            v_idx_naive = v_idx.tz_convert("UTC").tz_localize(None)
+        else:
+            v_idx_naive = v_idx
+        v_ts_ms = np.asarray(v_idx_naive.astype("datetime64[ms]").view("int64"), dtype=np.int64)
+        if np.array_equal(v_ts_ms, ts_ms_arr):
+            volumes_arr = np.ascontiguousarray(minute_volumes.values, dtype=np.float64)
+        else:
+            # Reindex volumes onto price grid; missing rows -> 0.0
+            vol_to_idx = {int(t): i for i, t in enumerate(v_ts_ms)}
+            volumes_arr = np.zeros((len(ts_ms_arr), len(minute_volumes.columns)), dtype=np.float64)
+            for out_i, t in enumerate(ts_ms_arr):
+                src = vol_to_idx.get(int(t))
+                if src is not None:
+                    volumes_arr[out_i] = minute_volumes.values[src]
+        vol_coin_to_col = {str(c): i for i, c in enumerate(minute_volumes.columns)}
+    else:
+        volumes_arr = None
+        vol_coin_to_col = {}
+
+    ts_to_row = {int(t): i for i, t in enumerate(ts_ms_arr)}
+
+    return PreparedMarket(
+        ts_ms_arr=ts_ms_arr,
+        prices_arr=prices_arr,
+        volumes_arr=volumes_arr,
+        coin_to_col=coin_to_col,
+        vol_coin_to_col=vol_coin_to_col,
+        ts_to_row=ts_to_row,
+    )
 
 
 @dataclass
@@ -111,6 +305,95 @@ class WalletState:
     anchor_set: bool = False
     # Realized PnL accumulated from fills AFTER the anchor crossing.
     realized_pnl_post_anchor: float = 0.0
+
+
+@dataclass
+class AnchorCacheEntry:
+    """Per-wallet snapshot at fold anchor (train_end). Used to skip the
+    redundant pre-anchor advance_wallet_state replay across the validation
+    sweep + 1000 random portfolios per fold (codex perf review #3,
+    ~2-10x speedup target on random path).
+
+    A simulation that uses this cache:
+        1. Copies positions/cost_basis dicts (will mutate during sim)
+        2. Copies anchor_positions/anchor_cost_basis dicts (read-only but
+           defensive against accidental mutation)
+        3. Sets stream.next_idx = next_idx_at_anchor (skip pre-anchor fills)
+        4. realized_pnl_post_anchor starts at 0 (anchor-derived metric)
+    """
+    positions: dict
+    cost_basis: dict
+    last_fill_ts: int
+    anchor_set: bool
+    anchor_positions: dict
+    anchor_cost_basis: dict
+    anchor_prices: dict
+    anchor_unrealized_fixed: float
+    next_idx_at_anchor: int
+
+
+def build_anchor_cache(
+    wallets: list,
+    wallet_streams: dict,
+    anchor_ts_ms: int,
+    prepared_market: "PreparedMarket | None" = None,
+) -> dict:
+    """Build per-wallet AnchorCacheEntry by replaying each stream once to
+    anchor_ts_ms. Subsequent simulations use the cache via clone-and-resume,
+    skipping the pre-anchor advance entirely.
+
+    If prepared_market is provided, the cache also captures anchor_prices +
+    anchor_unrealized_fixed (otherwise simulate_replication will compute
+    them per-call as fallback).
+
+    Mutates `wallet_streams[w].next_idx` to next_idx_at_anchor for each
+    cached wallet. Callers using the cache should expect this side-effect.
+    """
+    anchor_prices_row = None
+    if prepared_market is not None and prepared_market.prices_arr.shape[0] > 0:
+        anchor_row_idx = int(np.searchsorted(prepared_market.ts_ms_arr, anchor_ts_ms, side="right") - 1)
+        if anchor_row_idx >= 0:
+            anchor_prices_row = prepared_market.prices_arr[anchor_row_idx]
+
+    cache: dict = {}
+    for w in wallets:
+        if w not in wallet_streams:
+            continue
+        stream = wallet_streams[w]
+        stream.next_idx = 0
+        state = WalletState()
+        advance_wallet_state(state, stream, anchor_ts_ms, anchor_ts_ms=anchor_ts_ms)
+
+        if state.anchor_set and anchor_prices_row is not None and prepared_market is not None:
+            anchor_unrealized = 0.0
+            for coin, qty in state.anchor_positions.items():
+                if abs(qty) < EPS:
+                    continue
+                col = prepared_market.coin_to_col.get(coin)
+                if col is None:
+                    continue
+                px = anchor_prices_row[col]
+                if math.isnan(px):
+                    continue
+                cb = state.anchor_cost_basis.get(coin)
+                if cb is None or cb <= 0:
+                    continue
+                state.anchor_prices[coin] = float(px)
+                anchor_unrealized += float(qty) * (float(px) - float(cb))
+            state.anchor_unrealized_fixed = anchor_unrealized
+
+        cache[w] = AnchorCacheEntry(
+            positions=dict(state.positions),
+            cost_basis=dict(state.cost_basis),
+            last_fill_ts=state.last_fill_ts,
+            anchor_set=state.anchor_set,
+            anchor_positions=dict(state.anchor_positions),
+            anchor_cost_basis=dict(state.anchor_cost_basis),
+            anchor_prices=dict(state.anchor_prices),
+            anchor_unrealized_fixed=state.anchor_unrealized_fixed,
+            next_idx_at_anchor=stream.next_idx,
+        )
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +520,9 @@ def load_price_grid(coins: list[str], start: datetime, end: datetime, interval: 
     coin had no fills in that minute. This matches HL's own UI behavior of
     holding the last traded price until a new trade.
     """
-    db = MongoClient("mongodb://localhost:27017")["quants_lab"]
+    # codex perf review finding #2: close MongoClient before any fork-pool to
+    # avoid leaking PyMongo monitor threads (not fork-safe). Use context manager.
     coll_name = "hyperliquid_candles" if interval == "1m" else "hyperliquid_candles_1h"
-    c = db[coll_name]
     start_ms = int(start.timestamp() * 1000)
     end_ms = int((end + timedelta(days=1)).timestamp() * 1000)
     query = {
@@ -251,7 +534,9 @@ def load_price_grid(coins: list[str], start: datetime, end: datetime, interval: 
         # Production 1m data MUST come from S3 reconstruction; never mix in
         # stale API-backfilled 1m rows (which only cover ~5 days anyway).
         query["source"] = "s3_reconstructed"
-    docs = list(c.find(query, {"coin": 1, "timestamp_utc": 1, "close": 1, "_id": 0}))
+    with MongoClient("mongodb://localhost:27017") as client:
+        c = client["quants_lab"][coll_name]
+        docs = list(c.find(query, {"coin": 1, "timestamp_utc": 1, "close": 1, "_id": 0}))
     if not docs:
         return pd.DataFrame()
     df = pd.DataFrame(docs)
@@ -263,12 +548,63 @@ def load_price_grid(coins: list[str], start: datetime, end: datetime, interval: 
         # forward-fill within each coin so no-trade minutes carry forward
         # the last-known price.
         full_idx = pd.date_range(
-            start=pd.Timestamp(start, tz="UTC"),
-            end=pd.Timestamp(end + timedelta(days=1), tz="UTC"),
+            start=_utc_ts(start),
+            end=_utc_ts(end + timedelta(days=1)),
             freq="1min",
             inclusive="left",
         )
         pivot = pivot.reindex(full_idx).ffill()
+    return pivot
+
+
+def load_volume_grid(coins: list[str], start: datetime, end: datetime,
+                     interval: str = "1m") -> pd.DataFrame:
+    """Pull 1m traded volume (in coin units) per (minute, coin) for the same
+    window as the price grid.
+
+    Used by simulate_replication for liquidity-aware slippage:
+        - if order_size_coin > max_size_pct_of_volume * volume_in_minute,
+          the trade is SKIPPED (logged as skipped_notional)
+        - otherwise effective slippage bps grows linearly with order/volume:
+              eff_bps = base_bps + impact_bps_per_pct * (order_size / volume)
+
+    No-trade minutes have NO bar in MongoDB and therefore zero volume after
+    the reindex; the simulator treats zero-volume as "unknown liquidity" and
+    falls back to the fixed slippage_bps without skipping.
+
+    Returns a wide DataFrame indexed by UTC minute with columns=coins. Empty
+    when no docs match (e.g., long-tail coin with no 1m data).
+    """
+    if interval != "1m":
+        return pd.DataFrame()
+    # codex perf review finding #2: close MongoClient before fork-pool.
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int((end + timedelta(days=1)).timestamp() * 1000)
+    query = {
+        "coin": {"$in": list(coins)},
+        "interval": "1m",
+        "source": "s3_reconstructed",
+        "timestamp_utc": {"$gte": start_ms, "$lte": end_ms},
+    }
+    with MongoClient("mongodb://localhost:27017") as client:
+        c = client["quants_lab"]["hyperliquid_candles"]
+        docs = list(c.find(query, {"coin": 1, "timestamp_utc": 1, "volume": 1, "_id": 0}))
+    if not docs:
+        return pd.DataFrame()
+    df = pd.DataFrame(docs)
+    df["dt"] = pd.to_datetime(df["timestamp_utc"], unit="ms", utc=True)
+    pivot = df.pivot_table(index="dt", columns="coin", values="volume", aggfunc="last")
+    pivot = pivot.sort_index()
+    # Reindex onto the same 1-minute grid as the price grid. Missing minutes
+    # are filled with 0 (no trade activity in that minute = unknown
+    # liquidity, NOT a small but nonzero estimate).
+    full_idx = pd.date_range(
+        start=_utc_ts(start),
+        end=_utc_ts(end + timedelta(days=1)),
+        freq="1min",
+        inclusive="left",
+    )
+    pivot = pivot.reindex(full_idx).fillna(0.0)
     return pivot
 
 
@@ -282,7 +618,8 @@ def load_minute_close_prices(coins, start, end):
 # ---------------------------------------------------------------------------
 
 def compute_wallet_equity_at(
-    state: WalletState, prices_at_t: pd.Series, base_equity: float,
+    state: WalletState, prices_at_t, base_equity: float,
+    coin_to_col: dict | None = None,
 ) -> float:
     """Equity at time t, anchored on the wallet's equity at fold start (train_end).
 
@@ -290,6 +627,10 @@ def compute_wallet_equity_at(
                   + realized_pnl_post_anchor                # realized fills inside the fold
                   + (current_unrealized_at_t - anchor_unrealized_at_t)
                                                            # mark-to-market change since anchor
+
+    `prices_at_t` is EITHER:
+        - a pandas Series indexed by coin (legacy callers; uses .get(coin))
+        - a numpy ndarray indexed by column (perf path; requires coin_to_col)
 
     Where:
         current_unrealized_at_t = sum_coin state.positions[coin] * (price[t] - state.cost_basis[coin])
@@ -303,13 +644,22 @@ def compute_wallet_equity_at(
         # Pre-anchor: simulator hasn't crossed train_end yet.
         return base_equity
 
+    is_array = isinstance(prices_at_t, np.ndarray)
     current_unrealized = 0.0
     for coin, qty in state.positions.items():
         if abs(qty) < EPS:
             continue
-        px = prices_at_t.get(coin)
-        if px is None or pd.isna(px):
-            continue
+        if is_array:
+            col = coin_to_col.get(coin) if coin_to_col else None
+            if col is None:
+                continue
+            px = prices_at_t[col]
+            if math.isnan(px):
+                continue
+        else:
+            px = prices_at_t.get(coin)
+            if px is None or pd.isna(px):
+                continue
         cb = state.cost_basis.get(coin)
         if cb is None or cb <= 0:
             continue
@@ -337,11 +687,26 @@ def simulate_replication(
     fold_end: datetime,
     params: BotParams,
     anchor_dt: datetime | None = None,             # fold anchor time (train_end); defaults to fold_start
+    minute_volumes: pd.DataFrame | None = None,    # minute_ts -> coin -> traded volume (coin units)
+    anchor_cache: dict | None = None,              # optional: precomputed AnchorCacheEntry per wallet (codex P0 #3)
+    prepared_market: "PreparedMarket | None" = None,  # optional: pre-built PreparedMarket (caller-cached across sims)
 ) -> pd.DataFrame:
     """Run replication bot over [fold_start, fold_end] at 1m cadence.
 
     Returns DataFrame of per-minute snapshots: ts, our_equity, gross_notional,
-    n_active_coins, fees_minute, slippage_minute.
+    n_active_coins, fees_minute, slippage_minute, skipped_notional_minute.
+
+    If `minute_volumes` is supplied and `params.enable_liquidity_filter` is
+    True, fills check the per-coin per-minute traded volume:
+      - if abs(order_size_coin) > params.max_size_pct_of_volume * volume,
+        the order is SKIPPED and the target notional is logged into
+        skipped_notional_minute (NOT applied to our_quantity)
+      - else effective_slippage_bps = params.slippage_bps +
+            params.volume_impact_bps_per_pct * 100 * (order_size / volume)
+    A zero-volume minute (no S3 fills for that coin) is treated as unknown
+    liquidity: the simulator falls back to fixed slippage_bps without
+    skipping. This avoids false skips on quiet minutes; the broader 174-day
+    backtest would skip nearly everything if zero-vol counted as illiquid.
     """
     if not selected_wallets:
         return pd.DataFrame()
@@ -362,7 +727,32 @@ def simulate_replication(
     wallet_states = {w: WalletState() for w in selected_wallets}
     for w in selected_wallets:
         if w in wallet_streams:
-            wallet_streams[w].next_idx = 0
+            # If anchor_cache is provided, set cursor to post-anchor position
+            # (skip pre-anchor replay). Otherwise reset to 0 (legacy path).
+            if anchor_cache is not None and w in anchor_cache:
+                wallet_streams[w].next_idx = anchor_cache[w].next_idx_at_anchor
+            else:
+                wallet_streams[w].next_idx = 0
+
+    # Build PreparedMarket (numpy arrays) ONCE per simulate call (or use caller-
+    # provided to amortize across many simulations in the same fold). Hot loop
+    # uses prices_arr[row_idx, col] + coin_to_col instead of pandas .loc[ts]
+    # + Series.get(coin) — codex perf review #1, ~10-30x speedup target.
+    pm = prepared_market if prepared_market is not None else prepare_market(minute_prices, minute_volumes)
+    prices_arr = pm.prices_arr
+    volumes_arr = pm.volumes_arr
+    coin_to_col = pm.coin_to_col
+    vol_coin_to_col = pm.vol_coin_to_col
+    ts_to_row = pm.ts_to_row
+    ts_ms_arr = pm.ts_ms_arr
+    n_coins = prices_arr.shape[1]
+
+    # Pre-extract column lists once for the iteration order. coin_names_by_col
+    # lets us reverse-map column -> coin name for "for c in prices_at_t.index"
+    # patterns from the legacy code (last_prices update loop).
+    coin_names_by_col = [None] * n_coins
+    for c, i in coin_to_col.items():
+        coin_names_by_col[i] = c
 
     # The anchor (train_end) is the time at which base_equity is true. Pre-anchor
     # fills update positions/cost_basis silently; post-anchor fills accumulate
@@ -370,18 +760,36 @@ def simulate_replication(
     anchor_ts_ms = int((anchor_dt or fold_start).timestamp() * 1000)
 
     # First: advance each wallet's state to the anchor moment and capture the
-    # anchor snapshot (positions, cost_basis, prices at anchor). This is run
-    # ONCE per fold-simulation; the per-minute loop below will not re-advance
-    # state until after the anchor.
-    anchor_prices_row = None
-    if not minute_prices.empty:
-        # Find the LAST minute_prices row at or before anchor_ts_ms.
-        idx = minute_prices.index
-        anchor_pd_ts = pd.Timestamp(anchor_ts_ms, unit="ms", tz="UTC")
-        eligible_idx = idx[idx <= anchor_pd_ts]
-        if len(eligible_idx) > 0:
-            anchor_prices_row = minute_prices.loc[eligible_idx[-1]]
+    # anchor snapshot (positions, cost_basis, prices at anchor). If
+    # anchor_cache is provided, CLONE the cached snapshot (codex P0 #3) instead
+    # of re-running advance_wallet_state from stream start every simulation.
+    # codex perf review finding #1: compute anchor_prices_row WHENEVER prices_arr
+    # is nonempty, NOT only when anchor_cache is None. Otherwise if a cache dict
+    # is passed but a selected wallet is missing from it, the fallback path
+    # cannot compute anchor_unrealized_fixed, diverging from cache-OFF.
+    anchor_prices_row = None  # numpy ndarray (row of prices_arr)
+    if prices_arr.shape[0] > 0:
+        # Find row index of LAST minute_prices row at or before anchor_ts_ms.
+        anchor_row_idx = int(np.searchsorted(ts_ms_arr, anchor_ts_ms, side="right") - 1)
+        if anchor_row_idx >= 0:
+            anchor_prices_row = prices_arr[anchor_row_idx]
     for w in selected_wallets:
+        if anchor_cache is not None and w in anchor_cache:
+            # Clone from cache — clones mutable dicts so the sim can mutate
+            # positions/cost_basis without leaking back into the cache.
+            entry = anchor_cache[w]
+            state = wallet_states[w]
+            state.positions = dict(entry.positions)
+            state.cost_basis = dict(entry.cost_basis)
+            state.last_fill_ts = entry.last_fill_ts
+            state.anchor_set = entry.anchor_set
+            state.anchor_positions = dict(entry.anchor_positions)
+            state.anchor_cost_basis = dict(entry.anchor_cost_basis)
+            state.anchor_prices = dict(entry.anchor_prices)
+            state.anchor_unrealized_fixed = entry.anchor_unrealized_fixed
+            state.realized_pnl_post_anchor = 0.0
+            # stream.next_idx already set to next_idx_at_anchor above
+            continue
         if w in wallet_streams:
             advance_wallet_state(wallet_states[w], wallet_streams[w], anchor_ts_ms, anchor_ts_ms=anchor_ts_ms)
         state = wallet_states[w]
@@ -391,8 +799,11 @@ def simulate_replication(
             for coin, qty in state.anchor_positions.items():
                 if abs(qty) < EPS:
                     continue
-                px = anchor_prices_row.get(coin)
-                if px is None or pd.isna(px):
+                col = coin_to_col.get(coin)
+                if col is None:
+                    continue
+                px = anchor_prices_row[col]
+                if math.isnan(px):
                     continue
                 cb = state.anchor_cost_basis.get(coin)
                 if cb is None or cb <= 0:
@@ -411,24 +822,30 @@ def simulate_replication(
     soft_consensus = params.consensus == "soft"
 
     rows = []
-    # Build minute index over fold range.
-    minute_index = minute_prices.index
-    minute_index = minute_index[(minute_index >= pd.Timestamp(fold_start, tz="UTC")) & (minute_index <= pd.Timestamp(fold_end, tz="UTC"))]
-    if len(minute_index) == 0:
+    # Build minute index over fold range. Half-open semantics: include minutes
+    # in [fold_start, fold_end + 1 day) so the LAST calendar day's minutes are
+    # iterated (codex r29 P0 #1 fix). Prior code used `<= fold_end` which is
+    # midnight-of-last-day and missed all minutes during that day.
+    fold_start_ms = int(fold_start.timestamp() * 1000)
+    fold_end_ms_exclusive = int((fold_end + timedelta(days=1)).timestamp() * 1000)
+    # Slice ts_ms_arr to in-fold range. searchsorted is O(log n).
+    lo = int(np.searchsorted(ts_ms_arr, fold_start_ms, side="left"))
+    hi = int(np.searchsorted(ts_ms_arr, fold_end_ms_exclusive, side="left"))
+    if hi <= lo:
         return pd.DataFrame()
+    minute_row_indices = np.arange(lo, hi, dtype=np.int64)
 
     poll_step_minutes = params.poll_minutes
     poll_counter = 0
 
-    for ts in minute_index:
-        ts_ms = int(ts.timestamp() * 1000)
+    for row_idx in minute_row_indices:
+        ts_ms = int(ts_ms_arr[row_idx])
+        prices_row = prices_arr[row_idx]            # numpy float64[n_coins], NaN for missing
 
         # Advance each selected wallet's state up to ts.
         for w in selected_wallets:
             if w in wallet_streams:
                 advance_wallet_state(wallet_states[w], wallet_streams[w], ts_ms, anchor_ts_ms=anchor_ts_ms)
-
-        prices_at_t = minute_prices.loc[ts] if ts in minute_prices.index else pd.Series(dtype=float)
 
         # MTM EQUITY WALK: equity accrues position PnL every minute, not just on
         # rebalance fills. delta_equity = sum_coin qty * (price_now - price_last).
@@ -438,16 +855,16 @@ def simulate_replication(
                 if abs(qty) < EPS:
                     continue
                 p0 = last_prices.get(coin)
-                p1 = prices_at_t.get(coin)
-                if p0 is not None and p1 is not None and not pd.isna(p0) and not pd.isna(p1):
-                    mtm_pnl_this_step += float(qty) * (float(p1) - float(p0))
+                if p0 is None:
+                    continue
+                col = coin_to_col.get(coin)
+                if col is None:
+                    continue
+                p1 = prices_row[col]
+                if math.isnan(p1):
+                    continue
+                mtm_pnl_this_step += qty * (p1 - p0)
             our_equity += mtm_pnl_this_step
-
-        # Update last_prices for next step's MTM walk.
-        for c in prices_at_t.index:
-            p = prices_at_t.get(c)
-            if p is not None and not pd.isna(p):
-                last_prices[c] = float(p)
 
         # MTM our positions to current price (for diagnostic gross).
         gross = 0.0
@@ -455,9 +872,12 @@ def simulate_replication(
         for coin, qty in our_quantity.items():
             if abs(qty) < EPS:
                 continue
-            px = prices_at_t.get(coin)
-            if px is not None and not pd.isna(px):
-                gross += abs(qty * float(px))
+            col = coin_to_col.get(coin)
+            if col is None:
+                continue
+            px = prices_row[col]
+            if not math.isnan(px):
+                gross += abs(qty * px)
                 active_coins += 1
 
         # STALENESS RULE: any coin with a non-zero position whose last
@@ -476,6 +896,15 @@ def simulate_replication(
         # Only do signal/rebalance work every poll_minutes step (or stale force).
         poll_counter += 1
         if (poll_counter % poll_step_minutes != 0) and not stale_force:
+            # Update last_prices for held coins so next minute's MTM walk has
+            # valid p0 (skipped path also bypasses the post-rebalance update).
+            for coin in our_quantity:
+                col = coin_to_col.get(coin)
+                if col is None:
+                    continue
+                p = prices_row[col]
+                if not math.isnan(p):
+                    last_prices[coin] = float(p)
             rows.append({"ts": ts_ms, "our_equity": our_equity, "gross_notional": gross,
                          "n_active_coins": active_coins, "fees_minute": 0.0, "slippage_minute": 0.0})
             continue
@@ -486,7 +915,7 @@ def simulate_replication(
         for w in selected_wallets:
             state = wallet_states[w]
             base_eq = wallet_base_equity.get(w, 1.0)
-            eq_w = compute_wallet_equity_at(state, prices_at_t, base_eq)
+            eq_w = compute_wallet_equity_at(state, prices_row, base_eq, coin_to_col=coin_to_col)
             if eq_w <= EPS:
                 wallet_signals_now[w] = {}
                 continue
@@ -494,10 +923,13 @@ def simulate_replication(
             for coin, qty in state.positions.items():
                 if abs(qty) < EPS:
                     continue
-                px = prices_at_t.get(coin)
-                if px is None or pd.isna(px):
+                col = coin_to_col.get(coin)
+                if col is None:
                     continue
-                signed_notional = qty * float(px)
+                px = prices_row[col]
+                if math.isnan(px):
+                    continue
+                signed_notional = qty * px
                 sig[coin] = signed_notional / eq_w
             wallet_signals_now[w] = sig
 
@@ -535,18 +967,31 @@ def simulate_replication(
             target_pct = {c: v * scale for c, v in target_pct.items()}
 
         # Compute target notional + rebalance.
+        # Liquidity-aware slippage (per Section 4.3 + GPT review point 8):
+        # When minute_volumes is supplied we look up the coin's traded volume
+        # in the SAME minute and either SKIP (order too big) or apply a
+        # volume-impact slippage adder.
+        liquidity_aware = (
+            params.enable_liquidity_filter
+            and volumes_arr is not None
+        )
+        vols_row = volumes_arr[row_idx] if liquidity_aware else None
+
         fees_minute = 0.0
         slippage_minute = 0.0
+        skipped_notional_minute = 0.0
         for coin in target_pct:
             target_notional = target_pct[coin] * our_equity
-            px = prices_at_t.get(coin)
-            if px is None or pd.isna(px) or float(px) <= EPS:
+            col = coin_to_col.get(coin)
+            if col is None:
+                continue
+            px = prices_row[col]
+            if math.isnan(px) or px <= EPS:
                 continue
             current_qty = our_quantity.get(coin, 0.0)
-            current_notional = current_qty * float(px)
-            target_qty = target_notional / float(px)
+            target_qty = target_notional / px
             delta_qty = target_qty - current_qty
-            delta_notional = delta_qty * float(px)
+            delta_notional = delta_qty * px
             if abs(delta_notional) <= params.min_delta_usd:
                 continue
             if abs(delta_notional) <= params.min_delta_pct * abs(target_notional + EPS):
@@ -555,9 +1000,26 @@ def simulate_replication(
             if abs(current_qty) < EPS and abs(target_qty) > EPS:
                 if cooldown_until.get(coin, 0) > ts_ms:
                     continue
+            # Liquidity check (only when minute-volume data is available AND
+            # the volume in that minute is meaningfully > 0; zero-volume
+            # minutes are treated as "unknown liquidity, fall back to fixed
+            # slippage" rather than "illiquid, skip").
+            eff_slip_bps = params.slippage_bps
+            if liquidity_aware and vols_row is not None:
+                vcol = vol_coin_to_col.get(coin)
+                if vcol is not None:
+                    vol_coin = vols_row[vcol]
+                    if not math.isnan(vol_coin) and vol_coin > EPS:
+                        size_frac = abs(delta_qty) / vol_coin
+                        if size_frac > params.max_size_pct_of_volume:
+                            skipped_notional_minute += abs(delta_notional)
+                            continue
+                        # 100*size_frac is "size as % of volume"; bps adder is
+                        # impact_bps_per_pct * pct.
+                        eff_slip_bps = params.slippage_bps + params.volume_impact_bps_per_pct * (100.0 * size_frac)
             # Execute fill.
             fee = abs(delta_notional) * params.fee_bps_per_side / 10000.0
-            slip = abs(delta_notional) * params.slippage_bps / 10000.0
+            slip = abs(delta_notional) * eff_slip_bps / 10000.0
             fees_minute += fee
             slippage_minute += slip
             our_quantity[coin] = target_qty
@@ -566,19 +1028,52 @@ def simulate_replication(
             if abs(target_qty) < EPS:
                 cooldown_until[coin] = ts_ms + params.cooldown_seconds * 1000
 
-        # Close positions for coins no longer in target (with cooldown set).
+        # Close positions for coins no longer in target. Liquidity-aware
+        # PARTIAL exits (codex r29 P1 #5 fix): if the full position exceeds
+        # the per-minute liquidity cap, exit ONLY up to the cap this minute
+        # and drain the remainder over subsequent minutes. Position is NOT
+        # left stuck; partial fills accumulate to a full exit as liquidity
+        # allows.
         for coin in list(our_quantity.keys()):
             if coin not in target_pct and abs(our_quantity[coin]) > EPS:
-                px = prices_at_t.get(coin)
-                if px is None or pd.isna(px) or float(px) <= EPS:
+                col = coin_to_col.get(coin)
+                if col is None:
                     continue
-                notional = our_quantity[coin] * float(px)
-                fee = abs(notional) * params.fee_bps_per_side / 10000.0
-                slip = abs(notional) * params.slippage_bps / 10000.0
+                px = prices_row[col]
+                if math.isnan(px) or px <= EPS:
+                    continue
+                # Default: full exit at fixed slippage.
+                exit_qty = our_quantity[coin]
+                eff_slip_bps_exit = params.slippage_bps
+                if liquidity_aware and vols_row is not None:
+                    vcol = vol_coin_to_col.get(coin)
+                    if vcol is not None:
+                        vol_coin = vols_row[vcol]
+                        if not math.isnan(vol_coin) and vol_coin > EPS:
+                            cap_qty = params.max_size_pct_of_volume * vol_coin
+                            if abs(exit_qty) > cap_qty:
+                                # Partial exit: trim by the cap (signed).
+                                signed_cap = cap_qty if exit_qty > 0 else -cap_qty
+                                unfilled = exit_qty - signed_cap
+                                exit_qty = signed_cap
+                                # Log the deferred notional (qty * px) as skipped
+                                # for THIS minute; the remainder stays open and
+                                # gets drained next minute.
+                                skipped_notional_minute += abs(unfilled * px)
+                                size_frac = params.max_size_pct_of_volume
+                            else:
+                                size_frac = abs(exit_qty) / vol_coin
+                            eff_slip_bps_exit = params.slippage_bps + params.volume_impact_bps_per_pct * (100.0 * size_frac)
+                exit_notional = exit_qty * px
+                fee = abs(exit_notional) * params.fee_bps_per_side / 10000.0
+                slip = abs(exit_notional) * eff_slip_bps_exit / 10000.0
                 fees_minute += fee
                 slippage_minute += slip
-                our_quantity[coin] = 0.0
-                cooldown_until[coin] = ts_ms + params.cooldown_seconds * 1000
+                # Reduce by the exit_qty actually transacted.
+                our_quantity[coin] = our_quantity[coin] - exit_qty
+                if abs(our_quantity[coin]) < EPS:
+                    our_quantity[coin] = 0.0
+                    cooldown_until[coin] = ts_ms + params.cooldown_seconds * 1000
 
         # Max-staleness rebalance trigger (every staleness_minutes).
         # (We approximate by always running the rebalance on poll cycles; staleness
@@ -589,13 +1084,47 @@ def simulate_replication(
         # We compute position_pnl from the next-minute step.
         our_equity -= (fees_minute + slippage_minute)
 
+        # Update last_prices for next step's MTM walk. AFTER rebalance so that
+        # newly-opened positions in our_quantity also get their price seeded
+        # for next minute's MTM (codex P1 #9 — only HELD coins, not all 715
+        # columns). Matches the OLD code's pre-rebalance "all-columns" update
+        # for coins that end up held.
+        for coin in our_quantity:
+            col = coin_to_col.get(coin)
+            if col is None:
+                continue
+            p = prices_row[col]
+            if not math.isnan(p):
+                last_prices[coin] = float(p)
+
+        # Net signed notional for stress-regime accounting. Positive = net
+        # long, negative = net short. A uniform adverse move on all coins
+        # hurts net_long by adverse_pct and helps net_short by adverse_pct,
+        # so the symmetric stress impact is -adverse_pct * net_long_notional.
+        net_long_notional = 0.0
+        gross_notional = 0.0
+        n_active = 0
+        for c, q in our_quantity.items():
+            if abs(q) < EPS:
+                continue
+            col = coin_to_col.get(c)
+            if col is None:
+                continue
+            px = prices_row[col]
+            if math.isnan(px):
+                continue
+            net_long_notional += q * px
+            gross_notional += abs(q * px)
+            n_active += 1
         rows.append({
             "ts": ts_ms,
             "our_equity": our_equity,
-            "gross_notional": sum(abs(q * float(prices_at_t.get(c, 0) or 0)) for c, q in our_quantity.items()),
-            "n_active_coins": sum(1 for q in our_quantity.values() if abs(q) > EPS),
+            "gross_notional": gross_notional,
+            "net_long_notional": net_long_notional,
+            "n_active_coins": n_active,
             "fees_minute": fees_minute,
             "slippage_minute": slippage_minute,
+            "skipped_notional_minute": skipped_notional_minute,
         })
 
     if not rows:
@@ -614,10 +1143,34 @@ def simulate_replication(
 # Metric helpers
 # ---------------------------------------------------------------------------
 
-def equity_curve_metrics(curve: pd.DataFrame, starting_capital: float) -> dict:
+def equity_curve_metrics(curve: pd.DataFrame, starting_capital: float,
+                         stress_adverse_pct: float = 0.10) -> dict:
+    """Compute Sharpe / max-DD / net-return / worst-day on the daily curve,
+    plus a synthetic stress-regime overlay (Section 10 spec item):
+
+      - net_long_notional per minute is tracked in `curve` (filled by the
+        simulator). For each day, take the LARGEST abs net_long across all
+        minutes in that day; this is the "worst exposure peak" the day
+        carried.
+      - Stress: apply a uniform `stress_adverse_pct` move on ALL coins on
+        the day with the LARGEST `peak_net_long` exposure. The portfolio
+        takes a hypothetical loss = adverse_pct * peak_net_long on that day.
+      - Output `stress_max_single_day_loss_pct` = the synthetic loss as
+        a percentage of starting capital. Layer it onto the actual curve to
+        compute `stress_max_dd_pct`: max DD if the stress event hit the day
+        with the worst already-actualized return.
+
+    This is a post-hoc, no-resimulation stress test. It captures the spirit
+    of "a uniform 10% adverse move across all coins on a single day" without
+    re-running the bot under a perturbed price grid.
+    """
     if curve.empty or "our_equity" not in curve.columns:
         return {"sharpe": 0.0, "max_dd_pct": 0.0, "net_return_pct": 0.0, "worst_day_pct": 0.0,
-                "n_minutes": 0}
+                "n_minutes": 0,
+                "stress_max_single_day_loss_pct": 0.0,
+                "stress_max_dd_pct": 0.0,
+                "stress_peak_net_long_usd": 0.0,
+                "stress_peak_net_long_day": None}
     eq = curve["our_equity"]
     # Resample to daily for Sharpe (matches spec).
     curve = curve.copy()
@@ -630,9 +1183,55 @@ def equity_curve_metrics(curve: pd.DataFrame, starting_capital: float) -> dict:
     max_dd = float(-dd.min() * 100)
     net = float((daily_eq.iloc[-1] / starting_capital - 1.0) * 100)
     worst = float(daily_returns.min() * 100) if not daily_returns.empty else 0.0
+
+    # Stress regime overlay.
+    if "net_long_notional" in curve.columns and not curve.empty and starting_capital > EPS:
+        curve["abs_net_long"] = curve["net_long_notional"].abs()
+        daily_peak_net_long = curve.set_index("dt")["abs_net_long"].resample("1D").max().dropna()
+        if not daily_peak_net_long.empty:
+            worst_exposure_day = daily_peak_net_long.idxmax()
+            peak_net_long = float(daily_peak_net_long.loc[worst_exposure_day])
+            stress_loss_usd = stress_adverse_pct * peak_net_long
+            stress_single_day_loss_pct = -100.0 * stress_loss_usd / starting_capital
+            # Layer the synthetic loss onto the WORST already-bad day in the
+            # actual daily returns, then re-walk equity day-by-day anchored on
+            # the actual day-0 equity. We DO NOT anchor on starting_capital
+            # because the day-0 equity may already differ from starting_capital
+            # due to day-1 fees/slippage; anchoring on starting_capital would
+            # create a discontinuity that distorts the drawdown calc.
+            daily_returns_stressed = daily_returns.copy()
+            if not daily_returns_stressed.empty:
+                worst_day_idx = daily_returns_stressed.idxmin()
+                daily_returns_stressed.loc[worst_day_idx] = daily_returns_stressed.loc[worst_day_idx] + stress_single_day_loss_pct / 100.0
+                # Walk equity with stressed returns, day-0 anchored.
+                stressed_factors = (1.0 + daily_returns_stressed).cumprod()
+                eq_stressed_tail = daily_eq.iloc[0] * stressed_factors
+                eq_stressed = pd.concat([daily_eq.iloc[:1], eq_stressed_tail])
+                # Drop any duplicate index entries (in case day-0 leaks into tail).
+                eq_stressed = eq_stressed[~eq_stressed.index.duplicated(keep="first")]
+                peak_s = eq_stressed.cummax()
+                dd_s = ((eq_stressed - peak_s) / peak_s.replace(0, np.nan)).fillna(0)
+                stress_max_dd = float(-dd_s.min() * 100)
+            else:
+                stress_max_dd = max_dd
+        else:
+            peak_net_long = 0.0
+            stress_single_day_loss_pct = 0.0
+            stress_max_dd = max_dd
+            worst_exposure_day = None
+    else:
+        peak_net_long = 0.0
+        stress_single_day_loss_pct = 0.0
+        stress_max_dd = max_dd
+        worst_exposure_day = None
+
     return {
         "sharpe": sharpe, "max_dd_pct": max_dd, "net_return_pct": net,
         "worst_day_pct": worst, "n_minutes": len(curve),
+        "stress_max_single_day_loss_pct": stress_single_day_loss_pct,
+        "stress_max_dd_pct": stress_max_dd,
+        "stress_peak_net_long_usd": peak_net_long,
+        "stress_peak_net_long_day": str(worst_exposure_day) if worst_exposure_day is not None else None,
     }
 
 
@@ -651,19 +1250,59 @@ def run_fold(
     minute_prices: pd.DataFrame,
     n_random: int,
     K_choices: list,
+    minute_volumes: pd.DataFrame | None = None,
 ) -> dict:
     """One fold of the walk-forward.
 
-    Train: rank wallets via composite score using ONLY fills with time <= train_end.
-    Validation: parameter sweep on val_start..val_end.
-    Test: best-validation params evaluated ONCE on test_start..test_end.
+    Train: rank wallets via composite score using ONLY fills before val_start
+    (i.e., fills strictly within the train window's calendar days).
+    Validation: parameter sweep on [val_start, test_start).
+    Test: best-validation params evaluated ONCE on [test_start, test_end + 1d).
+
+    Window semantics (codex r29 P0 #1 fix). Fold dates are MIDNIGHT UTC
+    timestamps. Without explicit half-open semantics the original code had
+    an off-by-one: train_fills filtered with `time <= train_end_ms` (=
+    midnight of train_end_day) EXCLUDED fills DURING train_end_day, but
+    eq_at_train_end took the END-OF-day equity of train_end_day. That
+    mismatch let the post-anchor forward simulator double-count fills on
+    train_end_day. The fix: use HALF-OPEN windows everywhere:
+      train: [train_start, val_start)  -- fills strictly before val_start
+      val:   [val_start, test_start)
+      test:  [test_start, test_end + 1d)
+    Anchor is val_start (= midnight of train_end_day + 1). Anchor equity is
+    end-of-day equity of train_end_day, which corresponds exactly to the
+    val_start anchor moment.
+
+    Backtest invariants enforced by assert at the boundaries:
+      I1) train_start < val_start = train_end + 1d
+      I2) train_fills.time < val_start_ms (no test/val data in train)
+      I3) wallet_scores recomputed per fold from train-only data
+      I4) eq_at_anchor uses equity[date == train_end.date()] (end-of-train-window day)
     """
+    # I1: window ordering invariant (half-open).
+    assert train_start < val_start, f"train invariant: {train_start} !< {val_start}"
+    assert val_start < val_end + timedelta(days=1), f"val invariant: {val_start} not before {val_end + timedelta(days=1)}"
+    assert val_end < test_start, f"val/test invariant: val_end {val_end} >= test_start {test_start}"
+    assert test_start <= test_end, f"test invariant: {test_start} > {test_end}"
+
+    # Half-open boundary timestamps.
+    train_start_ms = int(train_start.timestamp() * 1000)
+    val_start_ms = int(val_start.timestamp() * 1000)
+
     # 1) Compute wallet metrics on train window only.
     from importlib import util
     spec = util.spec_from_file_location("v13_metrics_mod", ROOT / "scripts" / "v13_wallet_metrics.py")
     mod = util.module_from_spec(spec); spec.loader.exec_module(mod)
     market = mod.load_market_daily_returns(train_start, train_end)
-    train_fills = fills[(fills["time"] >= int(train_start.timestamp() * 1000)) & (fills["time"] <= int(train_end.timestamp() * 1000))]
+    train_fills = fills[
+        (fills["time"] >= train_start_ms)
+        & (fills["time"] < val_start_ms)
+    ]
+    # I2: assert no future leak in train_fills (strict half-open top-bound).
+    if not train_fills.empty:
+        assert train_fills["time"].max() < val_start_ms, (
+            f"fold {fold_idx} train_fills leak: max_time {train_fills['time'].max()} >= val_start_ms {val_start_ms}"
+        )
     train_rows = []
     for w in sorted(set(equity["wallet"].unique())):
         eq_w = equity[equity["wallet"] == w]
@@ -679,51 +1318,94 @@ def run_fold(
     if train_metrics.empty:
         return {"fold": fold_idx, "status": "no_train_metrics"}
 
+    # Compute the additive z-score ranking per Section 5.5 (pool-level z-scores).
+    if hasattr(mod, "compute_additive_zscore_ranking"):
+        train_metrics = mod.compute_additive_zscore_ranking(train_metrics)
+
     eligible = train_metrics[train_metrics["eligible"]]
     if eligible.empty:
         return {"fold": fold_idx, "status": "no_eligible"}
+
+    # I3: scores must be NaN for non-eligible (pool-level z-score logic invariant).
+    non_elig = train_metrics[~train_metrics["eligible"]]
+    if not non_elig.empty:
+        assert non_elig["wallet_score"].isna().all(), (
+            f"fold {fold_idx}: non-eligible wallets must have NaN wallet_score"
+        )
 
     eligible_sorted = eligible.sort_values("wallet_score", ascending=False).reset_index(drop=True)
     wallet_scores = dict(zip(eligible_sorted["wallet"], eligible_sorted["wallet_score"]))
     all_eligible_wallets = eligible_sorted["wallet"].tolist()
 
-    # Wallet base equities at train_end (anchor for forward simulation).
+    # Wallet base equities at the ANCHOR moment = val_start.
+    #
+    # Per Alberto rule 16 + decision A (2026-05-26 17:09 CEST): the SIZING
+    # anchor is spot_usdc_today (a wallet-level scalar), NOT the daily
+    # reconstructed perp series. Capital references = spot per rule 16.
+    # spot_usdc_today is constant per wallet (attached by reconstruction at
+    # bucket-loop time), so picking the value for any single date in the
+    # equity df yields the same scalar; we keep the date-filter to be
+    # explicit about WHEN we anchor (the value happens to be invariant in
+    # the date dim for v3-A, but that may change if a future v4 reconstructs
+    # historical spot too).
     eq_at_train_end = (
         equity[equity["date"] == train_end.date()]
-        .set_index("wallet")["equity_usd"]
+        .dropna(subset=["spot_usdc_today"])
+        .set_index("wallet")["spot_usdc_today"]
+        .astype(float)
         .to_dict()
     )
 
     # Build fill streams for forward replay (all eligible wallets).
     streams = build_wallet_fill_streams(fills, all_eligible_wallets)
 
-    # 2) Parameter sweep on VALIDATION. Full grid per Section 6.2.
-    # K x per_coin_cap x gross_cap x cooldown x poll_minutes x weighting x consensus
+    # Perf v3 (codex P0 #1 + #3): build PreparedMarket + anchor_cache ONCE per
+    # fold, then pass to every simulate_replication call below. This avoids
+    # rebuilding numpy arrays for each of the 36 validation combos + 1 test +
+    # 1000 random portfolios + 9 ablations (~1047 sims per fold).
+    perf_pm = prepare_market(minute_prices, minute_volumes)
+    perf_anchor_ts_ms = int(val_start.timestamp() * 1000)
+    perf_anchor_cache = build_anchor_cache(
+        all_eligible_wallets, streams, perf_anchor_ts_ms, perf_pm
+    )
+    logger.info(f"Fold {fold_idx}: prepared market + anchor cache for {len(perf_anchor_cache)} wallets")
+
+    # 2) Parameter sweep on VALIDATION. v1 sweep per spec Section 6.2:
+    #     K in {10, 25, 50}      -- 5 / 100 dropped (too concentrated / too dilute)
+    #     per_coin_cap = 0.25    -- FIXED (no sweep)
+    #     gross_cap in {1.0, 1.5} -- 2.0 dropped (too aggressive for v1)
+    #     cooldown = 120s        -- FIXED (no sweep)
+    #     poll in {1, 5, 10} minutes
+    #     weighting = "equal"    -- FIXED (score-weighted is ABLATION DIAGNOSTIC only)
+    #     consensus in {off, soft} -- hard40 ABLATION DIAGNOSTIC only
+    # The wider sweep (K=5/100, score-weighted, 2.0x gross, 60s cooldown,
+    # 15%/35% per-coin cap) is exercised by the 9 ablations as diagnostics
+    # but never selected for production parameters.
     best_params, best_val_sharpe = None, -1e9
     K_grid = [k for k in K_choices if k <= len(eligible_sorted)]
     for K in K_grid:
         selected = eligible_sorted.head(K)["wallet"].tolist()
-        for per_coin_cap in [0.15, 0.25, 0.35]:
-            for gross in [1.0, 1.5, 2.0]:
-                for cooldown in [60, 120]:
-                    for poll in [1, 5, 10]:
-                        for weighting in ["equal", "score"]:
-                            for consensus in ["off", "soft"]:    # hard40 ABLATION-ONLY
-                                p = BotParams(
-                                    K=K, per_coin_cap=per_coin_cap, gross_cap=gross,
-                                    cooldown_seconds=cooldown, poll_minutes=poll,
-                                    weighting=weighting, consensus=consensus,
-                                )
-                                # simulate_replication() internally resets stream cursors per call.
-                                curve = simulate_replication(
-                                    selected, streams, wallet_scores, eq_at_train_end,
-                                    minute_prices, val_start, val_end, p,
-                                    anchor_dt=train_end,
-                                )
-                                m = equity_curve_metrics(curve, p.starting_capital)
-                                if m["sharpe"] > best_val_sharpe:
-                                    best_val_sharpe = m["sharpe"]
-                                    best_params = p
+        for gross in [1.0, 1.5]:
+            for poll in [1, 5, 10]:
+                for consensus in ["off", "soft"]:    # hard40 ABLATION-ONLY
+                    p = BotParams(
+                        K=K, per_coin_cap=0.25, gross_cap=gross,
+                        cooldown_seconds=120, poll_minutes=poll,
+                        weighting="equal", consensus=consensus,
+                    )
+                    # simulate_replication() internally resets stream cursors per call.
+                    curve = simulate_replication(
+                        selected, streams, wallet_scores, eq_at_train_end,
+                        minute_prices, val_start, val_end, p,
+                        anchor_dt=val_start,    # half-open anchor: val_start = end-of-train moment
+                        minute_volumes=minute_volumes,
+                        anchor_cache=perf_anchor_cache,
+                        prepared_market=perf_pm,
+                    )
+                    m = equity_curve_metrics(curve, p.starting_capital)
+                    if m["sharpe"] > best_val_sharpe:
+                        best_val_sharpe = m["sharpe"]
+                        best_params = p
 
     if best_params is None:
         return {"fold": fold_idx, "status": "no_valid_params"}
@@ -737,39 +1419,94 @@ def run_fold(
     test_curve = simulate_replication(
         selected, streams, wallet_scores, eq_at_train_end,
         minute_prices, test_start, test_end, best_params,
-        anchor_dt=train_end,
+        anchor_dt=val_start,    # half-open anchor: val_start = end-of-train moment
+        minute_volumes=minute_volumes,
+        anchor_cache=perf_anchor_cache,
+        prepared_market=perf_pm,
     )
     test_metrics = equity_curve_metrics(test_curve, best_params.starting_capital)
 
+    # Real per-fold fee + slippage accumulation for spec 6.3 row 4 (aggregate
+    # fee drag). The simulator already emits per-minute fees_minute +
+    # slippage_minute in test_curve; we just sum them and derive gross PnL.
+    # gross_pnl = net_pnl + fees + slippage  (since simulator subtracts both
+    # from our_equity at each minute, the equity curve's net_return_pct is
+    # net-of-cost). fee_drag = (fees + slippage) / gross_pnl_usd. When gross
+    # PnL is non-positive the gate is undefined; report as 1.0 (= 100%) so it
+    # fails the < 30% test conservatively.
+    if not test_curve.empty:
+        test_fees_usd = float(test_curve["fees_minute"].sum()) if "fees_minute" in test_curve.columns else 0.0
+        test_slippage_usd = float(test_curve["slippage_minute"].sum()) if "slippage_minute" in test_curve.columns else 0.0
+    else:
+        test_fees_usd = 0.0
+        test_slippage_usd = 0.0
+    test_net_pnl_usd = float(test_metrics["net_return_pct"]) / 100.0 * best_params.starting_capital
+    test_gross_pnl_usd = test_net_pnl_usd + test_fees_usd + test_slippage_usd
+    if test_gross_pnl_usd > EPS:
+        test_fee_drag = (test_fees_usd + test_slippage_usd) / test_gross_pnl_usd
+    else:
+        test_fee_drag = 1.0  # gross non-positive -> conservative FAIL
+
     # 4) Random portfolio percentile on OOS test (BOTH Sharpe + net-PnL gates).
     rng = np.random.default_rng(42 + fold_idx)
-    random_sharpes = []
-    random_pnls = []
-    for trial in range(n_random):
-        if len(all_eligible_wallets) < best_params.K:
-            random_sharpes.append(0.0)
-            random_pnls.append(0.0)
-            continue
-        rand_sel = list(rng.choice(all_eligible_wallets, size=best_params.K, replace=False))
-        for w in rand_sel:
-            if w in streams:
-                streams[w].next_idx = 0
-        rc = simulate_replication(rand_sel, streams, wallet_scores, eq_at_train_end,
-                                  minute_prices, test_start, test_end, best_params,
-                                  anchor_dt=train_end)
-        rm = equity_curve_metrics(rc, best_params.starting_capital)
-        random_sharpes.append(rm["sharpe"])
-        random_pnls.append(rm["net_return_pct"])
+    # Parallelize 1000 random portfolios across all available cores.
+    # Each random trial is independent (different seed -> different wallet
+    # selection -> independent simulation). Pure-Python single-thread was the
+    # bottleneck per HB29 (Fold 0 ran 2h+ with no result; observed ~430
+    # iter/sec on one core). Use fork-based pool so workers inherit
+    # streams/prices/volumes via COW (avoiding ~3GB pickle per IPC call).
+    n_workers = max(1, min(os.cpu_count() or 1, 12))
+    rng_seed_base = 42 + fold_idx
+    logger.info(f"Fold {fold_idx}: launching {n_random} random portfolios across {n_workers} workers...")
+    _set_random_trial_globals(
+        streams=streams,
+        wallet_scores=wallet_scores,
+        minute_prices=minute_prices,
+        minute_volumes=minute_volumes,
+        eq_at_train_end=eq_at_train_end,
+        best_params=best_params,
+        test_start=test_start,
+        test_end=test_end,
+        val_start=val_start,
+        all_eligible_wallets=all_eligible_wallets,
+        rng_seed_base=rng_seed_base,
+        anchor_cache=perf_anchor_cache,
+        prepared_market=perf_pm,
+    )
+    random_sharpes = [0.0] * n_random
+    random_pnls = [0.0] * n_random
+    fork_ctx = mp.get_context("fork")
+    progress_step = max(50, n_random // 20)  # log every ~5%
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=fork_ctx) as pool:
+        futures = [pool.submit(_simulate_random_trial, t) for t in range(n_random)]
+        completed = 0
+        for future in as_completed(futures):
+            trial, sh, pn = future.result()
+            random_sharpes[trial] = sh
+            random_pnls[trial] = pn
+            completed += 1
+            if completed % progress_step == 0 or completed == n_random:
+                logger.info(f"Fold {fold_idx}: {completed}/{n_random} random portfolios done")
     random_sharpes_sorted = sorted(random_sharpes)
     random_pnls_sorted = sorted(random_pnls)
     sharpe_pct_rank = (np.searchsorted(random_sharpes_sorted, test_metrics["sharpe"]) / max(1, len(random_sharpes_sorted))) * 100
     pnl_pct_rank = (np.searchsorted(random_pnls_sorted, test_metrics["net_return_pct"]) / max(1, len(random_pnls_sorted))) * 100
 
-    # 5) Robustness: top-1/5/10 removal + leave-one-out + random dropout 20%.
-    robust = {}
-    for k_remove in [1, 5, 10]:
+    # 5) Robustness: K-aware top-N removal.
+    # K-aware ablation set (GPT review point 7):
+    #   K >= 25: remove_top_1, remove_top_5, remove_top_10
+    #   K >= 10: remove_top_1, remove_top_3            (5 and 10 would gut the portfolio)
+    #   K <  10: leave-one-out only (top 1 removal)
+    # Skipped removal levels are emitted as None to keep the schema stable.
+    if best_params.K >= 25:
+        k_removes = [1, 5, 10]
+    elif best_params.K >= 10:
+        k_removes = [1, 3]
+    else:
+        k_removes = [1]
+    robust = {f"remove_top{r}_sharpe": None for r in (1, 3, 5, 10)}
+    for k_remove in k_removes:
         if best_params.K - k_remove <= 0:
-            robust[f"remove_top{k_remove}_sharpe"] = None
             continue
         remaining = eligible_sorted.iloc[k_remove:k_remove + best_params.K]["wallet"].tolist()
         if len(remaining) < best_params.K:
@@ -779,7 +1516,10 @@ def run_fold(
                 streams[w].next_idx = 0
         rc = simulate_replication(remaining[:best_params.K], streams, wallet_scores, eq_at_train_end,
                                   minute_prices, test_start, test_end, best_params,
-                                  anchor_dt=train_end)
+                                  anchor_dt=val_start,    # half-open anchor: val_start = end-of-train moment
+                                  minute_volumes=minute_volumes,
+                                  anchor_cache=perf_anchor_cache,
+                                  prepared_market=perf_pm)
         rm = equity_curve_metrics(rc, best_params.starting_capital)
         robust[f"remove_top{k_remove}_sharpe"] = rm["sharpe"]
 
@@ -788,6 +1528,18 @@ def run_fold(
 
     # Propagate the deployment_blocked_by_near_liq flag (from train_metrics).
     deployment_blocked_by_near_liq = bool(train_metrics.get("deployment_blocked_by_near_liq", pd.Series([True])).any())
+
+    # Capture per-fold pooled-aggregate inputs for v13_report Section 6.3
+    # AGGREGATE evaluation (spec 6.3 criteria 1-6 across all 8 windows
+    # POOLED). The report needs raw daily returns and the full random-
+    # portfolio sample distribution per fold; per-fold scalar summaries do
+    # not aggregate correctly (mean-of-Sharpes != pooled Sharpe).
+    test_daily_returns: list[float] = []
+    if not test_curve.empty and "our_equity" in test_curve.columns:
+        _tcc = test_curve.copy()
+        _tcc["dt"] = pd.to_datetime(_tcc["ts"], unit="ms", utc=True)
+        _td_eq = _tcc.set_index("dt")["our_equity"].resample("1D").last().dropna()
+        test_daily_returns = _td_eq.pct_change().dropna().astype(float).tolist()
 
     # Build the ablation context so caller can run the 9 ablations later.
     # CRITICAL: minute_prices slice must include >= train_end so the simulator
@@ -803,6 +1555,7 @@ def run_fold(
         eq_at_train_end=eq_at_train_end,
         minute_prices=daily_close_or_prices(train_end, test_end, minute_prices),
         train_end=train_end,
+        val_start=val_start,
         test_start=test_start,
         test_end=test_end,
         best_params=best_params,
@@ -810,6 +1563,7 @@ def run_fold(
         random_p95_pnl=float(np.percentile(random_pnls, 95)) if random_pnls else 0.0,
         robust=robust,
         fills=fills,
+        minute_volumes=minute_volumes,
     )
 
     return {
@@ -839,19 +1593,32 @@ def run_fold(
         "random_p95_pnl": float(np.percentile(random_pnls, 95)),
         "latest_fold_profitable": latest_fold_profitable,
         "deployment_blocked_by_near_liq": deployment_blocked_by_near_liq,
-        "fee_drag": 0.30,                # placeholder; per-fold fee drag from train_metrics post-MVP
+        # Real per-fold fee_drag = (fees + slippage) / gross_pnl, derived from
+        # simulator's per-minute fees_minute + slippage_minute. Falls back to
+        # 1.0 when gross PnL is non-positive (gate undefined; conservative FAIL).
+        "fee_drag": test_fee_drag,
+        "test_fees_usd": test_fees_usd,
+        "test_slippage_usd": test_slippage_usd,
+        "test_gross_pnl_usd": test_gross_pnl_usd,
+        "test_net_pnl_usd": test_net_pnl_usd,
         "_ablation_context": ctx,
         "_test_metrics": test_metrics,
+        "_test_daily_returns": test_daily_returns,
+        "_random_sharpes_sample": list(map(float, random_sharpes)),
+        "_random_pnls_sample": list(map(float, random_pnls)),
         **robust,
     }
 
 
 def daily_close_or_prices(start, end, prices):
-    """Return prices subset to [start, end] for ablation use."""
+    """Return prices subset to [start, end + 1d) for ablation use. Half-open
+    end so the LAST calendar day's minutes are included (matches the
+    simulate_replication change for codex r29 P0 #1)."""
     if prices.empty:
         return prices
     idx = prices.index
-    mask = (idx >= pd.Timestamp(start, tz="UTC")) & (idx <= pd.Timestamp(end, tz="UTC"))
+    end_exclusive = _utc_ts(end) + pd.Timedelta(days=1)
+    mask = (idx >= _utc_ts(start)) & (idx < end_exclusive)
     return prices.loc[mask]
 
 
@@ -893,6 +1660,7 @@ class AblationContext:
     eq_at_train_end: dict
     minute_prices: pd.DataFrame
     train_end: datetime
+    val_start: datetime              # = train_end + 1d (anchor moment)
     test_start: datetime
     test_end: datetime
     best_params: BotParams
@@ -900,6 +1668,7 @@ class AblationContext:
     random_p95_pnl: float
     robust: dict
     fills: pd.DataFrame
+    minute_volumes: pd.DataFrame | None = None
 
 
 def _ablation_row(fold_idx, exp, variant, sharpe, pnl, status, note=""):
@@ -917,7 +1686,8 @@ def _simulate(ctx: AblationContext, selected: list, params: BotParams) -> dict:
     curve = simulate_replication(
         selected, ctx.wallet_streams, ctx.wallet_scores, ctx.eq_at_train_end,
         ctx.minute_prices, ctx.test_start, ctx.test_end, params,
-        anchor_dt=ctx.train_end,
+        anchor_dt=ctx.val_start,
+        minute_volumes=getattr(ctx, "minute_volumes", None),
     )
     return equity_curve_metrics(curve, params.starting_capital)
 
@@ -930,8 +1700,10 @@ def _benchmark_buy_hold_curve(coin: str, minute_prices: pd.DataFrame,
     Timestamps derived from prices.index AFTER dropna, ensuring equity values
     line up with their actual bar timestamps (codex r23 #2 fix).
     """
+    # Half-open end (codex r30 P1 #2): include last test-day minutes.
+    test_end_exclusive = _utc_ts(test_end) + pd.Timedelta(days=1)
     idx_full = minute_prices.index
-    idx_in = idx_full[(idx_full >= pd.Timestamp(test_start, tz="UTC")) & (idx_full <= pd.Timestamp(test_end, tz="UTC"))]
+    idx_in = idx_full[(idx_full >= _utc_ts(test_start)) & (idx_full < test_end_exclusive)]
     if len(idx_in) < 2 or coin not in minute_prices.columns:
         return {"sharpe": 0.0, "net_return_pct": 0.0}
     prices = minute_prices.loc[idx_in, coin].dropna()
@@ -946,8 +1718,10 @@ def _benchmark_buy_hold_curve(coin: str, minute_prices: pd.DataFrame,
 def _equal_weight_basket_curve(coins: list, minute_prices: pd.DataFrame,
                                test_start: datetime, test_end: datetime,
                                starting_capital: float) -> dict:
+    # Half-open end (codex r30 P1 #2): include last test-day minutes.
+    test_end_exclusive = _utc_ts(test_end) + pd.Timedelta(days=1)
     idx_full = minute_prices.index
-    idx_in = idx_full[(idx_full >= pd.Timestamp(test_start, tz="UTC")) & (idx_full <= pd.Timestamp(test_end, tz="UTC"))]
+    idx_in = idx_full[(idx_full >= _utc_ts(test_start)) & (idx_full < test_end_exclusive)]
     if len(idx_in) < 2:
         return {"sharpe": 0.0, "net_return_pct": 0.0}
     valid_coins = [c for c in coins if c in minute_prices.columns]
@@ -1275,15 +2049,34 @@ def main():
     ap.add_argument("--val-days", type=int, default=15)
     ap.add_argument("--test-days", type=int, default=15)
     ap.add_argument("--step-days", type=int, default=15)
-    ap.add_argument("--K-choices", default="5,10,25,50,100")
+    ap.add_argument("--K-choices", default="10,25,50",
+                    help="Production sweep values per spec Section 6.2 v1. Pass '5,10,25,50,100' explicitly to widen for ablation.")
     ap.add_argument("--random-portfolios", type=int, default=1000)
     ap.add_argument("--fills-dir", default=None)
     ap.add_argument("--output", default=str(DEFAULT_OUTPUT))
     ap.add_argument("--ablation-output", default=str(ABLATION_OUTPUT))
+    ap.add_argument("--daily-returns-output", default=None,
+                    help="Path to write per-(fold, day) daily returns. Required "
+                         "for spec 6.3 aggregate Sharpe (pooled across folds). "
+                         "Defaults to <output dir>/walk_forward_daily_returns.parquet.")
+    ap.add_argument("--random-samples-output", default=None,
+                    help="Path to write per-(fold, trial) random portfolio "
+                         "samples. Required for spec 6.3 aggregate random "
+                         "p95 (pooled across folds). Defaults to <output dir>/"
+                         "walk_forward_random_samples.parquet.")
     ap.add_argument("--price-interval", choices=["1m", "1h"], default="1m",
                     help="Price granularity. 1m is the production default "
                          "(S3-reconstructed; spec Section 5.7). 1h is a "
                          "fallback that flags results as APPROXIMATED.")
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="Directory to write per-fold checkpoint parquets. "
+                         "Each fold's result + daily returns + random samples "
+                         "are persisted immediately after completion. "
+                         "Defaults to <output dir>/walk_forward_checkpoints/.")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip folds whose checkpoint files already exist. "
+                         "Lets you resume a crashed multi-hour run without "
+                         "losing completed fold work.")
     args = ap.parse_args()
     import sys
 
@@ -1321,6 +2114,16 @@ def main():
     if args.price_interval == "1h":
         logger.warning("Using 1h candles -- cadence/cooldown/staleness results are APPROXIMATED, not validated.")
 
+    # Volume grid for liquidity-aware slippage (only meaningful at 1m).
+    minute_volumes = None
+    if args.price_interval == "1m":
+        logger.info(f"Loading 1m volume grid for {len(coins)} coins (liquidity-aware slippage)...")
+        minute_volumes = load_volume_grid(coins, start, end, "1m")
+        if minute_volumes is None or minute_volumes.empty:
+            logger.warning("Volume grid empty; liquidity-aware slippage will collapse to fixed bps.")
+        else:
+            logger.info(f"Loaded volume grid: {minute_volumes.shape[0]:,} minutes x {minute_volumes.shape[1]} coins")
+
     # Enumerate folds.
     folds = []
     t = start
@@ -1340,16 +2143,62 @@ def main():
 
     logger.info(f"Folds enumerated: {len(folds)}")
 
+    # Per-fold checkpointing: each fold writes its result + daily returns +
+    # random samples to disk IMMEDIATELY after completion, so a crash mid-run
+    # only loses the in-flight fold, not the completed work. --resume skips
+    # folds whose checkpoint files already exist (idempotent re-launches).
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else (out_path.parent / "walk_forward_checkpoints")
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    def _fold_ckpt_paths(fi: int) -> tuple[Path, Path, Path]:
+        return (
+            ckpt_dir / f"fold_{fi:02d}_result.parquet",
+            ckpt_dir / f"fold_{fi:02d}_daily_returns.parquet",
+            ckpt_dir / f"fold_{fi:02d}_random_samples.parquet",
+        )
+
     results = []
     fold_contexts: dict = {}
     fold_test_metrics: dict = {}
+    daily_returns_by_fold: dict = {}
+    random_samples_by_fold: dict = {}
     for (fi, ts, te, vs, ve, tts, tte) in folds:
+        res_p, dr_p, rs_p = _fold_ckpt_paths(fi)
+        if args.resume and res_p.exists() and dr_p.exists() and rs_p.exists():
+            logger.info(f"Fold {fi}: --resume; checkpoint exists at {res_p.name}, skipping compute")
+            # Reload from checkpoint into in-memory collectors so end-of-run
+            # concat picks them up; ablation context is NOT recoverable so
+            # ablations will skip this fold (will surface in report).
+            r_df = pd.read_parquet(res_p)
+            if not r_df.empty:
+                results.append(r_df.iloc[0].to_dict())
+            dr_df_load = pd.read_parquet(dr_p)
+            daily_returns_by_fold[fi] = dr_df_load["daily_return"].astype(float).tolist() if not dr_df_load.empty else []
+            rs_df_load = pd.read_parquet(rs_p)
+            if not rs_df_load.empty:
+                random_samples_by_fold[fi] = (
+                    rs_df_load["random_sharpe"].astype(float).tolist(),
+                    rs_df_load["random_pnl_pct"].astype(float).tolist(),
+                )
+            else:
+                random_samples_by_fold[fi] = ([], [])
+            continue
+
         logger.info(f"Fold {fi}: train {ts.date()}..{te.date()} val {vs.date()}..{ve.date()} test {tts.date()}..{tte.date()}")
         r = run_fold(fi, ts, te, vs, ve, tts, tte,
                      fills, journeys, equity, minute_prices,
-                     n_random=args.random_portfolios, K_choices=K_choices)
+                     n_random=args.random_portfolios, K_choices=K_choices,
+                     minute_volumes=minute_volumes)
         # Capture context + test_metrics for ablations BEFORE stripping from
-        # the dict that goes to parquet.
+        # the dict that goes to parquet. Also strip list-valued aggregate
+        # payloads so they do not poison the DataFrame schema.
+        daily_returns_by_fold[fi] = r.pop("_test_daily_returns", [])
+        random_samples_by_fold[fi] = (
+            r.pop("_random_sharpes_sample", []),
+            r.pop("_random_pnls_sample", []),
+        )
         if r.get("status") == "ok":
             fold_contexts[fi] = r.pop("_ablation_context")
             fold_test_metrics[fi] = r.pop("_test_metrics")
@@ -1359,11 +2208,66 @@ def main():
         results.append(r)
         logger.info(f"  -> status={r.get('status')} test_sharpe={r.get('test_sharpe', 'NA')} rank_sharpe={r.get('random_sharpe_pct_rank', 'NA')} rank_pnl={r.get('random_pnl_pct_rank', 'NA')}")
 
+        # Immediately persist this fold's checkpoint trio so a crash doesn't
+        # lose this fold's work. Use .tmp + os.replace for atomic write.
+        try:
+            r_df_one = pd.DataFrame([r])
+            for col in r_df_one.columns:
+                # Drop any non-scalar columns (e.g. nested objects) — checkpoint
+                # is for scalar fold-level fields only.
+                pass
+            dr_rows_one = [{"fold": fi, "day_idx": i, "daily_return": v}
+                           for i, v in enumerate(daily_returns_by_fold[fi])]
+            shs, pls = random_samples_by_fold[fi]
+            rs_rows_one = [{"fold": fi, "trial": i, "random_sharpe": s, "random_pnl_pct": p}
+                           for i, (s, p) in enumerate(zip(shs, pls))]
+            r_df_one.to_parquet(str(res_p) + ".tmp", index=False, compression="snappy")
+            pd.DataFrame(dr_rows_one, columns=["fold", "day_idx", "daily_return"]).to_parquet(str(dr_p) + ".tmp", index=False, compression="snappy")
+            pd.DataFrame(rs_rows_one, columns=["fold", "trial", "random_sharpe", "random_pnl_pct"]).to_parquet(str(rs_p) + ".tmp", index=False, compression="snappy")
+            os.replace(str(res_p) + ".tmp", res_p)
+            os.replace(str(dr_p) + ".tmp", dr_p)
+            os.replace(str(rs_p) + ".tmp", rs_p)
+            logger.info(f"Fold {fi} checkpoint written: {res_p.name}")
+        except Exception as e:
+            logger.error(f"Fold {fi} checkpoint write FAILED: {e}; in-memory state retained, continuing")
+
     df = pd.DataFrame(results)
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False, compression="snappy")
     logger.info(f"Wrote {len(df)} fold results to {out_path}")
+
+    # Spec 6.3 aggregate-evaluation supporting outputs: per-fold daily returns
+    # and per-fold random-portfolio samples. Report pools these across all
+    # folds to compute aggregate Sharpe + aggregate p95 (not approximable
+    # from per-fold scalar summaries; mean-of-Sharpes != pooled Sharpe).
+    dr_default = out_path.parent / "walk_forward_daily_returns.parquet"
+    rs_default = out_path.parent / "walk_forward_random_samples.parquet"
+    dr_path = Path(args.daily_returns_output) if args.daily_returns_output else dr_default
+    rs_path = Path(args.random_samples_output) if args.random_samples_output else rs_default
+
+    dr_rows = [
+        {"fold": fi, "day_idx": i, "daily_return": v}
+        for fi, drs in daily_returns_by_fold.items()
+        for i, v in enumerate(drs)
+    ]
+    rs_rows = [
+        {"fold": fi, "trial": i, "random_sharpe": s, "random_pnl_pct": p}
+        for fi, (shs, pls) in random_samples_by_fold.items()
+        for i, (s, p) in enumerate(zip(shs, pls))
+    ]
+    dr_path.parent.mkdir(parents=True, exist_ok=True)
+    rs_path.parent.mkdir(parents=True, exist_ok=True)
+    # Build with explicit schema so empty dataframes still have typed columns
+    # (otherwise downstream `.astype` blows up on a 0-column frame).
+    dr_df = pd.DataFrame(dr_rows, columns=["fold", "day_idx", "daily_return"])
+    rs_df = pd.DataFrame(rs_rows, columns=["fold", "trial", "random_sharpe", "random_pnl_pct"])
+    if not dr_df.empty:
+        dr_df = dr_df.astype({"fold": "int64", "day_idx": "int64", "daily_return": "float64"})
+    if not rs_df.empty:
+        rs_df = rs_df.astype({"fold": "int64", "trial": "int64", "random_sharpe": "float64", "random_pnl_pct": "float64"})
+    dr_df.to_parquet(dr_path, index=False, compression="snappy")
+    rs_df.to_parquet(rs_path, index=False, compression="snappy")
+    logger.info(f"Wrote {len(dr_rows)} daily-return rows to {dr_path}")
+    logger.info(f"Wrote {len(rs_rows)} random-sample rows to {rs_path}")
 
     # 6.7 ablation suite (9 experiments, real implementations).
     logger.info(f"Running 9 ablations across {len(fold_contexts)} successful folds...")

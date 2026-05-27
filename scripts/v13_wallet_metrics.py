@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-"""V13 Script 3/5 (v2): Wallet-level metrics + eligibility + composite score.
+"""V13 Script 3/5 (v2): Wallet-level metrics + eligibility + ADDITIVE z-score ranking.
 
-Per projects/quant/v13 Sections 5.3, 5.4, 5.5 + remediation plan v2.
+Per projects/quant/v13 Sections 5.3, 5.4, 5.5.
 
-v2 fixes (from codex r1 #10-#13 + r3 gotchas):
+Ranking score (spec 5.5):
+    wallet_score = z(after_fee_sharpe) + z(profit_factor_capped) + z(consistency_pct_days)
+where each component is winsorized [p01, p99], z-scored across the eligible
+pool, clipped to [-3, +3]. profit_factor is capped at the pool p99 BEFORE
+z-scoring to avoid infinite values when a wallet has zero gross loss.
+
+Liquidation gate semantics (spec 5.4 footnote, FIXED 2026-05-23):
+    self_liq = dir.startswith("Liquidated") AND closedPnl < 0
+            OR dir in {"Partial Borrow Liquidation", "Backstop Borrow Liquidation"} AND closedPnl < 0
+NOT the prior substring `dir.contains("Liquidat")` which over-counted by
+26.7% by misclassifying counterparty rows as self-liquidations (see
+scripts/v13_validate_liquidation_label_semantics.py).
+
+v2 fixes (codex r1 #10-#13 + r3 gotchas):
 
 #10 LOOK-AHEAD FIX: filter journeys by `exit_ts` inside the window (closed-
     in-window only), not by `entry_date`. Journeys that started inside the
@@ -18,10 +31,10 @@ v2 fixes (from codex r1 #10-#13 + r3 gotchas):
     our daily copy-fee (computed from fills) from the wallet's equity-
     series-derived daily PnL. Compute Sharpe on the corrected returns.
 
-#13 SURVIVAL FACTOR fix: liquidation events only (detected from S3 fills
-    via `dir == "Liquidation"`). Near-liquidation is UNSUPPORTED in v1 -
-    the report layer (script 5) flags it as PARTIAL_COVERAGE which forces
-    overall FAIL until margin-ratio data exists.
+#13 SURVIVAL FACTOR fix: liquidation events with FIXED semantics above.
+    Near-liquidation is UNSUPPORTED in v1 (requires margin-ratio history we
+    do not collect); the report layer flags it as PARTIAL_COVERAGE which
+    forces overall FAIL until margin-ratio data exists or Alberto overrides.
 
 Schema validation: required input columns including closedPnl, dir.
 """
@@ -168,8 +181,12 @@ def compute_metrics_for_wallet(
     window_start: datetime,
     window_end: datetime,
 ) -> dict:
-    # 1) Equity series within window.
-    eq = eq_df.sort_values("date").set_index("date")["equity_usd"]
+    # 1) Equity series within window. Per Alberto rule 16 + decision A on
+    # 2026-05-26 17:09 CEST, this is the PERFORMANCE series (perp account
+    # value reconstruction) — used for daily returns, drawdowns, performance
+    # metrics. It is NOT the wallet's "equity" in the rule-16 sense; that is
+    # spot USDC and lives in the spot_usdc_today column for sizing references.
+    eq = eq_df.sort_values("date").set_index("date")["perp_account_value_usd"]
     # eq.index is dates already (from script 1 output schema).
     eq = eq[(eq.index >= window_start.date()) & (eq.index <= window_end.date())]
     if eq.empty or len(eq) < 2:
@@ -181,7 +198,12 @@ def compute_metrics_for_wallet(
             "near_liq_coverage": "PARTIAL_COVERAGE",
         }
 
-    daily_returns = eq.pct_change().dropna()
+    # Codex r2 2026-05-26: pct_change yields inf when the previous-day
+    # denominator is 0 (common for wallets whose perp account value passes
+    # through $0 — e.g. fully exited then re-entered perp during the window).
+    # `dropna()` does NOT filter inf, so unfiltered inf values poison return
+    # mean/std/Sharpe computations. Filter explicitly.
+    daily_returns = eq.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
 
     # 2) Journeys closed inside window only (FIXES look-ahead).
     jr = jr_df.copy()
@@ -198,11 +220,17 @@ def compute_metrics_for_wallet(
         fills = fills[(fills["date"] >= window_start.date()) & (fills["date"] <= window_end.date())]
         fills["notional"] = fills["size"].astype(float) * fills["price"].astype(float)
 
+    # active_days = days with ACTUAL TRADING ACTIVITY in the train window
+    # (not days with nonzero equity, which would be ~every day for any
+    # funded wallet -- making the >=15 gate ineffective). Counts the
+    # distinct days on which the wallet had at least one fill.
+    active_days_from_fills = int(fills["date"].nunique()) if not fills.empty else 0
     m: dict = {
         "wallet": wallet,
         "window_start": window_start.date(),
         "window_end": window_end.date(),
-        "active_days": int((eq != 0).sum()),
+        "active_days": active_days_from_fills,
+        "active_days_eq_DIAG": int((eq != 0).sum()),  # legacy diagnostic
     }
 
     # 4) Return-series metrics.
@@ -274,13 +302,32 @@ def compute_metrics_for_wallet(
     med_eq = float(eq.median()) if eq.median() > 0 else 1.0
     m["turnover_per_day"] = float(m["total_traded_notional_usd"] / n_days / med_eq) if med_eq > 0 else 0.0
 
-    # 7) Liquidation detection (FIX for survival_factor).
-    # HL marks liquidation fills via dir field. Conservative: dir contains 'Liquidat' substring.
+    # 7) Liquidation detection (FIXED per liq-semantics validation 2026-05-23).
+    # See scripts/v13_validate_liquidation_label_semantics.py for the empirical
+    # justification. HL's S3 archive emits BOTH counterparties of every match
+    # with IDENTICAL dir strings (e.g., both rows say "Liquidated Isolated
+    # Long"). The substring filter "Liquidat" alone over-counts by ~26.7%
+    # because it includes the takeover-counterparty rows. The disambiguator is
+    # closedPnl: the LIQUIDATED wallet has closedPnl < 0 (lost money), the
+    # COUNTERPARTY has closedPnl == 0 (took over the position).
+    #
+    # ADL (Auto-Deleveraging) is NOT counted. 95.5% of ADL rows have
+    # closedPnl > 0; ADL force-closes a PROFITABLE position because the other
+    # side blew up. It does not reflect the wallet's own risk failure.
     liq_events = 0
-    if not fills.empty and "dir" in fills.columns:
-        liq_mask = fills["dir"].astype(str).str.contains("Liquidat", case=False, na=False)
+    liq_pnl_loss_usd = 0.0
+    if not fills.empty and "dir" in fills.columns and "closedPnl" in fills.columns:
+        dir_str = fills["dir"].astype(str)
+        is_liquidated = (
+            dir_str.str.startswith("Liquidated", na=False)
+            | dir_str.isin({"Partial Borrow Liquidation", "Backstop Borrow Liquidation"})
+        )
+        is_loser = fills["closedPnl"].astype(float) < 0
+        liq_mask = is_liquidated & is_loser
         liq_events = int(liq_mask.sum())
+        liq_pnl_loss_usd = float(fills.loc[liq_mask, "closedPnl"].astype(float).sum())
     m["liquidation_events"] = liq_events
+    m["liquidation_pnl_loss_usd"] = liq_pnl_loss_usd
     m["near_liq_coverage"] = "PARTIAL_COVERAGE"   # near-liq detection not supported in v1
     # Explicit deployment-block flag for downstream report (script 5). Per spec
     # remediation plan Section 5: partial coverage forces overall FAIL until
@@ -333,39 +380,155 @@ def compute_metrics_for_wallet(
     else:
         m["after_fee_sharpe"] = m["sharpe_pct"]
 
-    # 11) Section 5.4 eligibility.
+    # 10b) after_fee_pnl_usd: REALIZED fill PnL minus fees+slippage from the
+    # train-window FILLS. This is decoupled from the equity diff to avoid
+    # deposits / withdrawals / MTM contaminating the gate (codex r29 P1 #4).
+    # Spec: "wallet actually made money in the train window" -- realized.
+    realized_pnl_usd = 0.0
+    if not fills.empty and "closedPnl" in fills.columns:
+        realized_pnl_usd = float(pd.to_numeric(fills["closedPnl"], errors="coerce").fillna(0).sum())
+    total_fee_slip = m.get("total_fees_usd", 0.0) + m.get("total_slippage_usd", 0.0)
+    m["after_fee_pnl_usd"] = realized_pnl_usd - total_fee_slip
+    m["realized_pnl_usd"] = realized_pnl_usd  # diagnostic exposure
+
+    # 10b) New gates: median train equity + consistency pct days.
+    m["median_train_equity"] = float(eq.median()) if not eq.empty else 0.0
+    m["consistency_pct_days"] = float((daily_returns > 0).mean()) if not daily_returns.empty else 0.0
+
+    # 11) Section 5.4 eligibility (revised per Alberto greenlight 2026-05-23).
+    # DROPPED hard gates: fee_drag (kept as diagnostic), btc_eth_r2 (kept as
+    # diagnostic). ADDED: median_train_equity >= $1000, after_fee_pnl > 0.
+    # KEPT threshold: max_dd < 50%, pnl_concentration_day < 50% (Alberto
+    # picked code thresholds over the prior 30% spec values).
     eligible = (
         m["active_days"] >= 15
         and m["trade_count"] >= 30
         and m["max_dd_pct"] < 50.0
         and m["median_holding_hours"] * 60 > 5
-        and m["fee_drag"] < 0.40
         and m["pnl_concentration_day"] < 0.50
-        and m["btc_eth_r2"] < 0.50
         and m["active_in_last_7d"] == 1
         and m["liquidation_events"] == 0
+        and m["median_train_equity"] >= 1000.0
+        and m["after_fee_pnl_usd"] > 0.0
     )
     m["eligible"] = bool(eligible)
 
-    # 12) Section 5.5 composite score.
-    pct_profitable_days = float((daily_returns > 0).mean())
-    m["consistency_factor"] = pct_profitable_days * max(0.0, 1.0 - m["max_dd_pct"] / 100.0)
+    # 12) Section 5.5 ranking inputs (raw values; pool-level z-scores and
+    # final wallet_score are computed in main() after all wallets are
+    # processed -- see compute_additive_zscore_ranking).
+    #
+    # profit_factor is computed in step (5) above and can be inf or 0; the
+    # post-processor handles capping at the eligible-pool p99 before
+    # z-scoring.
+    #
+    # We retain the old factor columns for diagnostic backward-compat but
+    # they no longer feed the production wallet_score.
+    pct_profitable_days = m["consistency_pct_days"]
+    m["consistency_factor_DIAG"] = pct_profitable_days * max(0.0, 1.0 - m["max_dd_pct"] / 100.0)
     hold_min = m["median_holding_hours"] * 60
-    m["copyability_factor"] = (
+    m["copyability_factor_DIAG"] = (
         min(hold_min / 30.0, 1.0) * max(0.0, 1.0 - min(m["turnover_per_day"] / 5.0, 1.0))
     )
-    m["diversification_factor"] = max(0.0, 1.0 - m["pnl_concentration_coin"])
-    # Survival: hard liq = 0. Near-liq UNSUPPORTED in v1 -> 1.0 placeholder
-    # for arithmetic but downstream report flags this as partial coverage.
-    m["survival_factor"] = float(m["active_in_last_7d"]) * (0.0 if liq_events > 0 else 1.0)
-    m["wallet_score"] = (
-        m["after_fee_sharpe"]
-        * m["consistency_factor"]
-        * m["copyability_factor"]
-        * m["diversification_factor"]
-        * m["survival_factor"]
-    )
+    m["diversification_factor_DIAG"] = max(0.0, 1.0 - m["pnl_concentration_coin"])
+    m["survival_factor_DIAG"] = float(m["active_in_last_7d"]) * (0.0 if liq_events > 0 else 1.0)
+    # wallet_score is populated by the post-processor in main().
+    m["wallet_score"] = float("nan")
     return m
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: pool-level additive z-score ranking (Section 5.5)
+# ---------------------------------------------------------------------------
+
+def _winsorize(series: pd.Series, low: float = 0.01, high: float = 0.99) -> pd.Series:
+    """Clip a numeric series at the [low, high] quantiles. NaN-safe."""
+    s = pd.to_numeric(series, errors="coerce")
+    if s.dropna().empty:
+        return s
+    lo = s.quantile(low)
+    hi = s.quantile(high)
+    return s.clip(lower=lo, upper=hi)
+
+
+def _zscore_clipped(series: pd.Series, clip: float = 3.0) -> pd.Series:
+    """Standard z-score, clipped to [-clip, +clip]. NaN-safe."""
+    s = pd.to_numeric(series, errors="coerce")
+    if s.dropna().empty:
+        return pd.Series(0.0, index=series.index)
+    mu = float(s.mean())
+    sd = float(s.std(ddof=0))
+    if sd == 0 or not np.isfinite(sd):
+        return pd.Series(0.0, index=series.index)
+    z = (s - mu) / sd
+    return z.clip(lower=-clip, upper=clip)
+
+
+def compute_additive_zscore_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    """Per Section 5.5: wallet_score = z(after_fee_sharpe) + z(profit_factor_capped)
+    + z(consistency_pct_days), with each component winsorized + z-scored +
+    clipped to [-3, +3] across the ELIGIBLE pool.
+
+    profit_factor is capped at the eligible-pool p99 BEFORE z-scoring to
+    avoid infinite values when a wallet has zero gross loss.
+
+    Non-eligible wallets retain wallet_score = NaN. The score is computed
+    independently per call (no leakage across folds); the caller must invoke
+    this with a single fold's metrics frame.
+    """
+    out = df.copy()
+    elig_mask = out["eligible"] == True  # noqa: E712
+    if elig_mask.sum() == 0:
+        out["wallet_score"] = float("nan")
+        out["wallet_score_z_after_fee_sharpe"] = float("nan")
+        out["wallet_score_z_profit_factor"] = float("nan")
+        out["wallet_score_z_consistency"] = float("nan")
+        return out
+
+    elig = out.loc[elig_mask].copy()
+
+    # 1) Cap profit_factor at pool p99 (handles inf values from zero-loss wallets).
+    pf_raw = pd.to_numeric(elig["profit_factor"], errors="coerce")
+    pf_finite = pf_raw.replace([np.inf, -np.inf], np.nan).dropna()
+    if not pf_finite.empty:
+        p99 = float(pf_finite.quantile(0.99))
+        pf_capped = pf_raw.replace([np.inf, -np.inf], p99).clip(upper=p99).fillna(0.0)
+    else:
+        pf_capped = pd.Series(0.0, index=elig.index)
+    elig["profit_factor_capped"] = pf_capped
+
+    # 2) Winsorize each component at [p01, p99] within the eligible pool.
+    afs_w = _winsorize(elig["after_fee_sharpe"])
+    pf_w = _winsorize(elig["profit_factor_capped"])
+    con_w = _winsorize(elig["consistency_pct_days"])
+
+    # 3) z-score + clip each to [-3, +3].
+    z_afs = _zscore_clipped(afs_w)
+    z_pf = _zscore_clipped(pf_w)
+    z_con = _zscore_clipped(con_w)
+
+    elig["wallet_score_z_after_fee_sharpe"] = z_afs
+    elig["wallet_score_z_profit_factor"] = z_pf
+    elig["wallet_score_z_consistency"] = z_con
+    elig["wallet_score"] = z_afs + z_pf + z_con
+
+    # Merge eligible scores back to full frame; non-eligible stay NaN.
+    out.loc[elig.index, "wallet_score_z_after_fee_sharpe"] = z_afs
+    out.loc[elig.index, "wallet_score_z_profit_factor"] = z_pf
+    out.loc[elig.index, "wallet_score_z_consistency"] = z_con
+    out.loc[elig.index, "wallet_score"] = z_afs + z_pf + z_con
+    out.loc[elig.index, "profit_factor_capped"] = pf_capped
+
+    # Fill non-eligible rows with NaN for new columns (must be present in schema).
+    for col in (
+        "wallet_score_z_after_fee_sharpe",
+        "wallet_score_z_profit_factor",
+        "wallet_score_z_consistency",
+        "profit_factor_capped",
+    ):
+        if col not in out.columns:
+            out[col] = float("nan")
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +598,11 @@ def main():
         return
 
     df = pd.DataFrame(rows)
+
+    # Section 5.5: post-process the per-wallet raw metrics into the additive
+    # z-score wallet_score using the ELIGIBLE pool as the z-score reference.
+    df = compute_additive_zscore_ranking(df)
+
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False, compression="snappy")
@@ -443,15 +611,19 @@ def main():
     n_elig = int(df["eligible"].sum())
     n_liq = int((df["liquidation_events"] > 0).sum())
     logger.info(f"Eligible: {n_elig} / {len(df)} ({100*n_elig/len(df):.1f}%)")
-    logger.info(f"Wallets with liquidation event in window: {n_liq}")
+    logger.info(f"Wallets with self-liquidation event in window: {n_liq}")
     if n_elig > 0:
         top = df[df["eligible"]].sort_values("wallet_score", ascending=False).head(10)
-        logger.info("Top 10 eligible by wallet_score:")
+        logger.info("Top 10 eligible by wallet_score (additive z-score sum):")
         for _, r in top.iterrows():
             logger.info(
-                f"  {r['wallet'][:10]}.. score={r['wallet_score']:>8.3f} "
-                f"after_fee_sharpe={r['after_fee_sharpe']:>5.2f} hold_h={r['median_holding_hours']:>5.1f} "
-                f"trades={r['trade_count']:>5} fee_drag={r['fee_drag']:.2f}"
+                f"  {r['wallet'][:10]}.. score={r['wallet_score']:>6.2f} "
+                f"[z_afs={r.get('wallet_score_z_after_fee_sharpe', float('nan')):>5.2f} "
+                f"z_pf={r.get('wallet_score_z_profit_factor', float('nan')):>5.2f} "
+                f"z_con={r.get('wallet_score_z_consistency', float('nan')):>5.2f}] "
+                f"afs={r['after_fee_sharpe']:>5.2f} pf={r['profit_factor']:>5.2f} "
+                f"con={r['consistency_pct_days']:.2f} eq={r['median_train_equity']:>8.0f} "
+                f"afp={r['after_fee_pnl_usd']:>8.2f}"
             )
 
 

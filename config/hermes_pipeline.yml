@@ -164,7 +164,7 @@ tasks:
     tags: [data, funding, hyperliquid, exotic]
 
   hyperliquid_microstructure_1s:
-    enabled: true  # RE-ENABLED 2026-05-22 per Alberto: collecting L2 for V13 slippage modeling; retention removed from raw collections
+    enabled: false  # TEMP DISABLED 2026-05-27 15:25 CEST: V11 sync=2845s under full-ledger-enum API load; freeing rate budget. RE-ENABLE after enum + sign-fix re-run.
     task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
     schedule:
       type: cron
@@ -178,8 +178,8 @@ tasks:
       max_pairs: 10
       restrict_to_bybit_pairs: false
       bybit_collection: "bybit_funding_rates"
-      duration_seconds: 50
-      poll_seconds: 1.5
+      duration_seconds: 45   # 2026-05-22 was 50; 31% timeout rate at 58s budget, need headroom
+      poll_seconds: 2.0      # 2026-05-22 was 1.5; reduce API calls (~22 polls per cycle)
       max_levels: 20
       write_mongo: true
       write_parquet: true
@@ -228,8 +228,8 @@ tasks:
       api_key_env: "COINALYZE_API_KEY"
       liq_collection: "coinalyze_liquidations"
       oi_collection: "coinalyze_oi"
-      backfill_daily_days: 365
-      hourly_lookback_days: 90
+      backfill_daily_days: 14   # 2026-05-22 was 365; backfill done (42K daily docs), 14d window catches gaps
+      hourly_lookback_days: 2   # 2026-05-22 was 90; 581K hourly docs already in db, 48h window catches gaps
     tags: [data, liquidations, oi, coinalyze, exotic]
 
   coinglass:
@@ -435,8 +435,10 @@ tasks:
 
   # ═══════ Layer 4: Testnet Resolution (legacy — E2 only) ═
   # E1 executor lifecycle managed natively by HB bot
+  # DISABLED 2026-05-24 (Alberto direction "kill anything hummingbot related").
+  # Depends on HBApiClient at localhost:8000 which is intentionally stopped.
   testnet_resolver:
-    enabled: true
+    enabled: false
     task_class: app.tasks.resolution.testnet_resolver_task.TestnetResolverTask
     schedule:
       type: cron

@@ -169,6 +169,18 @@ app/outputs/
 app/data/cache/
 .gstack/
 
+# Local data caches (raw fills, ledgers, dbs, parquet outputs — never commit)
+app/data/hl_s3_fills/
+app/data/v13/
+app/data/wallet_alpha/
+app/data/*.parquet
+app/data/*.db
+app/data/raw_ledger_cache_20k/
+app/data/raw_funding_cache_20k/
+
+# Operational lock files
+.claude/scheduled_tasks.lock
+
 # Trained ML models (pickle files, environment-specific)
 app/models/
 
