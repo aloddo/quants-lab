@@ -1,0 +1,1594 @@
+[
+  {
+    "symbol": "GWEI",
+    "pair": "GWEIUSDT",
+    "announce_time": "2026-05-18 08:50:34",
+    "pre_listing_mexc_vol_7d_avg": 34500.85324428572,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PHAROS",
+    "pair": "PHAROSUSDT",
+    "announce_time": "2026-05-14 09:24:48",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BMNR",
+    "pair": "BMNRUSDT",
+    "announce_time": "2026-05-14 08:26:22",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ORCL",
+    "pair": "ORCLUSDT",
+    "announce_time": "2026-05-06 09:01:35",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CRCL",
+    "pair": "CRCLUSDT",
+    "announce_time": "2026-05-06 09:01:20",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BILL",
+    "pair": "BILLUSDT",
+    "announce_time": "2026-05-06 06:55:12",
+    "pre_listing_mexc_vol_7d_avg": 24942312.93793,
+    "pre_listing_days_data": 3,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MEGA",
+    "pair": "MEGAUSDT",
+    "announce_time": "2026-04-30 11:22:22",
+    "pre_listing_mexc_vol_7d_avg": 2065165.1603,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AIGENSYN",
+    "pair": "AIGENSYNUSDT",
+    "announce_time": "2026-04-30 05:43:47",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BLEND",
+    "pair": "BLENDUSDT",
+    "announce_time": "2026-04-29 10:12:15",
+    "pre_listing_mexc_vol_7d_avg": 603569.6744516668,
+    "pre_listing_days_data": 6,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "GOOGL",
+    "pair": "GOOGLUSDT",
+    "announce_time": "2026-04-27 08:32:54",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "OPG",
+    "pair": "OPGUSDT",
+    "announce_time": "2026-04-23 06:21:11",
+    "pre_listing_mexc_vol_7d_avg": 3218035.424133333,
+    "pre_listing_days_data": 3,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TSM",
+    "pair": "TSMUSDT",
+    "announce_time": "2026-04-22 09:14:14",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "INTC",
+    "pair": "INTCUSDT",
+    "announce_time": "2026-04-22 09:13:49",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CHIP",
+    "pair": "CHIPUSDT",
+    "announce_time": "2026-04-21 13:34:44",
+    "pre_listing_mexc_vol_7d_avg": 1131697.57257,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "GENIUS",
+    "pair": "GENIUSUSDT",
+    "announce_time": "2026-04-16 08:16:08",
+    "pre_listing_mexc_vol_7d_avg": 2014370.35108,
+    "pre_listing_days_data": 4,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "EDGE",
+    "pair": "EDGEUSDT",
+    "announce_time": "2026-03-31 13:04:48",
+    "pre_listing_mexc_vol_7d_avg": 1736074.5047,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BASED",
+    "pair": "BASEDUSDT",
+    "announce_time": "2026-03-30 08:37:14",
+    "pre_listing_mexc_vol_7d_avg": 1077970.64488,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PRL",
+    "pair": "PRLUSDT",
+    "announce_time": "2026-03-27 05:03:20",
+    "pre_listing_mexc_vol_7d_avg": 916367.5096999999,
+    "pre_listing_days_data": 3,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BSB",
+    "pair": "BSBUSDT",
+    "announce_time": "2026-03-26 05:16:47",
+    "pre_listing_mexc_vol_7d_avg": 223746.17348428568,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "KAT",
+    "pair": "KATUSDT",
+    "announce_time": "2026-03-18 13:17:57",
+    "pre_listing_mexc_vol_7d_avg": 578398.38278,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CFG",
+    "pair": "CFGUSDT",
+    "announce_time": "2026-03-17 04:22:59",
+    "pre_listing_mexc_vol_7d_avg": 272954.46614285716,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BP",
+    "pair": "BPUSDT",
+    "announce_time": "2026-03-16 06:16:20",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "XAG",
+    "pair": "XAGUSDT",
+    "announce_time": "2026-03-09 03:23:13",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "XAU",
+    "pair": "XAUUSDT",
+    "announce_time": "2026-03-09 03:18:33",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "OPN",
+    "pair": "OPNUSDT",
+    "announce_time": "2026-03-05 11:40:37",
+    "pre_listing_mexc_vol_7d_avg": 675758.1529,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ROBO",
+    "pair": "ROBOUSDT",
+    "announce_time": "2026-02-27 08:46:54",
+    "pre_listing_mexc_vol_7d_avg": 1026249.4063,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ESP",
+    "pair": "ESPUSDT",
+    "announce_time": "2026-02-12 11:36:30",
+    "pre_listing_mexc_vol_7d_avg": 1373390.07776,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AZTEC",
+    "pair": "AZTECUSDT",
+    "announce_time": "2026-02-12 07:47:10",
+    "pre_listing_mexc_vol_7d_avg": 2192127.93974,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TRIA",
+    "pair": "TRIAUSDT",
+    "announce_time": "2026-02-05 10:29:23",
+    "pre_listing_mexc_vol_7d_avg": 13555685.92702,
+    "pre_listing_days_data": 3,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ZAMA",
+    "pair": "ZAMAUSDT",
+    "announce_time": "2026-02-02 12:21:21",
+    "pre_listing_mexc_vol_7d_avg": 2940451.71726,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "INX",
+    "pair": "INXUSDT",
+    "announce_time": "2026-01-30 19:25:47",
+    "pre_listing_mexc_vol_7d_avg": 377482.37264,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BIRB",
+    "pair": "BIRBUSDT",
+    "announce_time": "2026-01-28 11:38:35",
+    "pre_listing_mexc_vol_7d_avg": 3609015.2386,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SPACE",
+    "pair": "SPACEUSDT",
+    "announce_time": "2026-01-23 12:39:21",
+    "pre_listing_mexc_vol_7d_avg": 1207967.69024,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FIGHT",
+    "pair": "FIGHTUSDT",
+    "announce_time": "2026-01-23 12:03:33",
+    "pre_listing_mexc_vol_7d_avg": 1616485.416245,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ACU",
+    "pair": "ACUUSDT",
+    "announce_time": "2026-01-23 08:22:14",
+    "pre_listing_mexc_vol_7d_avg": 1108015.8146074999,
+    "pre_listing_days_data": 4,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SENT",
+    "pair": "SENTUSDT",
+    "announce_time": "2026-01-22 12:39:29",
+    "pre_listing_mexc_vol_7d_avg": 5645527.74225,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ELSA",
+    "pair": "ELSAUSDT",
+    "announce_time": "2026-01-22 07:41:34",
+    "pre_listing_mexc_vol_7d_avg": 4140846.1857666667,
+    "pre_listing_days_data": 3,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SKR",
+    "pair": "SKRUSDT",
+    "announce_time": "2026-01-21 07:00:10",
+    "pre_listing_mexc_vol_7d_avg": 3001433.137544,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PLAYSOUT",
+    "pair": "PLAYSOUTUSDT",
+    "announce_time": "2026-01-20 10:05:06",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SPORTFUN",
+    "pair": "SPORTFUNUSDT",
+    "announce_time": "2026-01-19 10:00:43",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FOGO",
+    "pair": "FOGOUSDT",
+    "announce_time": "2026-01-15 16:12:15",
+    "pre_listing_mexc_vol_7d_avg": 1474408.97254,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FHE",
+    "pair": "FHEUSDT",
+    "announce_time": "2026-01-07 08:40:12",
+    "pre_listing_mexc_vol_7d_avg": 517740.73583571427,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "WHITEWHALE",
+    "pair": "WHITEWHALEUSDT",
+    "announce_time": "2026-01-06 12:28:11",
+    "pre_listing_mexc_vol_7d_avg": 127766.73545,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "LIT",
+    "pair": "LITUSDT",
+    "announce_time": "2025-12-30 14:07:23",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BREV",
+    "pair": "BREVUSDT",
+    "announce_time": "2025-12-30 13:10:23",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "POWER",
+    "pair": "POWERUSDT",
+    "announce_time": "2025-12-29 10:47:35",
+    "pre_listing_mexc_vol_7d_avg": 315336.47198,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MAGMA",
+    "pair": "MAGMAUSDT",
+    "announce_time": "2025-12-26 07:41:57",
+    "pre_listing_mexc_vol_7d_avg": 155259.91425714287,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ZKP",
+    "pair": "ZKPUSDT",
+    "announce_time": "2025-12-22 09:48:01",
+    "pre_listing_mexc_vol_7d_avg": 2427408.009125,
+    "pre_listing_days_data": 4,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "RAVE",
+    "pair": "RAVEUSDT",
+    "announce_time": "2025-12-15 06:33:22",
+    "pre_listing_mexc_vol_7d_avg": 3843877.05055,
+    "pre_listing_days_data": 4,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "US",
+    "pair": "USUSDT",
+    "announce_time": "2025-12-12 11:22:07",
+    "pre_listing_mexc_vol_7d_avg": 5096674.185405,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CYS",
+    "pair": "CYSUSDT",
+    "announce_time": "2025-12-12 11:20:28",
+    "pre_listing_mexc_vol_7d_avg": 1250060.01455,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "WET",
+    "pair": "WETUSDT",
+    "announce_time": "2025-12-09 14:51:01",
+    "pre_listing_mexc_vol_7d_avg": 2125015.5285,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FOLKS",
+    "pair": "FOLKSUSDT",
+    "announce_time": "2025-12-09 11:24:02",
+    "pre_listing_mexc_vol_7d_avg": 1421176.751,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "NIGHT",
+    "pair": "NIGHTUSDT",
+    "announce_time": "2025-12-09 11:14:41",
+    "pre_listing_mexc_vol_7d_avg": 1661512.73713,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "STABLE",
+    "pair": "STABLEUSDT",
+    "announce_time": "2025-12-08 13:15:54",
+    "pre_listing_mexc_vol_7d_avg": 16114532.49528,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "RLS",
+    "pair": "RLSUSDT",
+    "announce_time": "2025-12-02 10:42:41",
+    "pre_listing_mexc_vol_7d_avg": 3036388.33282,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "IRYS",
+    "pair": "IRYSUSDT",
+    "announce_time": "2025-11-27 06:29:56",
+    "pre_listing_mexc_vol_7d_avg": 7062663.007526667,
+    "pre_listing_days_data": 3,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MON",
+    "pair": "MONUSDT",
+    "announce_time": "2025-11-25 07:51:29",
+    "pre_listing_mexc_vol_7d_avg": 16589917.21888,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BOBBOB",
+    "pair": "BOBBOBUSDT",
+    "announce_time": "2025-11-24 08:43:32",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BEAT",
+    "pair": "BEATUSDT",
+    "announce_time": "2025-11-21 11:12:41",
+    "pre_listing_mexc_vol_7d_avg": 3080729.710174286,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "JCT",
+    "pair": "JCTUSDT",
+    "announce_time": "2025-11-17 10:43:26",
+    "pre_listing_mexc_vol_7d_avg": 971374.5965821428,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "UAI",
+    "pair": "UAIUSDT",
+    "announce_time": "2025-11-17 10:43:47",
+    "pre_listing_mexc_vol_7d_avg": 1201518.2517714289,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PIEVERSE",
+    "pair": "PIEVERSEUSDT",
+    "announce_time": "2025-11-14 13:49:17",
+    "pre_listing_mexc_vol_7d_avg": 2150828.2505,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ALLO",
+    "pair": "ALLOUSDT",
+    "announce_time": "2025-11-14 12:50:05",
+    "pre_listing_mexc_vol_7d_avg": 39887631.129099995,
+    "pre_listing_days_data": 4,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TRUST",
+    "pair": "TRUSTUSDT",
+    "announce_time": "2025-11-14 12:30:27",
+    "pre_listing_mexc_vol_7d_avg": 695039.0944285715,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CC",
+    "pair": "CCUSDT",
+    "announce_time": "2025-11-10 07:12:38",
+    "pre_listing_mexc_vol_7d_avg": 2450821.6331,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MMT",
+    "pair": "MMTUSDT",
+    "announce_time": "2025-11-04 12:14:29",
+    "pre_listing_mexc_vol_7d_avg": 20362307.3888,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "KITE",
+    "pair": "KITEUSDT",
+    "announce_time": "2025-11-03 13:20:17",
+    "pre_listing_mexc_vol_7d_avg": 1058819.4961,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AT",
+    "pair": "ATUSDT",
+    "announce_time": "2025-10-29 14:15:46",
+    "pre_listing_mexc_vol_7d_avg": 3476602.06155,
+    "pre_listing_days_data": 6,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PIGGY",
+    "pair": "PIGGYUSDT",
+    "announce_time": "2025-10-29 12:37:36",
+    "pre_listing_mexc_vol_7d_avg": 1368887.3335000002,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "COMMON",
+    "pair": "COMMONUSDT",
+    "announce_time": "2025-10-27 13:33:36",
+    "pre_listing_mexc_vol_7d_avg": 1363549.91373,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "LAB",
+    "pair": "LABUSDT",
+    "announce_time": "2025-10-27 10:06:22",
+    "pre_listing_mexc_vol_7d_avg": 1094120.474627143,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BLUAI",
+    "pair": "BLUAIUSDT",
+    "announce_time": "2025-10-24 12:08:42",
+    "pre_listing_mexc_vol_7d_avg": 3693575.8170675,
+    "pre_listing_days_data": 4,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MET",
+    "pair": "METUSDT",
+    "announce_time": "2025-10-23 14:08:09",
+    "pre_listing_mexc_vol_7d_avg": 16672326.0929,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "APR",
+    "pair": "APRUSDT",
+    "announce_time": "2025-10-23 12:34:35",
+    "pre_listing_mexc_vol_7d_avg": 4346943.4173,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TURTLE",
+    "pair": "TURTLEUSDT",
+    "announce_time": "2025-10-22 15:19:10",
+    "pre_listing_mexc_vol_7d_avg": 3275650.824,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "RIVER",
+    "pair": "RIVERUSDT",
+    "announce_time": "2025-10-22 12:47:55",
+    "pre_listing_mexc_vol_7d_avg": 2047327.1505714285,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ZBT",
+    "pair": "ZBTUSDT",
+    "announce_time": "2025-10-17 13:21:06",
+    "pre_listing_mexc_vol_7d_avg": 3718304.6214,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "EVAA",
+    "pair": "EVAAUSDT",
+    "announce_time": "2025-10-17 12:19:49",
+    "pre_listing_mexc_vol_7d_avg": 1425003.5968571429,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "HANA",
+    "pair": "HANAUSDT",
+    "announce_time": "2025-10-17 12:19:33",
+    "pre_listing_mexc_vol_7d_avg": 2282141.9685728573,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CLO",
+    "pair": "CLOUSDT",
+    "announce_time": "2025-10-17 12:19:25",
+    "pre_listing_mexc_vol_7d_avg": 6325065.072405,
+    "pre_listing_days_data": 4,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "RECALL",
+    "pair": "RECALLUSDT",
+    "announce_time": "2025-10-15 12:35:24",
+    "pre_listing_mexc_vol_7d_avg": 9553233.9991,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "YB",
+    "pair": "YBUSDT",
+    "announce_time": "2025-10-15 11:08:55",
+    "pre_listing_mexc_vol_7d_avg": 6492751.5936,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ENSO",
+    "pair": "ENSOUSDT",
+    "announce_time": "2025-10-14 09:33:16",
+    "pre_listing_mexc_vol_7d_avg": 5937387.449,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "EUL",
+    "pair": "EULUSDT",
+    "announce_time": "2025-10-14 08:48:37",
+    "pre_listing_mexc_vol_7d_avg": 755148.8175714286,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "GIGGLE",
+    "pair": "GIGGLEUSDT",
+    "announce_time": "2025-10-09 12:27:15",
+    "pre_listing_mexc_vol_7d_avg": 5261206.5757142855,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "4",
+    "pair": "4USDT",
+    "announce_time": "2025-10-08 12:46:06",
+    "pre_listing_mexc_vol_7d_avg": 11568036.503321428,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "KGEN",
+    "pair": "KGENUSDT",
+    "announce_time": "2025-10-07 15:31:48",
+    "pre_listing_mexc_vol_7d_avg": 2761522.9745,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "LYN",
+    "pair": "LYNUSDT",
+    "announce_time": "2025-10-06 08:19:00",
+    "pre_listing_mexc_vol_7d_avg": 7848973.6651,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "2Z",
+    "pair": "2ZUSDT",
+    "announce_time": "2025-10-02 13:49:23",
+    "pre_listing_mexc_vol_7d_avg": 138008734.6361,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "COAI",
+    "pair": "COAIUSDT",
+    "announce_time": "2025-10-02 08:45:34",
+    "pre_listing_mexc_vol_7d_avg": 1752929.8313857145,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TRUTH",
+    "pair": "TRUTHUSDT",
+    "announce_time": "2025-10-01 14:25:26",
+    "pre_listing_mexc_vol_7d_avg": 3446900.50461,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "NOM",
+    "pair": "NOMUSDT",
+    "announce_time": "2025-10-01 08:50:14",
+    "pre_listing_mexc_vol_7d_avg": 1697150.38667,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "VFY",
+    "pair": "VFYUSDT",
+    "announce_time": "2025-09-30 12:43:50",
+    "pre_listing_mexc_vol_7d_avg": 7818392.757,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "EDEN",
+    "pair": "EDENUSDT",
+    "announce_time": "2025-09-30 11:59:02",
+    "pre_listing_mexc_vol_7d_avg": 90563359.217,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FF",
+    "pair": "FFUSDT",
+    "announce_time": "2025-09-29 14:37:04",
+    "pre_listing_mexc_vol_7d_avg": 187495526.3676,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "XAN",
+    "pair": "XANUSDT",
+    "announce_time": "2025-09-29 11:01:08",
+    "pre_listing_mexc_vol_7d_avg": 82291229.512,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "APEX",
+    "pair": "APEXUSDT",
+    "announce_time": "2025-09-28 08:53:14",
+    "pre_listing_mexc_vol_7d_avg": 8726630.027557144,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "LIGHT",
+    "pair": "LIGHTUSDT",
+    "announce_time": "2025-09-27 13:34:50",
+    "pre_listing_mexc_vol_7d_avg": 6675165.0752,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "RLUSD",
+    "pair": "RLUSDUSDT",
+    "announce_time": "2025-09-26 14:18:38",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AKE",
+    "pair": "AKEUSDT",
+    "announce_time": "2025-09-26 13:43:11",
+    "pre_listing_mexc_vol_7d_avg": 707725.9906239571,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MIRA",
+    "pair": "MIRAUSDT",
+    "announce_time": "2025-09-26 12:58:37",
+    "pre_listing_mexc_vol_7d_avg": 190383432.958,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "XPL",
+    "pair": "XPLUSDT",
+    "announce_time": "2025-09-25 13:11:52",
+    "pre_listing_mexc_vol_7d_avg": 415925964.0191,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FLUID",
+    "pair": "FLUIDUSDT",
+    "announce_time": "2025-09-24 12:04:49",
+    "pre_listing_mexc_vol_7d_avg": 185756.59114285716,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BLESS",
+    "pair": "BLESSUSDT",
+    "announce_time": "2025-09-24 10:19:02",
+    "pre_listing_mexc_vol_7d_avg": 16760675.22158,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "HEMI",
+    "pair": "HEMIUSDT",
+    "announce_time": "2025-09-23 13:21:19",
+    "pre_listing_mexc_vol_7d_avg": 5569754.819237143,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "0G",
+    "pair": "0GUSDT",
+    "announce_time": "2025-09-22 10:42:55",
+    "pre_listing_mexc_vol_7d_avg": 146709349.418,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ASTER",
+    "pair": "ASTERUSDT",
+    "announce_time": "2025-09-20 06:17:21",
+    "pre_listing_mexc_vol_7d_avg": 204628959.76285002,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BARD",
+    "pair": "BARDUSDT",
+    "announce_time": "2025-09-18 11:21:18",
+    "pre_listing_mexc_vol_7d_avg": 4522883.9484,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AIA",
+    "pair": "AIAUSDT",
+    "announce_time": "2025-09-18 10:16:47",
+    "pre_listing_mexc_vol_7d_avg": 3557433.7599,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "STBL",
+    "pair": "STBLUSDT",
+    "announce_time": "2025-09-17 10:28:34",
+    "pre_listing_mexc_vol_7d_avg": 11507034.66251,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ZKC",
+    "pair": "ZKCUSDT",
+    "announce_time": "2025-09-15 14:14:25",
+    "pre_listing_mexc_vol_7d_avg": 6645308.8969,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "Q",
+    "pair": "QUSDT",
+    "announce_time": "2025-09-12 12:07:42",
+    "pre_listing_mexc_vol_7d_avg": 696115.7880142856,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "XPIN",
+    "pair": "XPINUSDT",
+    "announce_time": "2025-09-12 12:06:06",
+    "pre_listing_mexc_vol_7d_avg": 1950294.6495544,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "UB",
+    "pair": "UBUSDT",
+    "announce_time": "2025-09-12 09:35:13",
+    "pre_listing_mexc_vol_7d_avg": 3252198.16062,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "HOLO",
+    "pair": "HOLOUSDT",
+    "announce_time": "2025-09-11 12:15:39",
+    "pre_listing_mexc_vol_7d_avg": 13283069.7256,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "OKB",
+    "pair": "OKBUSDT",
+    "announce_time": "2025-09-11 12:03:22",
+    "pre_listing_mexc_vol_7d_avg": 11296192.833857143,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "LINEA",
+    "pair": "LINEAUSDT",
+    "announce_time": "2025-09-10 15:11:43",
+    "pre_listing_mexc_vol_7d_avg": 19753940.94086,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AVNT",
+    "pair": "AVNTUSDT",
+    "announce_time": "2025-09-09 14:15:11",
+    "pre_listing_mexc_vol_7d_avg": 8613550.0083,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "OPEN",
+    "pair": "OPENUSDT",
+    "announce_time": "2025-09-08 13:14:29",
+    "pre_listing_mexc_vol_7d_avg": 11334750.41376,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "NODE",
+    "pair": "NODEUSDT",
+    "announce_time": "2025-09-04 10:03:02",
+    "pre_listing_mexc_vol_7d_avg": 4357998.564107143,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PTB",
+    "pair": "PTBUSDT",
+    "announce_time": "2025-09-03 13:19:33",
+    "pre_listing_mexc_vol_7d_avg": 3116512.05556,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ARIA",
+    "pair": "ARIAUSDT",
+    "announce_time": "2025-09-03 13:03:09",
+    "pre_listing_mexc_vol_7d_avg": 259323.4679185714,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SOMI",
+    "pair": "SOMIUSDT",
+    "announce_time": "2025-09-02 14:52:20",
+    "pre_listing_mexc_vol_7d_avg": 2591144.671,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "WLFI",
+    "pair": "WLFIUSDT",
+    "announce_time": "2025-09-01 13:07:11",
+    "pre_listing_mexc_vol_7d_avg": 388682659.3487,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BDXN",
+    "pair": "BDXNUSDT",
+    "announce_time": "2025-09-01 07:57:28",
+    "pre_listing_mexc_vol_7d_avg": 6705153.2307899995,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MITO",
+    "pair": "MITOUSDT",
+    "announce_time": "2025-08-29 10:28:44",
+    "pre_listing_mexc_vol_7d_avg": 3380748.119055,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CAMP",
+    "pair": "CAMPUSDT",
+    "announce_time": "2025-08-28 08:51:47",
+    "pre_listing_mexc_vol_7d_avg": 9849367.023155,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BTR",
+    "pair": "BTRUSDT",
+    "announce_time": "2025-08-27 11:25:06",
+    "pre_listing_mexc_vol_7d_avg": 8076844.9622,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BSU",
+    "pair": "BSUUSDT",
+    "announce_time": "2025-08-27 10:57:12",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "YZY",
+    "pair": "YZYUSDT",
+    "announce_time": "2025-08-21 04:37:28",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SAPIEN",
+    "pair": "SAPIENUSDT",
+    "announce_time": "2025-08-20 18:23:53",
+    "pre_listing_mexc_vol_7d_avg": 3330444.7899,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "DAM",
+    "pair": "DAMUSDT",
+    "announce_time": "2025-08-18 13:03:47",
+    "pre_listing_mexc_vol_7d_avg": 1515459.4774,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ALPINE",
+    "pair": "ALPINEUSDT",
+    "announce_time": "2025-08-14 09:57:44",
+    "pre_listing_mexc_vol_7d_avg": 9217143.647485714,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ASR",
+    "pair": "ASRUSDT",
+    "announce_time": "2025-08-14 09:56:44",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "XNY",
+    "pair": "XNYUSDT",
+    "announce_time": "2025-08-13 13:44:23",
+    "pre_listing_mexc_vol_7d_avg": 1025205.7724964286,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AIO",
+    "pair": "AIOUSDT",
+    "announce_time": "2025-08-13 13:43:56",
+    "pre_listing_mexc_vol_7d_avg": 314376.56731285714,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SKY",
+    "pair": "SKYUSDT",
+    "announce_time": "2025-08-11 08:46:12",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "K",
+    "pair": "KUSDT",
+    "announce_time": "2025-08-08 08:42:31",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "YALA",
+    "pair": "YALAUSDT",
+    "announce_time": "2025-08-08 07:49:45",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "IN",
+    "pair": "INUSDT",
+    "announce_time": "2025-08-07 10:34:12",
+    "pre_listing_mexc_vol_7d_avg": 1404492.01208,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "RHEA",
+    "pair": "RHEAUSDT",
+    "announce_time": "2025-08-06 11:36:03",
+    "pre_listing_mexc_vol_7d_avg": 799473.82525,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PROVE",
+    "pair": "PROVEUSDT",
+    "announce_time": "2025-08-05 17:12:57",
+    "pre_listing_mexc_vol_7d_avg": 55954526.2909,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TOWNS",
+    "pair": "TOWNSUSDT",
+    "announce_time": "2025-08-05 14:46:53",
+    "pre_listing_mexc_vol_7d_avg": 23775713.4343,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "MYX",
+    "pair": "MYXUSDT",
+    "announce_time": "2025-08-05 09:38:14",
+    "pre_listing_mexc_vol_7d_avg": 2214266.8670614283,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "NAORIS",
+    "pair": "NAORISUSDT",
+    "announce_time": "2025-07-31 12:39:03",
+    "pre_listing_mexc_vol_7d_avg": 2298819.47611,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "A2Z",
+    "pair": "A2ZUSDT",
+    "announce_time": "2025-07-31 09:26:18",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TREE",
+    "pair": "TREEUSDT",
+    "announce_time": "2025-07-29 14:20:58",
+    "pre_listing_mexc_vol_7d_avg": 4751803.1869,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ESPORTS",
+    "pair": "ESPORTSUSDT",
+    "announce_time": "2025-07-29 10:32:36",
+    "pre_listing_mexc_vol_7d_avg": 489916.26731,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "1000TAG",
+    "pair": "1000TAGUSDT",
+    "announce_time": "2025-07-28 09:12:29",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FIS",
+    "pair": "FISUSDT",
+    "announce_time": "2025-07-28 09:12:08",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "DOLO",
+    "pair": "DOLOUSDT",
+    "announce_time": "2025-07-28 09:11:17",
+    "pre_listing_mexc_vol_7d_avg": 2019776.6178742857,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ASP",
+    "pair": "ASPUSDT",
+    "announce_time": "2025-07-24 12:24:55",
+    "pre_listing_mexc_vol_7d_avg": 101262.7877,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "DIA",
+    "pair": "DIAUSDT",
+    "announce_time": "2025-07-23 08:21:06",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TA",
+    "pair": "TAUSDT",
+    "announce_time": "2025-07-21 09:26:58",
+    "pre_listing_mexc_vol_7d_avg": 4236153.8317,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ERA",
+    "pair": "ERAUSDT",
+    "announce_time": "2025-07-17 16:02:35",
+    "pre_listing_mexc_vol_7d_avg": 7217976.6983,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "USD1",
+    "pair": "USD1USDT",
+    "announce_time": "2025-07-16 11:06:12",
+    "pre_listing_mexc_vol_7d_avg": 3690802.4276285716,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ES",
+    "pair": "ESUSDT",
+    "announce_time": "2025-07-16 10:52:13",
+    "pre_listing_mexc_vol_7d_avg": 5443816.4868,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TAC",
+    "pair": "TACUSDT",
+    "announce_time": "2025-07-15 11:01:10",
+    "pre_listing_mexc_vol_7d_avg": 3626217.609991,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "C",
+    "pair": "CUSDT",
+    "announce_time": "2025-07-15 10:37:20",
+    "pre_listing_mexc_vol_7d_avg": 5732773.93506,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "VELVET",
+    "pair": "VELVETUSDT",
+    "announce_time": "2025-07-15 10:37:28",
+    "pre_listing_mexc_vol_7d_avg": 654207.1172866666,
+    "pre_listing_days_data": 6,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PUMPFUN",
+    "pair": "PUMPFUNUSDT",
+    "announce_time": "2025-07-14 17:28:45",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AIN",
+    "pair": "AINUSDT",
+    "announce_time": "2025-07-10 11:29:54",
+    "pre_listing_mexc_vol_7d_avg": 3107842.5668483335,
+    "pre_listing_days_data": 6,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "USELESS",
+    "pair": "USELESSUSDT",
+    "announce_time": "2025-07-10 11:29:45",
+    "pre_listing_mexc_vol_7d_avg": 1875449.027702143,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CROSS",
+    "pair": "CROSSUSDT",
+    "announce_time": "2025-07-10 11:29:37",
+    "pre_listing_mexc_vol_7d_avg": 964806.7507885714,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "TANSSI",
+    "pair": "TANSSIUSDT",
+    "announce_time": "2025-07-09 12:21:40",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "M",
+    "pair": "MUSDT",
+    "announce_time": "2025-07-08 09:52:16",
+    "pre_listing_mexc_vol_7d_avg": 1806883.809215,
+    "pre_listing_days_data": 6,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "DMC",
+    "pair": "DMCUSDT",
+    "announce_time": "2025-07-03 11:37:27",
+    "pre_listing_mexc_vol_7d_avg": 2747461.956787857,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "ICNT",
+    "pair": "ICNTUSDT",
+    "announce_time": "2025-07-03 11:11:03",
+    "pre_listing_mexc_vol_7d_avg": 1386901.40592,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "FRAG",
+    "pair": "FRAGUSDT",
+    "announce_time": "2025-07-01 09:37:00",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SAHARA",
+    "pair": "SAHARAUSDT",
+    "announce_time": "2025-06-26 12:17:47",
+    "pre_listing_mexc_vol_7d_avg": 41799493.99084,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SOSO",
+    "pair": "SOSOUSDT",
+    "announce_time": "2025-06-26 11:29:11",
+    "pre_listing_mexc_vol_7d_avg": 15226.570714285715,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "H",
+    "pair": "HUSDT",
+    "announce_time": "2025-06-25 09:58:05",
+    "pre_listing_mexc_vol_7d_avg": 9346493.56109,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "NEWT",
+    "pair": "NEWTUSDT",
+    "announce_time": "2025-06-24 14:14:53",
+    "pre_listing_mexc_vol_7d_avg": 61852975.5982,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SPK",
+    "pair": "SPKUSDT",
+    "announce_time": "2025-06-17 09:22:24",
+    "pre_listing_mexc_vol_7d_avg": 32732422.22282,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "CUDIS",
+    "pair": "CUDISUSDT",
+    "announce_time": "2025-06-12 08:49:29",
+    "pre_listing_mexc_vol_7d_avg": 269351.13372285716,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SQD",
+    "pair": "SQDUSDT",
+    "announce_time": "2025-06-11 11:35:10",
+    "pre_listing_mexc_vol_7d_avg": 673209.8874771429,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "RESOLV",
+    "pair": "RESOLVUSDT",
+    "announce_time": "2025-06-10 13:25:26",
+    "pre_listing_mexc_vol_7d_avg": 33631294.21492,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "HOME",
+    "pair": "HOMEUSDT",
+    "announce_time": "2025-06-10 11:35:44",
+    "pre_listing_mexc_vol_7d_avg": 44467026.6889,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SKATE",
+    "pair": "SKATEUSDT",
+    "announce_time": "2025-06-09 10:29:09",
+    "pre_listing_mexc_vol_7d_avg": 7903727.80096,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "B2",
+    "pair": "B2USDT",
+    "announce_time": "2025-06-09 09:26:11",
+    "pre_listing_mexc_vol_7d_avg": 729618.1559871428,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "LA",
+    "pair": "LAUSDT",
+    "announce_time": "2025-06-05 06:03:17",
+    "pre_listing_mexc_vol_7d_avg": 32266039.211455,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PUMPBTC",
+    "pair": "PUMPBTCUSDT",
+    "announce_time": "2025-06-03 04:51:28",
+    "pre_listing_mexc_vol_7d_avg": 987058.6921499999,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SOPH",
+    "pair": "SOPHUSDT",
+    "announce_time": "2025-05-28 13:16:00",
+    "pre_listing_mexc_vol_7d_avg": 77644616.00802,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "A",
+    "pair": "AUSDT",
+    "announce_time": "2025-05-28 08:37:14",
+    "pre_listing_mexc_vol_7d_avg": 549626.8963,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AGT",
+    "pair": "AGTUSDT",
+    "announce_time": "2025-05-28 06:37:16",
+    "pre_listing_mexc_vol_7d_avg": 1098718.2803115714,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "HUMA",
+    "pair": "HUMAUSDT",
+    "announce_time": "2025-05-26 13:12:16",
+    "pre_listing_mexc_vol_7d_avg": 85241806.55125,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SOON",
+    "pair": "SOONUSDT",
+    "announce_time": "2025-05-23 09:10:10",
+    "pre_listing_mexc_vol_7d_avg": 12584451.7796,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "B",
+    "pair": "BUSDT",
+    "announce_time": "2025-05-23 06:25:23",
+    "pre_listing_mexc_vol_7d_avg": 3125255.64904,
+    "pre_listing_days_data": 5,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "AWE",
+    "pair": "AWEUSDT",
+    "announce_time": "2025-05-22 09:41:10",
+    "pre_listing_mexc_vol_7d_avg": 204639.62205499999,
+    "pre_listing_days_data": 2,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SAROS",
+    "pair": "SAROSUSDT",
+    "announce_time": "2025-05-20 08:25:03",
+    "pre_listing_mexc_vol_7d_avg": 2142159.9903885713,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "PRAI",
+    "pair": "PRAIUSDT",
+    "announce_time": "2025-05-19 08:28:38",
+    "pre_listing_mexc_vol_7d_avg": 1698319.3751816666,
+    "pre_listing_days_data": 6,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SYRUP",
+    "pair": "SYRUPUSDT",
+    "announce_time": "2025-05-19 08:01:08",
+    "pre_listing_mexc_vol_7d_avg": 5643842.9502385715,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "NXPC",
+    "pair": "NXPCUSDT",
+    "announce_time": "2025-05-15 06:33:36",
+    "pre_listing_mexc_vol_7d_avg": 247927996.1141,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "LAUNCHCOIN",
+    "pair": "LAUNCHCOINUSDT",
+    "announce_time": "2025-05-14 10:04:34",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SKYAI",
+    "pair": "SKYAIUSDT",
+    "announce_time": "2025-05-13 10:36:49",
+    "pre_listing_mexc_vol_7d_avg": 0,
+    "pre_listing_days_data": 0,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "DOOD",
+    "pair": "DOODUSDT",
+    "announce_time": "2025-05-09 13:46:09",
+    "pre_listing_mexc_vol_7d_avg": 4879504.05354,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "SXT",
+    "pair": "SXTUSDT",
+    "announce_time": "2025-05-08 13:17:15",
+    "pre_listing_mexc_vol_7d_avg": 3446680.9583,
+    "pre_listing_days_data": 1,
+    "bybit_listed": true
+  },
+  {
+    "symbol": "BANK",
+    "pair": "BANKUSDT",
+    "announce_time": "2025-05-08 09:15:10",
+    "pre_listing_mexc_vol_7d_avg": 393938.9422442857,
+    "pre_listing_days_data": 7,
+    "bybit_listed": true
+  }
+]

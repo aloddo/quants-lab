@@ -1,0 +1,33 @@
+[
+  {
+    "symbol": "GWEI",
+    "cg_id": "ethgas-2",
+    "mcap": 281598135,
+    "fdv": 1340943501,
+    "volume": 5311351,
+    "circ_supply": 2100000000.0,
+    "total_supply": 10000000000.0,
+    "twitter": 0,
+    "telegram": 127481,
+    "categories": [
+      "Infrastructure",
+      "Decentralized Finance (DeFi)",
+      "BNB Chain Ecosystem"
+    ],
+    "platforms": [
+      "ethereum",
+      "binance-smart-chain"
+    ],
+    "genesis": null
+  },
+  {
+    "symbol": "PHAROS",
+    "cg_id": null,
+    "error": "not_found"
+  },
+  {
+    "symbol": "BMNR",
+    "cg_id": null,
+    "error": "not_found"
+  }
+]

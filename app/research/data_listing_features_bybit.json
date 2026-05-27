@@ -1,0 +1,1793 @@
+[
+  {
+    "symbol": "GWEI",
+    "announce_time": "2026-05-18 08:50:34",
+    "bybit_vol": 3302631.4547,
+    "bybit_oi": 3337502.0,
+    "on_mexc": true,
+    "mexc_vol": 19198.82269,
+    "still_listed": true
+  },
+  {
+    "symbol": "PHAROS",
+    "announce_time": "2026-05-14 09:24:48",
+    "bybit_vol": 3873790.6609,
+    "bybit_oi": 800738.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "BMNR",
+    "announce_time": "2026-05-14 08:26:22",
+    "bybit_vol": 320325.6708,
+    "bybit_oi": 12866.4,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "ORCL",
+    "announce_time": "2026-05-06 09:01:35",
+    "bybit_vol": 216816.1532,
+    "bybit_oi": 1218.54,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "CRCL",
+    "announce_time": "2026-05-06 09:01:20",
+    "bybit_vol": 1096907.3982,
+    "bybit_oi": 6138.9,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "BILL",
+    "announce_time": "2026-05-06 06:55:12",
+    "bybit_vol": 55221947.8563,
+    "bybit_oi": 70970180.0,
+    "on_mexc": true,
+    "mexc_vol": 2371381.87911,
+    "still_listed": true
+  },
+  {
+    "symbol": "MEGA",
+    "announce_time": "2026-04-30 11:22:22",
+    "bybit_vol": 3526556.0283,
+    "bybit_oi": 60524085.0,
+    "on_mexc": true,
+    "mexc_vol": 97509.21663,
+    "still_listed": true
+  },
+  {
+    "symbol": "AIGENSYN",
+    "announce_time": "2026-04-30 05:43:47",
+    "bybit_vol": 10303773.9523,
+    "bybit_oi": 94698070.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "BLEND",
+    "announce_time": "2026-04-29 10:12:15",
+    "bybit_vol": 2086829.3995,
+    "bybit_oi": 21681601.0,
+    "on_mexc": true,
+    "mexc_vol": 69643.51883,
+    "still_listed": true
+  },
+  {
+    "symbol": "GOOGL",
+    "announce_time": "2026-04-27 08:32:54",
+    "bybit_vol": 587516.3763,
+    "bybit_oi": 1639.94,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "OPG",
+    "announce_time": "2026-04-23 06:21:11",
+    "bybit_vol": 2469229.9577,
+    "bybit_oi": 14917270.0,
+    "on_mexc": true,
+    "mexc_vol": 183987.8397,
+    "still_listed": true
+  },
+  {
+    "symbol": "TSM",
+    "announce_time": "2026-04-22 09:14:14",
+    "bybit_vol": 169628.0257,
+    "bybit_oi": 1624.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "INTC",
+    "announce_time": "2026-04-22 09:13:49",
+    "bybit_vol": 2570593.0525,
+    "bybit_oi": 11894.54,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "CHIP",
+    "announce_time": "2026-04-21 13:34:44",
+    "bybit_vol": 3917638.9157,
+    "bybit_oi": 150549070.0,
+    "on_mexc": true,
+    "mexc_vol": 212004.40039,
+    "still_listed": true
+  },
+  {
+    "symbol": "GENIUS",
+    "announce_time": "2026-04-16 08:16:08",
+    "bybit_vol": 1561140.0746,
+    "bybit_oi": 3880936.0,
+    "on_mexc": true,
+    "mexc_vol": 200801.7767,
+    "still_listed": true
+  },
+  {
+    "symbol": "EDGE",
+    "announce_time": "2026-03-31 13:04:48",
+    "bybit_vol": 5913920.4796,
+    "bybit_oi": 9403136.0,
+    "on_mexc": true,
+    "mexc_vol": 89763.6869,
+    "still_listed": true
+  },
+  {
+    "symbol": "BASED",
+    "announce_time": "2026-03-30 08:37:14",
+    "bybit_vol": 1740844.537,
+    "bybit_oi": 33295146.0,
+    "on_mexc": true,
+    "mexc_vol": 112160.85681,
+    "still_listed": true
+  },
+  {
+    "symbol": "PRL",
+    "announce_time": "2026-03-27 05:03:20",
+    "bybit_vol": 692548.454,
+    "bybit_oi": 6655915.0,
+    "on_mexc": true,
+    "mexc_vol": 111578.7941,
+    "still_listed": true
+  },
+  {
+    "symbol": "BSB",
+    "announce_time": "2026-03-26 05:16:47",
+    "bybit_vol": 64125622.3357,
+    "bybit_oi": 18976952.0,
+    "on_mexc": true,
+    "mexc_vol": 1244174.95651,
+    "still_listed": true
+  },
+  {
+    "symbol": "KAT",
+    "announce_time": "2026-03-18 13:17:57",
+    "bybit_vol": 968902.5002,
+    "bybit_oi": 179096700.0,
+    "on_mexc": true,
+    "mexc_vol": 121107.515223,
+    "still_listed": true
+  },
+  {
+    "symbol": "CFG",
+    "announce_time": "2026-03-17 04:22:59",
+    "bybit_vol": 7023970.9371,
+    "bybit_oi": 9532500.0,
+    "on_mexc": true,
+    "mexc_vol": 353728.8207,
+    "still_listed": true
+  },
+  {
+    "symbol": "BP",
+    "announce_time": "2026-03-16 06:16:20",
+    "bybit_vol": 68053.097,
+    "bybit_oi": 7231141.0,
+    "on_mexc": true,
+    "mexc_vol": 64514.6411,
+    "still_listed": true
+  },
+  {
+    "symbol": "XAG",
+    "announce_time": "2026-03-09 03:23:13",
+    "bybit_vol": 45130687.4571,
+    "bybit_oi": 322051.003,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "XAU",
+    "announce_time": "2026-03-09 03:18:33",
+    "bybit_vol": 43729173.9946,
+    "bybit_oi": 5727.068,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "OPN",
+    "announce_time": "2026-03-05 11:40:37",
+    "bybit_vol": 664624.1953,
+    "bybit_oi": 9611712.0,
+    "on_mexc": true,
+    "mexc_vol": 68648.0393,
+    "still_listed": true
+  },
+  {
+    "symbol": "ROBO",
+    "announce_time": "2026-02-27 08:46:54",
+    "bybit_vol": 1048180.6044,
+    "bybit_oi": 64893900.0,
+    "on_mexc": true,
+    "mexc_vol": 150871.11271,
+    "still_listed": true
+  },
+  {
+    "symbol": "ESP",
+    "announce_time": "2026-02-12 11:36:30",
+    "bybit_vol": 273368.0808,
+    "bybit_oi": 16688180.0,
+    "on_mexc": true,
+    "mexc_vol": 58157.38127,
+    "still_listed": true
+  },
+  {
+    "symbol": "AZTEC",
+    "announce_time": "2026-02-12 07:47:10",
+    "bybit_vol": 610852.546,
+    "bybit_oi": 71874640.0,
+    "on_mexc": true,
+    "mexc_vol": 59445.74928,
+    "still_listed": true
+  },
+  {
+    "symbol": "TRIA",
+    "announce_time": "2026-02-05 10:29:23",
+    "bybit_vol": 3832746.6805,
+    "bybit_oi": 245575060.0,
+    "on_mexc": true,
+    "mexc_vol": 8598290.73129,
+    "still_listed": true
+  },
+  {
+    "symbol": "ZAMA",
+    "announce_time": "2026-02-02 12:21:21",
+    "bybit_vol": 343645.8803,
+    "bybit_oi": 73482324.0,
+    "on_mexc": true,
+    "mexc_vol": 97495.11632,
+    "still_listed": true
+  },
+  {
+    "symbol": "INX",
+    "announce_time": "2026-01-30 19:25:47",
+    "bybit_vol": 1279757.6756,
+    "bybit_oi": 145125320.0,
+    "on_mexc": true,
+    "mexc_vol": 70233.789906,
+    "still_listed": true
+  },
+  {
+    "symbol": "BIRB",
+    "announce_time": "2026-01-28 11:38:35",
+    "bybit_vol": 687355.8374,
+    "bybit_oi": 9985010.0,
+    "on_mexc": true,
+    "mexc_vol": 62115.6006,
+    "still_listed": true
+  },
+  {
+    "symbol": "SPACE",
+    "announce_time": "2026-01-23 12:39:21",
+    "bybit_vol": 7726660.9964,
+    "bybit_oi": 141108590.0,
+    "on_mexc": true,
+    "mexc_vol": 230233.657895,
+    "still_listed": true
+  },
+  {
+    "symbol": "FIGHT",
+    "announce_time": "2026-01-23 12:03:33",
+    "bybit_vol": 4666085.7001,
+    "bybit_oi": 505405170.0,
+    "on_mexc": true,
+    "mexc_vol": 149358.613714,
+    "still_listed": true
+  },
+  {
+    "symbol": "ACU",
+    "announce_time": "2026-01-23 08:22:14",
+    "bybit_vol": 169242.6741,
+    "bybit_oi": 4458028.0,
+    "on_mexc": true,
+    "mexc_vol": 57723.94099,
+    "still_listed": true
+  },
+  {
+    "symbol": "SENT",
+    "announce_time": "2026-01-22 12:39:29",
+    "bybit_vol": 1252777.5494,
+    "bybit_oi": 88247760.0,
+    "on_mexc": true,
+    "mexc_vol": 101430.4578,
+    "still_listed": true
+  },
+  {
+    "symbol": "ELSA",
+    "announce_time": "2026-01-22 07:41:34",
+    "bybit_vol": 152729.8891,
+    "bybit_oi": 15121648.0,
+    "on_mexc": true,
+    "mexc_vol": 53802.5493,
+    "still_listed": true
+  },
+  {
+    "symbol": "SKR",
+    "announce_time": "2026-01-21 07:00:10",
+    "bybit_vol": 1954502.0602,
+    "bybit_oi": 168442060.0,
+    "on_mexc": true,
+    "mexc_vol": 81731.064586,
+    "still_listed": true
+  },
+  {
+    "symbol": "PLAYSOUT",
+    "announce_time": "2026-01-20 10:05:06",
+    "bybit_vol": 13167253.6597,
+    "bybit_oi": 18455800.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "SPORTFUN",
+    "announce_time": "2026-01-19 10:00:43",
+    "bybit_vol": 1902949.7719,
+    "bybit_oi": 16841300.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "FOGO",
+    "announce_time": "2026-01-15 16:12:15",
+    "bybit_vol": 402657.8579,
+    "bybit_oi": 70215340.0,
+    "on_mexc": true,
+    "mexc_vol": 61745.9248,
+    "still_listed": true
+  },
+  {
+    "symbol": "FHE",
+    "announce_time": "2026-01-07 08:40:12",
+    "bybit_vol": 1864359.6871,
+    "bybit_oi": 79324545.0,
+    "on_mexc": true,
+    "mexc_vol": 193107.1118,
+    "still_listed": true
+  },
+  {
+    "symbol": "WHITEWHALE",
+    "announce_time": "2026-01-06 12:28:11",
+    "bybit_vol": 1685775.0731,
+    "bybit_oi": 213430880.0,
+    "on_mexc": true,
+    "mexc_vol": 21409.664835,
+    "still_listed": true
+  },
+  {
+    "symbol": "LIT",
+    "announce_time": "2025-12-30 14:07:23",
+    "bybit_vol": 15198027.6778,
+    "bybit_oi": 14521871.0,
+    "on_mexc": true,
+    "mexc_vol": 449319.2904,
+    "still_listed": true
+  },
+  {
+    "symbol": "BREV",
+    "announce_time": "2025-12-30 13:10:23",
+    "bybit_vol": 191810.3194,
+    "bybit_oi": 10345098.0,
+    "on_mexc": true,
+    "mexc_vol": 73201.3493,
+    "still_listed": true
+  },
+  {
+    "symbol": "POWER",
+    "announce_time": "2025-12-29 10:47:35",
+    "bybit_vol": 374846.6952,
+    "bybit_oi": 32597214.0,
+    "on_mexc": true,
+    "mexc_vol": 14943.59574,
+    "still_listed": true
+  },
+  {
+    "symbol": "MAGMA",
+    "announce_time": "2025-12-26 07:41:57",
+    "bybit_vol": 3122514.8461,
+    "bybit_oi": 8913727.0,
+    "on_mexc": true,
+    "mexc_vol": 95941.45934,
+    "still_listed": true
+  },
+  {
+    "symbol": "ZKP",
+    "announce_time": "2025-12-22 09:48:01",
+    "bybit_vol": 1012366.4162,
+    "bybit_oi": 12925606.0,
+    "on_mexc": true,
+    "mexc_vol": 63150.47379,
+    "still_listed": true
+  },
+  {
+    "symbol": "RAVE",
+    "announce_time": "2025-12-15 06:33:22",
+    "bybit_vol": 14160336.5477,
+    "bybit_oi": 15688877.0,
+    "on_mexc": true,
+    "mexc_vol": 64399.281,
+    "still_listed": true
+  },
+  {
+    "symbol": "US",
+    "announce_time": "2025-12-12 11:22:07",
+    "bybit_vol": 346371.5156,
+    "bybit_oi": 384635550.0,
+    "on_mexc": true,
+    "mexc_vol": 15865.41544,
+    "still_listed": true
+  },
+  {
+    "symbol": "CYS",
+    "announce_time": "2025-12-12 11:20:28",
+    "bybit_vol": 1183799.1676,
+    "bybit_oi": 4478980.0,
+    "on_mexc": true,
+    "mexc_vol": 151691.0593,
+    "still_listed": true
+  },
+  {
+    "symbol": "WET",
+    "announce_time": "2025-12-09 14:51:01",
+    "bybit_vol": 267891.1101,
+    "bybit_oi": 16314122.0,
+    "on_mexc": true,
+    "mexc_vol": 56068.70597,
+    "still_listed": true
+  },
+  {
+    "symbol": "FOLKS",
+    "announce_time": "2025-12-09 11:24:02",
+    "bybit_vol": 244908.8097,
+    "bybit_oi": 937269.26,
+    "on_mexc": true,
+    "mexc_vol": 119391.8314,
+    "still_listed": true
+  },
+  {
+    "symbol": "NIGHT",
+    "announce_time": "2025-12-09 11:14:41",
+    "bybit_vol": 437374.6119,
+    "bybit_oi": 111113200.0,
+    "on_mexc": true,
+    "mexc_vol": 58551.84608,
+    "still_listed": true
+  },
+  {
+    "symbol": "STABLE",
+    "announce_time": "2025-12-08 13:15:54",
+    "bybit_vol": 4416531.2528,
+    "bybit_oi": 305857330.0,
+    "on_mexc": true,
+    "mexc_vol": 116290.301031,
+    "still_listed": true
+  },
+  {
+    "symbol": "RLS",
+    "announce_time": "2025-12-02 10:42:41",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 242685.152322,
+    "still_listed": false
+  },
+  {
+    "symbol": "IRYS",
+    "announce_time": "2025-11-27 06:29:56",
+    "bybit_vol": 11942130.2676,
+    "bybit_oi": 97862130.0,
+    "on_mexc": true,
+    "mexc_vol": 400924.50223,
+    "still_listed": true
+  },
+  {
+    "symbol": "MON",
+    "announce_time": "2025-11-25 07:51:29",
+    "bybit_vol": 14141110.7009,
+    "bybit_oi": 520200815.0,
+    "on_mexc": true,
+    "mexc_vol": 154369.9822,
+    "still_listed": true
+  },
+  {
+    "symbol": "BOBBOB",
+    "announce_time": "2025-11-24 08:43:32",
+    "bybit_vol": 2163739.1145,
+    "bybit_oi": 95583320.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "BEAT",
+    "announce_time": "2025-11-21 11:12:41",
+    "bybit_vol": 6054883.987,
+    "bybit_oi": 7895642.0,
+    "on_mexc": true,
+    "mexc_vol": 117431.02982,
+    "still_listed": true
+  },
+  {
+    "symbol": "JCT",
+    "announce_time": "2025-11-17 10:43:26",
+    "bybit_vol": 582282.0247,
+    "bybit_oi": 439524000.0,
+    "on_mexc": true,
+    "mexc_vol": 67884.391853,
+    "still_listed": true
+  },
+  {
+    "symbol": "UAI",
+    "announce_time": "2025-11-17 10:43:47",
+    "bybit_vol": 1069733.6388,
+    "bybit_oi": 3747906.0,
+    "on_mexc": true,
+    "mexc_vol": 100953.3238,
+    "still_listed": true
+  },
+  {
+    "symbol": "PIEVERSE",
+    "announce_time": "2025-11-14 13:49:17",
+    "bybit_vol": 4758294.1592,
+    "bybit_oi": 10020468.0,
+    "on_mexc": true,
+    "mexc_vol": 82728.7654,
+    "still_listed": true
+  },
+  {
+    "symbol": "ALLO",
+    "announce_time": "2025-11-14 12:50:05",
+    "bybit_vol": 102429.1863,
+    "bybit_oi": 5616404.0,
+    "on_mexc": true,
+    "mexc_vol": 62544.52027,
+    "still_listed": true
+  },
+  {
+    "symbol": "TRUST",
+    "announce_time": "2025-11-14 12:30:27",
+    "bybit_vol": 181549.0882,
+    "bybit_oi": 9094960.0,
+    "on_mexc": true,
+    "mexc_vol": 66161.90983,
+    "still_listed": true
+  },
+  {
+    "symbol": "CC",
+    "announce_time": "2025-11-10 07:12:38",
+    "bybit_vol": 1947598.7943,
+    "bybit_oi": 86588198.0,
+    "on_mexc": true,
+    "mexc_vol": 278146.15302,
+    "still_listed": true
+  },
+  {
+    "symbol": "MMT",
+    "announce_time": "2025-11-04 12:14:29",
+    "bybit_vol": 934698.3164,
+    "bybit_oi": 10130178.0,
+    "on_mexc": true,
+    "mexc_vol": 68106.6575,
+    "still_listed": true
+  },
+  {
+    "symbol": "KITE",
+    "announce_time": "2025-11-03 13:20:17",
+    "bybit_vol": 9094407.9484,
+    "bybit_oi": 37167062.0,
+    "on_mexc": true,
+    "mexc_vol": 271977.08009,
+    "still_listed": true
+  },
+  {
+    "symbol": "AT",
+    "announce_time": "2025-10-29 14:15:46",
+    "bybit_vol": 12295158.5267,
+    "bybit_oi": 6985556.0,
+    "on_mexc": true,
+    "mexc_vol": 236177.27072,
+    "still_listed": true
+  },
+  {
+    "symbol": "PIGGY",
+    "announce_time": "2025-10-29 12:37:36",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 31411.71433,
+    "still_listed": false
+  },
+  {
+    "symbol": "COMMON",
+    "announce_time": "2025-10-27 13:33:36",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 85410.5277773,
+    "still_listed": false
+  },
+  {
+    "symbol": "LAB",
+    "announce_time": "2025-10-27 10:06:22",
+    "bybit_vol": 94407609.3023,
+    "bybit_oi": 7162373.0,
+    "on_mexc": true,
+    "mexc_vol": 2346301.84938,
+    "still_listed": true
+  },
+  {
+    "symbol": "BLUAI",
+    "announce_time": "2025-10-24 12:08:42",
+    "bybit_vol": 12454772.9575,
+    "bybit_oi": 246805220.0,
+    "on_mexc": true,
+    "mexc_vol": 616415.45261,
+    "still_listed": true
+  },
+  {
+    "symbol": "MET",
+    "announce_time": "2025-10-23 14:08:09",
+    "bybit_vol": 243728.2797,
+    "bybit_oi": 19816580.6,
+    "on_mexc": true,
+    "mexc_vol": 68845.0349,
+    "still_listed": true
+  },
+  {
+    "symbol": "APR",
+    "announce_time": "2025-10-23 12:34:35",
+    "bybit_vol": 8236949.8874,
+    "bybit_oi": 12669168.0,
+    "on_mexc": true,
+    "mexc_vol": 253521.35739,
+    "still_listed": true
+  },
+  {
+    "symbol": "TURTLE",
+    "announce_time": "2025-10-22 15:19:10",
+    "bybit_vol": 89106.7766,
+    "bybit_oi": 8865100.0,
+    "on_mexc": true,
+    "mexc_vol": 57453.89598,
+    "still_listed": true
+  },
+  {
+    "symbol": "RIVER",
+    "announce_time": "2025-10-22 12:47:55",
+    "bybit_vol": 15332770.2089,
+    "bybit_oi": 1979584.8,
+    "on_mexc": true,
+    "mexc_vol": 567767.1796,
+    "still_listed": true
+  },
+  {
+    "symbol": "ZBT",
+    "announce_time": "2025-10-17 13:21:06",
+    "bybit_vol": 3157577.757,
+    "bybit_oi": 22225797.2,
+    "on_mexc": true,
+    "mexc_vol": 113077.51592,
+    "still_listed": true
+  },
+  {
+    "symbol": "EVAA",
+    "announce_time": "2025-10-17 12:19:49",
+    "bybit_vol": 249572.1476,
+    "bybit_oi": 1563468.8,
+    "on_mexc": true,
+    "mexc_vol": 107092.7542,
+    "still_listed": true
+  },
+  {
+    "symbol": "HANA",
+    "announce_time": "2025-10-17 12:19:33",
+    "bybit_vol": 3282707.051,
+    "bybit_oi": 41261320.0,
+    "on_mexc": true,
+    "mexc_vol": 88952.733503,
+    "still_listed": true
+  },
+  {
+    "symbol": "CLO",
+    "announce_time": "2025-10-17 12:19:25",
+    "bybit_vol": 3085471.4235,
+    "bybit_oi": 11661019.0,
+    "on_mexc": true,
+    "mexc_vol": 200140.21859,
+    "still_listed": true
+  },
+  {
+    "symbol": "RECALL",
+    "announce_time": "2025-10-15 12:35:24",
+    "bybit_vol": 2114674.907,
+    "bybit_oi": 24325409.0,
+    "on_mexc": true,
+    "mexc_vol": 108938.83068,
+    "still_listed": true
+  },
+  {
+    "symbol": "YB",
+    "announce_time": "2025-10-15 11:08:55",
+    "bybit_vol": 157458.1129,
+    "bybit_oi": 7769376.8,
+    "on_mexc": true,
+    "mexc_vol": 59113.2331,
+    "still_listed": true
+  },
+  {
+    "symbol": "ENSO",
+    "announce_time": "2025-10-14 09:33:16",
+    "bybit_vol": 399470.7345,
+    "bybit_oi": 4160015.6,
+    "on_mexc": true,
+    "mexc_vol": 58504.6639,
+    "still_listed": true
+  },
+  {
+    "symbol": "EUL",
+    "announce_time": "2025-10-14 08:48:37",
+    "bybit_vol": 114563.6473,
+    "bybit_oi": 459690.8,
+    "on_mexc": true,
+    "mexc_vol": 56994.5353,
+    "still_listed": true
+  },
+  {
+    "symbol": "GIGGLE",
+    "announce_time": "2025-10-09 12:27:15",
+    "bybit_vol": 874124.1889,
+    "bybit_oi": 58299.233,
+    "on_mexc": true,
+    "mexc_vol": 162481.86,
+    "still_listed": true
+  },
+  {
+    "symbol": "4",
+    "announce_time": "2025-10-08 12:46:06",
+    "bybit_vol": 228144.7863,
+    "bybit_oi": 119313832.0,
+    "on_mexc": true,
+    "mexc_vol": 103667.872903,
+    "still_listed": true
+  },
+  {
+    "symbol": "KGEN",
+    "announce_time": "2025-10-07 15:31:48",
+    "bybit_vol": 313090.0314,
+    "bybit_oi": 4288776.0,
+    "on_mexc": true,
+    "mexc_vol": 73823.3591,
+    "still_listed": true
+  },
+  {
+    "symbol": "LYN",
+    "announce_time": "2025-10-06 08:19:00",
+    "bybit_vol": 5490080.2263,
+    "bybit_oi": 86500476.0,
+    "on_mexc": true,
+    "mexc_vol": 518807.01573,
+    "still_listed": true
+  },
+  {
+    "symbol": "2Z",
+    "announce_time": "2025-10-02 13:49:23",
+    "bybit_vol": 336276.4842,
+    "bybit_oi": 12999524.0,
+    "on_mexc": true,
+    "mexc_vol": 60430.72486,
+    "still_listed": true
+  },
+  {
+    "symbol": "COAI",
+    "announce_time": "2025-10-02 08:45:34",
+    "bybit_vol": 450113.0511,
+    "bybit_oi": 8167840.0,
+    "on_mexc": true,
+    "mexc_vol": 81721.6549,
+    "still_listed": true
+  },
+  {
+    "symbol": "TRUTH",
+    "announce_time": "2025-10-01 14:25:26",
+    "bybit_vol": 3220812.956,
+    "bybit_oi": 127181640.0,
+    "on_mexc": true,
+    "mexc_vol": 209889.996116,
+    "still_listed": true
+  },
+  {
+    "symbol": "NOM",
+    "announce_time": "2025-10-01 08:50:14",
+    "bybit_vol": 323582.4472,
+    "bybit_oi": 415100530.0,
+    "on_mexc": true,
+    "mexc_vol": 62407.227806,
+    "still_listed": true
+  },
+  {
+    "symbol": "VFY",
+    "announce_time": "2025-09-30 12:43:50",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 56172.966415,
+    "still_listed": false
+  },
+  {
+    "symbol": "EDEN",
+    "announce_time": "2025-09-30 11:59:02",
+    "bybit_vol": 59276135.7436,
+    "bybit_oi": 83418915.0,
+    "on_mexc": true,
+    "mexc_vol": 889339.51257,
+    "still_listed": true
+  },
+  {
+    "symbol": "FF",
+    "announce_time": "2025-09-29 14:37:04",
+    "bybit_vol": 7059068.0447,
+    "bybit_oi": 122479736.0,
+    "on_mexc": true,
+    "mexc_vol": 172911.27996,
+    "still_listed": true
+  },
+  {
+    "symbol": "XAN",
+    "announce_time": "2025-09-29 11:01:08",
+    "bybit_vol": 409114.4536,
+    "bybit_oi": 87835246.0,
+    "on_mexc": true,
+    "mexc_vol": 65611.571511,
+    "still_listed": true
+  },
+  {
+    "symbol": "APEX",
+    "announce_time": "2025-09-28 08:53:14",
+    "bybit_vol": 254127.3856,
+    "bybit_oi": 6979513.4,
+    "on_mexc": true,
+    "mexc_vol": 63122.624,
+    "still_listed": true
+  },
+  {
+    "symbol": "LIGHT",
+    "announce_time": "2025-09-27 13:34:50",
+    "bybit_vol": 399197.6695,
+    "bybit_oi": 12215182.0,
+    "on_mexc": true,
+    "mexc_vol": 68662.3247,
+    "still_listed": true
+  },
+  {
+    "symbol": "RLUSD",
+    "announce_time": "2025-09-26 14:18:38",
+    "bybit_vol": 183885.9799,
+    "bybit_oi": 431382.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "AKE",
+    "announce_time": "2025-09-26 13:43:11",
+    "bybit_vol": 126473.2272,
+    "bybit_oi": 4678914900.0,
+    "on_mexc": true,
+    "mexc_vol": 56691.6957537,
+    "still_listed": true
+  },
+  {
+    "symbol": "MIRA",
+    "announce_time": "2025-09-26 12:58:37",
+    "bybit_vol": 208202.2062,
+    "bybit_oi": 10035886.6,
+    "on_mexc": true,
+    "mexc_vol": 60992.79209,
+    "still_listed": true
+  },
+  {
+    "symbol": "XPL",
+    "announce_time": "2025-09-25 13:11:52",
+    "bybit_vol": 9117150.1953,
+    "bybit_oi": 219915594.0,
+    "on_mexc": true,
+    "mexc_vol": 249237.77199,
+    "still_listed": true
+  },
+  {
+    "symbol": "FLUID",
+    "announce_time": "2025-09-24 12:04:49",
+    "bybit_vol": 165515.748,
+    "bybit_oi": 1054668.3,
+    "on_mexc": true,
+    "mexc_vol": 476.5617,
+    "still_listed": true
+  },
+  {
+    "symbol": "BLESS",
+    "announce_time": "2025-09-24 10:19:02",
+    "bybit_vol": 357771.1334,
+    "bybit_oi": 204000010.0,
+    "on_mexc": true,
+    "mexc_vol": 96784.457736,
+    "still_listed": true
+  },
+  {
+    "symbol": "HEMI",
+    "announce_time": "2025-09-23 13:21:19",
+    "bybit_vol": 145695.8924,
+    "bybit_oi": 78129026.0,
+    "on_mexc": true,
+    "mexc_vol": 57422.347838,
+    "still_listed": true
+  },
+  {
+    "symbol": "0G",
+    "announce_time": "2025-09-22 10:42:55",
+    "bybit_vol": 593834.1906,
+    "bybit_oi": 4246294.0,
+    "on_mexc": true,
+    "mexc_vol": 59086.5357,
+    "still_listed": true
+  },
+  {
+    "symbol": "ASTER",
+    "announce_time": "2025-09-20 06:17:21",
+    "bybit_vol": 5969160.6334,
+    "bybit_oi": 64625413.0,
+    "on_mexc": true,
+    "mexc_vol": 833960.0255,
+    "still_listed": true
+  },
+  {
+    "symbol": "BARD",
+    "announce_time": "2025-09-18 11:21:18",
+    "bybit_vol": 1525550.556,
+    "bybit_oi": 25577547.0,
+    "on_mexc": true,
+    "mexc_vol": 77047.6049,
+    "still_listed": true
+  },
+  {
+    "symbol": "AIA",
+    "announce_time": "2025-09-18 10:16:47",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 1086322.25767,
+    "still_listed": false
+  },
+  {
+    "symbol": "STBL",
+    "announce_time": "2025-09-17 10:28:34",
+    "bybit_vol": 408882.0227,
+    "bybit_oi": 38508938.0,
+    "on_mexc": true,
+    "mexc_vol": 73474.76364,
+    "still_listed": true
+  },
+  {
+    "symbol": "ZKC",
+    "announce_time": "2025-09-15 14:14:25",
+    "bybit_vol": 242106.392,
+    "bybit_oi": 13717233.0,
+    "on_mexc": true,
+    "mexc_vol": 73014.85813,
+    "still_listed": true
+  },
+  {
+    "symbol": "Q",
+    "announce_time": "2025-09-12 12:07:42",
+    "bybit_vol": 2237687.7009,
+    "bybit_oi": 123296110.0,
+    "on_mexc": true,
+    "mexc_vol": 73319.55622,
+    "still_listed": true
+  },
+  {
+    "symbol": "XPIN",
+    "announce_time": "2025-09-12 12:06:06",
+    "bybit_vol": 340038.438,
+    "bybit_oi": 1381451600.0,
+    "on_mexc": true,
+    "mexc_vol": 95296.3696228,
+    "still_listed": true
+  },
+  {
+    "symbol": "UB",
+    "announce_time": "2025-09-12 09:35:13",
+    "bybit_vol": 16268872.2653,
+    "bybit_oi": 27700260.0,
+    "on_mexc": true,
+    "mexc_vol": 291408.01446,
+    "still_listed": true
+  },
+  {
+    "symbol": "HOLO",
+    "announce_time": "2025-09-11 12:15:39",
+    "bybit_vol": 1786661.5007,
+    "bybit_oi": 33980702.0,
+    "on_mexc": true,
+    "mexc_vol": 52649.70131,
+    "still_listed": true
+  },
+  {
+    "symbol": "OKB",
+    "announce_time": "2025-09-11 12:03:22",
+    "bybit_vol": 586940.5168,
+    "bybit_oi": 9831.88,
+    "on_mexc": true,
+    "mexc_vol": 79274.274,
+    "still_listed": true
+  },
+  {
+    "symbol": "LINEA",
+    "announce_time": "2025-09-10 15:11:43",
+    "bybit_vol": 597199.4778,
+    "bybit_oi": 830371400.0,
+    "on_mexc": true,
+    "mexc_vol": 98520.728631,
+    "still_listed": true
+  },
+  {
+    "symbol": "AVNT",
+    "announce_time": "2025-09-09 14:15:11",
+    "bybit_vol": 592987.7797,
+    "bybit_oi": 29791442.0,
+    "on_mexc": true,
+    "mexc_vol": 65550.5747,
+    "still_listed": true
+  },
+  {
+    "symbol": "OPEN",
+    "announce_time": "2025-09-08 13:14:29",
+    "bybit_vol": 11215807.7294,
+    "bybit_oi": 17931080.0,
+    "on_mexc": true,
+    "mexc_vol": 190535.69072,
+    "still_listed": true
+  },
+  {
+    "symbol": "NODE",
+    "announce_time": "2025-09-04 10:03:02",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 96976.52407,
+    "still_listed": false
+  },
+  {
+    "symbol": "PTB",
+    "announce_time": "2025-09-03 13:19:33",
+    "bybit_vol": 549006.4488,
+    "bybit_oi": 1703360000.0,
+    "on_mexc": true,
+    "mexc_vol": 71410.8931058,
+    "still_listed": true
+  },
+  {
+    "symbol": "ARIA",
+    "announce_time": "2025-09-03 13:03:09",
+    "bybit_vol": 519251.8577,
+    "bybit_oi": 50531595.0,
+    "on_mexc": true,
+    "mexc_vol": 94394.41851,
+    "still_listed": true
+  },
+  {
+    "symbol": "SOMI",
+    "announce_time": "2025-09-02 14:52:20",
+    "bybit_vol": 563692.8372,
+    "bybit_oi": 10846027.6,
+    "on_mexc": true,
+    "mexc_vol": 62733.8019,
+    "still_listed": true
+  },
+  {
+    "symbol": "WLFI",
+    "announce_time": "2025-09-01 13:07:11",
+    "bybit_vol": 7229792.5468,
+    "bybit_oi": 319597382.0,
+    "on_mexc": true,
+    "mexc_vol": 475357.27629,
+    "still_listed": true
+  },
+  {
+    "symbol": "BDXN",
+    "announce_time": "2025-09-01 07:57:28",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 71785.159034,
+    "still_listed": false
+  },
+  {
+    "symbol": "MITO",
+    "announce_time": "2025-08-29 10:28:44",
+    "bybit_vol": 316996.7395,
+    "bybit_oi": 11580110.0,
+    "on_mexc": true,
+    "mexc_vol": 62710.73429,
+    "still_listed": true
+  },
+  {
+    "symbol": "CAMP",
+    "announce_time": "2025-08-28 08:51:47",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 114420.647484,
+    "still_listed": false
+  },
+  {
+    "symbol": "BTR",
+    "announce_time": "2025-08-27 11:25:06",
+    "bybit_vol": 725614.216,
+    "bybit_oi": 46116936.0,
+    "on_mexc": true,
+    "mexc_vol": 86630.48054,
+    "still_listed": true
+  },
+  {
+    "symbol": "BSU",
+    "announce_time": "2025-08-27 10:57:12",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "YZY",
+    "announce_time": "2025-08-21 04:37:28",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "SAPIEN",
+    "announce_time": "2025-08-20 18:23:53",
+    "bybit_vol": 1837571.7143,
+    "bybit_oi": 12613638.0,
+    "on_mexc": true,
+    "mexc_vol": 77303.57317,
+    "still_listed": true
+  },
+  {
+    "symbol": "DAM",
+    "announce_time": "2025-08-18 13:03:47",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 58425.338119,
+    "still_listed": false
+  },
+  {
+    "symbol": "ALPINE",
+    "announce_time": "2025-08-14 09:57:44",
+    "bybit_vol": 14313.7618,
+    "bybit_oi": 634120.0,
+    "on_mexc": true,
+    "mexc_vol": 56672.2639,
+    "still_listed": true
+  },
+  {
+    "symbol": "ASR",
+    "announce_time": "2025-08-14 09:56:44",
+    "bybit_vol": 27607.8913,
+    "bybit_oi": 144729.4,
+    "on_mexc": true,
+    "mexc_vol": 49718.018,
+    "still_listed": true
+  },
+  {
+    "symbol": "XNY",
+    "announce_time": "2025-08-13 13:44:23",
+    "bybit_vol": 120886.9871,
+    "bybit_oi": 61103260.0,
+    "on_mexc": true,
+    "mexc_vol": 87552.781496,
+    "still_listed": true
+  },
+  {
+    "symbol": "AIO",
+    "announce_time": "2025-08-13 13:43:56",
+    "bybit_vol": 78335.5057,
+    "bybit_oi": 9902160.0,
+    "on_mexc": true,
+    "mexc_vol": 62576.01836,
+    "still_listed": true
+  },
+  {
+    "symbol": "SKY",
+    "announce_time": "2025-08-11 08:46:12",
+    "bybit_vol": 599065.5904,
+    "bybit_oi": 55214380.0,
+    "on_mexc": true,
+    "mexc_vol": 67666.01199,
+    "still_listed": true
+  },
+  {
+    "symbol": "K",
+    "announce_time": "2025-08-08 08:42:31",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "YALA",
+    "announce_time": "2025-08-08 07:49:45",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "IN",
+    "announce_time": "2025-08-07 10:34:12",
+    "bybit_vol": 204073.9498,
+    "bybit_oi": 15703900.0,
+    "on_mexc": true,
+    "mexc_vol": 55392.79281,
+    "still_listed": true
+  },
+  {
+    "symbol": "RHEA",
+    "announce_time": "2025-08-06 11:36:03",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 57367.992092,
+    "still_listed": false
+  },
+  {
+    "symbol": "PROVE",
+    "announce_time": "2025-08-05 17:12:57",
+    "bybit_vol": 63310.2135,
+    "bybit_oi": 5505358.0,
+    "on_mexc": true,
+    "mexc_vol": 55048.1065,
+    "still_listed": true
+  },
+  {
+    "symbol": "TOWNS",
+    "announce_time": "2025-08-05 14:46:53",
+    "bybit_vol": 1233716.2953,
+    "bybit_oi": 208751720.0,
+    "on_mexc": true,
+    "mexc_vol": 103654.899032,
+    "still_listed": true
+  },
+  {
+    "symbol": "MYX",
+    "announce_time": "2025-08-05 09:38:14",
+    "bybit_vol": 1068934.7535,
+    "bybit_oi": 17012166.0,
+    "on_mexc": true,
+    "mexc_vol": 113588.04173,
+    "still_listed": true
+  },
+  {
+    "symbol": "NAORIS",
+    "announce_time": "2025-07-31 12:39:03",
+    "bybit_vol": 2952130.1218,
+    "bybit_oi": 61504860.0,
+    "on_mexc": true,
+    "mexc_vol": 171882.8759,
+    "still_listed": true
+  },
+  {
+    "symbol": "A2Z",
+    "announce_time": "2025-07-31 09:26:18",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "TREE",
+    "announce_time": "2025-07-29 14:20:58",
+    "bybit_vol": 190768.8037,
+    "bybit_oi": 20790715.6,
+    "on_mexc": true,
+    "mexc_vol": 54473.2694,
+    "still_listed": true
+  },
+  {
+    "symbol": "ESPORTS",
+    "announce_time": "2025-07-29 10:32:36",
+    "bybit_vol": 18640987.8561,
+    "bybit_oi": 5587819.0,
+    "on_mexc": true,
+    "mexc_vol": 208213.2556,
+    "still_listed": true
+  },
+  {
+    "symbol": "1000TAG",
+    "announce_time": "2025-07-28 09:12:29",
+    "bybit_vol": 205923.4249,
+    "bybit_oi": 543865.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "FIS",
+    "announce_time": "2025-07-28 09:12:08",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "DOLO",
+    "announce_time": "2025-07-28 09:11:17",
+    "bybit_vol": 234000.0888,
+    "bybit_oi": 17658054.0,
+    "on_mexc": true,
+    "mexc_vol": 54840.98312,
+    "still_listed": true
+  },
+  {
+    "symbol": "ASP",
+    "announce_time": "2025-07-24 12:24:55",
+    "bybit_vol": 199152.0501,
+    "bybit_oi": 7979684.0,
+    "on_mexc": true,
+    "mexc_vol": 54817.71946,
+    "still_listed": true
+  },
+  {
+    "symbol": "DIA",
+    "announce_time": "2025-07-23 08:21:06",
+    "bybit_vol": 15693.2417,
+    "bybit_oi": 2620800.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "TA",
+    "announce_time": "2025-07-21 09:26:58",
+    "bybit_vol": 5069074.9862,
+    "bybit_oi": 79732732.0,
+    "on_mexc": true,
+    "mexc_vol": 164925.58046,
+    "still_listed": true
+  },
+  {
+    "symbol": "ERA",
+    "announce_time": "2025-07-17 16:02:35",
+    "bybit_vol": 114559.4021,
+    "bybit_oi": 5196182.0,
+    "on_mexc": true,
+    "mexc_vol": 56820.2574,
+    "still_listed": true
+  },
+  {
+    "symbol": "USD1",
+    "announce_time": "2025-07-16 11:06:12",
+    "bybit_vol": 250550.823,
+    "bybit_oi": 787032.0,
+    "on_mexc": true,
+    "mexc_vol": 4425584.6124,
+    "still_listed": true
+  },
+  {
+    "symbol": "ES",
+    "announce_time": "2025-07-16 10:52:13",
+    "bybit_vol": 145972.6599,
+    "bybit_oi": 6556070.0,
+    "on_mexc": true,
+    "mexc_vol": 62358.74153,
+    "still_listed": true
+  },
+  {
+    "symbol": "TAC",
+    "announce_time": "2025-07-15 11:01:10",
+    "bybit_vol": 648964.203,
+    "bybit_oi": 143111560.0,
+    "on_mexc": true,
+    "mexc_vol": 76012.238729,
+    "still_listed": true
+  },
+  {
+    "symbol": "C",
+    "announce_time": "2025-07-15 10:37:20",
+    "bybit_vol": 429368.256,
+    "bybit_oi": 10758456.0,
+    "on_mexc": true,
+    "mexc_vol": 77943.74058,
+    "still_listed": true
+  },
+  {
+    "symbol": "VELVET",
+    "announce_time": "2025-07-15 10:37:28",
+    "bybit_vol": 368416.975,
+    "bybit_oi": 8115800.0,
+    "on_mexc": true,
+    "mexc_vol": 64788.64328,
+    "still_listed": true
+  },
+  {
+    "symbol": "PUMPFUN",
+    "announce_time": "2025-07-14 17:28:45",
+    "bybit_vol": 12727959.9083,
+    "bybit_oi": 11160094200.0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": true
+  },
+  {
+    "symbol": "AIN",
+    "announce_time": "2025-07-10 11:29:54",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 55428.08373,
+    "still_listed": false
+  },
+  {
+    "symbol": "USELESS",
+    "announce_time": "2025-07-10 11:29:45",
+    "bybit_vol": 2643945.9238,
+    "bybit_oi": 77912083.0,
+    "on_mexc": true,
+    "mexc_vol": 137325.932173,
+    "still_listed": true
+  },
+  {
+    "symbol": "CROSS",
+    "announce_time": "2025-07-10 11:29:37",
+    "bybit_vol": 103491.7161,
+    "bybit_oi": 4074899.0,
+    "on_mexc": true,
+    "mexc_vol": 69170.03018,
+    "still_listed": true
+  },
+  {
+    "symbol": "TANSSI",
+    "announce_time": "2025-07-09 12:21:40",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "M",
+    "announce_time": "2025-07-08 09:52:16",
+    "bybit_vol": 8608187.8705,
+    "bybit_oi": 8029568.0,
+    "on_mexc": true,
+    "mexc_vol": 143488.26388,
+    "still_listed": true
+  },
+  {
+    "symbol": "DMC",
+    "announce_time": "2025-07-03 11:37:27",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 42776.9027565,
+    "still_listed": false
+  },
+  {
+    "symbol": "ICNT",
+    "announce_time": "2025-07-03 11:11:03",
+    "bybit_vol": 705620.6497,
+    "bybit_oi": 3359754.0,
+    "on_mexc": true,
+    "mexc_vol": 62022.59456,
+    "still_listed": true
+  },
+  {
+    "symbol": "FRAG",
+    "announce_time": "2025-07-01 09:37:00",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "SAHARA",
+    "announce_time": "2025-06-26 12:17:47",
+    "bybit_vol": 12268321.6766,
+    "bybit_oi": 401437631.0,
+    "on_mexc": true,
+    "mexc_vol": 141853.995,
+    "still_listed": true
+  },
+  {
+    "symbol": "SOSO",
+    "announce_time": "2025-06-26 11:29:11",
+    "bybit_vol": 481305.7858,
+    "bybit_oi": 1721900.0,
+    "on_mexc": true,
+    "mexc_vol": 125631.2626,
+    "still_listed": true
+  },
+  {
+    "symbol": "H",
+    "announce_time": "2025-06-25 09:58:05",
+    "bybit_vol": 7646690.1191,
+    "bybit_oi": 136174140.0,
+    "on_mexc": true,
+    "mexc_vol": 159853.76535,
+    "still_listed": true
+  },
+  {
+    "symbol": "NEWT",
+    "announce_time": "2025-06-24 14:14:53",
+    "bybit_vol": 158405.9125,
+    "bybit_oi": 11296340.0,
+    "on_mexc": true,
+    "mexc_vol": 56321.61153,
+    "still_listed": true
+  },
+  {
+    "symbol": "SPK",
+    "announce_time": "2025-06-17 09:22:24",
+    "bybit_vol": 1167357.586,
+    "bybit_oi": 114195850.0,
+    "on_mexc": true,
+    "mexc_vol": 57435.7755,
+    "still_listed": true
+  },
+  {
+    "symbol": "CUDIS",
+    "announce_time": "2025-06-12 08:49:29",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 64564.711344,
+    "still_listed": false
+  },
+  {
+    "symbol": "SQD",
+    "announce_time": "2025-06-11 11:35:10",
+    "bybit_vol": 532809.3943,
+    "bybit_oi": 13510168.0,
+    "on_mexc": true,
+    "mexc_vol": 58644.19581,
+    "still_listed": true
+  },
+  {
+    "symbol": "RESOLV",
+    "announce_time": "2025-06-10 13:25:26",
+    "bybit_vol": 329534.4614,
+    "bybit_oi": 51642430.0,
+    "on_mexc": true,
+    "mexc_vol": 65840.0614,
+    "still_listed": true
+  },
+  {
+    "symbol": "HOME",
+    "announce_time": "2025-06-10 11:35:44",
+    "bybit_vol": 4323257.034,
+    "bybit_oi": 283760070.0,
+    "on_mexc": true,
+    "mexc_vol": 115502.79989,
+    "still_listed": true
+  },
+  {
+    "symbol": "SKATE",
+    "announce_time": "2025-06-09 10:29:09",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 54067.014157,
+    "still_listed": false
+  },
+  {
+    "symbol": "B2",
+    "announce_time": "2025-06-09 09:26:11",
+    "bybit_vol": 176576.8736,
+    "bybit_oi": 784879.0,
+    "on_mexc": true,
+    "mexc_vol": 63744.00104,
+    "still_listed": true
+  },
+  {
+    "symbol": "LA",
+    "announce_time": "2025-06-05 06:03:17",
+    "bybit_vol": 959256.7845,
+    "bybit_oi": 12916926.6,
+    "on_mexc": true,
+    "mexc_vol": 57078.69289,
+    "still_listed": true
+  },
+  {
+    "symbol": "PUMPBTC",
+    "announce_time": "2025-06-03 04:51:28",
+    "bybit_vol": 149048.2176,
+    "bybit_oi": 34561270.0,
+    "on_mexc": true,
+    "mexc_vol": 58687.00052,
+    "still_listed": true
+  },
+  {
+    "symbol": "SOPH",
+    "announce_time": "2025-05-28 13:16:00",
+    "bybit_vol": 495621.5425,
+    "bybit_oi": 164255920.0,
+    "on_mexc": true,
+    "mexc_vol": 56551.695305,
+    "still_listed": true
+  },
+  {
+    "symbol": "A",
+    "announce_time": "2025-05-28 08:37:14",
+    "bybit_vol": 363666.3878,
+    "bybit_oi": 21793808.0,
+    "on_mexc": true,
+    "mexc_vol": 88288.0343,
+    "still_listed": true
+  },
+  {
+    "symbol": "AGT",
+    "announce_time": "2025-05-28 06:37:16",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 77184.379191,
+    "still_listed": false
+  },
+  {
+    "symbol": "HUMA",
+    "announce_time": "2025-05-26 13:12:16",
+    "bybit_vol": 676396.4208,
+    "bybit_oi": 102501334.0,
+    "on_mexc": true,
+    "mexc_vol": 63117.56551,
+    "still_listed": true
+  },
+  {
+    "symbol": "SOON",
+    "announce_time": "2025-05-23 09:10:10",
+    "bybit_vol": 723396.1111,
+    "bybit_oi": 12022924.0,
+    "on_mexc": true,
+    "mexc_vol": 68193.996,
+    "still_listed": true
+  },
+  {
+    "symbol": "B",
+    "announce_time": "2025-05-23 06:25:23",
+    "bybit_vol": 2466382.4473,
+    "bybit_oi": 13734680.0,
+    "on_mexc": true,
+    "mexc_vol": 197942.69372,
+    "still_listed": true
+  },
+  {
+    "symbol": "AWE",
+    "announce_time": "2025-05-22 09:41:10",
+    "bybit_vol": 212318.5398,
+    "bybit_oi": 10266620.0,
+    "on_mexc": true,
+    "mexc_vol": 54041.81367,
+    "still_listed": true
+  },
+  {
+    "symbol": "SAROS",
+    "announce_time": "2025-05-20 08:25:03",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 57387.8261082,
+    "still_listed": false
+  },
+  {
+    "symbol": "PRAI",
+    "announce_time": "2025-05-19 08:28:38",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 54574.1072548,
+    "still_listed": false
+  },
+  {
+    "symbol": "SYRUP",
+    "announce_time": "2025-05-19 08:01:08",
+    "bybit_vol": 386386.9806,
+    "bybit_oi": 8272098.0,
+    "on_mexc": true,
+    "mexc_vol": 67989.066,
+    "still_listed": true
+  },
+  {
+    "symbol": "NXPC",
+    "announce_time": "2025-05-15 06:33:36",
+    "bybit_vol": 468405.7732,
+    "bybit_oi": 6135091.6,
+    "on_mexc": true,
+    "mexc_vol": 53531.9856,
+    "still_listed": true
+  },
+  {
+    "symbol": "LAUNCHCOIN",
+    "announce_time": "2025-05-14 10:04:34",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": false,
+    "mexc_vol": 0,
+    "still_listed": false
+  },
+  {
+    "symbol": "SKYAI",
+    "announce_time": "2025-05-13 10:36:49",
+    "bybit_vol": 0,
+    "bybit_oi": 0,
+    "on_mexc": true,
+    "mexc_vol": 463862.6358,
+    "still_listed": false
+  },
+  {
+    "symbol": "DOOD",
+    "announce_time": "2025-05-09 13:46:09",
+    "bybit_vol": 162526.0093,
+    "bybit_oi": 261052580.0,
+    "on_mexc": true,
+    "mexc_vol": 61932.646395,
+    "still_listed": true
+  },
+  {
+    "symbol": "SXT",
+    "announce_time": "2025-05-08 13:17:15",
+    "bybit_vol": 101057.3864,
+    "bybit_oi": 73839864.0,
+    "on_mexc": true,
+    "mexc_vol": 70871.03835,
+    "still_listed": true
+  },
+  {
+    "symbol": "BANK",
+    "announce_time": "2025-05-08 09:15:10",
+    "bybit_vol": 144225.9774,
+    "bybit_oi": 11665930.0,
+    "on_mexc": true,
+    "mexc_vol": 57725.05418,
+    "still_listed": true
+  }
+]

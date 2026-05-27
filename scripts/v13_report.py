@@ -1,38 +1,53 @@
 #!/usr/bin/env python3
-"""V13 Script 5/5 (v2): Strategy report.
+"""V13 Script 5/5 (v3): Strategy report.
 
-Per projects/quant/v13 Section 6.3 + 6.8 + remediation plan v2.
+Per projects/quant/v13 Section 6.3 + 6.8.
 
-v2 fixes (from codex r1 #21-#23 + R3 partial-coverage enforcement):
+v3 verdict logic (Alberto decision 2026-05-24: "let's go with the spec"):
 
-#21 PER-FOLD PER-ROW evaluation. Final verdict PASSes only if EVERY criterion
-    passes on EVERY fold. No mean-across-folds masking.
+Spec Section 6.3 has TWO tiers, NOT strict per-fold-per-row:
 
-#22 LATEST FOLD = sort by test_end, include failed folds. The actual latest
-    attempted fold must be successful AND profitable.
+  AGGREGATE OOS (criteria 1-6, pooled across all 8 test windows):
+    1. Aggregate Sharpe > 1.5
+    2. Aggregate random-portfolio percentile rank >= 95th on BOTH Sharpe + PnL
+    3. Aggregate net PnL beats USDC/BTC/ETH/HYPE/HL_index/alt/momentum/V12
+    4. Aggregate fee drag < 30% of gross PnL
+    5. Returns survive K-aware top-N removal (still profitable across folds)
+    6. Latency sensitivity (worst poll Sharpe >= 0.7 * best poll Sharpe)
 
-#23 PENDING ANALYSES force overall FAIL. If any of the 6 questions cannot
-    be answered with data, the report verdict is FAIL.
+  FOLD-LEVEL (F1-F4, partial failures allowed):
+    F1. Profitable folds >= 6 of 8 (generalized: >= ceil(0.75 * n_folds))
+    F2. Most recent fold profitable
+    F3. NO fold max DD > 25%
+    F4. NO fold worst single-day < -10%
 
-Additional R3 gotcha enforcement:
-- deployment_blocked_by_near_liq propagated from wallet_metrics: forces FAIL
-  until margin-ratio data exists or Alberto explicitly overrides.
-- Ablation `not_implemented` rows from walk_forward: each missing ablation
-  forces FAIL.
-- Price interval = "1h" with APPROXIMATED label propagation: latency-
-  sensitive criteria (poll cadence, staleness, cooldown) cannot pass at
-  1h granularity.
+Spec rationale (verbatim): "15-day test windows are noisy enough that demanding
+every fold pass every threshold over-rejects on noise. The aggregate gate plus
+the 6-of-8 fold-level threshold accepts strategies that work most of the time
+but allows one or two weak folds without auto-failing."
+
+Aggregate computation REQUIRES walk_forward's per-fold daily-returns and full
+random-sample outputs (see walk_forward --daily-returns-output and
+--random-samples-output). mean-of-Sharpes != pooled Sharpe.
+
+Pending enforcement (unchanged from v2):
+- deployment_blocked_by_near_liq forces FAIL until margin-ratio data or override
+- Ablation completeness issues force FAIL
+- Price interval = "1h" forces FAIL via cadence-not-validated blocker
 
 Inputs:
-    --walk-forward-results <path>    walk_forward_results.parquet
+    --walk-forward-results <path>    walk_forward_results.parquet (per-fold scalars)
+    --daily-returns <path>           walk_forward_daily_returns.parquet (per-(fold, day))
+    --random-samples <path>          walk_forward_random_samples.parquet (per-(fold, trial))
     --wallet-metrics <path>          wallet_metrics.parquet (latest fold)
     --ablation-results <path>        ablation_results.parquet
-    --price-interval                 "1m" or "1h" (matches walk-forward run)
+    --price-interval                 "1m" or "1h"
     --output <path>                  app/data/v13/strategy_report.md
 """
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
@@ -90,69 +105,39 @@ def _is_strict_true(x) -> bool:
     return False
 
 
-def _evaluate_fold(row: dict) -> dict:
-    """Per-fold per-row Section 6.3 evaluation. NaN = missing = FAIL."""
+def _evaluate_fold_caps(row: dict) -> dict:
+    """Section 6.3 FOLD-LEVEL caps (F3 + F4 only): NO fold may exceed these.
+
+    Per spec 6.3 the per-fold checks are F3 max-DD<25 and F4 worst-day<10
+    enforced as HARD CAPS across folds. F1 (profitable count) and F2
+    (latest profitable) are evaluated separately at the corpus level. The
+    aggregate criteria 1-6 are evaluated by _evaluate_aggregate on pooled
+    daily returns + random samples.
+
+    A row with non-ok status is auto-fail on caps (cannot verify).
+
+    NaN = missing = FAIL.
+    """
     fails: list[str] = []
     if row.get("status") != "ok":
         fails.append(f"fold_status:{row.get('status')}")
         return {"fold": row.get("fold"), "all_pass": False, "fails": fails}
 
-    # Row 1: Sharpe >= 1.5
-    sharpe = _safe_float(row.get("test_sharpe"))
-    if sharpe is None:
-        fails.append("sharpe_missing")
-    elif sharpe < PASS_THRESHOLDS["sharpe_min"]:
-        fails.append(f"sharpe_below_min({sharpe:.2f}<{PASS_THRESHOLDS['sharpe_min']})")
-
-    # Row 2: max DD <= 25%
+    # F3: max DD <= 25%
     max_dd = _safe_float(row.get("test_max_dd_pct"))
     if max_dd is None:
         fails.append("max_dd_missing")
     elif max_dd > PASS_THRESHOLDS["max_dd_max_pct"]:
         fails.append(f"max_dd_exceeded({max_dd:.1f}>{PASS_THRESHOLDS['max_dd_max_pct']})")
 
-    # Row 3: worst single day <= 10%
+    # F4: worst single day <= 10% (absolute)
     worst_day_raw = _safe_float(row.get("test_worst_day_pct"))
     if worst_day_raw is None:
         fails.append("worst_day_missing")
     elif abs(worst_day_raw) > PASS_THRESHOLDS["worst_day_max_pct_abs"]:
         fails.append(f"worst_day_exceeded({abs(worst_day_raw):.1f}>{PASS_THRESHOLDS['worst_day_max_pct_abs']})")
 
-    # Row 4: beats benchmarks (USDC, BTC, ETH, HYPE, perp index, alt basket, momentum, V12)
-    # ENFORCED via ablation #2 (top_vs_beta) at the ablation-completeness layer
-    # below, not as a per-fold row column. Walk_forward emits this as ablation
-    # rows; if any benchmark beat fails, ablation_issues will surface it.
-
-    # Row 5: random Sharpe + net PnL percentile >= 95
-    sharpe_rank = _safe_float(row.get("random_sharpe_pct_rank"))
-    if sharpe_rank is None:
-        fails.append("random_sharpe_rank_missing")
-    elif sharpe_rank < PASS_THRESHOLDS["random_sharpe_pct_min"]:
-        fails.append(f"sharpe_pct_rank_below({sharpe_rank:.1f}<{PASS_THRESHOLDS['random_sharpe_pct_min']})")
-    pnl_rank = _safe_float(row.get("random_pnl_pct_rank"))
-    if pnl_rank is None:
-        fails.append("random_pnl_rank_missing")
-    elif pnl_rank < PASS_THRESHOLDS["random_pnl_pct_min"]:
-        fails.append(f"pnl_pct_rank_below({pnl_rank:.1f}<{PASS_THRESHOLDS['random_pnl_pct_min']})")
-
-    # Row 6: fee_drag <= 30% (the per-fold fee drag column needs to come from
-    # walk_forward; if absent we FAIL to be safe).
-    fee_drag = _safe_float(row.get("fee_drag"))
-    if fee_drag is None:
-        fails.append("fee_drag_missing")
-    elif fee_drag > PASS_THRESHOLDS["fee_drag_max_frac"]:
-        fails.append(f"fee_drag_exceeded({fee_drag:.2f}>{PASS_THRESHOLDS['fee_drag_max_frac']})")
-
-    # Row 7: top-1/5/10 removal must remain profitable
-    for k in [1, 5, 10]:
-        col = f"remove_top{k}_sharpe"
-        val = _safe_float(row.get(col))
-        if val is None:
-            fails.append(f"robust_{col}_missing")
-        elif val <= PASS_THRESHOLDS["robust_remove_min_sharpe"]:
-            fails.append(f"robust_{col}_failed({val:.2f})")
-
-    # Row 8: latest fold profitable (only enforced on the latest-fold row).
+    # Latest-fold dedicated check (F2): latest fold profitable.
     if _is_strict_true(row.get("is_latest_fold")):
         if not _is_strict_true(row.get("latest_fold_profitable")):
             fails.append("latest_fold_not_profitable")
@@ -164,9 +149,172 @@ def _evaluate_fold(row: dict) -> dict:
     return {"fold": row.get("fold"), "all_pass": len(fails) == 0, "fails": fails}
 
 
+def _evaluate_aggregate(wf_sorted: pd.DataFrame,
+                        daily_returns_df: pd.DataFrame | None,
+                        random_samples_df: pd.DataFrame | None) -> dict:
+    """Spec 6.3 AGGREGATE OOS evaluation (criteria 1-6, pooled across all
+    test windows).
+
+    Returns dict with per-criterion pass/fail + value + missing reasons. The
+    overall aggregate verdict is the AND of criteria 1, 2 (Sharpe + PnL gates),
+    and 4. Criteria 3 (beats benchmarks), 5 (top-N removal), 6 (latency) are
+    enforced through ablation-completeness (see main).
+
+    Missing pool inputs are reported as MISSING and FAIL. Criterion 4 falls
+    back to mean of per-fold fee_drag (currently a 0.30 placeholder in
+    walk_forward; flagged as APPROXIMATED when not derived from pooled fees).
+    """
+    out: dict = {
+        "aggregate_sharpe": None,
+        "aggregate_sharpe_pass": False,
+        "aggregate_random_sharpe_p95": None,
+        "aggregate_random_pnl_p95": None,
+        "aggregate_sharpe_pct_rank": None,
+        "aggregate_pnl_pct_rank": None,
+        "aggregate_random_pass": False,
+        "aggregate_fee_drag": None,
+        "aggregate_fee_drag_pass": False,
+        "aggregate_fee_drag_source": "missing",
+        "aggregate_net_pnl_pct": None,
+        "missing": [],
+    }
+
+    # ── Aggregate Sharpe (criterion 1) ─────────────────────────────────
+    if daily_returns_df is None or daily_returns_df.empty:
+        out["missing"].append("daily_returns")
+    else:
+        # Pool daily returns across all 8 folds in chronological order. We
+        # treat each fold's test window as a contiguous block (per spec
+        # rationale: each test is independent OOS evaluation). Compute one
+        # aggregate Sharpe on the pooled series.
+        pooled = daily_returns_df.sort_values(["fold", "day_idx"])["daily_return"].astype(float)
+        pooled_clean = pooled.replace([np.inf, -np.inf], np.nan).dropna()
+        if pooled_clean.empty or pooled_clean.std() == 0:
+            out["missing"].append("aggregate_sharpe_undefined")
+        else:
+            agg_sh = float(pooled_clean.mean() / pooled_clean.std() * math.sqrt(365))
+            out["aggregate_sharpe"] = agg_sh
+            out["aggregate_sharpe_pass"] = agg_sh >= PASS_THRESHOLDS["sharpe_min"]
+            # Aggregate net PnL: compound the pooled daily returns.
+            out["aggregate_net_pnl_pct"] = float(((1.0 + pooled_clean).prod() - 1.0) * 100.0)
+
+    # ── Aggregate random p95 (criterion 2) ────────────────────────────
+    if random_samples_df is None or random_samples_df.empty:
+        out["missing"].append("random_samples")
+    elif out["aggregate_sharpe"] is None or out["aggregate_net_pnl_pct"] is None:
+        # Cannot compare without an aggregate Sharpe + PnL value.
+        out["missing"].append("aggregate_sharpe_for_random_rank")
+    else:
+        # Pool random sharpes + pnls across all folds. The aggregate gate
+        # is: strategy aggregate Sharpe + aggregate PnL must both rank >=
+        # 95th vs the pooled random distribution. We approximate the pooled
+        # random distribution as a per-fold compounded series per trial
+        # index, falling back to raw concatenation when trial indices
+        # disagree across folds.
+        rs = random_samples_df.copy()
+        # Try per-trial compounding: for each (trial), sum (or compound) the
+        # random pnls across folds; for Sharpe we use trial-by-trial mean of
+        # per-fold sharpes (no pooled daily series for randoms is emitted).
+        per_trial = rs.groupby("trial").agg({"random_sharpe": "mean", "random_pnl_pct": "sum"})
+        if per_trial.empty:
+            out["missing"].append("random_samples_empty")
+        else:
+            sh_p95 = float(per_trial["random_sharpe"].quantile(0.95))
+            pn_p95 = float(per_trial["random_pnl_pct"].quantile(0.95))
+            out["aggregate_random_sharpe_p95"] = sh_p95
+            out["aggregate_random_pnl_p95"] = pn_p95
+            # Rank: percentile of strategy aggregate vs the per-trial distribution.
+            sh_sorted = per_trial["random_sharpe"].sort_values().values
+            pn_sorted = per_trial["random_pnl_pct"].sort_values().values
+            sh_rank = float(np.searchsorted(sh_sorted, out["aggregate_sharpe"]) / max(1, len(sh_sorted)) * 100)
+            pn_rank = float(np.searchsorted(pn_sorted, out["aggregate_net_pnl_pct"]) / max(1, len(pn_sorted)) * 100)
+            out["aggregate_sharpe_pct_rank"] = sh_rank
+            out["aggregate_pnl_pct_rank"] = pn_rank
+            out["aggregate_random_pass"] = (sh_rank >= PASS_THRESHOLDS["random_sharpe_pct_min"]
+                                            and pn_rank >= PASS_THRESHOLDS["random_pnl_pct_min"])
+
+    # ── Aggregate fee drag (criterion 4) ──────────────────────────────
+    # Pooled fee_drag = sum(fees + slippage across all folds) / sum(gross_pnl
+    # across all folds). Walk_forward v3 emits per-fold test_fees_usd +
+    # test_slippage_usd + test_gross_pnl_usd accumulated from the simulator's
+    # per-minute fees_minute / slippage_minute. Falls back to mean of per-fold
+    # fee_drag values when the new cost columns are absent (older walk_forward
+    # outputs). When pooled gross PnL is non-positive the gate is undefined and
+    # set to 1.0 (conservative FAIL).
+    has_cost_columns = all(c in wf_sorted.columns for c in (
+        "test_fees_usd", "test_slippage_usd", "test_gross_pnl_usd"
+    ))
+    if has_cost_columns:
+        fees_total = float(pd.to_numeric(wf_sorted["test_fees_usd"], errors="coerce").fillna(0).sum())
+        slip_total = float(pd.to_numeric(wf_sorted["test_slippage_usd"], errors="coerce").fillna(0).sum())
+        gross_total = float(pd.to_numeric(wf_sorted["test_gross_pnl_usd"], errors="coerce").fillna(0).sum())
+        if gross_total > 1e-9:
+            out["aggregate_fee_drag"] = (fees_total + slip_total) / gross_total
+        else:
+            out["aggregate_fee_drag"] = 1.0  # gross non-positive -> conservative FAIL
+        out["aggregate_fee_drag_pass"] = out["aggregate_fee_drag"] < PASS_THRESHOLDS["fee_drag_max_frac"]
+        out["aggregate_fee_drag_source"] = "pooled_real"
+    else:
+        fee_drag_col = wf_sorted.get("fee_drag")
+        if fee_drag_col is not None and not fee_drag_col.dropna().empty:
+            out["aggregate_fee_drag"] = float(fee_drag_col.dropna().mean())
+            out["aggregate_fee_drag_pass"] = out["aggregate_fee_drag"] < PASS_THRESHOLDS["fee_drag_max_frac"]
+            out["aggregate_fee_drag_source"] = "mean_of_per_fold_legacy"
+        else:
+            out["missing"].append("fee_drag")
+
+    return out
+
+
+def _evaluate_fold_corpus(fold_evals: list, wf_sorted: pd.DataFrame) -> dict:
+    """Spec 6.3 FOLD-LEVEL corpus checks: F1 (>=6 of 8 profitable), F2
+    (latest profitable -- captured in fold caps), F3+F4 (per-fold caps,
+    NO fold may exceed -- captured in fold caps).
+
+    F1: count folds whose test_net_return_pct > 0. Generalize 6-of-8 to
+    >= ceil(0.75 * n_folds) so non-default fold counts behave sensibly.
+    """
+    out: dict = {
+        "n_folds_attempted": len(fold_evals),
+        "n_folds_profitable": 0,
+        "f1_threshold": 0,
+        "f1_pass": False,
+        "f3_f4_pass": False,
+        "f3_f4_violators": [],
+    }
+    if not fold_evals:
+        return out
+
+    # F1: profitable folds count.
+    if "test_net_return_pct" in wf_sorted.columns:
+        n_prof = int((wf_sorted["test_net_return_pct"].astype(float) > 0).sum())
+    else:
+        n_prof = 0
+    out["n_folds_profitable"] = n_prof
+    n_attempted = len(fold_evals)
+    threshold = max(1, math.ceil(n_attempted * 0.75))
+    out["f1_threshold"] = threshold
+    out["f1_pass"] = n_prof >= threshold
+
+    # F3 + F4: no fold may violate. fold_evals carry per-fold cap fails.
+    violators = [(f["fold"], f["fails"]) for f in fold_evals if not f["all_pass"]]
+    out["f3_f4_violators"] = violators
+    out["f3_f4_pass"] = len(violators) == 0
+
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--walk-forward-results", required=True)
+    ap.add_argument("--daily-returns", required=False,
+                    help="walk_forward_daily_returns.parquet from walk_forward "
+                         "--daily-returns-output. Required for spec 6.3 "
+                         "aggregate Sharpe (criteria 1).")
+    ap.add_argument("--random-samples", required=False,
+                    help="walk_forward_random_samples.parquet from walk_forward "
+                         "--random-samples-output. Required for spec 6.3 "
+                         "aggregate random p95 (criteria 2).")
     ap.add_argument("--wallet-metrics", required=False)
     ap.add_argument("--ablation-results", required=False)
     ap.add_argument("--price-interval", default="1m", choices=["1m", "1h"],
@@ -193,15 +341,43 @@ def main():
     if len(wf_sorted) > 0:
         wf_sorted.loc[wf_sorted.index[-1], "is_latest_fold"] = True
 
-    # Per-fold per-row evaluation.
-    fold_evals = [_evaluate_fold(r._asdict()) for r in wf_sorted.itertuples(index=False)]
-    n_fold_pass = sum(1 for f in fold_evals if f["all_pass"])
+    # Per-fold CAP-only evaluation (F3 + F4 only, plus F2 latest-profitable
+    # tagged on the latest-fold row). The strict per-fold-per-row evaluation
+    # is REMOVED per Alberto decision 2026-05-24 to match spec 6.3 (which
+    # warns "demanding every fold pass every threshold over-rejects on
+    # noise"). Aggregate criteria 1-6 are evaluated separately on pooled
+    # inputs by _evaluate_aggregate.
+    fold_evals = [_evaluate_fold_caps(r._asdict()) for r in wf_sorted.itertuples(index=False)]
     n_fold_attempted = len(fold_evals)
-    fold_level_pass = (n_fold_pass == n_fold_attempted) and (n_fold_attempted > 0)
 
-    # Latest-fold dedicated check.
+    # Latest-fold profitable (F2) is checked via the cap-evaluator's
+    # latest_fold_not_profitable fail string on the latest-fold row.
     latest_fold_eval = fold_evals[-1] if fold_evals else None
     latest_fold_pass = bool(latest_fold_eval and latest_fold_eval["all_pass"])
+
+    # Load aggregate-evaluation inputs (per-fold daily returns, random samples).
+    daily_returns_df = None
+    random_samples_df = None
+    if args.daily_returns and Path(args.daily_returns).exists():
+        try:
+            daily_returns_df = pd.read_parquet(args.daily_returns)
+        except Exception as e:
+            print(f"WARN: failed to read --daily-returns: {e}")
+    if args.random_samples and Path(args.random_samples).exists():
+        try:
+            random_samples_df = pd.read_parquet(args.random_samples)
+        except Exception as e:
+            print(f"WARN: failed to read --random-samples: {e}")
+
+    agg = _evaluate_aggregate(wf_sorted, daily_returns_df, random_samples_df)
+    fold_corpus = _evaluate_fold_corpus(fold_evals, wf_sorted)
+
+    # Aggregate verdict (criteria 1, 2, 4 evaluated here; 3/5/6 via ablation).
+    aggregate_pass = (agg["aggregate_sharpe_pass"]
+                      and agg["aggregate_random_pass"]
+                      and agg["aggregate_fee_drag_pass"])
+    fold_level_pass = fold_corpus["f1_pass"] and fold_corpus["f3_f4_pass"]
+    n_fold_pass = fold_corpus["n_folds_profitable"]
 
     # Pending-analyses: ablations + near-liq + price-interval approximation.
     pending_reasons: list[str] = []
@@ -282,8 +458,8 @@ def main():
     if args.price_interval == "1h":
         pending_reasons.append("price_interval_1h_cadence_unvalidated")
 
-    # Overall verdict.
-    overall_pass = fold_level_pass and latest_fold_pass and len(pending_reasons) == 0
+    # Overall verdict per spec 6.3 two-tier structure.
+    overall_pass = aggregate_pass and fold_level_pass and latest_fold_pass and len(pending_reasons) == 0
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -291,17 +467,66 @@ def main():
         f.write(f"# V13 Backtest Report\n\n")
         f.write(f"Walk-forward source: `{args.walk_forward_results}`\n\n")
         f.write(f"Folds attempted: {n_fold_attempted}\n")
-        f.write(f"Folds passing all rows: {n_fold_pass}\n\n")
+        f.write(f"Folds profitable (test net PnL > 0): {n_fold_pass} of {n_fold_attempted} (F1 threshold: >= {fold_corpus['f1_threshold']})\n\n")
 
-        f.write("## Verdict\n\n")
+        f.write("## Verdict (spec Section 6.3)\n\n")
         f.write(f"**Overall: {'PASS' if overall_pass else 'FAIL'}**\n\n")
+
+        # Aggregate tier (criteria 1-6 across all test windows POOLED).
+        f.write("### Aggregate OOS (criteria 1-6, pooled across all test windows)\n\n")
+        def _fmt(v, digits=2):
+            if v is None:
+                return "MISSING"
+            try:
+                return f"{float(v):.{digits}f}"
+            except Exception:
+                return str(v)
+        f.write(f"- 1. Aggregate Sharpe = {_fmt(agg['aggregate_sharpe'])} (threshold > {PASS_THRESHOLDS['sharpe_min']}): {'PASS' if agg['aggregate_sharpe_pass'] else 'FAIL'}\n")
+        f.write(f"- 2. Aggregate random p95 rank: Sharpe = {_fmt(agg['aggregate_sharpe_pct_rank'])} pct, PnL = {_fmt(agg['aggregate_pnl_pct_rank'])} pct (both must >= {PASS_THRESHOLDS['random_sharpe_pct_min']}): {'PASS' if agg['aggregate_random_pass'] else 'FAIL'}\n")
+        f.write(f"- 3. Aggregate net PnL beats USDC/BTC/ETH/HYPE/HL_index/alt/momentum/V12: enforced via ablation #2 (top_vs_beta). Aggregate net PnL = {_fmt(agg['aggregate_net_pnl_pct'])} %. See ablation completeness section.\n")
+        f.write(f"- 4. Aggregate fee drag = {_fmt(agg['aggregate_fee_drag'])} (threshold < {PASS_THRESHOLDS['fee_drag_max_frac']}): {'PASS' if agg['aggregate_fee_drag_pass'] else 'FAIL'}")
+        if agg["aggregate_fee_drag_source"] == "mean_of_per_fold_legacy":
+            f.write(" -- LEGACY (per-fold cost columns absent; using mean of per-fold scalar fee_drag from older walk_forward; re-run walk_forward for true pooled aggregate)")
+        elif agg["aggregate_fee_drag_source"] == "pooled_real":
+            f.write(" -- POOLED REAL (sum_folds(fees + slip) / sum_folds(gross_pnl) from simulator-tracked per-minute costs)")
+        f.write("\n")
+        f.write(f"- 5. Top-N removal still profitable: enforced via ablation #4 (remove_top_1_5_10). See ablation completeness section.\n")
+        f.write(f"- 6. Latency sensitivity (worst poll Sharpe >= 0.7 * best poll Sharpe): enforced via ablation #5 (latency_cadence). See ablation completeness section.\n")
+        if agg["missing"]:
+            f.write(f"- MISSING aggregate inputs: {agg['missing']}\n")
+        f.write("\n")
+
+        # Fold-level tier (F1-F4, partial failures allowed within bounds).
+        f.write("### Fold-level (F1-F4, per-fold caps and corpus checks)\n\n")
+        f.write(f"- F1. Profitable folds: {fold_corpus['n_folds_profitable']} of {fold_corpus['n_folds_attempted']} (threshold >= {fold_corpus['f1_threshold']}, generalizes spec 6-of-8): {'PASS' if fold_corpus['f1_pass'] else 'FAIL'}\n")
+        f.write(f"- F2. Latest fold profitable + caps: {'PASS' if latest_fold_pass else 'FAIL'}\n")
+        if fold_corpus["f3_f4_violators"]:
+            f.write(f"- F3+F4. Per-fold caps (max DD <= 25%, worst day <= 10%): FAIL on {len(fold_corpus['f3_f4_violators'])} fold(s):\n")
+            for fold, fails in fold_corpus["f3_f4_violators"]:
+                f.write(f"  - fold {fold}: {', '.join(fails)}\n")
+        else:
+            f.write(f"- F3+F4. Per-fold caps (max DD <= 25%, worst day <= 10%): PASS (no fold violators)\n")
+        f.write("\n")
+
         if not overall_pass:
-            f.write("Reasons FAIL:\n")
-            if not fold_level_pass:
-                f.write(f"- per_fold_per_row: only {n_fold_pass}/{n_fold_attempted} folds passed all Section 6.3 rows\n")
+            f.write("### FAIL reasons summary\n\n")
+            if not aggregate_pass:
+                f.write(f"- aggregate_tier: ")
+                agg_fails = []
+                if not agg["aggregate_sharpe_pass"]:
+                    agg_fails.append("sharpe")
+                if not agg["aggregate_random_pass"]:
+                    agg_fails.append("random_p95")
+                if not agg["aggregate_fee_drag_pass"]:
+                    agg_fails.append("fee_drag")
+                f.write(f"{', '.join(agg_fails)}\n")
+            if not fold_corpus["f1_pass"]:
+                f.write(f"- F1 profitable-folds: {fold_corpus['n_folds_profitable']}/{fold_corpus['n_folds_attempted']} < {fold_corpus['f1_threshold']}\n")
+            if not fold_corpus["f3_f4_pass"]:
+                f.write(f"- F3/F4: {len(fold_corpus['f3_f4_violators'])} fold(s) violate per-fold caps\n")
             if not latest_fold_pass:
                 fails = latest_fold_eval["fails"] if latest_fold_eval else ["no_folds"]
-                f.write(f"- latest_fold_not_clear: {', '.join(fails)}\n")
+                f.write(f"- F2 latest-fold: {', '.join(fails)}\n")
             for p in pending_reasons:
                 f.write(f"- pending: {p}\n")
             f.write("\n")
@@ -468,14 +693,14 @@ def main():
                 elif p == "price_interval_1h_cadence_unvalidated":
                     f.write("- **Backtest ran at 1h granularity.** Spec poll cadences (30s/1m/5m/10m) and staleness rule (15m) "
                             "cannot be validated at this granularity. 1m backfill required for full validation.\n")
-                elif p.startswith("ablations_unimplemented"):
-                    f.write(f"- **{p}**: Section 6.7 ablation suite is stubbed. Full implementation required before deploy.\n")
+                elif p.startswith("ablations_incomplete"):
+                    f.write(f"- **{p}**: Section 6.7 ablation suite has incomplete coverage for one or more folds. See ablation_results.parquet for the missing experiment/variant rows.\n")
                 else:
                     f.write(f"- {p}\n")
             f.write("\n")
 
         f.write("---\n")
-        f.write("Report generated by `scripts/v13_report.py` v2.\n")
+        f.write("Report generated by `scripts/v13_report.py` v3 (spec 6.3 two-tier verdict + pooled aggregate fee_drag).\n")
 
     print(f"Wrote report to {out}")
     print(f"Overall verdict: {'PASS' if overall_pass else 'FAIL'}")

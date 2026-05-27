@@ -1,0 +1,42 @@
+[
+  {
+    "symbol": "GWEI",
+    "cg_id": "ethgas-2",
+    "pre_listing_mcap": 289852025.10971594,
+    "pre_listing_vol": 6345053.222379218,
+    "pre_listing_price": 0.13797882111404386,
+    "current_mcap": 281598135,
+    "current_vol": 4473870,
+    "mcap_change": -2.8476220259601948
+  },
+  {
+    "symbol": "BILL",
+    "cg_id": "billions-network",
+    "pre_listing_mcap": 91842598.77569452,
+    "pre_listing_vol": 148727140.16996822,
+    "pre_listing_price": 0.03825744151980184,
+    "current_mcap": 270097379,
+    "current_vol": 103483391,
+    "mcap_change": 194.08725645890513
+  },
+  {
+    "symbol": "BLEND",
+    "cg_id": "fluent-network",
+    "pre_listing_mcap": 17932267.10273958,
+    "pre_listing_vol": 4856932.053423539,
+    "pre_listing_price": 0.09969753422574301,
+    "current_mcap": 19263579,
+    "current_vol": 18998141,
+    "mcap_change": 7.4241136919995565
+  },
+  {
+    "symbol": "OPG",
+    "cg_id": "opengradient",
+    "pre_listing_mcap": 59643648.33921143,
+    "pre_listing_vol": 34352208.80204173,
+    "pre_listing_price": 0.31492428896708974,
+    "current_mcap": 46616967,
+    "current_vol": 21280576,
+    "mcap_change": -21.840852633837482
+  }
+]

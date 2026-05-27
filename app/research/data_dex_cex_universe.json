@@ -1,0 +1,249 @@
+[
+  {
+    "symbol": "BONK",
+    "cg_id": "bonk",
+    "total_tickers": 100,
+    "cex_count": 12,
+    "cex_list": [
+      "Binance",
+      "Binance US",
+      "BingX",
+      "Bitget",
+      "Bybit",
+      "Bybit EU",
+      "Coinbase Exchange",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "PNUT",
+    "cg_id": "peanut-the-squirrel",
+    "total_tickers": 100,
+    "cex_count": 11,
+    "cex_list": [
+      "Binance",
+      "BingX",
+      "Bitget",
+      "Bybit",
+      "Bybit EU",
+      "Coinbase Exchange",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "ACT",
+    "cg_id": "act-i-the-ai-prophecy",
+    "total_tickers": 68,
+    "cex_count": 8,
+    "cex_list": [
+      "Binance",
+      "BingX",
+      "Bitget",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "POPCAT",
+    "cg_id": "popcat",
+    "total_tickers": 77,
+    "cex_count": 9,
+    "cex_list": [
+      "Binance US",
+      "BingX",
+      "Bybit",
+      "Bybit EU",
+      "Coinbase Exchange",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "MOODENG",
+    "cg_id": "moo-deng",
+    "total_tickers": 75,
+    "cex_count": 8,
+    "cex_list": [
+      "BingX",
+      "Bitget",
+      "Coinbase Exchange",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "FARTCOIN",
+    "cg_id": "fartcoin",
+    "total_tickers": 100,
+    "cex_count": 7,
+    "cex_list": [
+      "BingX",
+      "Bitget",
+      "Coinbase Exchange",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "GRIFFAIN",
+    "cg_id": "griffain",
+    "total_tickers": 32,
+    "cex_count": 5,
+    "cex_list": [
+      "BingX",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "CHILLGUY",
+    "cg_id": "just-a-chill-guy",
+    "total_tickers": 2,
+    "cex_count": 0,
+    "cex_list": [],
+    "perp_count": 0
+  },
+  {
+    "symbol": "PENGU",
+    "cg_id": "pudgy-penguins",
+    "total_tickers": 100,
+    "cex_count": 12,
+    "cex_list": [
+      "Binance",
+      "Binance US",
+      "BingX",
+      "Bitget",
+      "Bybit",
+      "Bybit EU",
+      "Coinbase Exchange",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "TRUMP",
+    "cg_id": "official-trump",
+    "total_tickers": 100,
+    "cex_count": 11,
+    "cex_list": [
+      "Binance",
+      "BingX",
+      "Bitget",
+      "Bybit",
+      "Bybit EU",
+      "Coinbase Exchange",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "SPX",
+    "cg_id": "spx6900",
+    "total_tickers": 100,
+    "cex_count": 6,
+    "cex_list": [
+      "BingX",
+      "Bybit",
+      "Coinbase Exchange",
+      "Kraken",
+      "KuCoin",
+      "MEXC"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "GIGA",
+    "cg_id": "gigachad-2",
+    "total_tickers": 42,
+    "cex_count": 5,
+    "cex_list": [
+      "Binance US",
+      "Coinbase Exchange",
+      "Kraken",
+      "KuCoin",
+      "MEXC"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "MEW",
+    "cg_id": "cat-in-a-dogs-world",
+    "total_tickers": 76,
+    "cex_count": 9,
+    "cex_list": [
+      "Binance US",
+      "BingX",
+      "Bitget",
+      "Bybit",
+      "HTX",
+      "Kraken",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "BOME",
+    "cg_id": "book-of-meme",
+    "total_tickers": 89,
+    "cex_count": 8,
+    "cex_list": [
+      "Binance",
+      "BingX",
+      "Bitget",
+      "Bybit",
+      "HTX",
+      "KuCoin",
+      "MEXC",
+      "OKX"
+    ],
+    "perp_count": 0
+  },
+  {
+    "symbol": "MYRO",
+    "cg_id": "myro",
+    "total_tickers": 21,
+    "cex_count": 2,
+    "cex_list": [
+      "KuCoin",
+      "MEXC"
+    ],
+    "perp_count": 0
+  }
+]

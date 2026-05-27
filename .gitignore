@@ -186,6 +186,7 @@ voice_msg.json
 voice_msg.srt
 voice_msg.tsv
 voice_msg.txt
+voice_msg.vtt
 
 # Codex session id (machine-local state)
 .context/codex-session-id

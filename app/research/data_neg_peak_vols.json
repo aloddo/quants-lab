@@ -1,0 +1,702 @@
+[
+  {
+    "symbol": "DVERSE",
+    "current_vol": 3898809.6676,
+    "peak_90d_vol": 10804597.3049,
+    "avg_90d_vol": 4219619.4968,
+    "days_data": 4
+  },
+  {
+    "symbol": "MOGU",
+    "current_vol": 3075246.4014666,
+    "peak_90d_vol": 3074689.1244853,
+    "avg_90d_vol": 1161424.8035502406,
+    "days_data": 32
+  },
+  {
+    "symbol": "GOLD(PAXG)",
+    "current_vol": 3038048.27,
+    "peak_90d_vol": 63958628.53,
+    "avg_90d_vol": 9932429.314555556,
+    "days_data": 90
+  },
+  {
+    "symbol": "UBOX",
+    "current_vol": 2917258.4485,
+    "peak_90d_vol": 7243832.0701,
+    "avg_90d_vol": 2754864.15388,
+    "days_data": 5
+  },
+  {
+    "symbol": "GOLD(XAUT)",
+    "current_vol": 2868294.77,
+    "peak_90d_vol": 162215646.5,
+    "avg_90d_vol": 22568070.997555554,
+    "days_data": 90
+  },
+  {
+    "symbol": "MX",
+    "current_vol": 2663171.5431,
+    "peak_90d_vol": 17914955.5143,
+    "avg_90d_vol": 3634559.037804445,
+    "days_data": 90
+  },
+  {
+    "symbol": "EUR",
+    "current_vol": 2352923.4129,
+    "peak_90d_vol": 12610374.4438,
+    "avg_90d_vol": 4440875.109680001,
+    "days_data": 90
+  },
+  {
+    "symbol": "RAIN",
+    "current_vol": 1832575.1239114,
+    "peak_90d_vol": 6880976.449576,
+    "avg_90d_vol": 1342530.6802126924,
+    "days_data": 90
+  },
+  {
+    "symbol": "ZEST",
+    "current_vol": 1718474.36533,
+    "peak_90d_vol": 1718497.36324,
+    "avg_90d_vol": 1718497.36324,
+    "days_data": 1
+  },
+  {
+    "symbol": "VIM",
+    "current_vol": 1635985.425,
+    "peak_90d_vol": 2982920.3737,
+    "avg_90d_vol": 2306242.90825,
+    "days_data": 2
+  },
+  {
+    "symbol": "XP",
+    "current_vol": 1597901.008388,
+    "peak_90d_vol": 1850249.353376,
+    "avg_90d_vol": 325620.8008311778,
+    "days_data": 90
+  },
+  {
+    "symbol": "CORN",
+    "current_vol": 1272604.38811,
+    "peak_90d_vol": 1127477.41649,
+    "avg_90d_vol": 597657.1072597777,
+    "days_data": 90
+  },
+  {
+    "symbol": "JGGL",
+    "current_vol": 1193784.3023,
+    "peak_90d_vol": 1708025.238,
+    "avg_90d_vol": 1435203.3538033334,
+    "days_data": 90
+  },
+  {
+    "symbol": "ATLA",
+    "current_vol": 1171380.8238,
+    "peak_90d_vol": 60064503.1568,
+    "avg_90d_vol": 8473707.538957777,
+    "days_data": 90
+  },
+  {
+    "symbol": "WXT",
+    "current_vol": 1116068.393823,
+    "peak_90d_vol": 11150314.522304,
+    "avg_90d_vol": 2336225.3877660665,
+    "days_data": 90
+  },
+  {
+    "symbol": "AIA",
+    "current_vol": 1028281.41271,
+    "peak_90d_vol": 3243597.68066,
+    "avg_90d_vol": 428220.1202073333,
+    "days_data": 90
+  },
+  {
+    "symbol": "BDX",
+    "current_vol": 1000237.18014,
+    "peak_90d_vol": 2427103.66919,
+    "avg_90d_vol": 1028223.8641805556,
+    "days_data": 90
+  },
+  {
+    "symbol": "ASTEROID",
+    "current_vol": 947625.71691778,
+    "peak_90d_vol": 7780272.60193356,
+    "avg_90d_vol": 2368142.725117451,
+    "days_data": 33
+  },
+  {
+    "symbol": "AIX",
+    "current_vol": 933510.007447,
+    "peak_90d_vol": 4382538.021479,
+    "avg_90d_vol": 1565404.0026852998,
+    "days_data": 90
+  },
+  {
+    "symbol": "TTN",
+    "current_vol": 885030.76193,
+    "peak_90d_vol": 1874208.93316,
+    "avg_90d_vol": 910185.3479703334,
+    "days_data": 90
+  },
+  {
+    "symbol": "AIXDROP",
+    "current_vol": 882728.10916627,
+    "peak_90d_vol": 2358403.4589102,
+    "avg_90d_vol": 401315.0277634583,
+    "days_data": 90
+  },
+  {
+    "symbol": "SKYAI",
+    "current_vol": 837549.2484,
+    "peak_90d_vol": 10290212.9549,
+    "avg_90d_vol": 3139943.004745,
+    "days_data": 20
+  },
+  {
+    "symbol": "9BIT",
+    "current_vol": 829190.982266,
+    "peak_90d_vol": 867963.307131,
+    "avg_90d_vol": 687501.3743459667,
+    "days_data": 90
+  },
+  {
+    "symbol": "SLVON",
+    "current_vol": 799514.97,
+    "peak_90d_vol": 1936332.21,
+    "avg_90d_vol": 393069.5955555556,
+    "days_data": 90
+  },
+  {
+    "symbol": "SHIB",
+    "current_vol": 793248.578644882,
+    "peak_90d_vol": 6965682.898866631,
+    "avg_90d_vol": 2467473.3170301965,
+    "days_data": 90
+  },
+  {
+    "symbol": "MBG",
+    "current_vol": 780142.4873,
+    "peak_90d_vol": 7486556.8284,
+    "avg_90d_vol": 2103417.3301999997,
+    "days_data": 90
+  },
+  {
+    "symbol": "PLAY",
+    "current_vol": 715044.11499,
+    "peak_90d_vol": 3565223.34466,
+    "avg_90d_vol": 516329.00909999997,
+    "days_data": 90
+  },
+  {
+    "symbol": "SPCM",
+    "current_vol": 629452.553582,
+    "peak_90d_vol": 619995.8544397,
+    "avg_90d_vol": 282320.3500602167,
+    "days_data": 90
+  },
+  {
+    "symbol": "GUA",
+    "current_vol": 588535.08587,
+    "peak_90d_vol": 1898516.48394,
+    "avg_90d_vol": 204887.14786833336,
+    "days_data": 90
+  },
+  {
+    "symbol": "GPAD",
+    "current_vol": 575311.33712,
+    "peak_90d_vol": 1208923.36333,
+    "avg_90d_vol": 482134.9051859523,
+    "days_data": 42
+  },
+  {
+    "symbol": "ZANO",
+    "current_vol": 573337.145,
+    "peak_90d_vol": 1012876.773,
+    "avg_90d_vol": 662063.880211111,
+    "days_data": 90
+  },
+  {
+    "symbol": "ASSET",
+    "current_vol": 546271.56385,
+    "peak_90d_vol": 1309309.52728,
+    "avg_90d_vol": 587135.713733,
+    "days_data": 20
+  },
+  {
+    "symbol": "ULTIMA",
+    "current_vol": 452821.91,
+    "peak_90d_vol": 6453380.9,
+    "avg_90d_vol": 882678.018111111,
+    "days_data": 90
+  },
+  {
+    "symbol": "BRL",
+    "current_vol": 447539.971,
+    "peak_90d_vol": 1103880.6571,
+    "avg_90d_vol": 418739.27314111113,
+    "days_data": 90
+  },
+  {
+    "symbol": "ACN",
+    "current_vol": 441547.3182,
+    "peak_90d_vol": 633331.183568,
+    "avg_90d_vol": 377766.4652659048,
+    "days_data": 21
+  },
+  {
+    "symbol": "SEDA",
+    "current_vol": 423560.21523,
+    "peak_90d_vol": 590230.40631,
+    "avg_90d_vol": 392322.05918322224,
+    "days_data": 90
+  },
+  {
+    "symbol": "QFI",
+    "current_vol": 418208.982,
+    "peak_90d_vol": 857305.974,
+    "avg_90d_vol": 323234.25479591836,
+    "days_data": 49
+  },
+  {
+    "symbol": "LUNC",
+    "current_vol": 413934.20423076,
+    "peak_90d_vol": 6808197.14341871,
+    "avg_90d_vol": 759686.6827406774,
+    "days_data": 90
+  },
+  {
+    "symbol": "SATO",
+    "current_vol": 410022.9706,
+    "peak_90d_vol": 3254669.0333,
+    "avg_90d_vol": 959411.52651875,
+    "days_data": 16
+  },
+  {
+    "symbol": "CES",
+    "current_vol": 409799.5774,
+    "peak_90d_vol": 526934.0212,
+    "avg_90d_vol": 165516.04981333335,
+    "days_data": 90
+  },
+  {
+    "symbol": "RON",
+    "current_vol": 409662.80954,
+    "peak_90d_vol": 818649.73126,
+    "avg_90d_vol": 97693.1598258889,
+    "days_data": 90
+  },
+  {
+    "symbol": "SENTIS",
+    "current_vol": 405785.27091,
+    "peak_90d_vol": 419472.44664,
+    "avg_90d_vol": 292462.12381811114,
+    "days_data": 90
+  },
+  {
+    "symbol": "OVPP",
+    "current_vol": 397542.296864,
+    "peak_90d_vol": 763742.62301,
+    "avg_90d_vol": 374565.8380737889,
+    "days_data": 90
+  },
+  {
+    "symbol": "OSHI",
+    "current_vol": 394285.423825,
+    "peak_90d_vol": 680598.099919,
+    "avg_90d_vol": 466155.45439144445,
+    "days_data": 90
+  },
+  {
+    "symbol": "BONK",
+    "current_vol": 371069.560190571,
+    "peak_90d_vol": 3479672.276956534,
+    "avg_90d_vol": 1012798.7251692234,
+    "days_data": 90
+  },
+  {
+    "symbol": "TROLLSOL",
+    "current_vol": 367637.57566,
+    "peak_90d_vol": 2084635.81351,
+    "avg_90d_vol": 213710.2145940333,
+    "days_data": 90
+  },
+  {
+    "symbol": "XRB",
+    "current_vol": 365339.5703,
+    "peak_90d_vol": 392055.2277,
+    "avg_90d_vol": 148834.76630777778,
+    "days_data": 90
+  },
+  {
+    "symbol": "VR",
+    "current_vol": 354929.465841,
+    "peak_90d_vol": 467085.39875,
+    "avg_90d_vol": 317118.2949420444,
+    "days_data": 90
+  },
+  {
+    "symbol": "ROLL",
+    "current_vol": 351110.37089,
+    "peak_90d_vol": 345642.64348,
+    "avg_90d_vol": 69624.84631,
+    "days_data": 90
+  },
+  {
+    "symbol": "AREA",
+    "current_vol": 350074.71647,
+    "peak_90d_vol": 389846.58921,
+    "avg_90d_vol": 15768.750199,
+    "days_data": 90
+  },
+  {
+    "symbol": "USDGO",
+    "current_vol": 346576.5207,
+    "peak_90d_vol": 3870654.8485,
+    "avg_90d_vol": 826500.6243190477,
+    "days_data": 21
+  },
+  {
+    "symbol": "GCOIN",
+    "current_vol": 345199.7454113,
+    "peak_90d_vol": 821615.4256846,
+    "avg_90d_vol": 407241.0313492349,
+    "days_data": 63
+  },
+  {
+    "symbol": "RLS",
+    "current_vol": 337701.465846,
+    "peak_90d_vol": 3565966.921619,
+    "avg_90d_vol": 250305.6003748111,
+    "days_data": 90
+  },
+  {
+    "symbol": "ZIG",
+    "current_vol": 332969.246505,
+    "peak_90d_vol": 827816.85817,
+    "avg_90d_vol": 162135.44384013335,
+    "days_data": 90
+  },
+  {
+    "symbol": "CHECK",
+    "current_vol": 328377.952931,
+    "peak_90d_vol": 807343.235338,
+    "avg_90d_vol": 249066.74207804442,
+    "days_data": 90
+  },
+  {
+    "symbol": "MWXT",
+    "current_vol": 326085.69409,
+    "peak_90d_vol": 1474343.25848,
+    "avg_90d_vol": 490351.3778276667,
+    "days_data": 90
+  },
+  {
+    "symbol": "XPASS",
+    "current_vol": 317140.36715,
+    "peak_90d_vol": 496623.72933,
+    "avg_90d_vol": 74359.52788088888,
+    "days_data": 90
+  },
+  {
+    "symbol": "AIXPLAY",
+    "current_vol": 314086.6388566,
+    "peak_90d_vol": 1347766.9701201,
+    "avg_90d_vol": 363670.65820850414,
+    "days_data": 72
+  },
+  {
+    "symbol": "ATS",
+    "current_vol": 312377.31052,
+    "peak_90d_vol": 305252.54848,
+    "avg_90d_vol": 64465.46901455556,
+    "days_data": 90
+  },
+  {
+    "symbol": "PEPE",
+    "current_vol": 300340.810428241,
+    "peak_90d_vol": 37286909.284536645,
+    "avg_90d_vol": 7276515.222529518,
+    "days_data": 90
+  },
+  {
+    "symbol": "MUON",
+    "current_vol": 296429.46,
+    "peak_90d_vol": 301498.31,
+    "avg_90d_vol": 100287.78688888889,
+    "days_data": 90
+  },
+  {
+    "symbol": "UNP",
+    "current_vol": 275624.66344,
+    "peak_90d_vol": 349075.62308,
+    "avg_90d_vol": 260456.47495544446,
+    "days_data": 90
+  },
+  {
+    "symbol": "PLB",
+    "current_vol": 267331.515,
+    "peak_90d_vol": 414071.43,
+    "avg_90d_vol": 250167.22159222222,
+    "days_data": 90
+  },
+  {
+    "symbol": "XCH",
+    "current_vol": 266197.865,
+    "peak_90d_vol": 260136.823,
+    "avg_90d_vol": 91355.59645555555,
+    "days_data": 90
+  },
+  {
+    "symbol": "GITLAWB",
+    "current_vol": 265810.6418991,
+    "peak_90d_vol": 279605.4940816,
+    "avg_90d_vol": 198432.11593795,
+    "days_data": 6
+  },
+  {
+    "symbol": "COCA",
+    "current_vol": 264764.55091,
+    "peak_90d_vol": 307415.23323,
+    "avg_90d_vol": 264394.8360038889,
+    "days_data": 90
+  },
+  {
+    "symbol": "COPXON",
+    "current_vol": 263363.41,
+    "peak_90d_vol": 821050.11,
+    "avg_90d_vol": 84732.30911111111,
+    "days_data": 90
+  },
+  {
+    "symbol": "APEPE",
+    "current_vol": 257528.9185635933,
+    "peak_90d_vol": 451648.9778517145,
+    "avg_90d_vol": 144250.1270449169,
+    "days_data": 90
+  },
+  {
+    "symbol": "\u5e01\u5b89\u4eba\u751f",
+    "current_vol": 257459.96105,
+    "peak_90d_vol": 3167029.6005,
+    "avg_90d_vol": 370874.4149597778,
+    "days_data": 90
+  },
+  {
+    "symbol": "PI",
+    "current_vol": 254257.12979,
+    "peak_90d_vol": 4551086.39114,
+    "avg_90d_vol": 569339.4761773333,
+    "days_data": 90
+  },
+  {
+    "symbol": "DN",
+    "current_vol": 253767.17569,
+    "peak_90d_vol": 248610.77768,
+    "avg_90d_vol": 69271.4485921111,
+    "days_data": 90
+  },
+  {
+    "symbol": "NIBI",
+    "current_vol": 251362.657056,
+    "peak_90d_vol": 316446.057522,
+    "avg_90d_vol": 250844.63465178892,
+    "days_data": 90
+  },
+  {
+    "symbol": "NPC",
+    "current_vol": 249026.985773,
+    "peak_90d_vol": 1154138.345692,
+    "avg_90d_vol": 238661.28238028887,
+    "days_data": 90
+  },
+  {
+    "symbol": "PHNIX",
+    "current_vol": 246298.575106866,
+    "peak_90d_vol": 349483.469478597,
+    "avg_90d_vol": 136524.5275816071,
+    "days_data": 90
+  },
+  {
+    "symbol": "BAS",
+    "current_vol": 244888.779145,
+    "peak_90d_vol": 874453.004452,
+    "avg_90d_vol": 218636.29099564443,
+    "days_data": 90
+  },
+  {
+    "symbol": "ADI",
+    "current_vol": 235244.0433,
+    "peak_90d_vol": 224730.7321,
+    "avg_90d_vol": 85216.69472448979,
+    "days_data": 49
+  },
+  {
+    "symbol": "GHX",
+    "current_vol": 234311.091598,
+    "peak_90d_vol": 259510.516835,
+    "avg_90d_vol": 88798.93725416667,
+    "days_data": 90
+  },
+  {
+    "symbol": "WARD",
+    "current_vol": 233746.058033,
+    "peak_90d_vol": 1467103.07508,
+    "avg_90d_vol": 139084.43854476666,
+    "days_data": 90
+  },
+  {
+    "symbol": "RTX",
+    "current_vol": 233074.794,
+    "peak_90d_vol": 6932255.835,
+    "avg_90d_vol": 1396401.6243,
+    "days_data": 90
+  },
+  {
+    "symbol": "KDX",
+    "current_vol": 226798.86038,
+    "peak_90d_vol": 284637.13477,
+    "avg_90d_vol": 241295.50567088887,
+    "days_data": 90
+  },
+  {
+    "symbol": "COINDEPO",
+    "current_vol": 220507.39446,
+    "peak_90d_vol": 422724.73742,
+    "avg_90d_vol": 282213.5604603333,
+    "days_data": 90
+  },
+  {
+    "symbol": "QUBIC",
+    "current_vol": 207983.0123057101,
+    "peak_90d_vol": 1121540.2970430327,
+    "avg_90d_vol": 315509.32648478687,
+    "days_data": 90
+  },
+  {
+    "symbol": "PUMP",
+    "current_vol": 206723.196674,
+    "peak_90d_vol": 4827952.782701,
+    "avg_90d_vol": 1176703.8805744445,
+    "days_data": 90
+  },
+  {
+    "symbol": "MEY",
+    "current_vol": 205440.41558,
+    "peak_90d_vol": 822953.01021,
+    "avg_90d_vol": 236473.4920651111,
+    "days_data": 90
+  },
+  {
+    "symbol": "GOMINING",
+    "current_vol": 205364.0286,
+    "peak_90d_vol": 396541.1793,
+    "avg_90d_vol": 189660.31514333334,
+    "days_data": 90
+  },
+  {
+    "symbol": "AI",
+    "current_vol": 203886.48078,
+    "peak_90d_vol": 2455466.93648,
+    "avg_90d_vol": 611059.3173323809,
+    "days_data": 21
+  },
+  {
+    "symbol": "LEE",
+    "current_vol": 200542.296,
+    "peak_90d_vol": 203388.185,
+    "avg_90d_vol": 196332.30424444444,
+    "days_data": 90
+  },
+  {
+    "symbol": "PLN",
+    "current_vol": 199659.67044,
+    "peak_90d_vol": 361688.76721,
+    "avg_90d_vol": 115880.08177288888,
+    "days_data": 90
+  },
+  {
+    "symbol": "CRCLON",
+    "current_vol": 199646.97,
+    "peak_90d_vol": 545052.78,
+    "avg_90d_vol": 145456.32888888888,
+    "days_data": 90
+  },
+  {
+    "symbol": "BZR",
+    "current_vol": 199366.166,
+    "peak_90d_vol": 332494.644,
+    "avg_90d_vol": 201952.2514222222,
+    "days_data": 90
+  },
+  {
+    "symbol": "WBTC",
+    "current_vol": 195268.46,
+    "peak_90d_vol": 2973203.97,
+    "avg_90d_vol": 1097624.1048888888,
+    "days_data": 90
+  },
+  {
+    "symbol": "ECHELON",
+    "current_vol": 193061.11333,
+    "peak_90d_vol": 276191.72451,
+    "avg_90d_vol": 87512.52398488889,
+    "days_data": 90
+  },
+  {
+    "symbol": "FET",
+    "current_vol": 192991.3484,
+    "peak_90d_vol": 3703925.8473,
+    "avg_90d_vol": 865906.4574355556,
+    "days_data": 90
+  },
+  {
+    "symbol": "TRAC",
+    "current_vol": 192590.7715,
+    "peak_90d_vol": 1178245.3271,
+    "avg_90d_vol": 94900.57543,
+    "days_data": 90
+  },
+  {
+    "symbol": "FUN",
+    "current_vol": 190775.11921,
+    "peak_90d_vol": 473259.10689,
+    "avg_90d_vol": 118271.07564277777,
+    "days_data": 90
+  },
+  {
+    "symbol": "KAG",
+    "current_vol": 190458.54,
+    "peak_90d_vol": 299917.17,
+    "avg_90d_vol": 106829.3262962963,
+    "days_data": 27
+  },
+  {
+    "symbol": "BSA",
+    "current_vol": 189551.5855,
+    "peak_90d_vol": 1572508.3153,
+    "avg_90d_vol": 350470.57517499995,
+    "days_data": 12
+  },
+  {
+    "symbol": "ATWO",
+    "current_vol": 188033.50984,
+    "peak_90d_vol": 477319.05915,
+    "avg_90d_vol": 316358.760935,
+    "days_data": 2
+  },
+  {
+    "symbol": "RAD",
+    "current_vol": 187707.2882,
+    "peak_90d_vol": 729527.5146,
+    "avg_90d_vol": 154246.41691333332,
+    "days_data": 90
+  },
+  {
+    "symbol": "PROPS",
+    "current_vol": 187478.951076,
+    "peak_90d_vol": 223768.0711,
+    "avg_90d_vol": 181110.5375317889,
+    "days_data": 90
+  }
+]

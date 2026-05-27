@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.quantslab.hl-wallet-collector</string>
+  <key>UserName</key>
+  <string>hermes</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/hermes/quants-lab</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/hermes/quants-lab/scripts/hl_wallet_collector_launcher.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/hermes/miniforge3/envs/quants-lab/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/hermes</string>
+    <key>MONGO_URI</key>
+    <string>mongodb://localhost:27017/quants_lab</string>
+    <key>MONGO_DATABASE</key>
+    <string>quants_lab</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/ql-hl-wallet-collector-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/ql-hl-wallet-collector-launchd.log</string>
+</dict>
+</plist>

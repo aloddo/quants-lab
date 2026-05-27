@@ -1,0 +1,346 @@
+[
+  {
+    "token": "ACT",
+    "bybit_date": "2024-11-11",
+    "binance_date": "2024-11-11",
+    "first_exchange": "bybit",
+    "first_date": "2024-11-11",
+    "gap_days": 0
+  },
+  {
+    "token": "AERO",
+    "bybit_date": "2024-07-15",
+    "binance_date": "2024-12-04",
+    "first_exchange": "bybit",
+    "first_date": "2024-07-15",
+    "gap_days": 142
+  },
+  {
+    "token": "AI16Z",
+    "bybit_date": null,
+    "binance_date": "2025-01-02",
+    "first_exchange": "binance",
+    "first_date": "2025-01-02",
+    "gap_days": null
+  },
+  {
+    "token": "AIXBT",
+    "bybit_date": "2024-12-20",
+    "binance_date": "2024-12-20",
+    "first_exchange": "bybit",
+    "first_date": "2024-12-20",
+    "gap_days": 0
+  },
+  {
+    "token": "BOME",
+    "bybit_date": "2024-03-15",
+    "binance_date": "2024-04-25",
+    "first_exchange": "bybit",
+    "first_date": "2024-03-15",
+    "gap_days": 40
+  },
+  {
+    "token": "BRETT",
+    "bybit_date": "2024-04-26",
+    "binance_date": "2024-08-20",
+    "first_exchange": "bybit",
+    "first_date": "2024-04-26",
+    "gap_days": 116
+  },
+  {
+    "token": "CHILLGUY",
+    "bybit_date": "2024-11-21",
+    "binance_date": "2024-11-27",
+    "first_exchange": "bybit",
+    "first_date": "2024-11-21",
+    "gap_days": 6
+  },
+  {
+    "token": "DEGEN",
+    "bybit_date": null,
+    "binance_date": "2024-11-15",
+    "first_exchange": "binance",
+    "first_date": "2024-11-15",
+    "gap_days": null
+  },
+  {
+    "token": "DOGE",
+    "bybit_date": "2026-04-03",
+    "binance_date": "2024-01-18",
+    "first_exchange": "binance",
+    "first_date": "2024-01-18",
+    "gap_days": 805
+  },
+  {
+    "token": "DRIFT",
+    "bybit_date": "2024-05-21",
+    "binance_date": "2024-11-08",
+    "first_exchange": "bybit",
+    "first_date": "2024-05-21",
+    "gap_days": 171
+  },
+  {
+    "token": "FARTCOIN",
+    "bybit_date": "2024-12-20",
+    "binance_date": "2024-12-20",
+    "first_exchange": "bybit",
+    "first_date": "2024-12-20",
+    "gap_days": 0
+  },
+  {
+    "token": "GIGA",
+    "bybit_date": "2024-12-12",
+    "binance_date": null,
+    "first_exchange": "bybit",
+    "first_date": "2024-12-12",
+    "gap_days": null
+  },
+  {
+    "token": "GOAT",
+    "bybit_date": "2024-10-22",
+    "binance_date": "2024-10-24",
+    "first_exchange": "bybit",
+    "first_date": "2024-10-22",
+    "gap_days": 2
+  },
+  {
+    "token": "GRIFFAIN",
+    "bybit_date": "2024-12-20",
+    "binance_date": "2025-01-02",
+    "first_exchange": "bybit",
+    "first_date": "2024-12-20",
+    "gap_days": 13
+  },
+  {
+    "token": "JTO",
+    "bybit_date": "2023-12-07",
+    "binance_date": "2023-12-08",
+    "first_exchange": "bybit",
+    "first_date": "2023-12-07",
+    "gap_days": 0
+  },
+  {
+    "token": "JUP",
+    "bybit_date": "2024-01-31",
+    "binance_date": "2024-01-31",
+    "first_exchange": "bybit",
+    "first_date": "2024-01-31",
+    "gap_days": 0
+  },
+  {
+    "token": "KMNO",
+    "bybit_date": "2024-10-09",
+    "binance_date": "2024-12-20",
+    "first_exchange": "bybit",
+    "first_date": "2024-10-09",
+    "gap_days": 72
+  },
+  {
+    "token": "MELANIA",
+    "bybit_date": "2025-01-20",
+    "binance_date": "2025-01-20",
+    "first_exchange": "bybit",
+    "first_date": "2025-01-20",
+    "gap_days": 0
+  },
+  {
+    "token": "MEW",
+    "bybit_date": "2024-04-23",
+    "binance_date": "2024-06-17",
+    "first_exchange": "bybit",
+    "first_date": "2024-04-23",
+    "gap_days": 55
+  },
+  {
+    "token": "MOODENG",
+    "bybit_date": "2024-10-01",
+    "binance_date": "2024-10-25",
+    "first_exchange": "bybit",
+    "first_date": "2024-10-01",
+    "gap_days": 24
+  },
+  {
+    "token": "MYRO",
+    "bybit_date": null,
+    "binance_date": "2024-03-05",
+    "first_exchange": "binance",
+    "first_date": "2024-03-05",
+    "gap_days": null
+  },
+  {
+    "token": "NEIRO",
+    "bybit_date": null,
+    "binance_date": "2024-09-16",
+    "first_exchange": "binance",
+    "first_date": "2024-09-16",
+    "gap_days": null
+  },
+  {
+    "token": "ORCA",
+    "bybit_date": "2024-04-01",
+    "binance_date": "2024-12-06",
+    "first_exchange": "bybit",
+    "first_date": "2024-04-01",
+    "gap_days": 249
+  },
+  {
+    "token": "PENGU",
+    "bybit_date": "2024-12-17",
+    "binance_date": "2025-07-23",
+    "first_exchange": "bybit",
+    "first_date": "2024-12-17",
+    "gap_days": 217
+  },
+  {
+    "token": "PNUT",
+    "bybit_date": "2024-11-11",
+    "binance_date": "2025-03-07",
+    "first_exchange": "bybit",
+    "first_date": "2024-11-11",
+    "gap_days": 116
+  },
+  {
+    "token": "PONKE",
+    "bybit_date": null,
+    "binance_date": "2024-11-04",
+    "first_exchange": "binance",
+    "first_date": "2024-11-04",
+    "gap_days": null
+  },
+  {
+    "token": "POPCAT",
+    "bybit_date": "2024-03-28",
+    "binance_date": "2024-08-22",
+    "first_exchange": "bybit",
+    "first_date": "2024-03-28",
+    "gap_days": 147
+  },
+  {
+    "token": "PUMP",
+    "bybit_date": null,
+    "binance_date": "2025-07-10",
+    "first_exchange": "binance",
+    "first_date": "2025-07-10",
+    "gap_days": null
+  },
+  {
+    "token": "PYTH",
+    "bybit_date": "2023-11-21",
+    "binance_date": "2023-11-22",
+    "first_exchange": "bybit",
+    "first_date": "2023-11-21",
+    "gap_days": 1
+  },
+  {
+    "token": "RAY",
+    "bybit_date": null,
+    "binance_date": "2021-08-18",
+    "first_exchange": "binance",
+    "first_date": "2021-08-18",
+    "gap_days": null
+  },
+  {
+    "token": "RENDER",
+    "bybit_date": "2024-07-26",
+    "binance_date": "2024-07-26",
+    "first_exchange": "bybit",
+    "first_date": "2024-07-26",
+    "gap_days": 0
+  },
+  {
+    "token": "SLERF",
+    "bybit_date": null,
+    "binance_date": "2024-11-21",
+    "first_exchange": "binance",
+    "first_date": "2024-11-21",
+    "gap_days": null
+  },
+  {
+    "token": "SPX",
+    "bybit_date": null,
+    "binance_date": "2024-12-10",
+    "first_exchange": "binance",
+    "first_date": "2024-12-10",
+    "gap_days": null
+  },
+  {
+    "token": "SWARMS",
+    "bybit_date": null,
+    "binance_date": "2025-01-07",
+    "first_exchange": "binance",
+    "first_date": "2025-01-07",
+    "gap_days": null
+  },
+  {
+    "token": "TNSR",
+    "bybit_date": null,
+    "binance_date": "2024-04-08",
+    "first_exchange": "binance",
+    "first_date": "2024-04-08",
+    "gap_days": null
+  },
+  {
+    "token": "TOSHI",
+    "bybit_date": null,
+    "binance_date": "2025-09-17",
+    "first_exchange": "binance",
+    "first_date": "2025-09-17",
+    "gap_days": null
+  },
+  {
+    "token": "TRUMP",
+    "bybit_date": null,
+    "binance_date": "2025-03-06",
+    "first_exchange": "binance",
+    "first_date": "2025-03-06",
+    "gap_days": null
+  },
+  {
+    "token": "TURBO",
+    "bybit_date": null,
+    "binance_date": "2024-05-30",
+    "first_exchange": "binance",
+    "first_date": "2024-05-30",
+    "gap_days": null
+  },
+  {
+    "token": "VINE",
+    "bybit_date": null,
+    "binance_date": "2025-01-24",
+    "first_exchange": "binance",
+    "first_date": "2025-01-24",
+    "gap_days": null
+  },
+  {
+    "token": "VIRTUAL",
+    "bybit_date": null,
+    "binance_date": "2024-12-10",
+    "first_exchange": "binance",
+    "first_date": "2024-12-10",
+    "gap_days": null
+  },
+  {
+    "token": "W",
+    "bybit_date": null,
+    "binance_date": "2024-04-03",
+    "first_exchange": "binance",
+    "first_date": "2024-04-03",
+    "gap_days": null
+  },
+  {
+    "token": "WIF",
+    "bybit_date": null,
+    "binance_date": "2024-04-04",
+    "first_exchange": "binance",
+    "first_date": "2024-04-04",
+    "gap_days": null
+  },
+  {
+    "token": "ZEREBRO",
+    "bybit_date": null,
+    "binance_date": "2025-01-02",
+    "first_exchange": "binance",
+    "first_date": "2025-01-02",
+    "gap_days": null
+  }
+]

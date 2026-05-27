@@ -1,0 +1,1817 @@
+[
+  {
+    "symbol": "SOXL",
+    "pair": "SOXLUSDT",
+    "announce_time": "2026-05-19 09:14:23",
+    "announce_ts": 1779182063000,
+    "title": "New listing: SOXLUSDT Perpetual Contract, with up to 20x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "DRAM",
+    "pair": "DRAMUSDT",
+    "announce_time": "2026-05-19 09:14:09",
+    "announce_ts": 1779182049000,
+    "title": "New listing: DRAMUSDT Perpetual Contract, with up to 20x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "CBRS",
+    "pair": "CBRSUSDT",
+    "announce_time": "2026-05-19 09:13:42",
+    "announce_ts": 1779182022000,
+    "title": "New listing: CBRSUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "GWEI",
+    "pair": "GWEIUSDT",
+    "announce_time": "2026-05-18 08:50:34",
+    "announce_ts": 1779094234000,
+    "title": "New listing: GWEIUSDT Perpetual Contract in Innovation Zone, with up to 25x leve",
+    "on_mexc": true
+  },
+  {
+    "symbol": "PHAROS",
+    "pair": "PHAROSUSDT",
+    "announce_time": "2026-05-14 09:24:48",
+    "announce_ts": 1778750688000,
+    "title": "New listing: PHAROSUSDT Perpetual Contract in Innovation Zone, with up to 20x le",
+    "on_mexc": false
+  },
+  {
+    "symbol": "BMNR",
+    "pair": "BMNRUSDT",
+    "announce_time": "2026-05-14 08:26:22",
+    "announce_ts": 1778747182000,
+    "title": "New listing: BMNRUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "SPY",
+    "pair": "SPYUSDT",
+    "announce_time": "2026-05-14 08:25:47",
+    "announce_ts": 1778747147000,
+    "title": "New listing: SPYUSDT Perpetual Contract, with up to 20x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "LLY",
+    "pair": "LLYUSDT",
+    "announce_time": "2026-05-14 08:25:11",
+    "announce_ts": 1778747111000,
+    "title": "New listing: LLYUSDT Perpetual Contract, with up to 20x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "IWM",
+    "pair": "IWMUSDT",
+    "announce_time": "2026-05-14 08:24:59",
+    "announce_ts": 1778747099000,
+    "title": "New listing: IWMUSDT Perpetual Contract, with up to 20x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "MRVL",
+    "pair": "MRVLUSDT",
+    "announce_time": "2026-05-13 08:44:37",
+    "announce_ts": 1778661877000,
+    "title": "New listing: MRVLUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "BZ",
+    "pair": "BZUSDT",
+    "announce_time": "2026-05-13 08:44:45",
+    "announce_ts": 1778661885000,
+    "title": "New listing: BZUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "BABA",
+    "pair": "BABAUSDT",
+    "announce_time": "2026-05-13 08:45:00",
+    "announce_ts": 1778661900000,
+    "title": "New listing: BABAUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "ARM",
+    "pair": "ARMUSDT",
+    "announce_time": "2026-05-13 08:45:09",
+    "announce_ts": 1778661909000,
+    "title": "New listing: ARMUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "CRWV",
+    "pair": "CRWVUSDT",
+    "announce_time": "2026-05-12 08:51:48",
+    "announce_ts": 1778575908000,
+    "title": "New listing: CRWVUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "AVGO",
+    "pair": "AVGOUSDT",
+    "announce_time": "2026-05-12 08:51:40",
+    "announce_ts": 1778575900000,
+    "title": "New listing: AVGOUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "LITE",
+    "pair": "LITEUSDT",
+    "announce_time": "2026-05-12 08:51:32",
+    "announce_ts": 1778575892000,
+    "title": "New listing: LITEUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "QQQ",
+    "pair": "QQQUSDT",
+    "announce_time": "2026-05-07 09:00:12",
+    "announce_ts": 1778144412000,
+    "title": "New listing: QQQUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "EWY",
+    "pair": "EWYUSDT",
+    "announce_time": "2026-05-07 08:59:43",
+    "announce_ts": 1778144383000,
+    "title": "New listing: EWYUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "MU",
+    "pair": "MUUSDT",
+    "announce_time": "2026-05-07 08:59:54",
+    "announce_ts": 1778144394000,
+    "title": "New listing: MUUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "EWJ",
+    "pair": "EWJUSDT",
+    "announce_time": "2026-05-07 09:00:03",
+    "announce_ts": 1778144403000,
+    "title": "New listing: EWJUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "ORCL",
+    "pair": "ORCLUSDT",
+    "announce_time": "2026-05-06 09:01:35",
+    "announce_ts": 1778058095000,
+    "title": "New listing: ORCLUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "NVDA",
+    "pair": "NVDAUSDT",
+    "announce_time": "2026-05-06 09:01:28",
+    "announce_ts": 1778058088000,
+    "title": "New listing: NVDAUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "CRCL",
+    "pair": "CRCLUSDT",
+    "announce_time": "2026-05-06 09:01:20",
+    "announce_ts": 1778058080000,
+    "title": "New listing: CRCLUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "BILL",
+    "pair": "BILLUSDT",
+    "announce_time": "2026-05-06 06:55:12",
+    "announce_ts": 1778050512000,
+    "title": "New listing: BILLUSDT Perpetual Contract in Innovation Zone, with up to 20x leve",
+    "on_mexc": true
+  },
+  {
+    "symbol": "MEGA",
+    "pair": "MEGAUSDT",
+    "announce_time": "2026-04-30 11:22:22",
+    "announce_ts": 1777548142000,
+    "title": "Bybit to convert MEGAUSDT Pre-Market Perpetual  Contract to standard Perpetual C",
+    "on_mexc": true
+  },
+  {
+    "symbol": "AIGENSYN",
+    "pair": "AIGENSYNUSDT",
+    "announce_time": "2026-04-30 05:43:47",
+    "announce_ts": 1777527827000,
+    "title": "New listing: AIGENSYNUSDT Perpetual Contract in Innovation Zone, with up to 20x ",
+    "on_mexc": false
+  },
+  {
+    "symbol": "BLEND",
+    "pair": "BLENDUSDT",
+    "announce_time": "2026-04-29 10:12:15",
+    "announce_ts": 1777457535000,
+    "title": "New listing: BLENDUSDT Perpetual Contract in Innovation Zone, with up to 20x lev",
+    "on_mexc": true
+  },
+  {
+    "symbol": "PLTR",
+    "pair": "PLTRUSDT",
+    "announce_time": "2026-04-29 08:49:25",
+    "announce_ts": 1777452565000,
+    "title": "New listing: PLTRUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "MSTR",
+    "pair": "MSTRUSDT",
+    "announce_time": "2026-04-29 08:39:16",
+    "announce_ts": 1777451956000,
+    "title": "New listing: MSTRUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "COIN",
+    "pair": "COINUSDT",
+    "announce_time": "2026-04-29 08:39:26",
+    "announce_ts": 1777451966000,
+    "title": "New listing: COINUSDT Perpetual Contract, with up to 10x leverage",
+    "on_mexc": false
+  },
+  {
+    "symbol": "AMZN",
+    "pair": "AMZNUSDT",
+    "announce_time": "2026-04-28 08:39:46",
+    "announce_ts": 1777365586000,
+    "title": "New listing: AMZNUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "SNDK",
+    "pair": "SNDKUSDT",
+    "announce_time": "2026-04-28 08:39:54",
+    "announce_ts": 1777365594000,
+    "title": "New listing: SNDKUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "AAPL",
+    "pair": "AAPLUSDT",
+    "announce_time": "2026-04-28 08:39:38",
+    "announce_ts": 1777365578000,
+    "title": "New listing: AAPLUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "META",
+    "pair": "METAUSDT",
+    "announce_time": "2026-04-27 08:40:13",
+    "announce_ts": 1777279213000,
+    "title": "New listing: METAUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "GOOGL",
+    "pair": "GOOGLUSDT",
+    "announce_time": "2026-04-27 08:32:54",
+    "announce_ts": 1777278774000,
+    "title": "New listing: GOOGLUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "MSFT",
+    "pair": "MSFTUSDT",
+    "announce_time": "2026-04-27 08:33:02",
+    "announce_ts": 1777278782000,
+    "title": "New listing: MSFTUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "OPG",
+    "pair": "OPGUSDT",
+    "announce_time": "2026-04-23 06:21:11",
+    "announce_ts": 1776925271000,
+    "title": "New listing: OPGUSDT Perpetual Contract in Innovation Zone, with up to 20x lever"
+  },
+  {
+    "symbol": "TSM",
+    "pair": "TSMUSDT",
+    "announce_time": "2026-04-22 09:14:14",
+    "announce_ts": 1776849254000,
+    "title": "New listing: TSMUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "INTC",
+    "pair": "INTCUSDT",
+    "announce_time": "2026-04-22 09:13:49",
+    "announce_ts": 1776849229000,
+    "title": "New listing: INTCUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "HOOD",
+    "pair": "HOODUSDT",
+    "announce_time": "2026-04-22 09:13:41",
+    "announce_ts": 1776849221000,
+    "title": "New listing: HOODUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "CHIP",
+    "pair": "CHIPUSDT",
+    "announce_time": "2026-04-21 13:34:44",
+    "announce_ts": 1776778484000,
+    "title": "Bybit to convert CHIPUSDT Pre-Market Perpetual Contract to standard Perpetual Co"
+  },
+  {
+    "symbol": "TSLA",
+    "pair": "TSLAUSDT",
+    "announce_time": "2026-04-21 12:58:34",
+    "announce_ts": 1776776314000,
+    "title": "New listing: TSLAUSDT Perpetual Contract, with up to 10x leverage"
+  },
+  {
+    "symbol": "CHIP",
+    "pair": "CHIPUSDT",
+    "announce_time": "2026-04-16 09:23:36",
+    "announce_ts": 1776331416000,
+    "title": "Bybit to list Pre-Market Perpetuals for CHIPUSDT on Apr 16, 2026, 10:00AM UTC"
+  },
+  {
+    "symbol": "GENIUS",
+    "pair": "GENIUSUSDT",
+    "announce_time": "2026-04-16 08:16:08",
+    "announce_ts": 1776327368000,
+    "title": "New listing: GENIUSUSDT Perpetual Contract in Innovation Zone, with up to 25x le"
+  },
+  {
+    "symbol": "EDGE",
+    "pair": "EDGEUSDT",
+    "announce_time": "2026-03-31 13:04:48",
+    "announce_ts": 1774962288000,
+    "title": "Bybit to convert EDGEUSDT Pre-Market Perpetual Contract to standard Perpetual Co"
+  },
+  {
+    "symbol": "BASED",
+    "pair": "BASEDUSDT",
+    "announce_time": "2026-03-30 08:37:14",
+    "announce_ts": 1774859834000,
+    "title": "New listing: BASEDUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "PRL",
+    "pair": "PRLUSDT",
+    "announce_time": "2026-03-27 05:03:20",
+    "announce_ts": 1774587800000,
+    "title": "New listing: PRLUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "BSB",
+    "pair": "BSBUSDT",
+    "announce_time": "2026-03-26 05:16:47",
+    "announce_ts": 1774502207000,
+    "title": "New listing: BSBUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "CL",
+    "pair": "CLUSDT",
+    "announce_time": "2026-03-24 08:11:06",
+    "announce_ts": 1774339866000,
+    "title": "New listing: CLUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "EDGE",
+    "pair": "EDGEUSDT",
+    "announce_time": "2026-03-20 03:50:20",
+    "announce_ts": 1773978620000,
+    "title": "Bybit to list Pre-Market Perpetuals for EDGEUSDT on Mar 20, 2026, 4:30AM UTC"
+  },
+  {
+    "symbol": "KAT",
+    "pair": "KATUSDT",
+    "announce_time": "2026-03-18 13:17:57",
+    "announce_ts": 1773839877000,
+    "title": "Bybit to convert KATUSDT Pre-Market Perpetual Contract to standard Perpetual Con"
+  },
+  {
+    "symbol": "CFG",
+    "pair": "CFGUSDT",
+    "announce_time": "2026-03-17 04:22:59",
+    "announce_ts": 1773721379000,
+    "title": "New listing: CFGUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "BP",
+    "pair": "BPUSDT",
+    "announce_time": "2026-03-16 06:16:20",
+    "announce_ts": 1773641780000,
+    "title": "Listing of BPUSDT on Bybit Perpetual Pre-Market on Mar 16, 2026, 10:00AM UTC"
+  },
+  {
+    "symbol": "XAG",
+    "pair": "XAGUSDT",
+    "announce_time": "2026-03-09 03:23:13",
+    "announce_ts": 1773026593000,
+    "title": "New listing: XAGUSDT Perpetual Contract, with up to 75x leverage"
+  },
+  {
+    "symbol": "XAU",
+    "pair": "XAUUSDT",
+    "announce_time": "2026-03-09 03:18:33",
+    "announce_ts": 1773026313000,
+    "title": "New listing: XAUUSDT Perpetual Contract, with up to 75x leverage"
+  },
+  {
+    "symbol": "OPN",
+    "pair": "OPNUSDT",
+    "announce_time": "2026-03-05 11:40:37",
+    "announce_ts": 1772710837000,
+    "title": "Bybit to convert OPNUSDT Pre-Market Perpetual Contract to standard Perpetual Con"
+  },
+  {
+    "symbol": "KAT",
+    "pair": "KATUSDT",
+    "announce_time": "2026-03-02 07:22:59",
+    "announce_ts": 1772436179000,
+    "title": "Bybit to list Pre-Market Perpetuals for KATUSDT on Mar 2, 2026, 8:00AM UTC"
+  },
+  {
+    "symbol": "ROBO",
+    "pair": "ROBOUSDT",
+    "announce_time": "2026-02-27 08:46:54",
+    "announce_ts": 1772182014000,
+    "title": "Bybit to convert ROBOUSDT Pre-Market Perpetual Contract to standard Perpetual Co"
+  },
+  {
+    "symbol": "ROBO",
+    "pair": "ROBOUSDT",
+    "announce_time": "2026-02-25 09:36:50",
+    "announce_ts": 1772012210000,
+    "title": "Listing of ROBOUSDT on Bybit Perpetual Pre-Market on Feb 25, 2026, 10:10AM UTC"
+  },
+  {
+    "symbol": "ESP",
+    "pair": "ESPUSDT",
+    "announce_time": "2026-02-12 11:36:30",
+    "announce_ts": 1770896190000,
+    "title": "Bybit to convert ESPUSDT Pre-Market Perpetual Contract to standard Perpetual Con"
+  },
+  {
+    "symbol": "AZTEC",
+    "pair": "AZTECUSDT",
+    "announce_time": "2026-02-12 07:47:10",
+    "announce_ts": 1770882430000,
+    "title": "New listing: AZTECUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "OPN",
+    "pair": "OPNUSDT",
+    "announce_time": "2026-02-11 09:53:15",
+    "announce_ts": 1770803595000,
+    "title": "Listing of OPNUSDT on Bybit Perpetual Pre-Market on Feb 11, 2026, 10:30AM UTC"
+  },
+  {
+    "symbol": "ESP",
+    "pair": "ESPUSDT",
+    "announce_time": "2026-02-10 09:36:45",
+    "announce_ts": 1770716205000,
+    "title": "Bybit to list Pre-Market Perpetuals for ESPUSDT on Feb 10, 2026, 10:10AM UTC"
+  },
+  {
+    "symbol": "TRIA",
+    "pair": "TRIAUSDT",
+    "announce_time": "2026-02-05 10:29:23",
+    "announce_ts": 1770287363000,
+    "title": "New listing: TRIAUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "ZAMA",
+    "pair": "ZAMAUSDT",
+    "announce_time": "2026-02-02 12:21:21",
+    "announce_ts": 1770034881000,
+    "title": "Bybit to convert ZAMAUSDT Pre-Market Perpetual Contract to standard Perpetual Co"
+  },
+  {
+    "symbol": "INX",
+    "pair": "INXUSDT",
+    "announce_time": "2026-01-30 19:25:47",
+    "announce_ts": 1769801147000,
+    "title": "Bybit to convert INXUSDT Pre-Market Perpetual Contract to standard Perpetual Con"
+  },
+  {
+    "symbol": "INX",
+    "pair": "INXUSDT",
+    "announce_time": "2026-01-29 08:41:05",
+    "announce_ts": 1769676065000,
+    "title": "Listing of INXUSDT on Bybit Perpetual Pre-Market on Jan 29, 2026, 9:30AM UTC"
+  },
+  {
+    "symbol": "BIRB",
+    "pair": "BIRBUSDT",
+    "announce_time": "2026-01-28 11:38:35",
+    "announce_ts": 1769600315000,
+    "title": "New listing: BIRBUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "SPACE",
+    "pair": "SPACEUSDT",
+    "announce_time": "2026-01-23 12:39:21",
+    "announce_ts": 1769171961000,
+    "title": "New listing: SPACEUSDT Perpetual Contract in Innovation Zone, with up to 12.5x l"
+  },
+  {
+    "symbol": "FIGHT",
+    "pair": "FIGHTUSDT",
+    "announce_time": "2026-01-23 12:03:33",
+    "announce_ts": 1769169813000,
+    "title": "New listing: FIGHTUSDT Perpetual Contract in Innovation Zone, with up to 20x lev"
+  },
+  {
+    "symbol": "ACU",
+    "pair": "ACUUSDT",
+    "announce_time": "2026-01-23 08:22:14",
+    "announce_ts": 1769156534000,
+    "title": "New listing: ACUUSDT Perpetual Contract in Innovation Zone, with up to 12.5x lev"
+  },
+  {
+    "symbol": "SENT",
+    "pair": "SENTUSDT",
+    "announce_time": "2026-01-22 12:39:29",
+    "announce_ts": 1769085569000,
+    "title": "Bybit to convert SENTUSDT Pre-Market Perpetual Contract to standard Perpetual Co"
+  },
+  {
+    "symbol": "ELSA",
+    "pair": "ELSAUSDT",
+    "announce_time": "2026-01-22 07:41:34",
+    "announce_ts": 1769067694000,
+    "title": "New listing: ELSAUSDT Perpetual Contract in Innovation Zone, with up to 20x leve"
+  },
+  {
+    "symbol": "SKR",
+    "pair": "SKRUSDT",
+    "announce_time": "2026-01-21 07:00:10",
+    "announce_ts": 1768978810000,
+    "title": "Bybit to convert SKRUSDT Pre-Market Perpetual Contract to standard Perpetual Con"
+  },
+  {
+    "symbol": "SKR",
+    "pair": "SKRUSDT",
+    "announce_time": "2026-01-20 10:34:54",
+    "announce_ts": 1768905294000,
+    "title": "Listing of SKRUSDT on Bybit Perpetual Pre-Market on Jan 20, 2026, 11:30AM UTC"
+  },
+  {
+    "symbol": "PLAYSOUT",
+    "pair": "PLAYSOUTUSDT",
+    "announce_time": "2026-01-20 10:05:06",
+    "announce_ts": 1768903506000,
+    "title": "New listing: PLAYSOUTUSDT Perpetual Contract in Innovation Zone, with up to 25x "
+  },
+  {
+    "symbol": "SPORTFUN",
+    "pair": "SPORTFUNUSDT",
+    "announce_time": "2026-01-19 10:00:43",
+    "announce_ts": 1768816843000,
+    "title": "New listing: SPORTFUNUSDT Perpetual Contract in Innovation Zone, with up to 20x "
+  },
+  {
+    "symbol": "FOGO",
+    "pair": "FOGOUSDT",
+    "announce_time": "2026-01-15 16:12:15",
+    "announce_ts": 1768493535000,
+    "title": "Bybit to convert FOGOUSDT Pre-Market Perpetual Contract to standard Perpetual Co"
+  },
+  {
+    "symbol": "FHE",
+    "pair": "FHEUSDT",
+    "announce_time": "2026-01-07 08:40:12",
+    "announce_ts": 1767775212000,
+    "title": "New listing: FHEUSDT Perpetual Contract in Innovation Zone, with up to 12.5x lev"
+  },
+  {
+    "symbol": "WHITEWHALE",
+    "pair": "WHITEWHALEUSDT",
+    "announce_time": "2026-01-06 12:28:11",
+    "announce_ts": 1767702491000,
+    "title": "New listing: WHITEWHALEUSDT Perpetual Contract in Innovation Zone, with up to 5x"
+  },
+  {
+    "symbol": "LIT",
+    "pair": "LITUSDT",
+    "announce_time": "2025-12-30 14:07:23",
+    "announce_ts": 1767103643000,
+    "title": "New listing: LITUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "BREV",
+    "pair": "BREVUSDT",
+    "announce_time": "2025-12-30 13:10:23",
+    "announce_ts": 1767100223000,
+    "title": "Listing of BREVUSDT on Bybit Perpetual Pre-Market on Dec 30, 2025, 1:45PM UTC"
+  },
+  {
+    "symbol": "POWER",
+    "pair": "POWERUSDT",
+    "announce_time": "2025-12-29 10:47:35",
+    "announce_ts": 1767005255000,
+    "title": "New listing: POWERUSDT Perpetual Contract in Innovation Zone, with up to 20x lev"
+  },
+  {
+    "symbol": "MAGMA",
+    "pair": "MAGMAUSDT",
+    "announce_time": "2025-12-26 07:41:57",
+    "announce_ts": 1766734917000,
+    "title": "New listing: MAGMAUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "ZKP",
+    "pair": "ZKPUSDT",
+    "announce_time": "2025-12-22 09:48:01",
+    "announce_ts": 1766396881000,
+    "title": "New listing: ZKPUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "RAVE",
+    "pair": "RAVEUSDT",
+    "announce_time": "2025-12-15 06:33:22",
+    "announce_ts": 1765780402000,
+    "title": "New Listing : RAVEUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "US",
+    "pair": "USUSDT",
+    "announce_time": "2025-12-12 11:22:07",
+    "announce_ts": 1765538527000,
+    "title": "New Listing : USUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "CYS",
+    "pair": "CYSUSDT",
+    "announce_time": "2025-12-12 11:20:28",
+    "announce_ts": 1765538428000,
+    "title": "New Listing : CYSUSDT Perpetual Contract in Innovation Zone, with up to 12.5x le"
+  },
+  {
+    "symbol": "WET",
+    "pair": "WETUSDT",
+    "announce_time": "2025-12-09 14:51:01",
+    "announce_ts": 1765291861000,
+    "title": "Converting WETUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract o"
+  },
+  {
+    "symbol": "FOLKS",
+    "pair": "FOLKSUSDT",
+    "announce_time": "2025-12-09 11:24:02",
+    "announce_ts": 1765279442000,
+    "title": "New Listing : FOLKSUSDT Perpetual Contract in Innovation Zone, with up to 20x le"
+  },
+  {
+    "symbol": "NIGHT",
+    "pair": "NIGHTUSDT",
+    "announce_time": "2025-12-09 11:14:41",
+    "announce_ts": 1765278881000,
+    "title": "New Listing :  NIGHTUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "STABLE",
+    "pair": "STABLEUSDT",
+    "announce_time": "2025-12-08 13:15:54",
+    "announce_ts": 1765199754000,
+    "title": "Converting STABLEUSDT Perpetual Pre-Market Trading to Standard Perpetual Contrac"
+  },
+  {
+    "symbol": "WET",
+    "pair": "WETUSDT",
+    "announce_time": "2025-12-04 11:06:31",
+    "announce_ts": 1764846391000,
+    "title": "Listing of WETUSDT on Bybit Perpetual Pre-Market on Dec 4, 2025, 12:00PM UTC"
+  },
+  {
+    "symbol": "RLS",
+    "pair": "RLSUSDT",
+    "announce_time": "2025-12-02 10:42:41",
+    "announce_ts": 1764672161000,
+    "title": "New Listing :  RLSUSDT Perpetual Contract, with up to 20x leverage"
+  },
+  {
+    "symbol": "IRYS",
+    "pair": "IRYSUSDT",
+    "announce_time": "2025-11-27 06:29:56",
+    "announce_ts": 1764224996000,
+    "title": "New Listing : IRYSUSDT Perpetual Contract in Innovation Zone, with up to 20x lev"
+  },
+  {
+    "symbol": "MON",
+    "pair": "MONUSDT",
+    "announce_time": "2025-11-25 07:51:29",
+    "announce_ts": 1764057089000,
+    "title": "New Listing :  MONUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "BOBBOB",
+    "pair": "BOBBOBUSDT",
+    "announce_time": "2025-11-24 08:43:32",
+    "announce_ts": 1763973812000,
+    "title": "New Listing : BOBBOBUSDT Perpetual Contract in Innovation Zone, with up to 20x l"
+  },
+  {
+    "symbol": "BEAT",
+    "pair": "BEATUSDT",
+    "announce_time": "2025-11-21 11:12:41",
+    "announce_ts": 1763723561000,
+    "title": "New Listing : BEATUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "JCT",
+    "pair": "JCTUSDT",
+    "announce_time": "2025-11-17 10:43:26",
+    "announce_ts": 1763376206000,
+    "title": "New Listing : JCTUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "UAI",
+    "pair": "UAIUSDT",
+    "announce_time": "2025-11-17 10:43:47",
+    "announce_ts": 1763376227000,
+    "title": "New Listing : UAIUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "SENT",
+    "pair": "SENTUSDT",
+    "announce_time": "2025-11-15 07:15:48",
+    "announce_ts": 1763190948000,
+    "title": "Listing of SENTUSDT on Bybit Perpetual Pre-Market on Nov 15, 2025, 8:00AM UTC"
+  },
+  {
+    "symbol": "PIEVERSE",
+    "pair": "PIEVERSEUSDT",
+    "announce_time": "2025-11-14 13:49:17",
+    "announce_ts": 1763128157000,
+    "title": "New Listing : PIEVERSEUSDT Perpetual Contract in Innovation Zone, with up to 25x"
+  },
+  {
+    "symbol": "ALLO",
+    "pair": "ALLOUSDT",
+    "announce_time": "2025-11-14 12:50:05",
+    "announce_ts": 1763124605000,
+    "title": "New Listing : ALLOUSDT Perpetual Contract in Innovation Zone, with up to 50x lev"
+  },
+  {
+    "symbol": "TRUST",
+    "pair": "TRUSTUSDT",
+    "announce_time": "2025-11-14 12:30:27",
+    "announce_ts": 1763123427000,
+    "title": "New Listing : TRUSTUSDT Perpetual Contract in Innovation Zone, with up to 25x le"
+  },
+  {
+    "symbol": "CC",
+    "pair": "CCUSDT",
+    "announce_time": "2025-11-10 07:12:38",
+    "announce_ts": 1762758758000,
+    "title": "Converting CCUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract on"
+  },
+  {
+    "symbol": "STABLE",
+    "pair": "STABLEUSDT",
+    "announce_time": "2025-11-06 12:56:29",
+    "announce_ts": 1762433789000,
+    "title": "Listing of STABLEUSDT on Bybit Perpetual Pre-Market on Nov 6, 2025, 1:30PM UTC"
+  },
+  {
+    "symbol": "MMT",
+    "pair": "MMTUSDT",
+    "announce_time": "2025-11-04 12:14:29",
+    "announce_ts": 1762258469000,
+    "title": "Converting MMTUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract o"
+  },
+  {
+    "symbol": "KITE",
+    "pair": "KITEUSDT",
+    "announce_time": "2025-11-03 13:20:17",
+    "announce_ts": 1762176017000,
+    "title": "Converting KITEUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract "
+  },
+  {
+    "symbol": "CC",
+    "pair": "CCUSDT",
+    "announce_time": "2025-11-05 13:53:31",
+    "announce_ts": 1762350811000,
+    "title": "Listing of CCUSDT on Bybit Perpetual Pre-Market on Oct 31, 2025, 2:00PM UTC"
+  },
+  {
+    "symbol": "AT",
+    "pair": "ATUSDT",
+    "announce_time": "2025-10-29 14:15:46",
+    "announce_ts": 1761747346000,
+    "title": "New Listing : ATUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "PIGGY",
+    "pair": "PIGGYUSDT",
+    "announce_time": "2025-10-29 12:37:36",
+    "announce_ts": 1761741456000,
+    "title": "New Listing : PIGGYUSDT Perpetual Contract in Innovation Zone, with up to 20x le"
+  },
+  {
+    "symbol": "KITE",
+    "pair": "KITEUSDT",
+    "announce_time": "2025-10-29 12:27:31",
+    "announce_ts": 1761740851000,
+    "title": "Listing of KITEUSDT on Bybit Perpetual Pre-Market on Oct 29, 2025, 1:00PM UTC"
+  },
+  {
+    "symbol": "COMMON",
+    "pair": "COMMONUSDT",
+    "announce_time": "2025-10-27 13:33:36",
+    "announce_ts": 1761572016000,
+    "title": "New Listing : COMMONUSDT Perpetual Contract in Innovation Zone, with up to 50x l"
+  },
+  {
+    "symbol": "LAB",
+    "pair": "LABUSDT",
+    "announce_time": "2025-10-27 10:06:22",
+    "announce_ts": 1761559582000,
+    "title": "New Listing : LABUSDT Perpetual Contract in Innovation Zone, with up to 50x leve"
+  },
+  {
+    "symbol": "MMT",
+    "pair": "MMTUSDT",
+    "announce_time": "2025-11-04 12:28:46",
+    "announce_ts": 1762259326000,
+    "title": "Listing of MMTUSDT on Bybit Perpetual Pre-Market on Oct 27, 2025, 11:00AM UTC"
+  },
+  {
+    "symbol": "BLUAI",
+    "pair": "BLUAIUSDT",
+    "announce_time": "2025-10-24 12:08:42",
+    "announce_ts": 1761307722000,
+    "title": "New Listing : BLUAIUSDT Perpetual Contract in Innovation Zone, with up to 25x le"
+  },
+  {
+    "symbol": "MET",
+    "pair": "METUSDT",
+    "announce_time": "2025-10-23 14:08:09",
+    "announce_ts": 1761228489000,
+    "title": "Converting METUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract o"
+  },
+  {
+    "symbol": "APR",
+    "pair": "APRUSDT",
+    "announce_time": "2025-10-23 12:34:35",
+    "announce_ts": 1761222875000,
+    "title": "New Listing : APRUSDT Perpetual Contract in Innovation Zone, with up to 50x leve"
+  },
+  {
+    "symbol": "MEGA",
+    "pair": "MEGAUSDT",
+    "announce_time": "2025-10-23 11:51:43",
+    "announce_ts": 1761220303000,
+    "title": "Listing of MEGAUSDT on Bybit Perpetual Pre-Market on Oct 23, 2025, 12:30PM UTC"
+  },
+  {
+    "symbol": "TURTLE",
+    "pair": "TURTLEUSDT",
+    "announce_time": "2025-10-22 15:19:10",
+    "announce_ts": 1761146350000,
+    "title": "New Listing : TURTLEUSDT Perpetual Contract in Innovation Zone, with up to 25x l"
+  },
+  {
+    "symbol": "RIVER",
+    "pair": "RIVERUSDT",
+    "announce_time": "2025-10-22 12:47:55",
+    "announce_ts": 1761137275000,
+    "title": "New Listing :  RIVERUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "ZBT",
+    "pair": "ZBTUSDT",
+    "announce_time": "2025-10-17 13:21:06",
+    "announce_ts": 1760707266000,
+    "title": "New Listing :  ZBTUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "EVAA",
+    "pair": "EVAAUSDT",
+    "announce_time": "2025-10-17 12:19:49",
+    "announce_ts": 1760703589000,
+    "title": "New Listing : EVAAUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "HANA",
+    "pair": "HANAUSDT",
+    "announce_time": "2025-10-17 12:19:33",
+    "announce_ts": 1760703573000,
+    "title": "New Listing : HANAUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "CLO",
+    "pair": "CLOUSDT",
+    "announce_time": "2025-10-17 12:19:25",
+    "announce_ts": 1760703565000,
+    "title": "New Listing : CLOUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "RECALL",
+    "pair": "RECALLUSDT",
+    "announce_time": "2025-10-15 12:35:24",
+    "announce_ts": 1760531724000,
+    "title": "New Listing : RECALLUSDT Perpetual Contract in Innovation Zone, with up to 50x l"
+  },
+  {
+    "symbol": "YB",
+    "pair": "YBUSDT",
+    "announce_time": "2025-10-15 11:08:55",
+    "announce_ts": 1760526535000,
+    "title": "Converting YBUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract on"
+  },
+  {
+    "symbol": "ENSO",
+    "pair": "ENSOUSDT",
+    "announce_time": "2025-10-14 09:33:16",
+    "announce_ts": 1760434396000,
+    "title": "New Listing :  ENSOUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "EUL",
+    "pair": "EULUSDT",
+    "announce_time": "2025-10-14 08:48:37",
+    "announce_ts": 1760431717000,
+    "title": "New Listing :  EULUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "YB",
+    "pair": "YBUSDT",
+    "announce_time": "2025-10-11 07:55:54",
+    "announce_ts": 1760169354000,
+    "title": "Listing of YBUSDT on Bybit Perpetual Pre-Market on Oct 11, 2025, 8:45AM UTC"
+  },
+  {
+    "symbol": "MET",
+    "pair": "METUSDT",
+    "announce_time": "2025-10-10 10:04:35",
+    "announce_ts": 1760090675000,
+    "title": "Listing of METUSDT on Bybit Perpetual Pre-Market on Oct 10, 2025, 10:45AM UTC"
+  },
+  {
+    "symbol": "GIGGLE",
+    "pair": "GIGGLEUSDT",
+    "announce_time": "2025-10-09 12:27:15",
+    "announce_ts": 1760012835000,
+    "title": "New Listing : GIGGLEUSDT Perpetual Contract in Innovation Zone, with up to 25x l"
+  },
+  {
+    "symbol": "4",
+    "pair": "4USDT",
+    "announce_time": "2025-10-08 12:46:06",
+    "announce_ts": 1759927566000,
+    "title": "New Listing : 4USDT Perpetual Contract in Innovation Zone, with up to 25x levera"
+  },
+  {
+    "symbol": "KGEN",
+    "pair": "KGENUSDT",
+    "announce_time": "2025-10-07 15:31:48",
+    "announce_ts": 1759851108000,
+    "title": "New Listing :  KGENUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "LYN",
+    "pair": "LYNUSDT",
+    "announce_time": "2025-10-06 08:19:00",
+    "announce_ts": 1759738740000,
+    "title": "New Listing :  LYNUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "2Z",
+    "pair": "2ZUSDT",
+    "announce_time": "2025-10-02 13:49:23",
+    "announce_ts": 1759412963000,
+    "title": "New Listing :  2ZUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "COAI",
+    "pair": "COAIUSDT",
+    "announce_time": "2025-10-02 08:45:34",
+    "announce_ts": 1759394734000,
+    "title": "New Listing : COAIUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "TRUTH",
+    "pair": "TRUTHUSDT",
+    "announce_time": "2025-10-01 14:25:26",
+    "announce_ts": 1759328726000,
+    "title": "New Listing :  TRUTHUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "NOM",
+    "pair": "NOMUSDT",
+    "announce_time": "2025-10-01 08:50:14",
+    "announce_ts": 1759308614000,
+    "title": "New Listing :  NOMUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "VFY",
+    "pair": "VFYUSDT",
+    "announce_time": "2025-09-30 12:43:50",
+    "announce_ts": 1759236230000,
+    "title": "New Listing : VFYUSDT Perpetual Contract in Innovation Zone, with up to 50x leve"
+  },
+  {
+    "symbol": "EDEN",
+    "pair": "EDENUSDT",
+    "announce_time": "2025-09-30 11:59:02",
+    "announce_ts": 1759233542000,
+    "title": "New Listing :  EDENUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "FF",
+    "pair": "FFUSDT",
+    "announce_time": "2025-09-29 14:37:04",
+    "announce_ts": 1759156624000,
+    "title": "New Listing :  FFUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "XAN",
+    "pair": "XANUSDT",
+    "announce_time": "2025-09-29 11:01:08",
+    "announce_ts": 1759143668000,
+    "title": "New Listing :  XANUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "APEX",
+    "pair": "APEXUSDT",
+    "announce_time": "2025-09-28 08:53:14",
+    "announce_ts": 1759049594000,
+    "title": "New Listing :  APEXUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "LIGHT",
+    "pair": "LIGHTUSDT",
+    "announce_time": "2025-09-27 13:34:50",
+    "announce_ts": 1758980090000,
+    "title": "New Listing : LIGHTUSDT Perpetual Contract in Innovation Zone, with up to 25x le"
+  },
+  {
+    "symbol": "RLUSD",
+    "pair": "RLUSDUSDT",
+    "announce_time": "2025-09-26 14:18:38",
+    "announce_ts": 1758896318000,
+    "title": "New Listing :  RLUSDUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "AKE",
+    "pair": "AKEUSDT",
+    "announce_time": "2025-09-26 13:43:11",
+    "announce_ts": 1758894191000,
+    "title": "New Listing : AKEUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "MIRA",
+    "pair": "MIRAUSDT",
+    "announce_time": "2025-09-26 12:58:37",
+    "announce_ts": 1758891517000,
+    "title": "New Listing :  MIRAUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "XPL",
+    "pair": "XPLUSDT",
+    "announce_time": "2025-09-25 13:11:52",
+    "announce_ts": 1758805912000,
+    "title": "Converting XPLUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract o"
+  },
+  {
+    "symbol": "FLUID",
+    "pair": "FLUIDUSDT",
+    "announce_time": "2025-09-24 12:04:49",
+    "announce_ts": 1758715489000,
+    "title": "New Listing :  FLUIDUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "BLESS",
+    "pair": "BLESSUSDT",
+    "announce_time": "2025-09-24 10:19:02",
+    "announce_ts": 1758709142000,
+    "title": "New Listing : BLESSUSDT Perpetual Contract in Innovation Zone, with up to 25x le"
+  },
+  {
+    "symbol": "HEMI",
+    "pair": "HEMIUSDT",
+    "announce_time": "2025-09-23 13:21:19",
+    "announce_ts": 1758633679000,
+    "title": "New Listing : HEMIUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "0G",
+    "pair": "0GUSDT",
+    "announce_time": "2025-09-22 10:42:55",
+    "announce_ts": 1758537775000,
+    "title": "Converting 0GUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract on"
+  },
+  {
+    "symbol": "ASTER",
+    "pair": "ASTERUSDT",
+    "announce_time": "2025-09-20 06:17:21",
+    "announce_ts": 1758349041000,
+    "title": "Converting ASTERUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract"
+  },
+  {
+    "symbol": "ASTER",
+    "pair": "ASTERUSDT",
+    "announce_time": "2025-09-19 07:57:03",
+    "announce_ts": 1758268623000,
+    "title": "Listing of ASTERUSDT on Bybit Perpetual Pre-Market on Sep 19, 2025, 9:00AM UTC"
+  },
+  {
+    "symbol": "BARD",
+    "pair": "BARDUSDT",
+    "announce_time": "2025-09-18 11:21:18",
+    "announce_ts": 1758194478000,
+    "title": "Converting BARDUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract "
+  },
+  {
+    "symbol": "AIA",
+    "pair": "AIAUSDT",
+    "announce_time": "2025-09-18 10:16:47",
+    "announce_ts": 1758190607000,
+    "title": "New Listing : AIAUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "0G",
+    "pair": "0GUSDT",
+    "announce_time": "2025-09-18 06:25:27",
+    "announce_ts": 1758176727000,
+    "title": "Listing of 0GUSDT on Bybit Perpetual Pre-Market on Sep 18, 2025, 7:00AM UTC"
+  },
+  {
+    "symbol": "STBL",
+    "pair": "STBLUSDT",
+    "announce_time": "2025-09-17 10:28:34",
+    "announce_ts": 1758104914000,
+    "title": "New Listing : STBLUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "BARD",
+    "pair": "BARDUSDT",
+    "announce_time": "2025-09-16 09:58:07",
+    "announce_ts": 1758016687000,
+    "title": "Listing of BARDUSDT on Bybit Perpetual Pre-Market on Sep 16, 2025, 10:30AM UTC"
+  },
+  {
+    "symbol": "ZKC",
+    "pair": "ZKCUSDT",
+    "announce_time": "2025-09-15 14:14:25",
+    "announce_ts": 1757945665000,
+    "title": "New Listing :  ZKCUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "Q",
+    "pair": "QUSDT",
+    "announce_time": "2025-09-12 12:07:42",
+    "announce_ts": 1757678862000,
+    "title": "New Listing : QUSDT Perpetual Contract in Innovation Zone, with up to 20x levera"
+  },
+  {
+    "symbol": "XPIN",
+    "pair": "XPINUSDT",
+    "announce_time": "2025-09-12 12:06:06",
+    "announce_ts": 1757678766000,
+    "title": "New Listing : XPINUSDT Perpetual Contract in Innovation Zone, with up to 20x lev"
+  },
+  {
+    "symbol": "UB",
+    "pair": "UBUSDT",
+    "announce_time": "2025-09-12 09:35:13",
+    "announce_ts": 1757669713000,
+    "title": "New Listing : UBUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "HOLO",
+    "pair": "HOLOUSDT",
+    "announce_time": "2025-09-11 12:15:39",
+    "announce_ts": 1757592939000,
+    "title": "New Listing :  HOLOUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "OKB",
+    "pair": "OKBUSDT",
+    "announce_time": "2025-09-11 12:03:22",
+    "announce_ts": 1757592202000,
+    "title": "New Listing :  OKBUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "LINEA",
+    "pair": "LINEAUSDT",
+    "announce_time": "2025-09-10 15:11:43",
+    "announce_ts": 1757517103000,
+    "title": "Converting LINEAUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract"
+  },
+  {
+    "symbol": "AVNT",
+    "pair": "AVNTUSDT",
+    "announce_time": "2025-09-09 14:15:11",
+    "announce_ts": 1757427311000,
+    "title": "New Listing : AVNTUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "OPEN",
+    "pair": "OPENUSDT",
+    "announce_time": "2025-09-08 13:14:29",
+    "announce_ts": 1757337269000,
+    "title": "New Listing : OPENUSDT Perpetual Contract in Innovation Zone, with up to 12.5x l"
+  },
+  {
+    "symbol": "NODE",
+    "pair": "NODEUSDT",
+    "announce_time": "2025-09-04 10:03:02",
+    "announce_ts": 1756980182000,
+    "title": "New Listing : NODEUSDT Perpetual Contract in Innovation Zone, with up to 20x lev"
+  },
+  {
+    "symbol": "PTB",
+    "pair": "PTBUSDT",
+    "announce_time": "2025-09-03 13:19:33",
+    "announce_ts": 1756905573000,
+    "title": "New Listing : PTBUSDT Perpetual Contract in Innovation Zone, with up to 20x leve"
+  },
+  {
+    "symbol": "ARIA",
+    "pair": "ARIAUSDT",
+    "announce_time": "2025-09-03 13:03:09",
+    "announce_ts": 1756904589000,
+    "title": "New Listing : ARIAUSDT Perpetual Contract in Innovation Zone, with up to 20x lev"
+  },
+  {
+    "symbol": "SOMI",
+    "pair": "SOMIUSDT",
+    "announce_time": "2025-09-02 14:52:20",
+    "announce_ts": 1756824740000,
+    "title": "New Listing :  SOMIUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "WLFI",
+    "pair": "WLFIUSDT",
+    "announce_time": "2025-09-01 13:07:11",
+    "announce_ts": 1756732031000,
+    "title": "Converting WLFIUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract "
+  },
+  {
+    "symbol": "LINEA",
+    "pair": "LINEAUSDT",
+    "announce_time": "2025-09-01 09:48:13",
+    "announce_ts": 1756720093000,
+    "title": "Listing of LINEAUSDT on Bybit Perpetual Pre-Market on Sep 1, 2025, 10:15AM UTC"
+  },
+  {
+    "symbol": "BDXN",
+    "pair": "BDXNUSDT",
+    "announce_time": "2025-09-01 07:57:28",
+    "announce_ts": 1756713448000,
+    "title": "BDXNUSDT Perpetual Contract Moved from Main Board to Innovation Zone"
+  },
+  {
+    "symbol": "MITO",
+    "pair": "MITOUSDT",
+    "announce_time": "2025-08-29 10:28:44",
+    "announce_ts": 1756463324000,
+    "title": "New Listing : MITOUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "CAMP",
+    "pair": "CAMPUSDT",
+    "announce_time": "2025-08-28 08:51:47",
+    "announce_ts": 1756371107000,
+    "title": "New Listing :  CAMPUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "BTR",
+    "pair": "BTRUSDT",
+    "announce_time": "2025-08-27 11:25:06",
+    "announce_ts": 1756293906000,
+    "title": "New Listing : BTRUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "BSU",
+    "pair": "BSUUSDT",
+    "announce_time": "2025-08-27 10:57:12",
+    "announce_ts": 1756292232000,
+    "title": "New Listing : BSUUSDT Perpetual Contract in Innovation Zone, with up to 20x leve"
+  },
+  {
+    "symbol": "WLFI",
+    "pair": "WLFIUSDT",
+    "announce_time": "2025-08-23 09:05:29",
+    "announce_ts": 1755939929000,
+    "title": "Listing of WLFIUSDT on Bybit Perpetual Pre-Market on Aug 23, 2025, 10:15AM UTC"
+  },
+  {
+    "symbol": "XPL",
+    "pair": "XPLUSDT",
+    "announce_time": "2025-08-22 09:32:46",
+    "announce_ts": 1755855166000,
+    "title": "Listing of XPLUSDT on Bybit Perpetual Pre-Market on Aug 22, 2025, 10:45AM UTC"
+  },
+  {
+    "symbol": "YZY",
+    "pair": "YZYUSDT",
+    "announce_time": "2025-08-21 04:37:28",
+    "announce_ts": 1755751048000,
+    "title": "New Listing :  YZYUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "SAPIEN",
+    "pair": "SAPIENUSDT",
+    "announce_time": "2025-08-20 18:23:53",
+    "announce_ts": 1755714233000,
+    "title": "New Listing : SAPIENUSDT Perpetual Contract in Innovation Zone, with up to 20x l"
+  },
+  {
+    "symbol": "DAM",
+    "pair": "DAMUSDT",
+    "announce_time": "2025-08-18 13:03:47",
+    "announce_ts": 1755522227000,
+    "title": "New Listing : DAMUSDT Perpetual Contract in Innovation Zone, with up to 20x leve"
+  },
+  {
+    "symbol": "ALPINE",
+    "pair": "ALPINEUSDT",
+    "announce_time": "2025-08-14 09:57:44",
+    "announce_ts": 1755165464000,
+    "title": "New Listing : ALPINEUSDT Perpetual Contract in Innovation Zone, with up to 25x l"
+  },
+  {
+    "symbol": "ASR",
+    "pair": "ASRUSDT",
+    "announce_time": "2025-08-14 09:56:44",
+    "announce_ts": 1755165404000,
+    "title": "New Listing : ASRUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "XNY",
+    "pair": "XNYUSDT",
+    "announce_time": "2025-08-13 13:44:23",
+    "announce_ts": 1755092663000,
+    "title": "New Listing : XNYUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "AIO",
+    "pair": "AIOUSDT",
+    "announce_time": "2025-08-13 13:43:56",
+    "announce_ts": 1755092636000,
+    "title": "New Listing : AIOUSDT Perpetual Contract in Innovation Zone, with up to 12.5x le"
+  },
+  {
+    "symbol": "SKY",
+    "pair": "SKYUSDT",
+    "announce_time": "2025-08-11 08:46:12",
+    "announce_ts": 1754901972000,
+    "title": "New Listing :  SKYUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "K",
+    "pair": "KUSDT",
+    "announce_time": "2025-08-08 08:42:31",
+    "announce_ts": 1754642551000,
+    "title": "New Listing : KUSDT Perpetual Contract in Innovation Zone, with up to 25x levera"
+  },
+  {
+    "symbol": "YALA",
+    "pair": "YALAUSDT",
+    "announce_time": "2025-08-08 07:49:45",
+    "announce_ts": 1754639385000,
+    "title": "New Listing : YALAUSDT Perpetual Contract in Innovation Zone, with up to 25x lev"
+  },
+  {
+    "symbol": "IN",
+    "pair": "INUSDT",
+    "announce_time": "2025-08-07 10:34:12",
+    "announce_ts": 1754562852000,
+    "title": "New Listing : INUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "RHEA",
+    "pair": "RHEAUSDT",
+    "announce_time": "2025-08-06 11:36:03",
+    "announce_ts": 1754480163000,
+    "title": "New Listing : RHEAUSDT Perpetual Contract in Innovation Zone, with up to 12.5x l"
+  },
+  {
+    "symbol": "PROVE",
+    "pair": "PROVEUSDT",
+    "announce_time": "2025-08-05 17:12:57",
+    "announce_ts": 1754413977000,
+    "title": "New Listing :  PROVEUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "TOWNS",
+    "pair": "TOWNSUSDT",
+    "announce_time": "2025-08-05 14:46:53",
+    "announce_ts": 1754405213000,
+    "title": "New Listing :  TOWNSUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "MYX",
+    "pair": "MYXUSDT",
+    "announce_time": "2025-08-05 09:38:14",
+    "announce_ts": 1754386694000,
+    "title": "New Listing : MYXUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "NAORIS",
+    "pair": "NAORISUSDT",
+    "announce_time": "2025-07-31 12:39:03",
+    "announce_ts": 1753965543000,
+    "title": "New Listing : NAORISUSDT Perpetual Contract in Innovation Zone, with up to 25x l"
+  },
+  {
+    "symbol": "A2Z",
+    "pair": "A2ZUSDT",
+    "announce_time": "2025-07-31 09:26:18",
+    "announce_ts": 1753953978000,
+    "title": "New Listing : A2ZUSDT Perpetual Contract in Innovation Zone, with up to 25x leve"
+  },
+  {
+    "symbol": "TREE",
+    "pair": "TREEUSDT",
+    "announce_time": "2025-07-29 14:20:58",
+    "announce_ts": 1753798858000,
+    "title": "New Listing :  TREEUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "ESPORTS",
+    "pair": "ESPORTSUSDT",
+    "announce_time": "2025-07-29 10:32:36",
+    "announce_ts": 1753785156000,
+    "title": "New Listing : ESPORTSUSDT Perpetual Contract in Innovation Zone, with up to 25x "
+  },
+  {
+    "symbol": "1000TAG",
+    "pair": "1000TAGUSDT",
+    "announce_time": "2025-07-28 09:12:29",
+    "announce_ts": 1753693949000,
+    "title": "New Listing : 1000TAGUSDT Perpetual Contract in Innovation Zone, with up to 12.5"
+  },
+  {
+    "symbol": "FIS",
+    "pair": "FISUSDT",
+    "announce_time": "2025-07-28 09:12:08",
+    "announce_ts": 1753693928000,
+    "title": "New Listing : FISUSDT Perpetual Contract in Innovation Zone, with up to 20x leve"
+  },
+  {
+    "symbol": "DOLO",
+    "pair": "DOLOUSDT",
+    "announce_time": "2025-07-28 09:11:17",
+    "announce_ts": 1753693877000,
+    "title": "New Listing : DOLOUSDT Perpetual Contract in Innovation Zone, with up to 12.5x l"
+  },
+  {
+    "symbol": "ASP",
+    "pair": "ASPUSDT",
+    "announce_time": "2025-07-24 12:24:55",
+    "announce_ts": 1753359895000,
+    "title": "New Listing :  ASPUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "DIA",
+    "pair": "DIAUSDT",
+    "announce_time": "2025-07-23 08:21:06",
+    "announce_ts": 1753258866000,
+    "title": "New Listing :  DIAUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "TA",
+    "pair": "TAUSDT",
+    "announce_time": "2025-07-21 09:26:58",
+    "announce_ts": 1753090018000,
+    "title": "New Listing : TAUSDT Perpetual Contract in Innovation Zone, with up to 25x lever"
+  },
+  {
+    "symbol": "ERA",
+    "pair": "ERAUSDT",
+    "announce_time": "2025-07-17 16:02:35",
+    "announce_ts": 1752768155000,
+    "title": "New Listing :  ERAUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "USD1",
+    "pair": "USD1USDT",
+    "announce_time": "2025-07-16 11:06:12",
+    "announce_ts": 1752663972000,
+    "title": "New Listing :  USD1USDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "ES",
+    "pair": "ESUSDT",
+    "announce_time": "2025-07-16 10:52:13",
+    "announce_ts": 1752663133000,
+    "title": "New Listing : ESUSDT Perpetual Contract in Innovation Zone, with up to 20x lever"
+  },
+  {
+    "symbol": "TAC",
+    "pair": "TACUSDT",
+    "announce_time": "2025-07-15 11:01:10",
+    "announce_ts": 1752577270000,
+    "title": "New Listing : TACUSDT Perpetual Contract in Innovation Zone, with up to 12.5x le"
+  },
+  {
+    "symbol": "C",
+    "pair": "CUSDT",
+    "announce_time": "2025-07-15 10:37:20",
+    "announce_ts": 1752575840000,
+    "title": "New Listing : CUSDT Perpetual Contract in Innovation Zone, with up to 12.5x leve"
+  },
+  {
+    "symbol": "VELVET",
+    "pair": "VELVETUSDT",
+    "announce_time": "2025-07-15 10:37:28",
+    "announce_ts": 1752575848000,
+    "title": "New Listing : VELVETUSDT Perpetual Contract in Innovation Zone, with up to 12.5x"
+  },
+  {
+    "symbol": "PUMPFUN",
+    "pair": "PUMPFUNUSDT",
+    "announce_time": "2025-07-14 17:28:45",
+    "announce_ts": 1752514125000,
+    "title": "Converting PUMPFUNUSDT Perpetual Pre-Market Trading to Standard  Perpetual Contr"
+  },
+  {
+    "symbol": "AIN",
+    "pair": "AINUSDT",
+    "announce_time": "2025-07-10 11:29:54",
+    "announce_ts": 1752146994000,
+    "title": "New Listing : AINUSDT Perpetual Contract in Innovation Zone, with up to 20x leve"
+  },
+  {
+    "symbol": "USELESS",
+    "pair": "USELESSUSDT",
+    "announce_time": "2025-07-10 11:29:45",
+    "announce_ts": 1752146985000,
+    "title": "New Listing : USELESSUSDT Perpetual Contract in Innovation Zone, with up to 12.5"
+  },
+  {
+    "symbol": "CROSS",
+    "pair": "CROSSUSDT",
+    "announce_time": "2025-07-10 11:29:37",
+    "announce_ts": 1752146977000,
+    "title": "New Listing : CROSSUSDT Perpetual Contract in Innovation Zone, with up to 20x le"
+  },
+  {
+    "symbol": "PUMPFUN",
+    "pair": "PUMPFUNUSDT",
+    "announce_time": "2025-07-10 03:26:41",
+    "announce_ts": 1752118001000,
+    "title": "Listing of PUMPFUNUSDT on Bybit Perpetual Pre-Market on Jul 10, 2025, 5:00AM UTC"
+  },
+  {
+    "symbol": "TANSSI",
+    "pair": "TANSSIUSDT",
+    "announce_time": "2025-07-09 12:21:40",
+    "announce_ts": 1752063700000,
+    "title": "New Listing : TANSSIUSDT Perpetual Contract in Innovation Zone, with up to 12.5x"
+  },
+  {
+    "symbol": "M",
+    "pair": "MUSDT",
+    "announce_time": "2025-07-08 09:52:16",
+    "announce_ts": 1751968336000,
+    "title": "New Listing : MUSDT Perpetual Contract in Innovation Zone, with up to 50x levera"
+  },
+  {
+    "symbol": "DMC",
+    "pair": "DMCUSDT",
+    "announce_time": "2025-07-03 11:37:27",
+    "announce_ts": 1751542647000,
+    "title": "New Listing : DMCUSDT Perpetual Contract in Innovation Zone, with up to 12.5x le"
+  },
+  {
+    "symbol": "ICNT",
+    "pair": "ICNTUSDT",
+    "announce_time": "2025-07-03 11:11:03",
+    "announce_ts": 1751541063000,
+    "title": "New Listing: ICNTUSDT Perpetual Contract Jul 3, 2025"
+  },
+  {
+    "symbol": "FRAG",
+    "pair": "FRAGUSDT",
+    "announce_time": "2025-07-01 09:37:00",
+    "announce_ts": 1751362620000,
+    "title": "New Listing : FRAGUSDT Perpetual Contract in Innovation Zone, with up to 12.5x l"
+  },
+  {
+    "symbol": "SAHARA",
+    "pair": "SAHARAUSDT",
+    "announce_time": "2025-06-26 12:17:47",
+    "announce_ts": 1750940267000,
+    "title": "Converting SAHARAUSDT Perpetual Pre-Market  Trading to Standard Perpetual Contra"
+  },
+  {
+    "symbol": "SOSO",
+    "pair": "SOSOUSDT",
+    "announce_time": "2025-06-26 11:29:11",
+    "announce_ts": 1750937351000,
+    "title": "New Listing : SOSOUSDT Perpetual Contract in Innovation Zone, with up to 20x lev"
+  },
+  {
+    "symbol": "H",
+    "pair": "HUSDT",
+    "announce_time": "2025-06-25 09:58:05",
+    "announce_ts": 1750845485000,
+    "title": "New Listing :  HUSDT Perpetual Contract, with up to 20x leverage"
+  },
+  {
+    "symbol": "NEWT",
+    "pair": "NEWTUSDT",
+    "announce_time": "2025-06-24 14:14:53",
+    "announce_ts": 1750774493000,
+    "title": "Converting NEWTUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract "
+  },
+  {
+    "symbol": "SAHARA",
+    "pair": "SAHARAUSDT",
+    "announce_time": "2025-06-20 11:20:22",
+    "announce_ts": 1750418422000,
+    "title": "Listing of SAHARAUSDT on Bybit Perpetual Pre-Market on Jun 20, 2025, 12:30PM UTC"
+  },
+  {
+    "symbol": "NEWT",
+    "pair": "NEWTUSDT",
+    "announce_time": "2025-06-20 08:56:43",
+    "announce_ts": 1750409803000,
+    "title": "Listing of NEWTUSDT on Bybit Perpetual Pre-Market on Jun 20, 2025, 9:30AM UTC"
+  },
+  {
+    "symbol": "SPK",
+    "pair": "SPKUSDT",
+    "announce_time": "2025-06-17 09:22:24",
+    "announce_ts": 1750152144000,
+    "title": "New Listing :  SPKUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "CUDIS",
+    "pair": "CUDISUSDT",
+    "announce_time": "2025-06-12 08:49:29",
+    "announce_ts": 1749718169000,
+    "title": "New Listing : CUDISUSDT Perpetual Contract in Innovation Zone, with up to 20x le"
+  },
+  {
+    "symbol": "SQD",
+    "pair": "SQDUSDT",
+    "announce_time": "2025-06-11 11:35:10",
+    "announce_ts": 1749641710000,
+    "title": "New Listing :  SQDUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "RESOLV",
+    "pair": "RESOLVUSDT",
+    "announce_time": "2025-06-10 13:25:26",
+    "announce_ts": 1749561926000,
+    "title": "New Listing :  RESOLVUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "HOME",
+    "pair": "HOMEUSDT",
+    "announce_time": "2025-06-10 11:35:44",
+    "announce_ts": 1749555344000,
+    "title": "New Listing :  HOMEUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "SKATE",
+    "pair": "SKATEUSDT",
+    "announce_time": "2025-06-09 10:29:09",
+    "announce_ts": 1749464949000,
+    "title": "New Listing : SKATEUSDT Perpetual Contract in Innovation Zone, with up to 20x le"
+  },
+  {
+    "symbol": "B2",
+    "pair": "B2USDT",
+    "announce_time": "2025-06-09 09:26:11",
+    "announce_ts": 1749461171000,
+    "title": "New Listing : B2USDT Perpetual Contract in Innovation Zone, with up to 12.5x lev"
+  },
+  {
+    "symbol": "LA",
+    "pair": "LAUSDT",
+    "announce_time": "2025-06-05 06:03:17",
+    "announce_ts": 1749103397000,
+    "title": "New Listing :  LAUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "BDXN",
+    "pair": "BDXNUSDT",
+    "announce_time": "2025-06-03 11:03:36",
+    "announce_ts": 1748948616000,
+    "title": "New Listing :  BDXNUSDT Perpetual Contract, with up to 12.5x leverage"
+  },
+  {
+    "symbol": "PUMPBTC",
+    "pair": "PUMPBTCUSDT",
+    "announce_time": "2025-06-03 04:51:28",
+    "announce_ts": 1748926288000,
+    "title": "New  Listing : PUMPBTCUSDT Perpetual Contract in Innovation Zone, with up to 20x"
+  },
+  {
+    "symbol": "SOPH",
+    "pair": "SOPHUSDT",
+    "announce_time": "2025-05-28 13:16:00",
+    "announce_ts": 1748438160000,
+    "title": "New Listing :  SOPHUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "A",
+    "pair": "AUSDT",
+    "announce_time": "2025-05-28 08:37:14",
+    "announce_ts": 1748421434000,
+    "title": "New Listing :  AUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "AGT",
+    "pair": "AGTUSDT",
+    "announce_time": "2025-05-28 06:37:16",
+    "announce_ts": 1748414236000,
+    "title": "New Listing : AGTUSDT Perpetual Contract in Innovation Zone, with up to 20x leve"
+  },
+  {
+    "symbol": "HUMA",
+    "pair": "HUMAUSDT",
+    "announce_time": "2025-05-26 13:12:16",
+    "announce_ts": 1748265136000,
+    "title": "New Listing :  HUMAUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "SOON",
+    "pair": "SOONUSDT",
+    "announce_time": "2025-05-23 09:10:10",
+    "announce_ts": 1747991410000,
+    "title": "New Listing :  SOONUSDT Perpetual Contract, with up to 50x leverage"
+  },
+  {
+    "symbol": "B",
+    "pair": "BUSDT",
+    "announce_time": "2025-05-23 06:25:23",
+    "announce_ts": 1747981523000,
+    "title": "New Listing : BUSDT Perpetual Contract in Innovation Zone, with up to 12.5x leve"
+  },
+  {
+    "symbol": "AWE",
+    "pair": "AWEUSDT",
+    "announce_time": "2025-05-22 09:41:10",
+    "announce_ts": 1747906870000,
+    "title": "New Listing : AWEUSDT Perpetual Contract in Innovation Zone, with up to 12.5x le"
+  },
+  {
+    "symbol": "SAROS",
+    "pair": "SAROSUSDT",
+    "announce_time": "2025-05-20 08:25:03",
+    "announce_ts": 1747729503000,
+    "title": "New Listing : SAROSUSDT Perpetual Contract in Innovation Zone, with up to 12.5x "
+  },
+  {
+    "symbol": "PRAI",
+    "pair": "PRAIUSDT",
+    "announce_time": "2025-05-19 08:28:38",
+    "announce_ts": 1747643318000,
+    "title": "New Listing : PRAIUSDT Perpetual Contract in Innovation Zone, with up to 12.5x l"
+  },
+  {
+    "symbol": "SYRUP",
+    "pair": "SYRUPUSDT",
+    "announce_time": "2025-05-19 08:01:08",
+    "announce_ts": 1747641668000,
+    "title": "New Listing :  SYRUPUSDT Perpetual Contract, with up to 25x leverage"
+  },
+  {
+    "symbol": "NXPC",
+    "pair": "NXPCUSDT",
+    "announce_time": "2025-05-15 06:33:36",
+    "announce_ts": 1747290816000,
+    "title": "New Listing :  NXPCUSDT Perpetual Contract, with up to 20x leverage"
+  },
+  {
+    "symbol": "LAUNCHCOIN",
+    "pair": "LAUNCHCOINUSDT",
+    "announce_time": "2025-05-14 10:04:34",
+    "announce_ts": 1747217074000,
+    "title": "New Listing : LAUNCHCOINUSDT Perpetual Contract in Innovation Zone, with up to 1"
+  },
+  {
+    "symbol": "SKYAI",
+    "pair": "SKYAIUSDT",
+    "announce_time": "2025-05-13 10:36:49",
+    "announce_ts": 1747132609000,
+    "title": "New Listing : SKYAIUSDT Perpetual Contract in Innovation Zone, with up to 12.5x "
+  },
+  {
+    "symbol": "DOOD",
+    "pair": "DOODUSDT",
+    "announce_time": "2025-05-09 13:46:09",
+    "announce_ts": 1746798369000,
+    "title": "New Listing : DOODUSDT Perpetual Contract in Innovation Zone, with up to 12.5x l"
+  },
+  {
+    "symbol": "SXT",
+    "pair": "SXTUSDT",
+    "announce_time": "2025-05-08 13:17:15",
+    "announce_ts": 1746710235000,
+    "title": "Converting SXTUSDT Perpetual Pre-Market Trading to Standard Perpetual Contract o"
+  },
+  {
+    "symbol": "BANK",
+    "pair": "BANKUSDT",
+    "announce_time": "2025-05-08 09:15:10",
+    "announce_ts": 1746695710000,
+    "title": "New Listing :  BANKUSDT Perpetual Contract in Innovation Zone, with up to 50x le"
+  }
+]

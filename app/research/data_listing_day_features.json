@@ -1,0 +1,4399 @@
+{
+  "positives": [
+    {
+      "symbol": "GWEI",
+      "vol_at_listing": 2754189.3998,
+      "price_at_listing": 0.1427,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PHAROS",
+      "vol_at_listing": 6389948.73,
+      "price_at_listing": 0.7422,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BMNR",
+      "vol_at_listing": 879185.3595,
+      "price_at_listing": 21.887,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ORCL",
+      "vol_at_listing": 322395.7376,
+      "price_at_listing": 191.86,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CRCL",
+      "vol_at_listing": 469439.2305,
+      "price_at_listing": 121.04,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BILL",
+      "vol_at_listing": 74471647.8527,
+      "price_at_listing": 0.07529,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MEGA",
+      "vol_at_listing": 31896743.8993,
+      "price_at_listing": 0.1669,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AIGENSYN",
+      "vol_at_listing": 20588165.6467,
+      "price_at_listing": 0.03918,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BLEND",
+      "vol_at_listing": 35805951.4818,
+      "price_at_listing": 0.1668,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "GOOGL",
+      "vol_at_listing": 64693.0564,
+      "price_at_listing": 351.73,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "OPG",
+      "vol_at_listing": 30306558.0596,
+      "price_at_listing": 0.3395,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TSM",
+      "vol_at_listing": 76508.7324,
+      "price_at_listing": 384.65,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "INTC",
+      "vol_at_listing": 1591514.4278,
+      "price_at_listing": 67.39,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CHIP",
+      "vol_at_listing": 548033397.632,
+      "price_at_listing": 0.06137,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "GENIUS",
+      "vol_at_listing": 41299644.7529,
+      "price_at_listing": 0.6637,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "EDGE",
+      "vol_at_listing": 24073290.814,
+      "price_at_listing": 0.6571,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BASED",
+      "vol_at_listing": 22056160.6054,
+      "price_at_listing": 0.1186,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PRL",
+      "vol_at_listing": 8800187.2412,
+      "price_at_listing": 0.1585,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BSB",
+      "vol_at_listing": 53207922.4133,
+      "price_at_listing": 0.1651,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "KAT",
+      "vol_at_listing": 5538952.5075,
+      "price_at_listing": 0.01142,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CFG",
+      "vol_at_listing": 10549823.9845,
+      "price_at_listing": 0.159,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BP",
+      "vol_at_listing": 1226353.48551,
+      "price_at_listing": 0.3586,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "XAG",
+      "vol_at_listing": 87627675.91274,
+      "price_at_listing": 87.4,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "XAU",
+      "vol_at_listing": 28237853.6623,
+      "price_at_listing": 5136.63,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "OPN",
+      "vol_at_listing": 16192858.3596,
+      "price_at_listing": 0.368,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ROBO",
+      "vol_at_listing": 33792292.8102,
+      "price_at_listing": 0.04025,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ESP",
+      "vol_at_listing": 17866515.822,
+      "price_at_listing": 0.07119,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AZTEC",
+      "vol_at_listing": 67514693.40279,
+      "price_at_listing": 0.020444,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TRIA",
+      "vol_at_listing": 29706129.25003,
+      "price_at_listing": 0.021103,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ZAMA",
+      "vol_at_listing": 25646961.39255,
+      "price_at_listing": 0.03535,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "INX",
+      "vol_at_listing": 13804378.27656,
+      "price_at_listing": 0.021059,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BIRB",
+      "vol_at_listing": 165563577.69064,
+      "price_at_listing": 0.33158,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SPACE",
+      "vol_at_listing": 26099355.64812,
+      "price_at_listing": 0.017728,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FIGHT",
+      "vol_at_listing": 32996335.08014,
+      "price_at_listing": 0.02043,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ACU",
+      "vol_at_listing": 70237597.38823,
+      "price_at_listing": 0.2863,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SENT",
+      "vol_at_listing": 57259113.00013,
+      "price_at_listing": 0.029784,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ELSA",
+      "vol_at_listing": 67661797.72282,
+      "price_at_listing": 0.17324,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SKR",
+      "vol_at_listing": 478443050.16777,
+      "price_at_listing": 0.020861,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PLAYSOUT",
+      "vol_at_listing": 899929.5778,
+      "price_at_listing": 0.08042,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SPORTFUN",
+      "vol_at_listing": 2846091.4195,
+      "price_at_listing": 0.07902,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FOGO",
+      "vol_at_listing": 27196859.6075,
+      "price_at_listing": 0.04846,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FHE",
+      "vol_at_listing": 2019342.96935,
+      "price_at_listing": 0.03932,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "WHITEWHALE",
+      "vol_at_listing": 8102952.362,
+      "price_at_listing": 0.08895,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "LIT",
+      "vol_at_listing": 46090634.14624,
+      "price_at_listing": 2.6628,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BREV",
+      "vol_at_listing": 616712.5393,
+      "price_at_listing": 0.429,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "POWER",
+      "vol_at_listing": 6905100.60408,
+      "price_at_listing": 0.35487,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MAGMA",
+      "vol_at_listing": 5137812.57894,
+      "price_at_listing": 0.14218,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ZKP",
+      "vol_at_listing": 16546791.54045,
+      "price_at_listing": 0.161,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "RAVE",
+      "vol_at_listing": 41995364.95579,
+      "price_at_listing": 0.43184,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "US",
+      "vol_at_listing": 12244269.281,
+      "price_at_listing": 0.01745,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CYS",
+      "vol_at_listing": 6895163.0841,
+      "price_at_listing": 0.2933,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "WET",
+      "vol_at_listing": 239175642.46567,
+      "price_at_listing": 0.17987,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FOLKS",
+      "vol_at_listing": 21519975.64463,
+      "price_at_listing": 14.896,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "NIGHT",
+      "vol_at_listing": 211507684.4872,
+      "price_at_listing": 0.03973,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "STABLE",
+      "vol_at_listing": 90309638.6112,
+      "price_at_listing": 0.02143,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "RLS",
+      "vol_at_listing": 23252809.05291,
+      "price_at_listing": 0.028614,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "IRYS",
+      "vol_at_listing": 22616035.49578,
+      "price_at_listing": 0.040285,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MON",
+      "vol_at_listing": 333149295.057502,
+      "price_at_listing": 0.045833,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BOBBOB",
+      "vol_at_listing": 10609375.30989,
+      "price_at_listing": 0.020434,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BEAT",
+      "vol_at_listing": 18720061.4281,
+      "price_at_listing": 0.8781,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "JCT",
+      "vol_at_listing": 25547809.9936,
+      "price_at_listing": 0.005158,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "UAI",
+      "vol_at_listing": 12386784.91765,
+      "price_at_listing": 0.18359,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PIEVERSE",
+      "vol_at_listing": 247711383.8123,
+      "price_at_listing": 0.13287,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ALLO",
+      "vol_at_listing": 13506952.37439,
+      "price_at_listing": 0.24725,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TRUST",
+      "vol_at_listing": 2250676.86142,
+      "price_at_listing": 0.13639,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CC",
+      "vol_at_listing": 31813204.8806,
+      "price_at_listing": 0.11795,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MMT",
+      "vol_at_listing": 633468811.69895,
+      "price_at_listing": 2.60174,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "KITE",
+      "vol_at_listing": 78791616.62482,
+      "price_at_listing": 0.07614,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AT",
+      "vol_at_listing": 14917845.7454,
+      "price_at_listing": 0.3635,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PIGGY",
+      "vol_at_listing": 20839770.79523,
+      "price_at_listing": 2.2015,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "COMMON",
+      "vol_at_listing": 16844265.6375,
+      "price_at_listing": 0.0181,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "LAB",
+      "vol_at_listing": 6770186.6764,
+      "price_at_listing": 0.1785,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BLUAI",
+      "vol_at_listing": 25163394.7265,
+      "price_at_listing": 0.02604,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MET",
+      "vol_at_listing": 66366619.70778,
+      "price_at_listing": 0.554,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "APR",
+      "vol_at_listing": 296255782.4152,
+      "price_at_listing": 0.6256,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TURTLE",
+      "vol_at_listing": 39980410.8857,
+      "price_at_listing": 0.171,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "RIVER",
+      "vol_at_listing": 85296208.1159,
+      "price_at_listing": 8.122,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ZBT",
+      "vol_at_listing": 91821766.29162,
+      "price_at_listing": 0.4162,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "EVAA",
+      "vol_at_listing": 15334398.449,
+      "price_at_listing": 3.618,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "HANA",
+      "vol_at_listing": 9586025.3067,
+      "price_at_listing": 0.05372,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CLO",
+      "vol_at_listing": 34126326.9808,
+      "price_at_listing": 0.3137,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "RECALL",
+      "vol_at_listing": 61483151.5537,
+      "price_at_listing": 0.4749,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "YB",
+      "vol_at_listing": 45854714.5511,
+      "price_at_listing": 0.6703,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ENSO",
+      "vol_at_listing": 68631921.5205,
+      "price_at_listing": 3.134,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "EUL",
+      "vol_at_listing": 14762787.767,
+      "price_at_listing": 8.971,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "GIGGLE",
+      "vol_at_listing": 110024279.26624,
+      "price_at_listing": 87.87,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "4",
+      "vol_at_listing": 133060286.1244,
+      "price_at_listing": 0.243,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "KGEN",
+      "vol_at_listing": 24199844.2794,
+      "price_at_listing": 0.2662,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "LYN",
+      "vol_at_listing": 26100519.8794,
+      "price_at_listing": 0.2754,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "2Z",
+      "vol_at_listing": 99083173.3997,
+      "price_at_listing": 0.5967,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "COAI",
+      "vol_at_listing": 23668489.831,
+      "price_at_listing": 0.3171,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TRUTH",
+      "vol_at_listing": 55022141.23769,
+      "price_at_listing": 0.014713,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "NOM",
+      "vol_at_listing": 9642972.8532,
+      "price_at_listing": 0.03982,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "VFY",
+      "vol_at_listing": 34578583.19543,
+      "price_at_listing": 0.11914,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "EDEN",
+      "vol_at_listing": 51303113.6496,
+      "price_at_listing": 0.398,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FF",
+      "vol_at_listing": 251790382.5486,
+      "price_at_listing": 0.2816,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "XAN",
+      "vol_at_listing": 113731962.60566,
+      "price_at_listing": 0.2386,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "APEX",
+      "vol_at_listing": 205016661.60259,
+      "price_at_listing": 2.16,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "LIGHT",
+      "vol_at_listing": 61932911.3114,
+      "price_at_listing": 0.8086,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "RLUSD",
+      "vol_at_listing": 729488.9369,
+      "price_at_listing": 0.9998,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AKE",
+      "vol_at_listing": 98176096.978,
+      "price_at_listing": 0.002425,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MIRA",
+      "vol_at_listing": 103749388.41946,
+      "price_at_listing": 1.4481,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "XPL",
+      "vol_at_listing": 1038547456.3237,
+      "price_at_listing": 1.2776,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FLUID",
+      "vol_at_listing": 28314411.9224,
+      "price_at_listing": 6.991,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BLESS",
+      "vol_at_listing": 32544009.8292,
+      "price_at_listing": 0.0522,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "HEMI",
+      "vol_at_listing": 110306944.90102,
+      "price_at_listing": 0.13826,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "0G",
+      "vol_at_listing": 461532273.86162,
+      "price_at_listing": 4.7815,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ASTER",
+      "vol_at_listing": 1283727486.3547,
+      "price_at_listing": 1.6553,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BARD",
+      "vol_at_listing": 77309767.178315,
+      "price_at_listing": 1.0576,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AIA",
+      "vol_at_listing": 42123102.7951,
+      "price_at_listing": 0.3977,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "STBL",
+      "vol_at_listing": 119759952.83123,
+      "price_at_listing": 0.13171,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ZKC",
+      "vol_at_listing": 80103330.64334,
+      "price_at_listing": 0.9343,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "Q",
+      "vol_at_listing": 12115784.93684,
+      "price_at_listing": 0.016581,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "XPIN",
+      "vol_at_listing": 12085251.40416,
+      "price_at_listing": 0.0017215,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "UB",
+      "vol_at_listing": 153100767.40233,
+      "price_at_listing": 0.026412,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "HOLO",
+      "vol_at_listing": 74725041.0637,
+      "price_at_listing": 0.4638,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "OKB",
+      "vol_at_listing": 4382718.7123,
+      "price_at_listing": 193.91,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "LINEA",
+      "vol_at_listing": 105456029.8224,
+      "price_at_listing": 0.02316,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AVNT",
+      "vol_at_listing": 175511571.0801,
+      "price_at_listing": 0.2123,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "OPEN",
+      "vol_at_listing": 66801744.8275,
+      "price_at_listing": 1.4234,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "NODE",
+      "vol_at_listing": 5017953.56086,
+      "price_at_listing": 0.0871,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PTB",
+      "vol_at_listing": 58365535.9537,
+      "price_at_listing": 0.02573,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ARIA",
+      "vol_at_listing": 16706532.83435,
+      "price_at_listing": 0.1079,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SOMI",
+      "vol_at_listing": 83373388.87359,
+      "price_at_listing": 0.4913,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "WLFI",
+      "vol_at_listing": 629576293.6501,
+      "price_at_listing": 0.2333,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BDXN",
+      "vol_at_listing": 951327.6003,
+      "price_at_listing": 0.04065,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MITO",
+      "vol_at_listing": 32118025.38255,
+      "price_at_listing": 0.21945,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CAMP",
+      "vol_at_listing": 123573882.32588,
+      "price_at_listing": 0.09638,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BTR",
+      "vol_at_listing": 16079327.99512,
+      "price_at_listing": 0.07925,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BSU",
+      "vol_at_listing": 2264652.8472,
+      "price_at_listing": 0.11564,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "YZY",
+      "vol_at_listing": 158927584.2397,
+      "price_at_listing": 0.831,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SAPIEN",
+      "vol_at_listing": 172079379.86183,
+      "price_at_listing": 0.21177,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "DAM",
+      "vol_at_listing": 32256432.92635,
+      "price_at_listing": 0.09599,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ALPINE",
+      "vol_at_listing": 66397551.8221,
+      "price_at_listing": 1.3,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ASR",
+      "vol_at_listing": 3274251.4998,
+      "price_at_listing": 5.504,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "XNY",
+      "vol_at_listing": 28560037.7646,
+      "price_at_listing": 0.014406,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AIO",
+      "vol_at_listing": 18120695.2528,
+      "price_at_listing": 0.09689,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SKY",
+      "vol_at_listing": 4759085.8869,
+      "price_at_listing": 0.08364,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "K",
+      "vol_at_listing": 37885954.6169,
+      "price_at_listing": 0.2499,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "YALA",
+      "vol_at_listing": 51165543.0706,
+      "price_at_listing": 0.4183,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "IN",
+      "vol_at_listing": 23845640.3562,
+      "price_at_listing": 0.09246,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "RHEA",
+      "vol_at_listing": 3222097.8233,
+      "price_at_listing": 0.07633,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PROVE",
+      "vol_at_listing": 345837323.1362,
+      "price_at_listing": 0.9885,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TOWNS",
+      "vol_at_listing": 62720723.5145,
+      "price_at_listing": 0.04026,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "MYX",
+      "vol_at_listing": 719929438.93053,
+      "price_at_listing": 1.25027,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "NAORIS",
+      "vol_at_listing": 17090057.0408,
+      "price_at_listing": 0.05417,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "A2Z",
+      "vol_at_listing": 10309461.0533,
+      "price_at_listing": 0.004988,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TREE",
+      "vol_at_listing": 60236909.423409,
+      "price_at_listing": 0.66826,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ESPORTS",
+      "vol_at_listing": 30323797.94614,
+      "price_at_listing": 0.12639,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "1000TAG",
+      "vol_at_listing": 3178436.5625,
+      "price_at_listing": 0.78,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FIS",
+      "vol_at_listing": 1175674.55606,
+      "price_at_listing": 0.13257,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "DOLO",
+      "vol_at_listing": 8435610.50669,
+      "price_at_listing": 0.17562,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ASP",
+      "vol_at_listing": 23210099.197,
+      "price_at_listing": 0.2031,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "DIA",
+      "vol_at_listing": 9985062.1643,
+      "price_at_listing": 0.873,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TA",
+      "vol_at_listing": 25104129.3137,
+      "price_at_listing": 0.1182,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ERA",
+      "vol_at_listing": 133043215.9567,
+      "price_at_listing": 1.6843,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "USD1",
+      "vol_at_listing": 792849.652,
+      "price_at_listing": 0.9989,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ES",
+      "vol_at_listing": 19097695.3231,
+      "price_at_listing": 0.3065,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TAC",
+      "vol_at_listing": 32005584.3417,
+      "price_at_listing": 0.02044,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "C",
+      "vol_at_listing": 23995425.94583,
+      "price_at_listing": 0.20306,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "VELVET",
+      "vol_at_listing": 11995279.7998,
+      "price_at_listing": 0.0696,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PUMPFUN",
+      "vol_at_listing": 353172739.1603,
+      "price_at_listing": 0.005734,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AIN",
+      "vol_at_listing": 54284468.4583,
+      "price_at_listing": 0.17317,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "USELESS",
+      "vol_at_listing": 23457283.4171,
+      "price_at_listing": 0.2926,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CROSS",
+      "vol_at_listing": 60341574.08129,
+      "price_at_listing": 0.13208,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "TANSSI",
+      "vol_at_listing": 59490006.5532,
+      "price_at_listing": 0.06025,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "M",
+      "vol_at_listing": 122896446.2682,
+      "price_at_listing": 0.202,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "DMC",
+      "vol_at_listing": 9392178.62218,
+      "price_at_listing": 0.0079651,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "ICNT",
+      "vol_at_listing": 65212803.7272,
+      "price_at_listing": 0.3126,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "FRAG",
+      "vol_at_listing": 41041917.88205,
+      "price_at_listing": 0.09267,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SAHARA",
+      "vol_at_listing": 135185093.75115,
+      "price_at_listing": 0.09349,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SOSO",
+      "vol_at_listing": 2569953.779,
+      "price_at_listing": 0.5054,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "H",
+      "vol_at_listing": 115554426.31494,
+      "price_at_listing": 0.037752,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "NEWT",
+      "vol_at_listing": 165695495.4888,
+      "price_at_listing": 0.5293,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SPK",
+      "vol_at_listing": 77292810.5292,
+      "price_at_listing": 0.05723,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "CUDIS",
+      "vol_at_listing": 13906842.4028,
+      "price_at_listing": 0.10082,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SQD",
+      "vol_at_listing": 19133404.9666,
+      "price_at_listing": 0.2466,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "RESOLV",
+      "vol_at_listing": 347407386.6673,
+      "price_at_listing": 0.3513,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "HOME",
+      "vol_at_listing": 151215564.915,
+      "price_at_listing": 0.03186,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SKATE",
+      "vol_at_listing": 25403091.05969,
+      "price_at_listing": 0.065,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "B2",
+      "vol_at_listing": 2489210.6,
+      "price_at_listing": 0.5547,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "LA",
+      "vol_at_listing": 188753243.49812,
+      "price_at_listing": 1.3461,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PUMPBTC",
+      "vol_at_listing": 2538645.6081,
+      "price_at_listing": 0.05994,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SOPH",
+      "vol_at_listing": 77261407.5295,
+      "price_at_listing": 0.06607,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "A",
+      "vol_at_listing": 11383607.2783,
+      "price_at_listing": 0.7582,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AGT",
+      "vol_at_listing": 1676806.21995,
+      "price_at_listing": 0.033084,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "HUMA",
+      "vol_at_listing": 59773096.55442,
+      "price_at_listing": 0.06675,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SOON",
+      "vol_at_listing": 71923503.697,
+      "price_at_listing": 0.4512,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "B",
+      "vol_at_listing": 74178965.57071,
+      "price_at_listing": 0.27669,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "AWE",
+      "vol_at_listing": 1267377.9841,
+      "price_at_listing": 0.06871,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SAROS",
+      "vol_at_listing": 5986097.61011,
+      "price_at_listing": 0.15907,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "PRAI",
+      "vol_at_listing": 1795952.6848,
+      "price_at_listing": 0.082,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SYRUP",
+      "vol_at_listing": 18608033.01586,
+      "price_at_listing": 0.33419,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "NXPC",
+      "vol_at_listing": 216042071.24551,
+      "price_at_listing": 2.6208,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "LAUNCHCOIN",
+      "vol_at_listing": 285564349.20026,
+      "price_at_listing": 0.31303,
+      "on_mexc": false,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SKYAI",
+      "vol_at_listing": 46767739.9189,
+      "price_at_listing": 0.0713,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "DOOD",
+      "vol_at_listing": 15837115.69376,
+      "price_at_listing": 0.008538,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "SXT",
+      "vol_at_listing": 18353707.0931,
+      "price_at_listing": 0.1453,
+      "on_mexc": true,
+      "bybit_listed": true
+    },
+    {
+      "symbol": "BANK",
+      "vol_at_listing": 18813980.3641,
+      "price_at_listing": 0.06298,
+      "on_mexc": true,
+      "bybit_listed": true
+    }
+  ],
+  "negatives": [
+    {
+      "symbol": "ZENT",
+      "vol_at_listing": 54917.906549,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AMGNON",
+      "vol_at_listing": 60502.87,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "IMGN",
+      "vol_at_listing": 58169.320346,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AI3",
+      "vol_at_listing": 71.557913,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BAS",
+      "vol_at_listing": 273917.13513,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "UBOX",
+      "vol_at_listing": 3152178.495,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XPR",
+      "vol_at_listing": 94911.1581146,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MAGATRUMP",
+      "vol_at_listing": 55158.49424,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "REAL",
+      "vol_at_listing": 95077.09265,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "IRC",
+      "vol_at_listing": 143952.7824635,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SWGT",
+      "vol_at_listing": 77257.248326,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KLK",
+      "vol_at_listing": 38032.7466,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MENGO",
+      "vol_at_listing": 56946.94585,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MOCHI",
+      "vol_at_listing": 166.937274323,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XSWAP",
+      "vol_at_listing": 236.26533,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XRPHAI",
+      "vol_at_listing": 51039.79848,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "114514",
+      "vol_at_listing": 54286.5843524,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SMX",
+      "vol_at_listing": 69869.846244,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TRWA",
+      "vol_at_listing": 56564.1174137,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CTK",
+      "vol_at_listing": 60868.9329,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ORAI",
+      "vol_at_listing": 60464.1817,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NEET",
+      "vol_at_listing": 58287.3929,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NERO",
+      "vol_at_listing": 12463.419244,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SEDA",
+      "vol_at_listing": 435132.77159,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PART",
+      "vol_at_listing": 53113.3435,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XCHNG",
+      "vol_at_listing": 142.8010323,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LUNC",
+      "vol_at_listing": 428667.86226608,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AURASOL",
+      "vol_at_listing": 84980.635149,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MANYU",
+      "vol_at_listing": 91046.20131201409,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FIO",
+      "vol_at_listing": 57423.1004802,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KITEAI",
+      "vol_at_listing": 692.15049645872,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MTP",
+      "vol_at_listing": 64800.6740025,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XPM",
+      "vol_at_listing": 17157.74024,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CRWDON",
+      "vol_at_listing": 59697.1,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "QUICK",
+      "vol_at_listing": 55856.804887,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WILD",
+      "vol_at_listing": 55294.64789,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "IJHON",
+      "vol_at_listing": 55722.14,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GAME2",
+      "vol_at_listing": 6505.289997,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MMUI",
+      "vol_at_listing": 92091.6052,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GCOIN",
+      "vol_at_listing": 374118.4857368,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CELR",
+      "vol_at_listing": 54431.472055,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BEAMX",
+      "vol_at_listing": 71238.278595,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CCD",
+      "vol_at_listing": 78340.067305,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PIG",
+      "vol_at_listing": 55759.67106349807,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "COINDEPO",
+      "vol_at_listing": 213438.03405,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XU3O8",
+      "vol_at_listing": 44739.331,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SPCFIN",
+      "vol_at_listing": 34412.4863486,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ERG",
+      "vol_at_listing": 55653.488,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ACA",
+      "vol_at_listing": 59822.365159,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AO",
+      "vol_at_listing": 57005.052,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WNT",
+      "vol_at_listing": 46765.4126067,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XRPC",
+      "vol_at_listing": 46.30734419,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SAUBER",
+      "vol_at_listing": 54574.381,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "USDUC",
+      "vol_at_listing": 67039.216148,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TROLL",
+      "vol_at_listing": 56883.81026674982,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BILION",
+      "vol_at_listing": 84767.49,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CITY",
+      "vol_at_listing": 60240.0727,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XO",
+      "vol_at_listing": 57348.35588922,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BLOCK",
+      "vol_at_listing": 101894.085621,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SDB",
+      "vol_at_listing": 19396.801066,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SAROS",
+      "vol_at_listing": 56990.2106052,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GST",
+      "vol_at_listing": 53695.626469,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PVT",
+      "vol_at_listing": 58394.3988597,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LLD",
+      "vol_at_listing": 53376.8882,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ZKJ",
+      "vol_at_listing": 66577.50294,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PROM",
+      "vol_at_listing": 122598.0449,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ARI",
+      "vol_at_listing": 14930.7010271,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SN51",
+      "vol_at_listing": 13236.01,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "9BIT",
+      "vol_at_listing": 832582.04325,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DMC",
+      "vol_at_listing": 42268.7463506,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HNS",
+      "vol_at_listing": 603.00243,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "REACT",
+      "vol_at_listing": 8016.80468,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NMT",
+      "vol_at_listing": 935.419,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PEPE2",
+      "vol_at_listing": 54791.38257025256,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SXP",
+      "vol_at_listing": 56070.981138,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CLAWNCH",
+      "vol_at_listing": 83103.72601298,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MBD",
+      "vol_at_listing": 7345.76863967,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EDEL",
+      "vol_at_listing": 61459.11278,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EQIXON",
+      "vol_at_listing": 59074.43,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TKO",
+      "vol_at_listing": 54130.08271,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BULLA",
+      "vol_at_listing": 86897.726226,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TRIO",
+      "vol_at_listing": 10828.81137,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PACT",
+      "vol_at_listing": 877.4938092,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MAN",
+      "vol_at_listing": 2297.24934,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NUTX",
+      "vol_at_listing": 1682.080460276283,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "INI",
+      "vol_at_listing": 78755.21771,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MORI",
+      "vol_at_listing": 99746.866262,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KISHU",
+      "vol_at_listing": 105888.19422960586,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SMURFCAT",
+      "vol_at_listing": 53380.444444775,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PAYAI",
+      "vol_at_listing": 85093.782752,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SVSA",
+      "vol_at_listing": 49202.093431,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VSN",
+      "vol_at_listing": 55179.09667,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LBC",
+      "vol_at_listing": 732.182668,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "APEPE",
+      "vol_at_listing": 265649.4205156261,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LOOP",
+      "vol_at_listing": 236.373191,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GOBLIN",
+      "vol_at_listing": 88656.150238,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FORU",
+      "vol_at_listing": 1.48079,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XTM",
+      "vol_at_listing": 5751.673121,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MAT",
+      "vol_at_listing": 96016.63234,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MATH",
+      "vol_at_listing": 54485.91752,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "QCOMON",
+      "vol_at_listing": 90418.94,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TRUU",
+      "vol_at_listing": 58128.04507564,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VES",
+      "vol_at_listing": 1671.452006,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PIVX",
+      "vol_at_listing": 62660.05857,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OMNOM",
+      "vol_at_listing": 54341.88766090515,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SIGMA",
+      "vol_at_listing": 56138.431417,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RTF",
+      "vol_at_listing": 65801.25677,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MDAO",
+      "vol_at_listing": 44578.295768,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MOONED",
+      "vol_at_listing": 29897.463289,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BTCBAM",
+      "vol_at_listing": 16908.44815,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NKN",
+      "vol_at_listing": 55617.388075,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RENTA",
+      "vol_at_listing": 139.6882581,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XEC",
+      "vol_at_listing": 60379.012044441,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LAZIO",
+      "vol_at_listing": 52968.518,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BOBACAT",
+      "vol_at_listing": 61.1144564,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NDC",
+      "vol_at_listing": 14.41992,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EWT",
+      "vol_at_listing": 67026.6109,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PAI",
+      "vol_at_listing": 55563.987717,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SUNCAT",
+      "vol_at_listing": 56041.4556119,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SHARE",
+      "vol_at_listing": 128347.1161,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SUPRA",
+      "vol_at_listing": 124889.4654271,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AMI",
+      "vol_at_listing": 58173.933842,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TET",
+      "vol_at_listing": 11597.7126,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NTX",
+      "vol_at_listing": 37529.23283,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MELION",
+      "vol_at_listing": 61161.29,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RICE",
+      "vol_at_listing": 58843.98952,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SER",
+      "vol_at_listing": 26586.5997597,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "JDON",
+      "vol_at_listing": 59798.61,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XEN",
+      "vol_at_listing": 61755.68188824309,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SMARS",
+      "vol_at_listing": 53935.90818551098,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AIW",
+      "vol_at_listing": 1090.3644498,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ZIG",
+      "vol_at_listing": 295227.049489,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "USAD",
+      "vol_at_listing": 1798.7165,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OZO",
+      "vol_at_listing": 97748.5973,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "IXS",
+      "vol_at_listing": 58225.7994,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VANKEDISI",
+      "vol_at_listing": 63521.4473,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "COLLAT",
+      "vol_at_listing": 55820.827428,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ELIZAOS",
+      "vol_at_listing": 147721.9773754,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PROS",
+      "vol_at_listing": 47343.3684,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KARRAT",
+      "vol_at_listing": 59412.9297,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LLYON",
+      "vol_at_listing": 71149.67,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GAMESTOP",
+      "vol_at_listing": 38484.13823847,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OTK",
+      "vol_at_listing": 2369.159544,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GOATED",
+      "vol_at_listing": 46803.93509,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SGB",
+      "vol_at_listing": 57084.9445531,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ARMON",
+      "vol_at_listing": 104451.29,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RDDTON",
+      "vol_at_listing": 64185.12,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OZONE",
+      "vol_at_listing": 543.523,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NOS",
+      "vol_at_listing": 68629.94414,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ALI",
+      "vol_at_listing": 1508.30643,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PYPLON",
+      "vol_at_listing": 62398.93,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "COS",
+      "vol_at_listing": 66434.0327587,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XCX",
+      "vol_at_listing": 62536.0155208,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DRN",
+      "vol_at_listing": 49813.8422,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NCN",
+      "vol_at_listing": 21.72537918,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PMT",
+      "vol_at_listing": 186122.80115,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SPC",
+      "vol_at_listing": 176.172342,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LAIKAL2",
+      "vol_at_listing": 1645.44914,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SIX",
+      "vol_at_listing": 36695.40799,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TAIX",
+      "vol_at_listing": 20488.47798703,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TEN",
+      "vol_at_listing": 72.7489415,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BLKON",
+      "vol_at_listing": 62287.32,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "URANUS",
+      "vol_at_listing": 58236.302599,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RUJI",
+      "vol_at_listing": 2988.7397,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RIF",
+      "vol_at_listing": 76420.15237,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NAT",
+      "vol_at_listing": 56868.3076080787,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "UPC",
+      "vol_at_listing": 48916.7331,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SRC",
+      "vol_at_listing": 31791.232022,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ATWO",
+      "vol_at_listing": 189529.65403,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FTT",
+      "vol_at_listing": 86200.3125,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TRIPLET",
+      "vol_at_listing": 67167.64484,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EFFECT",
+      "vol_at_listing": 9542.667356,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LIQUIDIUM",
+      "vol_at_listing": 57494.88746,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WMON",
+      "vol_at_listing": 57598.01,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "POND",
+      "vol_at_listing": 60315.45751,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DIN",
+      "vol_at_listing": 7918.333569,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XELS",
+      "vol_at_listing": 28294.326433,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AVGOON",
+      "vol_at_listing": 61431.25,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MEMES",
+      "vol_at_listing": 56047.7563378,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RAGEGUY",
+      "vol_at_listing": 77637.980313,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ENF",
+      "vol_at_listing": 7517.505409,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SPYON",
+      "vol_at_listing": 60709.03,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BIT1",
+      "vol_at_listing": 149041.996760142,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TBC",
+      "vol_at_listing": 100034.766,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MAMO",
+      "vol_at_listing": 54574.28787,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PFEON",
+      "vol_at_listing": 58851.44,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FLQLON",
+      "vol_at_listing": 55550.04,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CRCLON",
+      "vol_at_listing": 203101.82,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "USDS",
+      "vol_at_listing": 55062.8386,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "POLIS",
+      "vol_at_listing": 1072.25425,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TJRM",
+      "vol_at_listing": 61900.83852,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CVNAON",
+      "vol_at_listing": 78457.68,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OHO",
+      "vol_at_listing": 15938.070719,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FACT",
+      "vol_at_listing": 917.8181,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AZUR",
+      "vol_at_listing": 6021.016343,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WL",
+      "vol_at_listing": 3483.61998,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WOLFTON",
+      "vol_at_listing": 14937.608514,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HYDRA",
+      "vol_at_listing": 60293.75162,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "IBMON",
+      "vol_at_listing": 62503.33,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LEE",
+      "vol_at_listing": 200730.323,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "\u6211\u8e0f\u9a6c\u6765\u4e86",
+      "vol_at_listing": 56762.42116,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DOGINME",
+      "vol_at_listing": 55147.19019342,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OSHI",
+      "vol_at_listing": 393920.938198,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EAI",
+      "vol_at_listing": 5310.004279,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MOODENGETH",
+      "vol_at_listing": 56546.807886976,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SUPERFORM",
+      "vol_at_listing": 98783.56994,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RHEA",
+      "vol_at_listing": 56591.943232,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HELI",
+      "vol_at_listing": 20.380477826,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NVDAON",
+      "vol_at_listing": 91420.6,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SHIB",
+      "vol_at_listing": 907482.468064038,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CHEQ",
+      "vol_at_listing": 13458.325207,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TCT",
+      "vol_at_listing": 61.426339,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FWOG",
+      "vol_at_listing": 64089.778154,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AEROBUD",
+      "vol_at_listing": 64685.020195,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ANDYETH",
+      "vol_at_listing": 59870.503570129,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PORK",
+      "vol_at_listing": 56128.90582556995,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ALEO",
+      "vol_at_listing": 123360.70815,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "USDGO",
+      "vol_at_listing": 341421.4844,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BOBO",
+      "vol_at_listing": 92479.090257,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ELP",
+      "vol_at_listing": 1106.382976,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "3KDS",
+      "vol_at_listing": 60658.2313027,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TSUKA",
+      "vol_at_listing": 54231.23397,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XR",
+      "vol_at_listing": 11405.595952,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LO0P",
+      "vol_at_listing": 56826.7795,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OFC",
+      "vol_at_listing": 80102.12501,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DANGNN",
+      "vol_at_listing": 48245.72329441,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HP",
+      "vol_at_listing": 53233.476629,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MBG",
+      "vol_at_listing": 829324.4962,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FARM",
+      "vol_at_listing": 65220.025,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NVOON",
+      "vol_at_listing": 65226.7,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WFCON",
+      "vol_at_listing": 58817.85,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SYN",
+      "vol_at_listing": 62500.48727,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DC",
+      "vol_at_listing": 56508.207873116,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SNDKON",
+      "vol_at_listing": 84097.05,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ASS",
+      "vol_at_listing": 54986.913880383174,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BELUGA",
+      "vol_at_listing": 11003.1246,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OPENX",
+      "vol_at_listing": 30030.34706,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CHO",
+      "vol_at_listing": 40314.4062288,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FAVE",
+      "vol_at_listing": 101805.35581,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FUNTOKEN",
+      "vol_at_listing": 65733.226278,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ORCLON",
+      "vol_at_listing": 81477.68,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GITLAWB",
+      "vol_at_listing": 256333.7232776,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ADX",
+      "vol_at_listing": 1290.5023,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LIF3",
+      "vol_at_listing": 104072.5798,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NUMI",
+      "vol_at_listing": 75397.73405,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BOMB",
+      "vol_at_listing": 52846.83288303,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KEYCAT",
+      "vol_at_listing": 58015.1807704,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DOGS",
+      "vol_at_listing": 116454.56241091,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PXP",
+      "vol_at_listing": 70475.71598,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PACK",
+      "vol_at_listing": 6589.73426,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ETAN",
+      "vol_at_listing": 60438.312564,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XWGT",
+      "vol_at_listing": 17250.352174,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BDP",
+      "vol_at_listing": 56364.366642,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CHEEMS",
+      "vol_at_listing": 55858.8697196016,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ARTFI",
+      "vol_at_listing": 6997.884829,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XDB",
+      "vol_at_listing": 1990.0035179,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KFI",
+      "vol_at_listing": 10854.5536,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CULTDAO",
+      "vol_at_listing": 50431.2305974232,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VRTXON",
+      "vol_at_listing": 60489.45,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VISTA",
+      "vol_at_listing": 55749.9501,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XGZ",
+      "vol_at_listing": 35672.45,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SEND",
+      "vol_at_listing": 46616.18692,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LINON",
+      "vol_at_listing": 54832.53,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BLZ",
+      "vol_at_listing": 56113.048079,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TSLAX",
+      "vol_at_listing": 58746.09,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "READY",
+      "vol_at_listing": 6173.678895,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MSTRON",
+      "vol_at_listing": 78540.13,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HGG",
+      "vol_at_listing": 449.6777065,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BABYBONK",
+      "vol_at_listing": 205.212050684,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PBRON",
+      "vol_at_listing": 62833.66,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SHIDO",
+      "vol_at_listing": 89616.0366691,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CSIGMA",
+      "vol_at_listing": 8.09742,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HOT",
+      "vol_at_listing": 55209.4174078,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MILLI",
+      "vol_at_listing": 53658.836945234,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RC",
+      "vol_at_listing": 6945.24504,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SFI",
+      "vol_at_listing": 54795.678586,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OORT",
+      "vol_at_listing": 61217.1381,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CRETA",
+      "vol_at_listing": 14604.673528,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CARFI",
+      "vol_at_listing": 50001.4043,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WHITE",
+      "vol_at_listing": 56512.96682879,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BOTTO",
+      "vol_at_listing": 55379.94322,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RJV",
+      "vol_at_listing": 296.058023,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BAY",
+      "vol_at_listing": 55444.52459,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GHIBLI",
+      "vol_at_listing": 53548.2813128,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "POKT",
+      "vol_at_listing": 918.239333,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BDC",
+      "vol_at_listing": 52.295164,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SOEX",
+      "vol_at_listing": 14436.73972,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PRAI",
+      "vol_at_listing": 55219.0847134,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LTT",
+      "vol_at_listing": 21902.9773751,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NS",
+      "vol_at_listing": 84547.6226,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ACHRON",
+      "vol_at_listing": 61869.347,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BACON",
+      "vol_at_listing": 58407.1,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SAL",
+      "vol_at_listing": 2209.19694,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XLAB",
+      "vol_at_listing": 71090.707980007,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "M87",
+      "vol_at_listing": 64685.91456436,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SHOPON",
+      "vol_at_listing": 76208.43,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VADER",
+      "vol_at_listing": 56142.214726,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OKM",
+      "vol_at_listing": 56423.03666205,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BROCCOLIF3B",
+      "vol_at_listing": 90727.665273,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WCO",
+      "vol_at_listing": 19115.5863143,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AIXDROP",
+      "vol_at_listing": 812362.83084513,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SAFE4",
+      "vol_at_listing": 170976.814,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "IDEX",
+      "vol_at_listing": 56136.157146,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SOLX",
+      "vol_at_listing": 30093.201786018,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ZSWAP",
+      "vol_at_listing": 67138.637632,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MYRO",
+      "vol_at_listing": 58817.105498,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EL",
+      "vol_at_listing": 33992.11681,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AGGON",
+      "vol_at_listing": 55057.8,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BINDER",
+      "vol_at_listing": 155.978827,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GAIN",
+      "vol_at_listing": 4492.9239355,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GMMT",
+      "vol_at_listing": 2306.476729,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ML",
+      "vol_at_listing": 25789.79028,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XYM",
+      "vol_at_listing": 56173.964459,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EUR",
+      "vol_at_listing": 2290991.3435,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SNPT",
+      "vol_at_listing": 378.75496,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RAD",
+      "vol_at_listing": 177063.7461,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NEXI",
+      "vol_at_listing": 8738.41795,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AB",
+      "vol_at_listing": 12174.529765,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LNQ",
+      "vol_at_listing": 31999.636891,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CTP",
+      "vol_at_listing": 53314.4626525,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GIZA",
+      "vol_at_listing": 51836.034581,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SNEK",
+      "vol_at_listing": 58867.442607,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DIME",
+      "vol_at_listing": 1299.34553,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VRA",
+      "vol_at_listing": 77149.48345354,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AFC",
+      "vol_at_listing": 158840.5055,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BGSC",
+      "vol_at_listing": 76589.8538898,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EURI",
+      "vol_at_listing": 5813.3732,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SN64",
+      "vol_at_listing": 885.55,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HAM",
+      "vol_at_listing": 54649.44637743155,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GAMEVIRTUAL",
+      "vol_at_listing": 55261.733968,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NKEON",
+      "vol_at_listing": 56532.16,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WIN",
+      "vol_at_listing": 54920.63419317,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SIN",
+      "vol_at_listing": 31949.7325761,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SUT",
+      "vol_at_listing": 4682.5451,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CHIRP",
+      "vol_at_listing": 64480.241503,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MEMEFI",
+      "vol_at_listing": 53407.8027659,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OMG",
+      "vol_at_listing": 67654.71989,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "YACHT",
+      "vol_at_listing": 26814.17586,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NRG",
+      "vol_at_listing": 26436.16317,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SWEAT",
+      "vol_at_listing": 64164.7381677,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BBT",
+      "vol_at_listing": 68104.75403,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TIX",
+      "vol_at_listing": 33771.350005,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "QFI",
+      "vol_at_listing": 416303.823,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RVV",
+      "vol_at_listing": 192300.4980343,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BCAT",
+      "vol_at_listing": 5997.8894613,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DTEC",
+      "vol_at_listing": 67613.308772,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SMT",
+      "vol_at_listing": 59281.7991,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OPT",
+      "vol_at_listing": 15344.950418,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PROPC",
+      "vol_at_listing": 8337.2713,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VICS",
+      "vol_at_listing": 51683.46413,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FLORK",
+      "vol_at_listing": 88641.949080319,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LIKE",
+      "vol_at_listing": 56421.123436,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EPILEPTIC",
+      "vol_at_listing": 55986.6977196,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "COOK",
+      "vol_at_listing": 68544.10008,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MXNA",
+      "vol_at_listing": 85282.706692,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "UDS",
+      "vol_at_listing": 22283.0296,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MAP",
+      "vol_at_listing": 86876.10532,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MIN",
+      "vol_at_listing": 20955.981089,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PLN",
+      "vol_at_listing": 201323.91484,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SMCION",
+      "vol_at_listing": 108646.89,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PGPT",
+      "vol_at_listing": 22234.054043,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BAL",
+      "vol_at_listing": 56989.3966,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PENGUIN",
+      "vol_at_listing": 103009.900968,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ENPHON",
+      "vol_at_listing": 72881.1,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BNKR",
+      "vol_at_listing": 89134.1320471,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AGRS",
+      "vol_at_listing": 5811.6945,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OAS",
+      "vol_at_listing": 57295.7982236,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CESS",
+      "vol_at_listing": 63647.09584,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "JYAI",
+      "vol_at_listing": 20954.302380745,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XNA",
+      "vol_at_listing": 31399.418928,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TRVL",
+      "vol_at_listing": 48837.0099576,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FREEDOM",
+      "vol_at_listing": 99825.37216285757,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ABBC",
+      "vol_at_listing": 219.031261,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GOLD(XAUT)",
+      "vol_at_listing": 2898279.92,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HOODON",
+      "vol_at_listing": 86434.09,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ST",
+      "vol_at_listing": 59494.28488,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CWEB",
+      "vol_at_listing": 53234.2238517,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LUMI",
+      "vol_at_listing": 33881.733464,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NUSD",
+      "vol_at_listing": 8687.597,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "USDD",
+      "vol_at_listing": 839.1731,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CMGON",
+      "vol_at_listing": 59592.45,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EAT",
+      "vol_at_listing": 61052.82713,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TUSD",
+      "vol_at_listing": 22103.8203,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ARTX",
+      "vol_at_listing": 64082.2,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FAI",
+      "vol_at_listing": 117378.297244,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RGTION",
+      "vol_at_listing": 71808.69,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HANTA",
+      "vol_at_listing": 67553.537639,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FOREST",
+      "vol_at_listing": 65753.01704,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ACN",
+      "vol_at_listing": 433435.082307,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VTHO",
+      "vol_at_listing": 56824.1946481,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RBC",
+      "vol_at_listing": 29062.173547,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "3ULL",
+      "vol_at_listing": 55664.9778529,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MGT",
+      "vol_at_listing": 10077.59712767,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BELLS",
+      "vol_at_listing": 1940.553,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HDN",
+      "vol_at_listing": 35558.4593,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EFC",
+      "vol_at_listing": 54924.7435,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EMBLEM",
+      "vol_at_listing": 51127.248969,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SWFTC",
+      "vol_at_listing": 55943.315656,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "XOXO",
+      "vol_at_listing": 60119.91364494,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "JETTON",
+      "vol_at_listing": 54304.66411,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ISRGON",
+      "vol_at_listing": 72785.81,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BTX",
+      "vol_at_listing": 56915.004701,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PRCL",
+      "vol_at_listing": 3000.40172,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DCR",
+      "vol_at_listing": 116464.95,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KEKIUS",
+      "vol_at_listing": 82632.345054,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LFI",
+      "vol_at_listing": 70297.34408557,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PSQON",
+      "vol_at_listing": 56278.0,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SLC",
+      "vol_at_listing": 65693.39134762,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AAPLX",
+      "vol_at_listing": 59198.88,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RBNT",
+      "vol_at_listing": 58320.840435,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BZR",
+      "vol_at_listing": 200186.243,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DN",
+      "vol_at_listing": 250069.85109,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EMR",
+      "vol_at_listing": 17656.5688919,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "A1X",
+      "vol_at_listing": 56935.6864371,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GOCHU",
+      "vol_at_listing": 59624.8554023984,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KIBSHI",
+      "vol_at_listing": 10108.380647319,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BITBOARD",
+      "vol_at_listing": 64979.2111301,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CORAL",
+      "vol_at_listing": 155253.1786006,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "STBU",
+      "vol_at_listing": 1717.231507,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TSLAON",
+      "vol_at_listing": 81848.99,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RTX",
+      "vol_at_listing": 192436.193,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DKA",
+      "vol_at_listing": 62772.806262,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VON",
+      "vol_at_listing": 60815.17,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "IMO",
+      "vol_at_listing": 17192.7696,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CPOOL",
+      "vol_at_listing": 77863.53856,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "OMI",
+      "vol_at_listing": 130117.1595165,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FUN",
+      "vol_at_listing": 190298.48901,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "STRM",
+      "vol_at_listing": 100838.5854677,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SRX",
+      "vol_at_listing": 9255.40189,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SVL",
+      "vol_at_listing": 50459.32277,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ZANO",
+      "vol_at_listing": 603498.682,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ANYONE",
+      "vol_at_listing": 11344.1672,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SGT",
+      "vol_at_listing": 149094.3359,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ECOR",
+      "vol_at_listing": 49953.08533,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "FUEL",
+      "vol_at_listing": 33465.64316,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CULT",
+      "vol_at_listing": 33056.2316529,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HLK",
+      "vol_at_listing": 57404.718,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MEER",
+      "vol_at_listing": 6193.519251,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AIN",
+      "vol_at_listing": 55350.78834,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CARDS",
+      "vol_at_listing": 104163.4173,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TLTON",
+      "vol_at_listing": 58599.49,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "YEE",
+      "vol_at_listing": 54317.064785,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "METAX",
+      "vol_at_listing": 57241.95,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PI",
+      "vol_at_listing": 254506.98602,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CLONE",
+      "vol_at_listing": 120875.474415,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TESTICLE",
+      "vol_at_listing": 55358.269019,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PAXI",
+      "vol_at_listing": 420.40165,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SBTC",
+      "vol_at_listing": 19668.8,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BTS",
+      "vol_at_listing": 56468.7798445,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "EPT",
+      "vol_at_listing": 55945.8542735,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "DNX",
+      "vol_at_listing": 21557.11815,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "STORM",
+      "vol_at_listing": 55167.533171,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MBOOM",
+      "vol_at_listing": 51211.2418483,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "QLINDO",
+      "vol_at_listing": 14743.4486921,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GUI",
+      "vol_at_listing": 103833.460362466,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PERP",
+      "vol_at_listing": 66055.86946,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MINDHIVE",
+      "vol_at_listing": 1.0441518,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AIX",
+      "vol_at_listing": 932456.503857,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PNDC",
+      "vol_at_listing": 54016.7557490386,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SGOVON",
+      "vol_at_listing": 55240.43,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AKITA",
+      "vol_at_listing": 4189.44049,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CHMPZ",
+      "vol_at_listing": 30368.6496701,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HVLO",
+      "vol_at_listing": 17581.8692886,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GRAMPUS",
+      "vol_at_listing": 20533.9189452,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SWCH",
+      "vol_at_listing": 26438.06139,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PURR",
+      "vol_at_listing": 67069.81592,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "GOLD(PAXG)",
+      "vol_at_listing": 3110631.96,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BMNRON",
+      "vol_at_listing": 63752.77,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ASTEROID",
+      "vol_at_listing": 922265.63937017,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TIPON",
+      "vol_at_listing": 58842.92,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SNFT",
+      "vol_at_listing": 55685.93899,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VERSEWORLD",
+      "vol_at_listing": 61739.60712,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NEON",
+      "vol_at_listing": 57642.63752,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "LL",
+      "vol_at_listing": 44451.550159,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AMP",
+      "vol_at_listing": 56341.8123156,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "TXNON",
+      "vol_at_listing": 57657.94,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "WATT",
+      "vol_at_listing": 28897.9098,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "CES",
+      "vol_at_listing": 376591.1288,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SYMM",
+      "vol_at_listing": 1191.2465,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "AZEN",
+      "vol_at_listing": 2217.1568339,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "HARRY",
+      "vol_at_listing": 59876.43917,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BXE",
+      "vol_at_listing": 28788.08945,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VARA",
+      "vol_at_listing": 6848.544324,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ALPH",
+      "vol_at_listing": 68554.22915,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "RDNT",
+      "vol_at_listing": 56335.312813,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "D",
+      "vol_at_listing": 54622.894442,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ATS",
+      "vol_at_listing": 322891.31077,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MAS",
+      "vol_at_listing": 50165.12277,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "NOBODY",
+      "vol_at_listing": 65904.850676,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PHY",
+      "vol_at_listing": 54699.05642942,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "ROOT",
+      "vol_at_listing": 1081.05911836,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "UBU",
+      "vol_at_listing": 5.680691,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "VERDRA",
+      "vol_at_listing": 125412.91104,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "BATTERY",
+      "vol_at_listing": 14805.2397116,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "STAY",
+      "vol_at_listing": 20665.87740927,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SAUCE",
+      "vol_at_listing": 1857.67994,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "SFIN",
+      "vol_at_listing": 16691.76,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "PIB",
+      "vol_at_listing": 19434.4464048,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "KOM",
+      "vol_at_listing": 105884.97106616,
+      "on_mexc": true,
+      "bybit_listed": false
+    },
+    {
+      "symbol": "MAJOR",
+      "vol_at_listing": 60651.78606,
+      "on_mexc": true,
+      "bybit_listed": false
+    }
+  ]
+}

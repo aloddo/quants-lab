@@ -1,3 +1,0 @@
-<channel source="plugin:telegram:telegram" chat_id="-1003576397888" message_id="3459" user="beto_up" user_id="81062935" ts="2026-05-03T20:39:56.000Z">
-What happened
-</channel>

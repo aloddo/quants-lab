@@ -1,0 +1,110 @@
+[
+  {
+    "token": "AERO",
+    "gap_days": 142,
+    "bybit_price": 0.8776,
+    "binance_price": 1.7617,
+    "cascade_return": 100.7,
+    "max_gain": 166.8,
+    "max_dd": -47.1
+  },
+  {
+    "token": "BOME",
+    "gap_days": 40,
+    "bybit_price": 0.009174,
+    "binance_price": 0.011093,
+    "cascade_return": 20.9,
+    "max_gain": 214.3,
+    "max_dd": -22.5
+  },
+  {
+    "token": "BRETT",
+    "gap_days": 116,
+    "bybit_price": 0.04228,
+    "binance_price": 0.08923,
+    "cascade_return": 111.0,
+    "max_gain": 362.4,
+    "max_dd": -47.2
+  },
+  {
+    "token": "DRIFT",
+    "gap_days": 171,
+    "bybit_price": 0.555,
+    "binance_price": 1.3906,
+    "cascade_return": 150.6,
+    "max_gain": 272.9,
+    "max_dd": -61.5
+  },
+  {
+    "token": "GRIFFAIN",
+    "gap_days": 13,
+    "bybit_price": 0.29225,
+    "binance_price": 0.42932,
+    "cascade_return": 46.9,
+    "max_gain": 81.3,
+    "max_dd": -39.4
+  },
+  {
+    "token": "KMNO",
+    "gap_days": 72,
+    "bybit_price": 0.08969,
+    "binance_price": 0.19036,
+    "cascade_return": 112.2,
+    "max_gain": 177.6,
+    "max_dd": -9.3
+  },
+  {
+    "token": "MEW",
+    "gap_days": 55,
+    "bybit_price": 0.00643,
+    "binance_price": 0.004837,
+    "cascade_return": -24.8,
+    "max_gain": 16.6,
+    "max_dd": -58.2
+  },
+  {
+    "token": "MOODENG",
+    "gap_days": 24,
+    "bybit_price": 0.21162,
+    "binance_price": 0.21688,
+    "cascade_return": 2.5,
+    "max_gain": 27.5,
+    "max_dd": -70.6
+  },
+  {
+    "token": "ORCA",
+    "gap_days": 249,
+    "bybit_price": 4.01,
+    "binance_price": 7.003,
+    "cascade_return": 74.6,
+    "max_gain": 131.3,
+    "max_dd": -66.9
+  },
+  {
+    "token": "PENGU",
+    "gap_days": 217,
+    "bybit_price": 0.02874,
+    "binance_price": 0.042875,
+    "cascade_return": 49.2,
+    "max_gain": 63.6,
+    "max_dd": -87.1
+  },
+  {
+    "token": "PNUT",
+    "gap_days": 116,
+    "bybit_price": 0.3915,
+    "binance_price": 0.1827,
+    "cascade_return": -53.3,
+    "max_gain": 540.7,
+    "max_dd": -66.1
+  },
+  {
+    "token": "POPCAT",
+    "gap_days": 147,
+    "bybit_price": 0.3627,
+    "binance_price": 0.5813,
+    "cascade_return": 60.3,
+    "max_gain": 177.5,
+    "max_dd": -78.5
+  }
+]

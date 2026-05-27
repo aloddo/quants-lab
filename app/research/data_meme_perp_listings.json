@@ -1,0 +1,438 @@
+{
+  "MELANIA": {
+    "bybit": {
+      "symbol": "MELANIAUSDT",
+      "launch_time": "1737350019000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "MELANIAUSDT",
+      "status": "TRADING",
+      "onboard_date": 1737365400000
+    }
+  },
+  "TRUMP": {
+    "bybit": {},
+    "binance": {
+      "symbol": "TRUMPUSDC",
+      "status": "TRADING",
+      "onboard_date": 1741255200000
+    }
+  },
+  "JTO": {
+    "bybit": {
+      "symbol": "JTOUSDT",
+      "launch_time": "1701978619000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "JTOUSDT",
+      "status": "TRADING",
+      "onboard_date": 1702029600000
+    }
+  },
+  "PONKE": {
+    "bybit": {},
+    "binance": {
+      "symbol": "PONKEUSDT",
+      "status": "SETTLING",
+      "onboard_date": 1730723400000
+    }
+  },
+  "BRETT": {
+    "bybit": {
+      "symbol": "BRETTUSDT",
+      "launch_time": "1714119444000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "BRETTUSDT",
+      "status": "TRADING",
+      "onboard_date": 1724150100000
+    }
+  },
+  "DOGE": {
+    "bybit": {
+      "symbol": "DOGEUSDT-29MAY26",
+      "launch_time": "1775203200000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "DOGEUSDC",
+      "status": "TRADING",
+      "onboard_date": 1705572000000
+    }
+  },
+  "KMNO": {
+    "bybit": {
+      "symbol": "KMNOUSDT",
+      "launch_time": "1728463961000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "KMNOUSDT",
+      "status": "TRADING",
+      "onboard_date": 1734721200000
+    }
+  },
+  "GOAT": {
+    "bybit": {
+      "symbol": "GOATUSDT",
+      "launch_time": "1729593864000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "GOATUSDT",
+      "status": "TRADING",
+      "onboard_date": 1729776600000
+    }
+  },
+  "VIRTUAL": {
+    "bybit": {},
+    "binance": {
+      "symbol": "VIRTUALUSDT",
+      "status": "TRADING",
+      "onboard_date": 1733833800000
+    }
+  },
+  "CHILLGUY": {
+    "bybit": {
+      "symbol": "CHILLGUYUSDT",
+      "launch_time": "1732181897000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "CHILLGUYUSDT",
+      "status": "TRADING",
+      "onboard_date": 1732718700000
+    }
+  },
+  "TOSHI": {
+    "bybit": {},
+    "binance": {
+      "symbol": "TOSHIUSDT",
+      "status": "TRADING",
+      "onboard_date": 1758087000000
+    }
+  },
+  "DEGEN": {
+    "bybit": {},
+    "binance": {
+      "symbol": "DEGENUSDT",
+      "status": "SETTLING",
+      "onboard_date": 1731670200000
+    }
+  },
+  "AIXBT": {
+    "bybit": {
+      "symbol": "AIXBTUSDT",
+      "launch_time": "1734683907000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "AIXBTUSDT",
+      "status": "TRADING",
+      "onboard_date": 1734719400000
+    }
+  },
+  "DRIFT": {
+    "bybit": {
+      "symbol": "DRIFTUSDT",
+      "launch_time": "1716283968000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "DRIFTUSDT",
+      "status": "TRADING",
+      "onboard_date": 1731081600000
+    }
+  },
+  "VINE": {
+    "bybit": {},
+    "binance": {
+      "symbol": "VINEUSDT",
+      "status": "SETTLING",
+      "onboard_date": 1737712800000
+    }
+  },
+  "POPCAT": {
+    "bybit": {
+      "symbol": "POPCATUSDT",
+      "launch_time": "1711609319000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "POPCATUSDT",
+      "status": "TRADING",
+      "onboard_date": 1724331600000
+    }
+  },
+  "ZEREBRO": {
+    "bybit": {},
+    "binance": {
+      "symbol": "ZEREBROUSDT",
+      "status": "TRADING",
+      "onboard_date": 1735826400000
+    }
+  },
+  "PYTH": {
+    "bybit": {
+      "symbol": "PYTHUSDT",
+      "launch_time": "1700543350000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "PYTHUSDT",
+      "status": "TRADING",
+      "onboard_date": 1700663400000
+    }
+  },
+  "FARTCOIN": {
+    "bybit": {
+      "symbol": "FARTCOINUSDT",
+      "launch_time": "1734683847000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "FARTCOINUSDT",
+      "status": "TRADING",
+      "onboard_date": 1734720300000
+    }
+  },
+  "AI16Z": {
+    "bybit": {},
+    "binance": {
+      "symbol": "AI16ZUSDT",
+      "status": "SETTLING",
+      "onboard_date": 1735825500000
+    }
+  },
+  "W": {
+    "bybit": {},
+    "binance": {
+      "symbol": "WUSDT",
+      "status": "TRADING",
+      "onboard_date": 1712158200000
+    }
+  },
+  "GRIFFAIN": {
+    "bybit": {
+      "symbol": "GRIFFAINUSDT",
+      "launch_time": "1734683999000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "GRIFFAINUSDT",
+      "status": "TRADING",
+      "onboard_date": 1735824600000
+    }
+  },
+  "WIF": {
+    "bybit": {},
+    "binance": {
+      "symbol": "WIFUSDC",
+      "status": "TRADING",
+      "onboard_date": 1712214900000
+    }
+  },
+  "NEIRO": {
+    "bybit": {},
+    "binance": {
+      "symbol": "NEIROUSDT",
+      "status": "TRADING",
+      "onboard_date": 1726486200000
+    }
+  },
+  "SLERF": {
+    "bybit": {},
+    "binance": {
+      "symbol": "SLERFUSDT",
+      "status": "SETTLING",
+      "onboard_date": 1732188600000
+    }
+  },
+  "GIGA": {
+    "bybit": {
+      "symbol": "GIGAUSDT",
+      "launch_time": "1733989346000",
+      "status": "Trading"
+    },
+    "binance": {}
+  },
+  "TNSR": {
+    "bybit": {},
+    "binance": {
+      "symbol": "TNSRUSDT",
+      "status": "TRADING",
+      "onboard_date": 1712595600000
+    }
+  },
+  "AERO": {
+    "bybit": {
+      "symbol": "AEROUSDT",
+      "launch_time": "1721034308000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "AEROUSDT",
+      "status": "TRADING",
+      "onboard_date": 1733321700000
+    }
+  },
+  "JUP": {
+    "bybit": {
+      "symbol": "JUPUSDT",
+      "launch_time": "1706716267000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "JUPUSDT",
+      "status": "TRADING",
+      "onboard_date": 1706725800000
+    }
+  },
+  "RENDER": {
+    "bybit": {
+      "symbol": "RENDERUSDT",
+      "launch_time": "1721982407000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "RENDERUSDT",
+      "status": "TRADING",
+      "onboard_date": 1721988000000
+    }
+  },
+  "TURBO": {
+    "bybit": {},
+    "binance": {
+      "symbol": "TURBOUSDT",
+      "status": "TRADING",
+      "onboard_date": 1717083000000
+    }
+  },
+  "SWARMS": {
+    "bybit": {},
+    "binance": {
+      "symbol": "SWARMSUSDT",
+      "status": "TRADING",
+      "onboard_date": 1736252100000
+    }
+  },
+  "BOME": {
+    "bybit": {
+      "symbol": "BOMEUSDT",
+      "launch_time": "1710492745000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "BOMEUSDC",
+      "status": "TRADING",
+      "onboard_date": 1714028400000
+    }
+  },
+  "PUMP": {
+    "bybit": {},
+    "binance": {
+      "symbol": "PUMPUSDT",
+      "status": "TRADING",
+      "onboard_date": 1752132600000
+    }
+  },
+  "PENGU": {
+    "bybit": {
+      "symbol": "PENGUUSDT",
+      "launch_time": "1734445346000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "PENGUUSDC",
+      "status": "TRADING",
+      "onboard_date": 1753255800000
+    }
+  },
+  "ORCA": {
+    "bybit": {
+      "symbol": "ORCAUSDT",
+      "launch_time": "1711963329000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "ORCAUSDT",
+      "status": "TRADING",
+      "onboard_date": 1733497200000
+    }
+  },
+  "MEW": {
+    "bybit": {
+      "symbol": "MEWUSDT",
+      "launch_time": "1713863741000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "MEWUSDT",
+      "status": "TRADING",
+      "onboard_date": 1718632800000
+    }
+  },
+  "MOODENG": {
+    "bybit": {
+      "symbol": "MOODENGUSDT",
+      "launch_time": "1727765946000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "MOODENGUSDT",
+      "status": "TRADING",
+      "onboard_date": 1729850400000
+    }
+  },
+  "MYRO": {
+    "bybit": {},
+    "binance": {
+      "symbol": "MYROUSDT",
+      "status": "SETTLING",
+      "onboard_date": 1709627400000
+    }
+  },
+  "SPX": {
+    "bybit": {},
+    "binance": {
+      "symbol": "SPXUSDT",
+      "status": "TRADING",
+      "onboard_date": 1733834700000
+    }
+  },
+  "RAY": {
+    "bybit": {},
+    "binance": {
+      "symbol": "RAYUSDT",
+      "status": "SETTLING",
+      "onboard_date": 1629270000000
+    }
+  },
+  "PNUT": {
+    "bybit": {
+      "symbol": "PNUTUSDT",
+      "launch_time": "1731313006000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "PNUTUSDC",
+      "status": "TRADING",
+      "onboard_date": 1741341600000
+    }
+  },
+  "ACT": {
+    "bybit": {
+      "symbol": "ACTUSDT",
+      "launch_time": "1731312852000",
+      "status": "Trading"
+    },
+    "binance": {
+      "symbol": "ACTUSDT",
+      "status": "TRADING",
+      "onboard_date": 1731327300000
+    }
+  }
+}
