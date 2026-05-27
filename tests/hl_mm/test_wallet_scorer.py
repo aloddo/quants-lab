@@ -132,6 +132,87 @@ class TestLiveGating:
         assert is_active is False
 
 
+class TestMetaorderDetection:
+    """Tests for V3 metaorder detection (single and batch)."""
+
+    def _inject_twap(self, scorer, coin, wallet, direction, n_clips=5, interval=10.0, notional_per=500.0):
+        """Helper: inject a TWAP-like sequence of trades."""
+        import time as _time
+        base_time = _time.time()
+        side = "B" if direction == "buy" else "S"
+        for i in range(n_clips):
+            price = 1.0
+            size = notional_per / price
+            if side == "B":
+                scorer.record_trade(coin, side, price, size, wallet, f"0xlp{i}")
+            else:
+                scorer.record_trade(coin, side, price, size, f"0xlp{i}", wallet)
+            # Advance mock time by manipulating trade timestamps
+            with scorer._lock:
+                scorer._recent_trades[-1].timestamp = base_time + i * interval
+
+    def test_detects_single_coin_metaorder(self, scorer):
+        self._inject_twap(scorer, "BIO", "0xwhale", "buy", n_clips=5, interval=10.0)
+        scorer.detect_metaorders("BIO")
+        signal = scorer.get_active_metaorder("BIO")
+        assert signal is not None
+        assert signal.direction == "buy"
+        assert signal.wallet == "0xwhale"
+        assert signal.clip_count == 5
+
+    def test_no_metaorder_below_minimum_clips(self, scorer):
+        self._inject_twap(scorer, "BIO", "0xwhale", "buy", n_clips=2)
+        scorer.detect_metaorders("BIO")
+        signal = scorer.get_active_metaorder("BIO")
+        assert signal is None
+
+    def test_batch_detects_across_coins(self, scorer):
+        """Batch detection should find metaorders on multiple coins in one pass."""
+        self._inject_twap(scorer, "BIO", "0xwhaleA", "buy", n_clips=6, interval=8.0)
+        self._inject_twap(scorer, "ORDI", "0xwhaleB", "sell", n_clips=6, interval=12.0)
+
+        results = scorer.detect_metaorders_batch({"BIO", "ORDI", "PURR"})
+        assert results["BIO"] is not None
+        assert results["BIO"].direction == "buy"
+        assert results["ORDI"] is not None
+        assert results["ORDI"].direction == "sell"
+        assert results["PURR"] is None  # no trades
+
+    def test_batch_matches_single(self, scorer):
+        """Batch results should match individual detect_metaorders calls."""
+        self._inject_twap(scorer, "BIO", "0xwhale", "buy", n_clips=5, interval=10.0)
+
+        # Single path
+        scorer.detect_metaorders("BIO")
+        single_result = scorer.get_active_metaorder("BIO")
+
+        # Reset for batch
+        scorer._active_metaorders.clear()
+
+        # Batch path
+        batch_results = scorer.detect_metaorders_batch({"BIO"})
+        batch_result = batch_results["BIO"]
+
+        assert single_result is not None
+        assert batch_result is not None
+        assert single_result.wallet == batch_result.wallet
+        assert single_result.direction == batch_result.direction
+        assert single_result.clip_count == batch_result.clip_count
+
+    def test_metaorder_expires(self, scorer):
+        """Metaorder should expire when last clip is too old."""
+        import time as _time
+        self._inject_twap(scorer, "BIO", "0xwhale", "buy", n_clips=5, interval=10.0)
+        scorer.detect_metaorders("BIO")
+        signal = scorer.get_active_metaorder("BIO")
+        assert signal is not None
+
+        # Simulate time passing beyond expiry (2.5x avg_interval)
+        signal.last_seen = _time.time() - 300  # 5 min ago
+        result = scorer.get_active_metaorder("BIO")
+        assert result is None
+
+
 class TestMongoExport:
 
     def test_exports_wallets_with_data(self, scorer):

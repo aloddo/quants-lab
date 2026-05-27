@@ -85,6 +85,11 @@ class WalletScorer:
         self._wallets: dict[str, WalletStats] = {}
         self._recent_trades: deque[WalletTrade] = deque(maxlen=max_history)
 
+        # Per-coin running trade size stats for institutional clip detection
+        # Tracks median trade size so we can flag clips that are >Nx normal
+        self._coin_trade_sizes: dict[str, deque] = {}  # coin -> last 500 trade notionals
+        self._coin_trade_size_window: int = 500
+
         # Per-coin recent toxic wallet activity (for live gating)
         # coin -> list of (timestamp, wallet_addr) for toxic wallets seen in last 10s
         self._toxic_activity: dict[str, list[tuple[float, str]]] = {}
@@ -101,19 +106,38 @@ class WalletScorer:
         size: float,
         buyer: str,
         seller: str,
+        exchange_time: float = 0.0,
     ) -> None:
         """Record a trade with wallet addresses.
 
         Called from WS trade callback for every trade on our coins.
+
+        Bug #5 fix: Use exchange_time (from HL trade 'time' field, ms epoch)
+        instead of local time.time(). This prevents WS subscription replay trades
+        from being recorded with current timestamps and fabricating metaorders.
+        Trades older than 120s are silently dropped (stale replay).
         """
         if not buyer or not seller:
             return
 
-        notional = price * size
+        # Use exchange time if provided, else fall back to local
         now = time.time()
+        ts = exchange_time if exchange_time > 0 else now
+
+        # Bug #5: Drop stale replay trades (>120s old)
+        if now - ts > 120.0:
+            return
+
+        notional = price * size
+
+        # Track per-coin trade sizes for institutional clip detection
+        with self._lock:
+            if coin not in self._coin_trade_sizes:
+                self._coin_trade_sizes[coin] = deque(maxlen=self._coin_trade_size_window)
+            self._coin_trade_sizes[coin].append(notional)
 
         trade = WalletTrade(
-            coin=coin, timestamp=now, side=side,
+            coin=coin, timestamp=ts, side=side,
             price=price, size=size, notional=notional,
             buyer=buyer, seller=seller,
         )
@@ -265,8 +289,25 @@ class WalletScorer:
             ]
 
     def _ensure_wallet(self, address: str) -> None:
-        """Create wallet stats entry if it doesn't exist."""
+        """Create wallet stats entry if it doesn't exist.
+
+        Bug #6 fix: Cap wallet dict at 100K entries. If exceeded, evict
+        the oldest non-toxic wallets by last_trade_time.
+        """
         if address not in self._wallets:
+            if len(self._wallets) >= 100_000:
+                # Evict oldest non-toxic wallets
+                non_toxic = [
+                    (ws.last_trade_time, addr)
+                    for addr, ws in self._wallets.items()
+                    if not ws.is_toxic
+                ]
+                if non_toxic:
+                    non_toxic.sort()
+                    # Evict oldest 10%
+                    evict_count = max(1, len(non_toxic) // 10)
+                    for _, addr in non_toxic[:evict_count]:
+                        del self._wallets[addr]
             self._wallets[address] = WalletStats(address=address)
 
     def _apply_decay(self, ws: WalletStats) -> float:
@@ -321,21 +362,24 @@ class WalletScorer:
     # ------------------------------------------------------------------
 
     def detect_metaorders(self, coin: str) -> None:
-        """Scan recent trades for active metaorder patterns.
+        """Scan recent trades for active metaorder patterns on a single coin.
 
         A metaorder is: same wallet, same direction, >= 3 clips in <= 90s,
-        with regular cadence (CV < 0.6) and meaningful notional (>= $1K).
+        with regular cadence (CV < 0.6) and meaningful notional (>= $200).
 
         Called every tick. Updates self._active_metaorders[coin].
+
+        For batch scanning across many coins, use detect_metaorders_batch()
+        which iterates the deque once instead of N times.
         """
         with self._lock:
             now = time.time()
             cutoff = now - 90.0
 
-            # Group recent trades by (coin, aggressor, direction)
-            # Only look at trades on this coin in the last 90s
+            # Group recent trades by (aggressor, direction) for this coin only
             wallet_clips: dict[tuple[str, str], list[WalletTrade]] = {}
-            for trade in reversed(list(self._recent_trades)):
+            for i in range(len(self._recent_trades) - 1, -1, -1):
+                trade = self._recent_trades[i]
                 if trade.timestamp < cutoff:
                     break
                 if trade.coin != coin:
@@ -347,90 +391,195 @@ class WalletScorer:
                     wallet_clips[key] = []
                 wallet_clips[key].append(trade)
 
-            # Check each wallet's clips for metaorder signature
-            best_signal: Optional[MetaorderSignal] = None
-            best_confidence = 0.0
+            best_signal = self._evaluate_clips(coin, wallet_clips)
 
-            for (wallet, direction), clips in wallet_clips.items():
-                if len(clips) < 3:
-                    continue
-
-                # Sort by time (oldest first)
-                clips.sort(key=lambda t: t.timestamp)
-
-                # Total notional
-                total_notional = sum(t.notional for t in clips)
-                if total_notional < 1000.0:  # $1K minimum
-                    continue
-
-                # Same-side share (should be >= 80% — all clips are same direction by construction)
-                # Check if this wallet also had opposite-direction trades
-                opp_key = (wallet, "sell" if direction == "buy" else "buy")
-                opp_clips = wallet_clips.get(opp_key, [])
-                opp_notional = sum(t.notional for t in opp_clips)
-                if opp_notional > 0:
-                    same_share = total_notional / (total_notional + opp_notional)
-                    if same_share < 0.80:
-                        continue  # too much opposing flow, not a clean metaorder
-                else:
-                    same_share = 1.0
-
-                # Cadence regularity (coefficient of variation of inter-trade intervals)
-                intervals = [
-                    clips[i + 1].timestamp - clips[i].timestamp
-                    for i in range(len(clips) - 1)
-                ]
-                if len(intervals) >= 2:
-                    mean_interval = sum(intervals) / len(intervals)
-                    if mean_interval > 0:
-                        std_interval = (
-                            sum((iv - mean_interval) ** 2 for iv in intervals) / len(intervals)
-                        ) ** 0.5
-                        cv = std_interval / mean_interval
-                    else:
-                        cv = 999.0
-                else:
-                    cv = 0.0  # only 1 interval, can't measure regularity
-
-                # Confidence: combines clip count, notional, and regularity
-                clip_conf = min(1.0, len(clips) / 5.0)  # 5 clips = max confidence
-                notional_conf = min(1.0, total_notional / 5000.0)  # $5K = max
-                regularity_conf = max(0.0, 1.0 - cv) if cv < 1.0 else 0.0
-                confidence = clip_conf * 0.4 + notional_conf * 0.3 + regularity_conf * 0.3
-
-                # Max gap check: no single interval > 45s (reject slow discretionary)
-                max_gap = max(intervals) if intervals else 0
-                if max_gap > 45.0:
-                    continue
-
-                if confidence > best_confidence and cv < 0.6:
-                    best_confidence = confidence
-                    avg_interval = sum(intervals) / len(intervals) if intervals else 30.0
-                    best_signal = MetaorderSignal(
-                        wallet=wallet,
-                        coin=coin,
-                        direction=direction,
-                        clip_count=len(clips),
-                        total_notional=total_notional,
-                        avg_interval_s=avg_interval,
-                        cv=cv,
-                        confidence=confidence,
-                        first_seen=clips[0].timestamp,
-                        last_seen=clips[-1].timestamp,
-                    )
-
+            # Bug #7 fix: Log metaorder detection so dry runs show signal activity
+            prev_signal = self._active_metaorders.get(coin)
+            if best_signal and not prev_signal:
+                logger.info(
+                    f"[{coin}] METAORDER DETECTED: {best_signal.direction} "
+                    f"wallet={best_signal.wallet[:10]}... "
+                    f"clips={best_signal.clip_count} "
+                    f"notional=${best_signal.total_notional:.0f} "
+                    f"interval={best_signal.avg_interval_s:.1f}s "
+                    f"cv={best_signal.cv:.2f} "
+                    f"conf={best_signal.confidence:.2f}"
+                )
+            elif prev_signal and not best_signal:
+                logger.info(f"[{coin}] METAORDER EXPIRED: was {prev_signal.direction} from {prev_signal.wallet[:10]}...")
             self._active_metaorders[coin] = best_signal
 
+    def detect_metaorders_batch(self, coins: set[str]) -> dict[str, Optional["MetaorderSignal"]]:
+        """Scan recent trades for metaorder patterns across ALL coins in one pass.
+
+        Instead of calling detect_metaorders(coin) N times (each iterating the
+        full deque), we iterate the deque ONCE and group by coin. This is O(T)
+        instead of O(N*T) where T = trades in window, N = monitored coins.
+
+        Returns dict of coin -> MetaorderSignal (or None).
+        """
+        with self._lock:
+            now = time.time()
+            cutoff = now - 90.0
+
+            # Single pass: group trades by (coin, aggressor, direction)
+            wallet_clips: dict[str, dict[tuple[str, str], list[WalletTrade]]] = {}
+            for i in range(len(self._recent_trades) - 1, -1, -1):
+                trade = self._recent_trades[i]
+                if trade.timestamp < cutoff:
+                    break
+                if trade.coin not in coins:
+                    continue
+                aggressor = trade.buyer if trade.side == "B" else trade.seller
+                direction = "buy" if trade.side == "B" else "sell"
+                if trade.coin not in wallet_clips:
+                    wallet_clips[trade.coin] = {}
+                key = (aggressor, direction)
+                if key not in wallet_clips[trade.coin]:
+                    wallet_clips[trade.coin][key] = []
+                wallet_clips[trade.coin][key].append(trade)
+
+            # Evaluate each coin's clips
+            results: dict[str, Optional[MetaorderSignal]] = {}
+            for coin in coins:
+                coin_clips = wallet_clips.get(coin, {})
+                best_signal = self._evaluate_clips(coin, coin_clips)
+
+                # Logging: only log transitions. Use _batch_prev to avoid
+                # false re-logs caused by get_active_metaorder() expiry side-effect
+                # clearing _active_metaorders between ticks.
+                prev_signal = self._active_metaorders.get(coin)
+                if best_signal and not prev_signal:
+                    logger.info(
+                        f"[{coin}] METAORDER DETECTED: {best_signal.direction} "
+                        f"wallet={best_signal.wallet[:10]}... "
+                        f"clips={best_signal.clip_count} "
+                        f"notional=${best_signal.total_notional:.0f} "
+                        f"interval={best_signal.avg_interval_s:.1f}s "
+                        f"cv={best_signal.cv:.2f} "
+                        f"conf={best_signal.confidence:.2f}"
+                    )
+                elif prev_signal and not best_signal:
+                    logger.info(f"[{coin}] METAORDER EXPIRED: was {prev_signal.direction} from {prev_signal.wallet[:10]}...")
+                # Always update stored state (even if same signal continues)
+                self._active_metaorders[coin] = best_signal
+                results[coin] = best_signal
+
+            return results
+
+    def _evaluate_clips(
+        self,
+        coin: str,
+        wallet_clips: dict[tuple[str, str], list["WalletTrade"]],
+    ) -> Optional["MetaorderSignal"]:
+        """Evaluate wallet clips for a single coin. Returns best signal or None.
+
+        Extracted from detect_metaorders so it can be shared by both
+        single-coin and batch paths.
+        """
+        best_signal: Optional[MetaorderSignal] = None
+        best_confidence = 0.0
+
+        for (wallet, direction), clips in wallet_clips.items():
+            if len(clips) < 5:  # was 3 — too loose, caught retail. Real TWAPs have 5+ clips
+                continue
+
+            clips.sort(key=lambda t: t.timestamp)
+
+            total_notional = sum(t.notional for t in clips)
+            if total_notional < 500.0:  # was $200 — raised, $200 is noise on any coin
+                continue
+
+            opp_key = (wallet, "sell" if direction == "buy" else "buy")
+            opp_clips = wallet_clips.get(opp_key, [])
+            opp_notional = sum(t.notional for t in opp_clips)
+            if opp_notional > 0:
+                same_share = total_notional / (total_notional + opp_notional)
+                if same_share < 0.80:
+                    continue
+            else:
+                same_share = 1.0
+
+            intervals = [
+                clips[i + 1].timestamp - clips[i].timestamp
+                for i in range(len(clips) - 1)
+            ]
+            if len(intervals) >= 2:
+                mean_interval = sum(intervals) / len(intervals)
+                # Minimum average interval: real TWAPs have >= 2s between clips.
+                # Sub-second bursts are WS subscription replays or market orders,
+                # not algorithmic execution.
+                if mean_interval < 2.0:
+                    continue
+                if mean_interval > 0:
+                    std_interval = (
+                        sum((iv - mean_interval) ** 2 for iv in intervals) / len(intervals)
+                    ) ** 0.5
+                    cv = std_interval / mean_interval
+                else:
+                    cv = 999.0
+            else:
+                cv = 0.0
+
+            clip_conf = min(1.0, len(clips) / 5.0)
+            notional_conf = min(1.0, total_notional / 5000.0)
+            regularity_conf = max(0.0, 1.0 - cv) if cv < 1.0 else 0.0
+            confidence = clip_conf * 0.4 + notional_conf * 0.3 + regularity_conf * 0.3
+
+            max_gap = max(intervals) if intervals else 0
+            if max_gap > 45.0:
+                continue
+
+            if confidence > best_confidence and cv < 0.6:
+                best_confidence = confidence
+                avg_interval = sum(intervals) / len(intervals) if intervals else 30.0
+                best_signal = MetaorderSignal(
+                    wallet=wallet,
+                    coin=coin,
+                    direction=direction,
+                    clip_count=len(clips),
+                    total_notional=total_notional,
+                    avg_interval_s=avg_interval,
+                    cv=cv,
+                    confidence=confidence,
+                    first_seen=clips[0].timestamp,
+                    last_seen=clips[-1].timestamp,
+                )
+
+        return best_signal
+
+    def get_coin_trade_stats(self, coin: str) -> tuple[float, float]:
+        """Get median trade size and count for a coin.
+
+        Returns (median_notional, n_trades). Used by orchestrator to compute
+        clip_size_ratio = metaorder_avg_clip / median_trade for institutional
+        detection.
+        """
+        with self._lock:
+            sizes = self._coin_trade_sizes.get(coin)
+            if not sizes or len(sizes) < 10:
+                return (0.0, 0)
+            sorted_sizes = sorted(sizes)
+            median = sorted_sizes[len(sorted_sizes) // 2]
+            return (median, len(sizes))
+
     def get_active_metaorder(self, coin: str) -> Optional["MetaorderSignal"]:
-        """Get the currently detected metaorder for a coin (or None)."""
+        """Get the currently detected metaorder for a coin (or None).
+
+        Note: expiry check is read-only. Does NOT clear the stored signal
+        (that's detect_metaorders/detect_metaorders_batch's job). This avoids
+        a bug where the expiry side-effect caused batch detection to re-log
+        "DETECTED" every tick for the same ongoing metaorder.
+        """
         signal = self._active_metaorders.get(coin)
         if signal is None:
             return None
-        # Expire if last clip was > 2 expected intervals ago
+        # Expire if last clip was > 4x expected interval ago
+        # (was 2.5x — too aggressive, cuts off moves early.
+        # A whale might pause 30s between TWAP legs. 4x gives more room.)
         now = time.time()
-        expiry = signal.last_seen + signal.avg_interval_s * 2.5
+        expiry = signal.last_seen + signal.avg_interval_s * 4.0
         if now > expiry:
-            self._active_metaorders[coin] = None
             return None
         return signal
 

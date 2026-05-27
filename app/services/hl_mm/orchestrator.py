@@ -76,6 +76,7 @@ class HLMarketMaker:
         dry_run: bool = False,
         config: Optional[HLMMConfig] = None,
         query_address: Optional[str] = None,
+        rider_only: bool = False,
     ):
         # Credentials
         # address = signing address (agent wallet from env)
@@ -97,6 +98,7 @@ class HLMarketMaker:
 
         self.leverage = leverage
         self.dry_run = dry_run
+        self.rider_only = rider_only
         self.mongo_uri = mongo_uri
         self._initial_coins = initial_coins or []  # empty = screener auto-selects
         self.config = config or load_config()
@@ -138,6 +140,10 @@ class HLMarketMaker:
         self._start_time = 0.0
         self._tick_count = 0
         self._active_coins: set[str] = set()
+        # V3 rider: monitoring coins get trade-only WS (no L2 book, no quoting)
+        # Metaorder detection runs across this wider set. On detection, coins
+        # are promoted to _active_coins (lazy L2 subscribe + quoting).
+        self._monitoring_coins: set[str] = set()
         self._bybit_ws_task: Optional[asyncio.Task] = None
         self._hl_ws_tasks: dict[str, asyncio.Task] = {}
         self._last_mongo_flush: float = 0.0
@@ -204,6 +210,17 @@ class HLMarketMaker:
         # late fills. Keeps processing fills for 30s after deactivation to prevent
         # orphaned positions from cancel-race with late fills.
         self._cooling_coins: dict[str, float] = {}  # coin -> deactivation timestamp
+        # Bug #1 fix: coins demoted from active that should return to monitoring after cooling
+        self._pending_monitoring_restore: set[str] = set()
+
+        # V3 Rider: Coin liquidity context for metaorder normalization
+        self._coin_daily_volume: dict[str, float] = {}  # coin -> 24h USD volume
+
+        # V3 Rider: Paper PnL tracking for dry run episode simulation
+        # Records entry price when EPISODE_ENTRY fires, computes theoretical
+        # markout when episode ends. Answers: "would this have been a winner?"
+        self._paper_episodes: list[dict] = []  # completed episodes
+        self._paper_active: dict[str, dict] = {}  # coin -> {direction, entry_price, entry_time, conf}
 
         # Bug #14: Sticky daily stop — tracks the UTC date when stopped
         self._daily_stop_sticky: bool = False
@@ -362,8 +379,10 @@ class HLMarketMaker:
         )
         self.risk_manager = RiskManager(risk_cfg)
         logger.info(f"Risk limits: gross=${risk_cfg.max_gross_notional}, net=${risk_cfg.max_net_exposure}, resting=${risk_cfg.max_gross_resting}")
-        self.state_machine = StateMachine()
-        self.wallet_scorer = WalletScorer()
+        self.state_machine = StateMachine(rider_only=self.rider_only)
+        # Wider ring buffer for rider mode (50 coins × ~100 trades/90s each)
+        ws_max_history = 50_000 if self.rider_only else 10_000
+        self.wallet_scorer = WalletScorer(max_history=ws_max_history)
         self.mm_tracker = MMTracker(
             target_coins=set(self._initial_coins),
             poll_interval_s=60.0,
@@ -381,8 +400,10 @@ class HLMarketMaker:
         """Main entry point. Blocks until shutdown."""
         logger.info(
             f"HL MM starting: coins={self._initial_coins} leverage={self.leverage} "
-            f"dry_run={self.dry_run}"
+            f"dry_run={self.dry_run} rider_only={self.rider_only}"
         )
+        if self.rider_only:
+            logger.info("V3 RIDER MODE: will only quote when metaorder detected (IDLE -> EPISODE_ENTRY)")
 
         # Init SDK (REST calls) — retry on 429 with backoff
         for attempt in range(5):
@@ -436,9 +457,24 @@ class HLMarketMaker:
         await self._sync_positions_on_startup()
 
         # Determine which coins to activate:
-        # If coins specified via --coins: force-activate them (immune to demotion)
-        # If empty: run screener immediately to auto-select from MongoDB L2 stats
-        if self._initial_coins:
+        # V3 rider-only: populate wide monitoring set (trade-only WS)
+        # V2 / non-rider: activate coins for immediate quoting
+        if self.rider_only:
+            # Rider mode: wide-universe monitoring, no active quoting at startup
+            logger.info("Rider-only mode: populating wide monitoring set...")
+            try:
+                monitoring_coins = await self._get_monitoring_universe()
+                self._set_monitoring_coins(monitoring_coins)
+                logger.info(
+                    f"Rider monitoring {len(self._monitoring_coins)} coins "
+                    f"(trade-only WS, waiting for metaorders)"
+                )
+            except Exception as e:
+                logger.error(f"Monitoring set init failed: {e}")
+                # Fallback: use manual coins if specified
+                if self._initial_coins:
+                    self._set_monitoring_coins(set(self._initial_coins))
+        elif self._initial_coins:
             for coin in self._initial_coins:
                 await self._set_leverage(coin)
             for coin in self._initial_coins:
@@ -705,6 +741,64 @@ class HLMarketMaker:
         # Funding avoidance
         funding_window = self.risk_manager.is_funding_avoidance_window()
 
+        # === V3 RIDER: Pre-scan monitoring coins for metaorders ===
+        # Warmup: skip for first 30s — WS subscriptions replay recent trades
+        # that produce false-positive metaorder detections on startup.
+        past_rider_warmup = (now - self._start_time > 30.0)
+        if self.rider_only and self._monitoring_coins and past_rider_warmup:
+            all_monitored = self._monitoring_coins | self._active_coins
+            metaorder_results = self.wallet_scorer.detect_metaorders_batch(all_monitored)
+
+            # Promote monitoring coins where a metaorder is significant
+            # Three normalization factors:
+            # 1. flow_share: metaorder_notional / daily_volume (market impact)
+            # 2. clip_size_ratio: avg clip size / median trade size (institutional vs retail)
+            # Combined score determines if this is worth riding
+            for coin, signal in metaorder_results.items():
+                if signal is not None and coin in self._monitoring_coins:
+                    # Flow share: metaorder_notional / daily_volume
+                    daily_vol = self._coin_daily_volume.get(coin, 0)
+                    flow_share = (signal.total_notional / daily_vol * 100) if daily_vol > 0 else 0
+
+                    # Clip size ratio: avg clip / median trade (>3x = institutional)
+                    median_trade, n_trades = self.wallet_scorer.get_coin_trade_stats(coin)
+                    avg_clip = signal.total_notional / signal.clip_count if signal.clip_count > 0 else 0
+                    clip_ratio = (avg_clip / median_trade) if median_trade > 0 else 0
+
+                    # Gate: EITHER flow_share is meaningful OR clips are institutional-sized
+                    # This catches both:
+                    # - $500 shitcoin TWAP (high flow_share, normal clip size)
+                    # - $50M ETH TWAP (low flow_share but enormous clip_ratio)
+                    min_flow_share = 0.03  # 0.03% of daily volume (was 0.01 — much tighter)
+                    min_clip_ratio = 8.0   # 8x normal trade size (was 3x — 3x is retail on majors)
+                    passes_flow = flow_share >= min_flow_share
+                    passes_clip = clip_ratio >= min_clip_ratio and n_trades >= 50
+
+                    if not passes_flow and not passes_clip:
+                        continue  # noise — neither significant flow nor institutional clips
+
+                    promo_key = f"{coin}:{signal.wallet}"
+                    if promo_key not in getattr(self, '_promotion_attempted', set()):
+                        if not hasattr(self, '_promotion_attempted'):
+                            self._promotion_attempted = set()
+                        self._promotion_attempted.add(promo_key)
+                        gate = "flow" if passes_flow else "clip_size"
+                        logger.info(
+                            f"[{coin}] Metaorder promoting ({gate}) — "
+                            f"{signal.direction} conf={signal.confidence:.2f} "
+                            f"${signal.total_notional:.0f} flow={flow_share:.4f}% "
+                            f"clip_ratio={clip_ratio:.1f}x "
+                            f"(daily=${daily_vol/1e6:.1f}M med_trade=${median_trade:.0f})"
+                        )
+                        await self._promote_to_active(coin, signal)
+                elif signal is None and coin in self._monitoring_coins:
+                    # Metaorder ended — clear promotion cooldown for this coin
+                    if hasattr(self, '_promotion_attempted'):
+                        self._promotion_attempted = {
+                            k for k in self._promotion_attempted
+                            if not k.startswith(f"{coin}:")
+                        }
+
         # === STEP 3: Per-pair processing ===
         current_mids: dict[str, float] = {}
 
@@ -942,7 +1036,10 @@ class HLMarketMaker:
                         ask_ev = False  # suppress ask (toxic to sell into selling pressure)
 
             # V3: Detect metaorders from wallet trade stream
-            self.wallet_scorer.detect_metaorders(coin)
+            # In rider mode, batch detection already ran in pre-scan above.
+            # Just fetch the cached result. In V2 mode, detect per-coin.
+            if not self.rider_only:
+                self.wallet_scorer.detect_metaorders(coin)
             metaorder = self.wallet_scorer.get_active_metaorder(coin)
             # Get current state for metaorder_expired check
             _current_state = self.state_machine.get_state(coin)
@@ -979,6 +1076,7 @@ class HLMarketMaker:
                     and _current_state is not None
                     and _current_state.state in (PairState.EPISODE_ENTRY, PairState.EPISODE_EXIT)
                 ),
+                current_mid=fair_value,
             )
 
             # Codex #6: If pair is demoted (pending idle close), override to exit-only.
@@ -994,11 +1092,84 @@ class HLMarketMaker:
 
             # Run state machine
             # Capture previous quoting sides to detect changes
+            # NOTE: get_state returns a mutable reference — capture VALUES before transition
             prev_state_info = self.state_machine.get_state(coin)
             prev_quote_bid = prev_state_info.quote_bid if prev_state_info else False
             prev_quote_ask = prev_state_info.quote_ask if prev_state_info else False
+            prev_state_enum = prev_state_info.state if prev_state_info else None
 
             state_info = self.state_machine.transition(coin, ctx)
+
+            # V3 Rider: Paper episode PnL tracking (dry run simulation)
+            if self.rider_only:
+                # Use captured enum value (prev_state_enum), not object ref
+                # (state machine modifies PairStateInfo in-place during transition)
+                prev_was_episode = prev_state_enum == PairState.EPISODE_ENTRY
+                now_is_episode = state_info.state == PairState.EPISODE_ENTRY
+
+                # Episode started
+                if now_is_episode and not prev_was_episode and coin not in self._paper_active:
+                    daily_vol = self._coin_daily_volume.get(coin, 0)
+                    mo = self.wallet_scorer.get_active_metaorder(coin)
+                    mo_notional = mo.total_notional if mo else 0
+                    flow_share = (mo_notional / daily_vol * 100) if daily_vol > 0 else 0
+                    self._paper_active[coin] = {
+                        "direction": ctx.metaorder_direction,
+                        "entry_price": fair_value,
+                        "entry_time": now,
+                        "confidence": ctx.metaorder_confidence,
+                        "flow_share_pct": flow_share,
+                        "mo_notional": mo_notional,
+                        "daily_volume": daily_vol,
+                        # MFE/MAE tracking
+                        "peak_favorable": fair_value,
+                        "peak_adverse": fair_value,
+                        "price_path": [fair_value],
+                    }
+
+                # Episode in progress — update MFE/MAE
+                elif now_is_episode and coin in self._paper_active and fair_value > 0:
+                    ep = self._paper_active[coin]
+                    ep["price_path"].append(fair_value)
+                    if ep["direction"] == "buy":
+                        ep["peak_favorable"] = max(ep["peak_favorable"], fair_value)
+                        ep["peak_adverse"] = min(ep["peak_adverse"], fair_value)
+                    else:  # sell
+                        ep["peak_favorable"] = min(ep["peak_favorable"], fair_value)
+                        ep["peak_adverse"] = max(ep["peak_adverse"], fair_value)
+
+                # Episode ended (was in episode, now isn't)
+                elif prev_was_episode and not now_is_episode and coin in self._paper_active:
+                    ep = self._paper_active.pop(coin)
+                    exit_price = fair_value
+                    if ep["entry_price"] > 0 and exit_price > 0:
+                        entry = ep["entry_price"]
+                        if ep["direction"] == "buy":
+                            pnl_bps = (exit_price - entry) / entry * 10000
+                            mfe_bps = (ep["peak_favorable"] - entry) / entry * 10000
+                            mae_bps = (entry - ep["peak_adverse"]) / entry * 10000
+                        else:
+                            pnl_bps = (entry - exit_price) / entry * 10000
+                            mfe_bps = (entry - ep["peak_favorable"]) / entry * 10000
+                            mae_bps = (ep["peak_adverse"] - entry) / entry * 10000
+                        duration = now - ep["entry_time"]
+                        winner = "WIN" if pnl_bps > 0 else "LOSS"
+                        self._paper_episodes.append({
+                            "coin": coin, "direction": ep["direction"],
+                            "entry_price": entry, "exit_price": exit_price,
+                            "pnl_bps": pnl_bps, "mfe_bps": mfe_bps, "mae_bps": mae_bps,
+                            "duration_s": duration, "confidence": ep["confidence"],
+                            "winner": pnl_bps > 0, "n_ticks": len(ep["price_path"]),
+                            "flow_share_pct": ep.get("flow_share_pct", 0),
+                            "mo_notional": ep.get("mo_notional", 0),
+                            "daily_volume": ep.get("daily_volume", 0),
+                        })
+                        flow_str = f"flow={ep.get('flow_share_pct', 0):.4f}%" if ep.get('flow_share_pct') else ""
+                        logger.info(
+                            f"[{coin}] PAPER {winner}: {ep['direction']} "
+                            f"pnl={pnl_bps:+.1f}bps MFE={mfe_bps:+.1f}bps MAE={mae_bps:.1f}bps "
+                            f"dur={duration:.0f}s conf={ep['confidence']:.2f} {flow_str}"
+                        )
 
             # IMMEDIATE CANCEL on state transition: if a side was quoting and now
             # isn't, cancel that side's order RIGHT NOW instead of waiting for
@@ -1346,8 +1517,16 @@ class HLMarketMaker:
                     "late fill during deactivation cooling"
                 )
             else:
-                self._unsubscribe_hl_ws(cool_coin)
-                logger.info(f"Cooling {cool_coin}: expired, fully deactivated")
+                # Bug #1 fix: if this coin was demoted from rider active,
+                # restore to monitoring (unsubscribe L2 only, keep trades)
+                if cool_coin in self._pending_monitoring_restore:
+                    self._unsubscribe_hl_l2_only(cool_coin)
+                    self._monitoring_coins.add(cool_coin)
+                    self._pending_monitoring_restore.discard(cool_coin)
+                    logger.info(f"Cooling {cool_coin}: restored to monitoring set")
+                else:
+                    self._unsubscribe_hl_ws(cool_coin)
+                    logger.info(f"Cooling {cool_coin}: expired, fully deactivated")
             del self._cooling_coins[cool_coin]
 
         # === STEP 6: Status log (every 60s) ===
@@ -1432,8 +1611,15 @@ class HLMarketMaker:
         # V3: Episode state transition on fill
         # If in EPISODE_ENTRY and we got filled → move to EPISODE_EXIT
         # Fix #1 (R2): Also update quote flags to prevent stale entry-side quoting
+        # Note (Bug #8 review): inventory.record_fill() is called ABOVE this block
+        # (line ~1428), so next tick's ctx.inventory_usd will be correct. No race.
         _fill_state = self.state_machine.get_state(coin)
         if _fill_state and _fill_state.state == PairState.EPISODE_ENTRY:
+            # Set trailing stop state before transitioning
+            _fill_state.episode_entry_price = price
+            _fill_state.episode_direction = "buy" if side == "bid" else "sell"
+            _fill_state.episode_peak_price = price  # start tracking from fill price
+            _fill_state.trailing_activated = False
             self.state_machine.force_state(
                 coin, PairState.EPISODE_EXIT,
                 f"episode fill: {side} {size:.2f} @ ${price:.6f}"
@@ -1526,8 +1712,18 @@ class HLMarketMaker:
     # ==================================================================
 
     def _subscribe_hl_ws(self, coin: str) -> None:
-        """Subscribe to HL WS L2 book + trades for a coin."""
+        """Subscribe to HL WS L2 book + trades for a coin (full — active quoting).
+
+        Bug #2 fix: Check cooling coins to avoid duplicate subscriptions.
+        Cooling coins already have L2+trades subscribed from their previous
+        activation. Don't subscribe again.
+        """
         if not self.info:
+            return
+
+        # Bug #2: if coin is in cooling, WS subs are still alive — skip
+        if coin in self._cooling_coins:
+            logger.debug(f"Skipping HL WS subscribe for {coin} — already subscribed (cooling)")
             return
 
         try:
@@ -1535,16 +1731,48 @@ class HLMarketMaker:
                 {"type": "l2Book", "coin": coin},
                 lambda data: self._on_hl_book(coin, data),
             )
+            # Only subscribe trades if not already monitoring (avoid duplicate sub)
+            if coin not in self._monitoring_coins:
+                self.info.subscribe(
+                    {"type": "trades", "coin": coin},
+                    lambda data: self._on_hl_trades(coin, data),
+                )
+            logger.debug(f"Subscribed HL WS: {coin} L2 + trades (active)")
+        except Exception as e:
+            logger.error(f"HL WS subscribe failed for {coin}: {e}")
+
+    def _subscribe_hl_trades_only(self, coin: str) -> None:
+        """Subscribe to HL WS trades only (monitoring — no L2 book, no quoting).
+
+        V3 rider: wide-universe monitoring. Trade data feeds wallet_scorer
+        for metaorder detection. L2 book is subscribed lazily on detection.
+        """
+        if not self.info:
+            return
+        try:
             self.info.subscribe(
                 {"type": "trades", "coin": coin},
                 lambda data: self._on_hl_trades(coin, data),
             )
-            logger.debug(f"Subscribed HL WS: {coin} L2 + trades")
+            logger.debug(f"Subscribed HL WS: {coin} trades-only (monitoring)")
         except Exception as e:
-            logger.error(f"HL WS subscribe failed for {coin}: {e}")
+            logger.error(f"HL WS monitor subscribe failed for {coin}: {e}")
+
+    def _subscribe_hl_l2_only(self, coin: str) -> None:
+        """Subscribe to L2 book only (lazy activation — trades already subscribed)."""
+        if not self.info:
+            return
+        try:
+            self.info.subscribe(
+                {"type": "l2Book", "coin": coin},
+                lambda data: self._on_hl_book(coin, data),
+            )
+            logger.debug(f"Subscribed HL WS: {coin} L2 (lazy activation)")
+        except Exception as e:
+            logger.error(f"HL WS L2 subscribe failed for {coin}: {e}")
 
     def _unsubscribe_hl_ws(self, coin: str) -> None:
-        """Unsubscribe from HL WS for a coin."""
+        """Unsubscribe from ALL HL WS for a coin (L2 + trades)."""
         if not self.info:
             return
         try:
@@ -1552,6 +1780,200 @@ class HLMarketMaker:
             self.info.unsubscribe({"type": "trades", "coin": coin}, None)
         except Exception:
             pass
+
+    def _unsubscribe_hl_l2_only(self, coin: str) -> None:
+        """Unsubscribe L2 book only (demoting from active back to monitoring)."""
+        if not self.info:
+            return
+        try:
+            self.info.unsubscribe({"type": "l2Book", "coin": coin}, None)
+        except Exception:
+            pass
+
+    def _unsubscribe_hl_trades_only(self, coin: str) -> None:
+        """Unsubscribe trades only (removing from monitoring set)."""
+        if not self.info:
+            return
+        try:
+            self.info.unsubscribe({"type": "trades", "coin": coin}, None)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # V3 Rider: Wide-universe monitoring management
+    # ------------------------------------------------------------------
+
+    def _set_monitoring_coins(self, new_set: set[str]) -> None:
+        """Update the monitoring set. Subscribe/unsubscribe trade feeds as needed.
+
+        Coins that are already in _active_coins are skipped (they already have
+        full WS subscriptions).
+        """
+        # Only monitor coins that are NOT active (active = full WS)
+        effective_new = new_set - self._active_coins
+        effective_old = self._monitoring_coins - self._active_coins
+
+        to_add = effective_new - effective_old
+        to_remove = effective_old - effective_new
+
+        for coin in to_add:
+            self._subscribe_hl_trades_only(coin)
+        for coin in to_remove:
+            self._unsubscribe_hl_trades_only(coin)
+
+        self._monitoring_coins = effective_new
+        if to_add or to_remove:
+            logger.info(
+                f"Monitoring set updated: {len(self._monitoring_coins)} coins "
+                f"(+{len(to_add)} -{len(to_remove)})"
+            )
+
+    async def _promote_to_active(self, coin: str, metaorder: object) -> bool:
+        """Promote a monitoring coin to active quoting (lazy L2 activation).
+
+        Returns True if activation succeeded (spread/depth viable).
+        Called when a metaorder is detected on a monitoring-only coin.
+        """
+        if coin in self._active_coins:
+            return True  # already active
+
+        # Bug #7 fix: check risk gate before promoting
+        # Rider mode allows more active pairs (up to 5) since we only quote
+        # on metaorder signals, not continuously. The per-coin capital at risk
+        # is bounded by episode sizing, not pair count.
+        rider_max = 5
+        active_count = len(self._active_coins)
+        if self.rider_only and active_count >= rider_max:
+            logger.info(f"[{coin}] Metaorder detected but rider max pairs ({rider_max}) reached")
+            return False
+        elif not self.rider_only and not self.risk_manager.can_add_pair(active_count):
+            logger.info(f"[{coin}] Metaorder detected but risk gate denies — max pairs reached")
+            return False
+
+        # Bug #3 fix: Move coin from monitoring to a "promoting" state so
+        # _set_monitoring_coins won't unsubscribe trades during the sleep.
+        # Remove from monitoring BEFORE the sleep, add to active AFTER.
+        self._monitoring_coins.discard(coin)
+
+        # Step 1: Subscribe to L2 book (trades already subscribed via monitoring)
+        self._subscribe_hl_l2_only(coin)
+
+        # Step 2: Wait briefly for book initialization
+        await asyncio.sleep(0.5)
+
+        # Step 3: Check spread/depth viability
+        # Use signal_engine book data if available, otherwise accept
+        async with self._signal_lock:
+            sig = self.signal_engine.get_signal(coin)
+
+        viable = True
+        if sig and sig.book_age_ms < 5000 and sig.book is not None:
+            # Book is fresh — check spread
+            if sig.book.spread_bps > 30.0:
+                logger.info(
+                    f"[{coin}] Metaorder detected but spread too wide "
+                    f"({sig.book.spread_bps:.1f}bps > 30bps) — skipping activation"
+                )
+                self._unsubscribe_hl_l2_only(coin)
+                # Bug #3 fix: restore to monitoring since we removed it early
+                self._monitoring_coins.add(coin)
+                viable = False
+        # else: no book data yet, accept (we'll check on next tick)
+
+        if viable:
+            # Step 4: Set leverage and activate
+            await self._set_leverage(coin)
+            self._active_coins.add(coin)
+            self.state_machine.register_pair(coin)
+
+            # Set anchor tier
+            if coin in BYBIT_PERPS:
+                self.fv_engine.set_tier(coin, AnchorTier.DIRECT)
+            else:
+                self.fv_engine.set_tier(coin, AnchorTier.SYNTHETIC)
+
+            logger.info(
+                f"[{coin}] PROMOTED to active — metaorder "
+                f"{metaorder.direction} conf={metaorder.confidence:.2f}"
+            )
+
+        return viable
+
+    async def _get_monitoring_universe(self, top_n: int = 50) -> set[str]:
+        """Get top N coins by 24h volume from HL meta for monitoring.
+
+        Uses the same HL meta endpoint as the screener but with minimal
+        filtering — only excludes truly untradeable coins.
+        """
+        # Rider-mode blocked: only coins that are structurally untradeable
+        rider_blocked = {"PURR", "JEFF"}  # HYPE included in monitoring (whales trade it)
+
+        try:
+            meta = self.info.meta_and_asset_ctxs()
+            if not meta or len(meta) < 2:
+                return set()
+
+            universe = meta[0].get("universe", [])
+            contexts = meta[1]
+
+            # Rank by 24h volume
+            pairs = []
+            for pair_info, ctx in zip(universe, contexts):
+                coin = pair_info.get("name", "")
+                if coin in rider_blocked:
+                    continue
+                daily_vol = float(ctx.get("dayNtlVlm", 0) or 0)
+                if daily_vol > 100_000:  # $100K minimum daily volume
+                    pairs.append((coin, daily_vol))
+
+            # Sort by volume descending, take top N
+            pairs.sort(key=lambda x: x[1], reverse=True)
+            result = {coin for coin, _ in pairs[:top_n]}
+
+            # Cache daily volumes for metaorder normalization
+            for coin, vol in pairs[:top_n]:
+                self._coin_daily_volume[coin] = vol
+
+            # Also cache sz_decimals for potential activation
+            for pair_info in universe:
+                name = pair_info.get("name", "")
+                if name in result:
+                    self._sz_decimals[name] = pair_info.get("szDecimals", 4)
+
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get monitoring universe: {e}")
+            return set()
+
+    async def _demote_to_monitoring(self, coin: str) -> None:
+        """Demote an active coin back to monitoring-only (metaorder expired, no position).
+
+        Bug #1 (Codex): Use cooling period to catch late fills from cancel-race,
+        same as _deactivate_coin. Without cooling, a fill that lands after demotion
+        is silently ignored → inventory drift while bot thinks it's flat.
+        """
+        if coin not in self._active_coins:
+            return
+
+        # Only demote if no inventory
+        pos = self.inventory.get_position(coin)
+        if abs(pos.size) > 1e-10:
+            logger.debug(f"[{coin}] Skipping demotion — still has inventory {pos.size:.6f}")
+            return
+
+        # Cancel any remaining orders
+        await asyncio.to_thread(self.quote_engine.cancel_coin, coin)
+        self.state_machine.unregister_pair(coin)
+        self._active_coins.discard(coin)
+
+        # Move to cooling set for 30s (same as _deactivate_coin) to catch late fills.
+        # WS subscriptions stay alive during cooling. After cooling expires,
+        # the cooling cleanup path will unsubscribe L2 and add back to monitoring.
+        self._cooling_coins[coin] = time.time()
+        # Tag this coin for monitoring restoration after cooling
+        self._pending_monitoring_restore.add(coin)
+
+        logger.info(f"[{coin}] DEMOTED to cooling (30s) — will restore to monitoring after")
 
     def _on_hl_book(self, coin: str, data: dict) -> None:
         """Callback for HL WS L2 book updates.
@@ -1614,6 +2036,7 @@ class HLMarketMaker:
 
                 # V2: Feed wallet addresses to WalletScorer
                 # HL trade format: {side, px, sz, hash, time, users: [buyer, seller]}
+                # Bug #5 fix: pass exchange timestamp to prevent replay fabrication
                 for trade in trades:
                     users = trade.get("users", [])
                     if users and len(users) >= 2:
@@ -1622,10 +2045,13 @@ class HLMarketMaker:
                         side = trade.get("side", "")
                         price = float(trade.get("px", 0) or 0)
                         size = float(trade.get("sz", 0) or 0)
+                        # HL trade 'time' is ms epoch
+                        exchange_time = float(trade.get("time", 0) or 0) / 1000.0
                         if price > 0 and size > 0 and (buyer or seller):
                             self.wallet_scorer.record_trade(
                                 coin=coin, side=side, price=price,
                                 size=size, buyer=buyer, seller=seller,
+                                exchange_time=exchange_time,
                             )
 
                 # Bug #9 fix: track last WS message time for watchdog
@@ -1982,18 +2408,29 @@ class HLMarketMaker:
             await asyncio.sleep(60)
 
     async def _screener_loop(self) -> None:
-        """Run pair screener every 15 minutes.
+        """Run pair screener / monitoring set refresh.
 
-        Bug #13: Second-tier coins start in SHADOW and promote to ACTIVE
-        only after first-tier reaches fill count gate. Demoted pairs get
-        deactivated after inventory exit + WS unsubscribe.
+        V3 rider mode: refresh monitoring universe every 15 min (top 50 by volume).
+        V2 mode: original screener rotation (active pair management).
         """
         # Wait for initial data collection
         await asyncio.sleep(30)
 
         while self._running:
             try:
-                if self.screener.should_rescan():
+                if self.rider_only:
+                    # Rider mode: refresh the wide monitoring set
+                    monitoring = await self._get_monitoring_universe(top_n=50)
+                    if monitoring:
+                        self._set_monitoring_coins(monitoring)
+
+                    # Demote active coins whose metaorders expired and have no position
+                    for coin in list(self._active_coins):
+                        metaorder = self.wallet_scorer.get_active_metaorder(coin)
+                        if metaorder is None:
+                            await self._demote_to_monitoring(coin)
+
+                elif self.screener.should_rescan():
                     rankings = await self.screener.scan()
 
                     # Bug #16 fix: Set per-coin VPIN bucket sizes from daily volume
@@ -2540,6 +2977,29 @@ class HLMarketMaker:
             avg_pnl_per_trade=avg_pnl,
             fees=snapshot.total_fees,
         )
+
+        # V3 rider: log monitoring + paper PnL stats
+        if self.rider_only:
+            wallet_stats = self.wallet_scorer.get_summary()
+            episodes = self._paper_episodes
+            if episodes:
+                wins = sum(1 for e in episodes if e["winner"])
+                losses = len(episodes) - wins
+                total_bps = sum(e["pnl_bps"] for e in episodes)
+                avg_bps = total_bps / len(episodes)
+                wr = wins / len(episodes) * 100
+                paper_line = (
+                    f"Paper: {len(episodes)} episodes, {wins}W/{losses}L "
+                    f"({wr:.0f}% WR), avg={avg_bps:+.1f}bps, total={total_bps:+.1f}bps"
+                )
+            else:
+                paper_line = "Paper: 0 episodes yet"
+
+            logger.info(
+                f"Rider: {len(self._monitoring_coins)} monitoring, "
+                f"{len(self._active_coins)} active, "
+                f"{wallet_stats.get('total_wallets', 0)} wallets. {paper_line}"
+            )
 
     def _send_daily_summary(self) -> None:
         """Build and send daily PnL summary via Telegram."""

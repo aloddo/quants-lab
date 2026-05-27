@@ -83,6 +83,11 @@ def main():
         "--config", default=None,
         help="Path to hl_mm_config.yml (default: config/hl_mm_config.yml)",
     )
+    parser.add_argument(
+        "--rider-only", action="store_true",
+        help="V3 metaorder rider mode: only quote when a metaorder is detected. "
+             "Without this flag, runs in V2 mode (quote whenever EV+).",
+    )
     args = parser.parse_args()
 
     # Load environment
@@ -128,12 +133,15 @@ def main():
     print(f"  Coins:     {coins}")
     print(f"  Leverage:  {args.leverage}x")
     print(f"  Dry run:   {args.dry_run}")
+    print(f"  Rider only:{args.rider_only}")
     print(f"  MongoDB:   {mongo_uri}")
     print(f"  Log level: {args.log_level}")
     print("=" * 60)
 
     if args.dry_run:
         print("\n  *** DRY RUN MODE -- no orders will be placed ***\n")
+    if args.rider_only:
+        print("  *** V3 RIDER MODE -- only quoting on detected metaorders ***\n")
 
     # Load config
     config = load_config(args.config)
@@ -145,6 +153,7 @@ def main():
         mongo_uri=mongo_uri,
         dry_run=args.dry_run,
         config=config,
+        rider_only=args.rider_only,
     )
 
     # Handle signals for graceful shutdown (Gap 9)

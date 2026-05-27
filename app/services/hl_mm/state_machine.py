@@ -80,6 +80,9 @@ class PairContext:
     metaorder_confidence: float = 0.0    # 0..1
     metaorder_expired: bool = False      # did the metaorder disappear (2 clips missed)?
 
+    # V3: Episode exit — current mid price for trailing stop computation
+    current_mid: float = 0.0             # current fair value / mid price
+
 
 @dataclass
 class PairStateInfo:
@@ -94,6 +97,11 @@ class PairStateInfo:
     hedge_requested: bool = False       # should orchestrator trigger a hedge?
     pause_until: float = 0.0           # if PAUSE, when can we resume?
     reason: str = ""                    # human-readable reason for state
+    # V3: Trailing stop state for episode exit
+    episode_entry_price: float = 0.0    # price when we got filled (entry)
+    episode_direction: str = ""         # "buy" or "sell" (our position direction)
+    episode_peak_price: float = 0.0     # best price in our favor during exit
+    trailing_activated: bool = False     # has the trail activation threshold been hit?
 
 
 class StateMachine:
@@ -103,11 +111,19 @@ class StateMachine:
     transition() runs on the async tick loop. Lock protects _states dict.
     """
 
-    def __init__(self, pause_cooldown_s: float = 60.0):
+    def __init__(self, pause_cooldown_s: float = 60.0, rider_only: bool = False):
+        """
+        Args:
+            pause_cooldown_s: seconds to stay in PAUSE before returning to IDLE
+            rider_only: if True, suppress V2 quoting paths (QUOTING_BOTH,
+                QUOTING_ONE_SIDE). Only enter trades via EPISODE_ENTRY when a
+                metaorder is detected. This is V3 mode.
+        """
         import threading
         self._lock = threading.Lock()
         self._states: dict[str, PairStateInfo] = {}
         self._pause_cooldown_s = pause_cooldown_s
+        self._rider_only = rider_only
 
     def register_pair(self, coin: str) -> None:
         """Register a new pair, starting in IDLE."""
@@ -179,6 +195,13 @@ class StateMachine:
             exempt_from_pause = (
                 old_state in (PairState.HEDGE, PairState.EMERGENCY_FLATTEN)
                 or abs(ctx.inventory_usd) >= 5.0  # ANY state with inventory
+                # Rider mode: don't pause during episodes. Once we enter an episode,
+                # stay until timeout/fill/expiry. Also don't pause when metaorder
+                # is active (pre-episode). CB is designed for V2 continuous quoting.
+                or (self._rider_only and (
+                    ctx.metaorder_active
+                    or old_state in (PairState.EPISODE_ENTRY, PairState.EPISODE_EXIT)
+                ))
             )
             if not exempt_from_pause:
                 if old_state != PairState.PAUSE:
@@ -203,23 +226,35 @@ class StateMachine:
         # === V3: EPISODE-BASED METAORDER RIDING ===
 
         # --- IDLE -> EPISODE_ENTRY (metaorder detected + conditions met) ---
-        # Fix #3 (R2): Also require EV-positive on the entry side + anchor healthy
+        # Rider mode: metaorder IS the signal. Enter immediately with minimal gates.
+        # V2 mode: full signal warmup required (EV, spread, anchor, book freshness).
         if old_state == PairState.IDLE and ctx.metaorder_active:
-            entry_side_ev = (
-                ctx.bid_side_ev_positive if ctx.metaorder_direction == "buy"
-                else ctx.ask_side_ev_positive
-            )
-            if (ctx.spread_threshold_met
-                    and ctx.hl_book_fresh
-                    and ctx.bybit_anchor_healthy
-                    and entry_side_ev
-                    and ctx.metaorder_confidence >= 0.5
-                    and ctx.native_spread_bps >= 8.0):
-                reason = (
-                    f"metaorder detected: {ctx.metaorder_direction} "
-                    f"conf={ctx.metaorder_confidence:.2f} spread={ctx.native_spread_bps:.1f}bps"
+            if self._rider_only:
+                # Rider: only gate on confidence. Speed > caution.
+                # Spread/book/anchor checks are nice-to-have, not blockers.
+                if ctx.metaorder_confidence >= 0.60:  # was 0.35 — too loose, let in noise
+                    reason = (
+                        f"RIDER metaorder: {ctx.metaorder_direction} "
+                        f"conf={ctx.metaorder_confidence:.2f}"
+                    )
+                    self._enter_state(info, PairState.EPISODE_ENTRY, now, reason)
+            else:
+                # V2: full signal warmup required
+                entry_side_ev = (
+                    ctx.bid_side_ev_positive if ctx.metaorder_direction == "buy"
+                    else ctx.ask_side_ev_positive
                 )
-                self._enter_state(info, PairState.EPISODE_ENTRY, now, reason)
+                if (ctx.spread_threshold_met
+                        and ctx.hl_book_fresh
+                        and ctx.bybit_anchor_healthy
+                        and entry_side_ev
+                        and ctx.metaorder_confidence >= 0.35
+                        and ctx.native_spread_bps >= 4.0):
+                    reason = (
+                        f"metaorder detected: {ctx.metaorder_direction} "
+                        f"conf={ctx.metaorder_confidence:.2f} spread={ctx.native_spread_bps:.1f}bps"
+                    )
+                    self._enter_state(info, PairState.EPISODE_ENTRY, now, reason)
 
         # --- EPISODE_ENTRY: waiting for passive fill aligned with metaorder ---
         if info.state == PairState.EPISODE_ENTRY:
@@ -234,8 +269,13 @@ class StateMachine:
             info.exit_mode = False
             info.hedge_requested = False
 
-            # Cancel entry if metaorder disappears or confidence drops
-            if ctx.metaorder_expired or not ctx.metaorder_active:
+            # Cancel entry if metaorder disappears or confidence drops.
+            # Bug #4 fix: only check metaorder_expired (which is True when we're
+            # in an episode state AND the metaorder vanished). Don't also check
+            # "not metaorder_active" separately — that would cancel on brief
+            # confidence flickers where the signal drops below threshold for 1
+            # tick but the wallet is still actively trading.
+            if ctx.metaorder_expired:
                 # Go to PAUSE with 30s cooldown to prevent immediate re-entry
                 self._enter_state(info, PairState.PAUSE, now,
                                   "metaorder expired before fill")
@@ -243,31 +283,29 @@ class StateMachine:
                 info.quote_bid = False
                 info.quote_ask = False
 
-            # Cancel entry if we've been waiting too long (30s)
+            # Cancel entry if we've been waiting too long (60s)
+            # Rider mode: hold longer to capture full TWAP impact
             # Use PAUSE with cooldown to prevent immediate re-entry on same signal
-            elif now - info.entered_at > 30.0:
+            elif now - info.entered_at > 60.0:
                 self._enter_state(info, PairState.PAUSE, now,
-                                  "entry timeout (30s)")
+                                  "entry timeout (60s)")
                 info.pause_until = now + 30.0
                 info.quote_bid = False
                 info.quote_ask = False
 
             return info
 
-        # --- EPISODE_EXIT: have inventory, exit passively into the same flow ---
+        # --- EPISODE_EXIT: have inventory, manage with TP/SL/trailing ---
+        # Configuration (bps from entry price):
+        TRAIL_ACT_BPS = 2.0    # trailing activates after +2bps favorable move
+        TRAIL_DELTA_BPS = 1.0  # trail distance from peak (exit at peak - 1bps)
+        HARD_SL_BPS = 5.0      # hard stop loss
+        TIME_LIMIT_S = 120.0   # max hold time (2 min)
+
         if info.state == PairState.EPISODE_EXIT:
-            # Long position → ask-only (let the buy flow lift our ask)
-            # Short position → bid-only (let the sell flow hit our bid)
-            if ctx.inventory_usd > 0:
-                info.quote_bid = False
-                info.quote_ask = True
-            else:
-                info.quote_bid = True
-                info.quote_ask = False
             info.exit_mode = True
             info.hedge_requested = False
 
-            # Exit triggers (check in priority order):
             # 1. Position closed → IDLE
             if abs(ctx.inventory_usd) < 5.0:
                 self._enter_state(info, PairState.IDLE, now, "episode exit complete")
@@ -275,24 +313,69 @@ class StateMachine:
                 info.quote_ask = False
                 return info
 
-            # 2. Metaorder disappeared (flow dried up) → tighter timeout
-            if ctx.metaorder_expired:
-                # Flow is gone — if we've been in EXIT > 10s with no fill, flatten
-                exit_age = now - info.entered_at
-                if exit_age > 10.0:
-                    self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
-                                      f"metaorder expired + exit stale ({exit_age:.0f}s)")
-                    info.quote_bid = False
-                    info.quote_ask = False
-                    info.exit_mode = True
-                    return info
-                # else: keep exit quotes active for up to 10s hoping for one last fill
+            # Compute current PnL in bps from entry
+            mid = ctx.current_mid
+            entry = info.episode_entry_price
+            if entry > 0 and mid > 0:
+                if info.episode_direction == "buy":
+                    pnl_bps = (mid - entry) / entry * 10000
+                    # Update peak (highest price for long)
+                    if mid > info.episode_peak_price:
+                        info.episode_peak_price = mid
+                    retrace_bps = (info.episode_peak_price - mid) / entry * 10000
+                else:  # sell
+                    pnl_bps = (entry - mid) / entry * 10000
+                    # Update peak (lowest price for short)
+                    if info.episode_peak_price == 0 or mid < info.episode_peak_price:
+                        info.episode_peak_price = mid
+                    retrace_bps = (mid - info.episode_peak_price) / entry * 10000
+            else:
+                pnl_bps = 0
+                retrace_bps = 0
 
-            # 3. Hard stop: adverse > 6bps
-            if ctx.adverse_move_bps > 6.0:
+            # 2. Hard stop loss
+            if pnl_bps <= -HARD_SL_BPS:
                 self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
-                                  f"episode stop: adverse={ctx.adverse_move_bps:.1f}bps > 6bps")
+                                  f"episode SL: {pnl_bps:+.1f}bps <= -{HARD_SL_BPS}bps")
                 info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = True
+                return info
+
+            # 3. Trailing stop
+            if not info.trailing_activated and pnl_bps >= TRAIL_ACT_BPS:
+                info.trailing_activated = True
+                logger.info(
+                    f"[{info.coin}] Trailing activated: pnl={pnl_bps:+.1f}bps "
+                    f"peak={info.episode_peak_price:.4f}"
+                )
+
+            if info.trailing_activated and retrace_bps >= TRAIL_DELTA_BPS:
+                captured_bps = pnl_bps
+                self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
+                                  f"trailing stop: captured={captured_bps:+.1f}bps "
+                                  f"peak_pnl={(info.episode_peak_price - entry)/entry*10000 if info.episode_direction == 'buy' else (entry - info.episode_peak_price)/entry*10000:+.1f}bps")
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = True
+                return info
+
+            # 4. Time limit
+            exit_age = now - info.entered_at
+            if exit_age > TIME_LIMIT_S:
+                self._enter_state(info, PairState.EMERGENCY_FLATTEN, now,
+                                  f"episode time limit ({TIME_LIMIT_S:.0f}s), pnl={pnl_bps:+.1f}bps")
+                info.quote_bid = False
+                info.quote_ask = False
+                info.exit_mode = True
+                return info
+
+            # 5. Default: keep quoting the exit side
+            if ctx.inventory_usd > 0:
+                info.quote_bid = False
+                info.quote_ask = True
+            else:
+                info.quote_bid = True
                 info.quote_ask = False
                 info.exit_mode = True
                 return info
@@ -345,7 +428,8 @@ class StateMachine:
                                   f"or age={ctx.inventory_age_s:.0f}s > 30s")
 
         # --- IDLE -> QUOTING_BOTH or QUOTING_ONE_SIDE ---
-        if old_state == PairState.IDLE:
+        # SUPPRESSED in rider_only mode (V3): only enter via EPISODE_ENTRY.
+        if old_state == PairState.IDLE and not self._rider_only:
             if (ctx.hl_book_fresh and ctx.spread_threshold_met
                     and abs(ctx.inventory_usd) < ctx.q_soft * 0.5):
                 if ctx.bid_side_ev_positive and ctx.ask_side_ev_positive:
