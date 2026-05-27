@@ -33,7 +33,7 @@ c = c.replace(
     '"ADA-USDT","AVAX-USDT","LINK-USDT","DOT-USDT","UNI-USDT","NEAR-USDT","APT-USDT",'
     '"ARB-USDT","OP-USDT","SUI-USDT","SEI-USDT","WLD-USDT","LTC-USDT","BCH-USDT",'
     '"BNB-USDT","CRV-USDT","1000PEPE-USDT","ALGO-USDT","GALA-USDT","ONT-USDT",'
-    '"TAO-USDT","ZEC-USDT","AAVE-USDT","WIF-USDT"]; return web_utils.build_rate_limits(pairs)'
+    '"TAO-USDT","ZEC-USDT","AAVE-USDT","WIF-USDT","FARTCOIN-USDT","HYPE-USDT"]; return web_utils.build_rate_limits(pairs)'
 )
 
 # Position mode: force one-way for testnet

@@ -48,7 +48,10 @@ Close Types: Take Profit: {take_profit} | Stop Loss: {stop_loss} | Time Limit: {
     @property
     def executors_df(self):
         executors_df = pd.DataFrame([e.dict() for e in self.executors])
-        executors_df["side"] = executors_df["config"].apply(lambda x: x["side"].name)
+        if "config" in executors_df.columns:
+            executors_df["side"] = executors_df["config"].apply(lambda x: x["side"].name)
+        elif "side" not in executors_df.columns:
+            executors_df["side"] = "UNKNOWN"
         return executors_df
 
     def _get_bt_candlestick_trace(self):

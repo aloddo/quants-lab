@@ -181,6 +181,15 @@ app/data/raw_funding_cache_20k/
 # Operational lock files
 .claude/scheduled_tasks.lock
 
+# Whisper transcription artifacts (cosmetic; never commit)
+voice_msg.json
+voice_msg.srt
+voice_msg.tsv
+voice_msg.txt
+
+# Codex session id (machine-local state)
+.context/codex-session-id
+
 # Trained ML models (pickle files, environment-specific)
 app/models/
 

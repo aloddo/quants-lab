@@ -5,6 +5,31 @@ description: "HB-native strategy lifecycle: idea â†’ self-contained controller â
 
 # Quant Research & Deployment Process (HB-Native)
 
+## MANDATORY: Codex Loop Process (applies to ALL research and implementation)
+
+Every strategy, every analysis, every build MUST follow this process. No exceptions.
+
+### Phase A: Research Plan (before touching data)
+1. Ask Codex for independent, unbiased research/data requirements plan
+2. Loop with Codex until you reach consensus on what to analyze and how
+3. Send plan to Alberto for approval
+4. DO NOT touch data until Alberto approves
+
+### Phase B: Technical Implementation Plan (after research results)
+1. Plan the technical implementation, loop with Codex until agreement
+2. Send implementation plan to Alberto for approval
+3. DO NOT build until Alberto approves
+
+### Phase C: Build (after implementation approved)
+1. Build the implementation
+2. Loop with Codex for adversarial review until no bugs remain
+3. Ship
+
+**NEVER skip phases. NEVER jump to analysis or code without the Codex loop.**
+**"No bias no bias no bias" -- Codex provides the independent check on your thinking.**
+
+---
+
 **The controller IS the strategy.** One self-contained HB V2 controller runs in both
 BacktestingEngine (validation) and HB bot container (live). No separate eval functions,
 no custom signal pipelines, no breakout monitors.
@@ -57,9 +82,38 @@ Always use Hummingbot BacktestingEngine via QuantsLab. Custom loops overstate re
 
 ---
 
-## Phase 0 -- Idea Validation (before any code)
+## Phase -1 -- Data Readiness (BEFORE any analysis)
 
+No research begins until data passes these gates:
+
+- [ ] Signal data covers >= 1 year OR >= 2 distinct market regimes (bull + bear + range)
+- [ ] Price data covers same period at required resolution (1m for backtest, 1h for EDA)
+- [ ] No gaps > 24h in any series (check with coverage audit script)
+- [ ] Data source documented: exchange, endpoint, collection frequency, known limitations
+- [ ] Cross-reference: if using HL data as signal for BB execution, confirm price correlation > 0.99
+- [ ] Survivorship bias: only use pairs that existed at the START of the window, not just now
+- [ ] Minimum assets: any cross-sectional signal needs >= 20 assets with full coverage
+
+Data quality commands:
+```python
+# Coverage audit (run before ANY EDA)
+from app.research.data_quality import audit_coverage
+audit_coverage(collection="bybit_funding_rates", pair="BTC-USDT", expected_interval_h=8)
+
+# Stationarity test (run on every signal series)
+from app.research.statistical_tests import test_stationarity
+test_stationarity(signal_series, method="adf+kpss")
+```
+
+**If data is insufficient: go GET more data first. Never approximate or work around gaps.**
+
+---
+
+## Phase 0 -- Idea Validation (rigorous EDA, before controller code)
+
+### 0.1 Hypothesis definition
 - Define the market hypothesis: what inefficiency are you exploiting?
+- Define the economic mechanism: WHY does this edge exist? Who is on the other side?
 - Define success criteria: Avg R > 0 AND Median R > 0
 - Set walk-forward split BEFORE seeing any results:
   - **Train**: param tuning only -- must include the strategy's HOME REGIME
@@ -67,6 +121,58 @@ Always use Hummingbot BacktestingEngine via QuantsLab. Custom loops overstate re
   - **Out-of-sample**: never touch until deployment decision
 - For range/mean-reversion strategies: train window MUST include chop periods
 - Conditional strategies: hard-disable outside home regime in V1. Don't "let data decide."
+
+### 0.2 Statistical signal validation (MANDATORY before proceeding)
+
+Every signal hypothesis must pass ALL of these:
+
+1. **Information Coefficient (IC)**: Spearman rank correlation between signal and forward returns
+   - IC > 0.02 with p < 0.01 required
+   - Compute IC Information Ratio (ICIR = mean(IC) / std(IC)) -- needs ICIR > 0.5
+   - IC decay curve across lags 1h to 168h -- characterizes signal half-life
+
+2. **Permutation test**: shuffle signal timestamps 10,000 times
+   - Real IC must exceed 99th percentile of shuffled distribution
+   - This catches autocorrelation artifacts that inflate parametric t-tests
+
+3. **Multiple hypothesis correction**: when testing N coins or M holding periods
+   - Benjamini-Hochberg FDR control (q < 0.05) for cross-sectional tests
+   - Bonferroni for small number of independent tests
+
+4. **Non-overlapping analysis**: ALWAYS compute signal quality on non-overlapping trades
+   - Overlapping forward returns inflate sample size by hold_period/signal_freq
+   - Apply cooldown >= max hold period between signal occurrences
+   - Require >= 100 non-overlapping signals for any claim
+
+5. **Regime conditioning**: use HMM (2-3 state) fitted on BTC returns + volatility
+   - Report IC and trade stats SEPARATELY per regime state
+   - A signal that only works in one regime is conditional -- gates required
+
+6. **Stationarity**: ADF test (p < 0.05) on the signal series
+   - Non-stationary signals: apply fractional differentiation (d ~ 0.3-0.5) to achieve stationarity while preserving memory
+
+```python
+# Standard EDA template
+from app.research.statistical_tests import (
+    compute_ic_analysis,      # IC, ICIR, decay curve
+    permutation_test,         # 10K shuffles
+    fdr_correction,           # Benjamini-Hochberg
+    non_overlapping_signals,  # Apply cooldown
+    regime_condition,          # HMM-based regime split
+)
+```
+
+### 0.3 Report format for Phase 0
+
+Every Phase 0 report MUST include:
+- Hypothesis + economic mechanism
+- Data coverage (dates, assets, gaps)
+- IC and ICIR (with confidence interval)
+- Permutation p-value
+- Non-overlapping trade count and average return
+- Regime breakdown (IC per state)
+- Multiple hypothesis adjusted p-values (if testing multiple assets/periods)
+- **Explicit statement of what could make this result misleading**
 
 ---
 
