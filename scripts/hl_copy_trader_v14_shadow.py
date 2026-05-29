@@ -141,12 +141,19 @@ def get_source_state(wallet: str) -> Optional[dict]:
 
 
 def get_follower_equity(info: Info, parent_address: str) -> Optional[float]:
-    """Spot USDC balance (per HL_EQ rule #16: spot USDC only)."""
+    """Spot USDC balance (per HL_EQ rule #16: spot USDC only).
+
+    Hardened: HL info endpoint can return None/empty on transient timeouts;
+    guard before .get() to avoid NoneType crashes that look like real failures.
+    """
     try:
         r = requests.post(HL_API + "/info",
                           json={"type": "spotClearinghouseState", "user": parent_address},
                           timeout=5)
         data = r.json()
+        if not data or not isinstance(data, dict):
+            logger.debug(f"follower equity fetch: empty/non-dict response")
+            return None
         for b in data.get("balances", []):
             if b.get("coin") == "USDC":
                 return float(b.get("total", 0))
