@@ -62,6 +62,10 @@ def main():
     ap.add_argument("--starting-cash", type=float, default=10_000.0)
     ap.add_argument("--n-folds", type=int, default=8)
     ap.add_argument("--window-start", default="2025-12-01")
+    ap.add_argument("--source-proportional-sizing", action="store_true",
+                    help="Use source's max_position_pct_equity (capped at 1/K) for sizing")
+    ap.add_argument("--max-concurrent-per-wallet", type=int, default=0,
+                    help="Cap concurrent open positions per wallet (0 = unlimited)")
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
 
@@ -126,6 +130,8 @@ def main():
                     K_target=1, latency_s=args.latency_s, cooldown_s=args.cooldown_s,
                     starting_cash_usd=args.starting_cash, coin_info_by_coin=coin_info,
                     regime_tags={"trend": "UNK", "vol": "UNK"},
+                    source_proportional_sizing=args.source_proportional_sizing,
+                    max_concurrent_per_wallet=args.max_concurrent_per_wallet,
                 )
             except Exception as e:
                 logger.warning(f"  trainval fail {w[:14]}: {e}")
@@ -182,6 +188,8 @@ def main():
                 K_target=K, latency_s=args.latency_s, cooldown_s=args.cooldown_s,
                 starting_cash_usd=args.starting_cash, coin_info_by_coin=coin_info,
                 regime_tags=regime_tags,
+                source_proportional_sizing=args.source_proportional_sizing,
+                max_concurrent_per_wallet=args.max_concurrent_per_wallet,
             )
         except Exception as e:
             logger.error(f"  fold {fold.n} test sim failed: {e}")

@@ -257,6 +257,8 @@ def run_entry_only_fold(
     starting_cash_usd: float,
     coin_info_by_coin: dict[str, CoinInfo],
     regime_tags: dict,
+    source_proportional_sizing: bool = False,
+    max_concurrent_per_wallet: int = 0,  # 0 = unlimited
 ) -> FoldSimResult:
     """Event-driven entry-only fold simulator.
 
@@ -337,13 +339,24 @@ def run_entry_only_fold(
             # Cooldown gate
             if cooldown_until.get(cd_key, 0) > exec_ts:
                 continue
-            # Sizing: equal weight per wallet, K_target slot
+            # Max-concurrent gate (per-wallet burst protection)
+            if max_concurrent_per_wallet > 0:
+                wallet_open_count = sum(1 for k in open_legs if k[0] == ev.wallet)
+                if wallet_open_count >= max_concurrent_per_wallet:
+                    continue
+            # Sizing
             try:
                 eq_now = ledger.equity_usd_at(exec_ts, candle_close_at_fn)
             except ValueError:
                 continue
-            slot_notional = eq_now / K_target
             side_sign = 1 if ev.side == "long" else -1
+            if source_proportional_sizing:
+                # Use source's revealed conviction (max_position_pct_equity), capped at equal-weight slot
+                slot_notional = min(ev.source_pct_eq, 1.0 / K_target) * eq_now
+                if slot_notional < 10:  # skip dust
+                    continue
+            else:
+                slot_notional = eq_now / K_target
             delta_usd = side_sign * slot_notional
             qty_before = ledger.position_qty.get(ev.coin, 0.0)
             res = execute_or_skip(ev.coin, exec_ts, delta_usd, mark, ledger, ci)
