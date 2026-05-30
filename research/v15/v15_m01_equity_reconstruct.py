@@ -16,9 +16,10 @@ of that module for V15:
       (verified live 2026-05-30 on 0x2fcb6898: main 591818 + xyz 2357394 =
       2949212 = last perpAllTime point). v8 reconstructed MAIN only while
       anchoring to a whole-account number -> drift for multi-dex wallets. Here
-      we reconstruct ALL markable perp dexes (main + xyz: + cash: + hyna: +
-      para: + vntl:), value positions with per-coin marks, and DROP flx: and
-      any unmarkable coin (flagging the residual notional).
+      we reconstruct ALL perp dexes (main + every "<dex>:" prefix incl xyz/cash/
+      hyna/para/vntl/flx/km), value positions with per-coin marks, and only
+      EXCLUDE spot (@-tokens, USDC). Unmarkable coins are flagged (residual
+      notional) and gate the day, not silently dropped.
 
   (B) FLOW-NEUTRAL ROE. We emit a cumulative external-capital flow series
       (``ext_flow_cum``) so downstream modules can compute
@@ -109,12 +110,10 @@ LEDGER_DIR = Path("/Users/hermes/quants-lab/app/data/v13/raw_ledger_cache_20k")
 ANCHOR_PARQUET = Path("/Users/hermes/quants-lab/app/data/v13/wallet_anchor_state.parquet")
 MONGO_URI = "mongodb://localhost:27017/"
 
-# Perp dexes we can mark (have 1m candles in Mongo) and therefore reconstruct.
-# flx: is intentionally DROPPED (Alberto directive) even though candles exist.
-# km: candles exist too but km is not in the spec's markable list; we treat any
-# coin we have a mark for as markable by prefix-agnostic mark lookup, but we
-# EXCLUDE flx: at the fill-load boundary. Everything else is included if a mark
-# is available; unmarkable coins are flagged, not silently dropped.
+# ALL perp dexes are in scope (Alberto 2026-05-30). Any coin with a "<dex>:" prefix
+# (or unprefixed main) is reconstructed; flx and km are INCLUDED. Marks come from a
+# prefix-agnostic Mongo lookup. Only spot (@-tokens, USDC) is excluded. Unmarkable
+# coins are flagged (and gate the day), never silently dropped.
 DROPPED_DEX_PREFIXES: tuple[str, ...] = ()  # ALL dexes in scope (Alberto 2026-05-30): nothing dropped, incl flx:
 
 # Liquidation `dir` values in the S3 fills (brain s3-data-reference + spec).
@@ -238,10 +237,7 @@ def coin_dex(coin: str) -> str:
 # equity match the anchor instead of fighting it. Any perp coin (any "<dex>:"
 # prefix, incl flx:, or unprefixed main) is in scope; only spot (@-tokens, USDC)
 # is excluded.
-# Dex names whose USDC capital flows touch our reconstructed perp cash = all perp
-# dexes (every non-spot dex). Used only as documentation now; send-cash logic
-# accepts all perp-dex USDC moves.
-INCLUDED_PERP_DEXES: frozenset[str] = frozenset()  # sentinel: empty => "all perp dexes" (see coin_dex_in_scope)
+# (USDC capital-flow dex scoping is handled by dex_in_scope(): any non-spot dex.)
 # Dexes with a row in wallet_anchor_state.parquet (position seed source). main +
 # xyz + flx are seedable from the parquet; cash/hyna/para/vntl seed from fills
 # only (still IN SCOPE, just no static-anchor seed -> rely on fills + drift gate).
@@ -484,15 +480,15 @@ class AnchorState:
     has_unmarkable_dex_anchor: bool
     # per-dex accountValue at fetch time (today cross-check reference)
     acct_value_by_dex: dict[str, float]
-    aggregate_acct_value: float  # sum over markable, non-flx dexes
+    aggregate_acct_value: float  # sum over parquet dex rows (main+xyz+flx)
 
 
 def load_wallet_anchor(wallet: str, anchor_df: pd.DataFrame) -> Optional[AnchorState]:
     """Build the seed AnchorState from wallet_anchor_state.parquet.
 
-    The parquet only carries main/xyz/flx rows. We seed positions from main+xyz
-    (flx dropped). We also record whether the wallet has flx or other-dex anchor
-    presence so we can flag material unmarkable/flx exposure downstream.
+    The parquet only carries main/xyz/flx rows. We seed positions from ALL three
+    (flx is IN SCOPE). Positions on other in-scope dexes (cash/hyna/para/vntl/km)
+    have no parquet row and seed from fills instead.
     """
     wallet_lc = wallet.lower()
     wa = anchor_df[anchor_df["wallet"].str.lower() == wallet_lc]
@@ -679,7 +675,7 @@ def ledger_cash_delta(e: dict, wallet_lc: str) -> LedgerDelta:
         return LedgerDelta(0.0, 0.0)
     if k == "activateDexAbstraction":
         ev_dex = str(d.get("dex", "")).strip().lower()
-        if ev_dex not in ("", "main"):
+        if not dex_in_scope(ev_dex):  # all perp dexes in scope (was main-only)
             return LedgerDelta(0.0, 0.0)
         token = d.get("token")
         if token == "USDC" or token is None:
@@ -750,28 +746,23 @@ class WalkResult:
     ext_flow_cum: float  # ext flow within (anchor_ms, t_ms] (per-SEGMENT, not series)
     had_unknown_ledger: bool
     anchor_unmarkable: int = 0  # seeded positions with NO mark at anchor_ms
-    seed_incomplete: bool = False  # a material anchor position could not be proven
 
     @property
     def recon_incomplete(self) -> bool:
         """True if equity for this walk is NOT trustworthy: a seeded position
-        lacked an anchor mark (corrupted cash snap), a terminal mark was missing,
-        or a material anchor position could not be proven at the anchor."""
-        return (
-            self.anchor_unmarkable > 0
-            or self.n_unmarkable > 0
-            or self.seed_incomplete
-        )
+        lacked an anchor mark (corrupted cash snap) or a terminal mark was missing
+        -> we cannot value the book, so the day must not be trusted. (Hidden
+        no-anchor-dex exposure is caught at the wallet level by the inter-anchor
+        DRIFT gate, not here, since by definition we cannot see it per-row.)"""
+        return self.anchor_unmarkable > 0 or self.n_unmarkable > 0
 
 
 def seed_positions(
     fills: list[dict],
     anchor: AnchorState,
     anchor_ms: int,
-) -> tuple[dict[str, float], bool]:
+) -> dict[str, float]:
     """Seed positions held at anchor_ms (adapts v8's three-case seeding).
-
-    Returns (start_positions, seed_incomplete).
 
     1. Positions implied by fills at-or-before anchor_ms (positions_at).
     2. Coins first TRADED after anchor_ms: their first post-anchor fill's
@@ -782,9 +773,9 @@ def seed_positions(
        anchor is within 24h of the parquet fetch (proximity heuristic) -- never
        backfilled into far-earlier history (P0: projecting a later-opened
        position backward inflates/deflates the cash snap and drifts the walk).
-       When a MATERIAL static position cannot be proven at this anchor, we leave
-       it unseeded and set seed_incomplete=True so the caller flags the day
-       rather than emitting a silently-wrong equity.
+       When a static position cannot be proven at this anchor, we trust
+       positions_at (flat) and leave it unseeded; any genuine hidden exposure
+       surfaces as inter-anchor DRIFT and is quarantined at the wallet level.
        Coins with post-anchor fills are handled by case 2, not seeded here.
     """
     start_positions = positions_at(fills, anchor_ms)
@@ -804,7 +795,6 @@ def seed_positions(
     post_anchor_coins = {f["coin"] for f in fills if f["time"] > anchor_ms}
     any_fill_coins = {f["coin"] for f in fills}
     near_fetch = abs(anchor_ms - anchor.fetched_ms) <= 86_400_000
-    seed_incomplete = False
     for coin, szi in anchor.positions.items():
         if coin in start_positions or abs(szi) < 1e-9:
             continue
@@ -826,11 +816,11 @@ def seed_positions(
         # Case B far from fetch: positions_at (authoritative startPosition) shows
         # this coin FLAT at the anchor; the later snapshot holding it just means
         # it was re-opened after this anchor. Trust positions_at -> do NOT
-        # backfill the snapshot position into far history (P0 #3). No flag: a
-        # proven-flat coin is not an incompleteness. The only genuinely
-        # unrecoverable case (extra-dex with no anchor row) is caught at the
-        # wallet level by has_extradex_no_anchor.
-    return start_positions, seed_incomplete
+        # backfill the snapshot position into far history (P0 #3). A proven-flat
+        # coin is not an incompleteness. Genuinely-hidden exposure (a no-anchor-row
+        # dex position with no fills) cannot be seen here; it surfaces as
+        # inter-anchor DRIFT and is quarantined at the wallet level.
+    return start_positions
 
 
 def compute_eq_at(
@@ -850,7 +840,7 @@ def compute_eq_at(
     Missing marks are COUNTED (n_unmarkable) and their notional estimated, but
     not silently zeroed into equity; the caller decides whether to flag the day.
     """
-    start_positions, seed_incomplete = seed_positions(fills, anchor, anchor_ms)
+    start_positions = seed_positions(fills, anchor, anchor_ms)
 
     # Snap cash to the anchor equity using marked position value at anchor_ms.
     # If a SEEDED position has no mark at anchor_ms, the cash snap silently
@@ -916,7 +906,6 @@ def compute_eq_at(
         n_unmarkable=n_unmarkable,
         unmarkable_notional=unmarkable_notional,
         anchor_unmarkable=anchor_unmarkable,
-        seed_incomplete=seed_incomplete,
         ext_flow_cum=ext_flow_cum,
         had_unknown_ledger=had_unknown,
     )
@@ -1046,7 +1035,11 @@ def reconstruct_wallet(args: tuple) -> dict:
             stream, fills, anchor, wallet_lc, eod_ms, anchor_t, anchor_v
         )
         had_unknown_any = had_unknown_any or wr.had_unknown_ledger
-        row_incomplete = wr.recon_incomplete or has_extradex_no_anchor
+        # Row is incomplete only if we genuinely cannot value the book this day
+        # (missing anchor/terminal mark). Touching a no-anchor-row dex is NOT an
+        # incompleteness by itself (all dexes in scope) -> reconstruct it; hidden
+        # exposure is caught by the inter-anchor drift quarantine below.
+        row_incomplete = wr.recon_incomplete
         if row_incomplete:
             n_incomplete_rows += 1
 
@@ -1125,9 +1118,20 @@ def reconstruct_wallet(args: tuple) -> dict:
     # (P0). All dexes are in scope now, so merely touching a no-anchor-row dex
     # (cash/hyna/para/vntl) is NOT a quarantine -> those positions reconstruct
     # from fills, and any unseen/moving exposure surfaces as inter-anchor drift.
+    # Inter-anchor drift gate (codex backstop for hidden no-anchor-dex exposure):
+    # an out-of-sample walk that lands >X% from the next weekly anchor means the
+    # reconstruction is provably wrong for that wallet (e.g. a hidden position
+    # absorbed into cash whose value moved). Quarantine on the proven error, not
+    # on dex membership. NaN drift (all walks incomplete) is handled by frac below.
+    _med = audit["median_inter_anchor_drift_pct"]
+    _max = audit["max_inter_anchor_drift_pct"]
+    drift_fail = (
+        (_med == _med and _med > 0.10) or (_max == _max and _max > 0.50)
+    )
     audit["quarantined"] = bool(
         had_unknown_any
         or audit["unknown_ledger_types"]
+        or drift_fail
         or (audit["frac_incomplete_rows"] == audit["frac_incomplete_rows"]
             and audit["frac_incomplete_rows"] > 0.10)
     )
@@ -1297,8 +1301,13 @@ def today_crosscheck(
     else:
         out["main_xyz_anchor_snapshot_pct"] = np.nan
 
-    # Live clearinghouse sum-of-dexes (informational; time-stale by design).
-    dexes = [None, "xyz", "cash", "hyna", "para", "vntl", "flx"]
+    # Live clearinghouse sum over ALL perp dexes (informational; time-stale by
+    # design). Built from the known HIP-3 set UNION the dexes this wallet was
+    # actually seen on (anchor parquet), so we never miss a dex it trades. main
+    # is queried as dex=None.
+    KNOWN_PERP_DEXES = {"xyz", "cash", "hyna", "para", "vntl", "flx", "km"}
+    seen = {d for d in anchor.dexes_seen if d and d != "main"}
+    dexes = [None] + sorted(KNOWN_PERP_DEXES | seen)
     total = 0.0
     got_any = False
     for dex in dexes:
