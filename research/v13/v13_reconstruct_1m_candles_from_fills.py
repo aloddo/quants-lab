@@ -108,6 +108,11 @@ def main():
     ap.add_argument("--start", required=True, help="YYYY-MM-DD")
     ap.add_argument("--end", required=True, help="YYYY-MM-DD")
     ap.add_argument("--coins", help="Comma-separated coins to include; default all")
+    ap.add_argument(
+        "--fills-dir",
+        default="app/data/hl_s3_fills_v2",
+        help="Fills source dir (default: enriched v2, spans to 2026-05-27)",
+    )
     ap.add_argument("--collection", default="hyperliquid_candles")
     ap.add_argument("--mongo-uri", default="mongodb://localhost:27017")
     ap.add_argument("--mongo-db", default="quants_lab")
@@ -117,6 +122,10 @@ def main():
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     coin_filter = set(args.coins.split(",")) if args.coins else None
+    fills_dir = Path(args.fills_dir)
+    if not fills_dir.is_absolute():
+        fills_dir = ROOT / fills_dir
+    logger.info(f"Fills source: {fills_dir}")
 
     logger.info(f"Reconstructing 1m candles {start.date()} -> {end.date()}")
     if coin_filter:
@@ -135,7 +144,7 @@ def main():
     failed_files = []
     cur = start
     while cur <= end:
-        path = FILLS_DIR / f"{cur.strftime('%Y%m%d')}.parquet"
+        path = fills_dir / f"{cur.strftime('%Y%m%d')}.parquet"
         if not path.exists():
             logger.warning(f"Missing {path.name}; skipping")
             cur += timedelta(days=1)
