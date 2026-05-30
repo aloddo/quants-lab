@@ -190,8 +190,15 @@ def get_mongo() -> pymongo.database.Database:
 def get_mark(coin: str, ts_ms: int) -> Optional[float]:
     """1m candle close at-or-before ts_ms (latest). None if no candle covers it.
 
-    Works for any prefix present in Mongo (main + xyz:/cash:/hyna:/para:/vntl:/...)
-    because the candle ``coin`` field carries the full prefixed symbol.
+    Works for any prefix (main + xyz:/cash:/hyna:/para:/vntl:/flx:/km:) since the
+    candle ``coin`` carries the full prefixed symbol.
+
+    NOTE (2026-05-30 decision): exotic HIP-3 coins' true oracle (explorer_blocks
+    setOracle) was explored as a precise mark. It was PARKED: ranking uses HL-exact
+    weekly anchors and risk is enforced live + via exact event data (liquidations,
+    deposits), so intra-week mark precision is not a capital-risk control. If wanted
+    later, capture the oracle feed FORWARD (research/v13/v13_extract_oracle_marks.py
+    is the access proof), don't reconstruct backward.
     """
     minute_key = ts_ms // 60_000 * 60_000
     key = (coin, minute_key)
