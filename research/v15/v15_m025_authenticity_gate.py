@@ -297,7 +297,10 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
     # lo_ms-30d..hi_ms). seed = cumulative per-coin position held AT lo_ms, so the
     # net/gross and leverage accumulators start from real carried exposure instead
     # of flat 0. m01.positions_at is order-independent (cumulative signed_sz).
-    seed_pos = m01.positions_at(all_fills, lo_ms)
+    # ISSUE 2: seed STRICTLY pre-window (lo_ms - 1) so fills at t == lo_ms are NOT
+    # double-counted — the window loops below include t == lo_ms via `if t < win_lo:
+    # continue`, so seeding at lo_ms would count those fills twice.
+    seed_pos = m01.positions_at(all_fills, lo_ms - 1)
     funding = m01.load_wallet_funding(wallet, lo_ms, hi_ms)
     ledger = m01.load_wallet_ledger(wallet, lo_ms, hi_ms)
     last_t = max(f["time"] for f in fills)
@@ -348,7 +351,7 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
         rets = total_change/np.maximum(vals[:-1], 1e-9)
         if len(rets) >= MIN_ANCHORS and np.std(rets) > 1e-9:
             s.sharpe = float(np.mean(rets)/np.std(rets)*np.sqrt(52))
-            gross_hr = _median_leverage(fills, vals, seed_pos=seed_pos)
+            gross_hr = _median_leverage(all_fills, vals, lo_ms=lo_ms, seed_pos=seed_pos)
             s.median_lev = gross_hr
             max_dd = _max_weekly_dd(vals)
             if (s.sharpe >= SHARPE_FLAG and (gross_hr == gross_hr)
@@ -366,19 +369,31 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
     return s
 
 
-def _median_leverage(fills, vals, seed_pos=None):
+def _median_leverage(fills, vals, lo_ms=None, seed_pos=None):
     """Median (gross open notional / equity). Rough: peak gross per week vs anchor.
 
     FIX 2: ``seed_pos`` seeds the position carried into the window so peak gross
     notional reflects pre-window holdings rather than starting at 0.
+
+    ISSUE 3: ``fills`` may span pre-window history (lo_ms - 365d). When ``lo_ms`` is
+    given, prime ``last_px`` from the last pre-window fill price per coin (same as
+    _net_gross_ratio) so a seeded carried coin is priced from its first segment
+    instead of contributing 0 notional until it trades again in-window.
     """
     if len(vals) < 2:
         return float("nan")
     # use mean gross position notional proxy / median equity
     pos = defaultdict(float, dict(seed_pos) if seed_pos else {})
     last_px = {}
+    # ISSUE 3: prime last_px from pre-window fills so seeded positions are priced.
+    if lo_ms is not None:
+        for f in sorted(fills, key=lambda x: x["time"]):
+            if f["time"] < lo_ms:
+                last_px[f["coin"]] = f["price"]
     peak_gross = 0.0
     for f in sorted(fills, key=lambda x: x["time"]):
+        if lo_ms is not None and f["time"] < lo_ms:
+            continue
         pos[f["coin"]] += f["signed_sz"]
         last_px[f["coin"]] = f["price"]
         g = sum(abs(pos[c]*last_px.get(c, 0.0)) for c in pos)
@@ -420,7 +435,7 @@ def build_entities(wallets, lo_ms, hi_ms):
             parent[find(a)] = find(b)
 
     # direct transfer edges
-    deposits_by_bucket = defaultdict(list)   # for temporal funder match
+    funder_events = []   # ISSUE 1: one global time-sorted list of (t, w, dir, amt)
     for w in wallets:
         for e in m01.load_wallet_ledger(w, lo_ms, hi_ms):
             d = e.get("delta", {})
@@ -429,42 +444,40 @@ def build_entities(wallets, lo_ms, hi_ms):
                 dest = (d.get("destination") or "").lower()
                 if dest in wset:
                     union(w, dest)
-            # temporal funder match prep: deposits & withdrawals by rounded amount
+            # temporal funder match prep: deposits & withdrawals (global list)
             if typ in ("deposit", "withdraw"):
                 try:
                     amt = abs(float(d.get("usdc") or 0))
                 except (TypeError, ValueError):
                     amt = 0.0
                 if amt > 1.0:
-                    # FIX 3: round(amt,-1) is ONLY a hash prefilter to bound the
-                    # O(n^2) scan; the real float amount is carried for an exact
-                    # within-bucket comparison below.
-                    bucket = round(amt, -1)  # 10-USDC hash bucket (prefilter only)
-                    deposits_by_bucket[bucket].append(
+                    funder_events.append(
                         (int(e["time"]), w, "out" if typ == "withdraw" else "in", amt))
 
-    # FIX 3 + ISSUE E: temporal funder match. Inside a hash bucket, link A and B
-    # ONLY when a WITHDRAW from A is followed by a DEPOSIT to B within +/-10min AND
-    # the actual float amounts agree within +/-0.5% (capital hand-off). The rounded
-    # bucket no longer drives linkage; it just narrows the candidate set before
-    # comparing real amounts. STRICT chronological direction: only union when the
-    # EARLIER event (t0) is the withdraw ("out") and the LATER (t1) is the deposit
-    # ("in"). The reverse (in -> out) is NOT a capital hand-off and is rejected.
+    # ISSUE 1: temporal funder match over a SINGLE global time-sorted list (no per-
+    # bucket grouping). The prior round(amt,-1) bucketing missed cross-bucket pairs
+    # (e.g. 1004 -> bucket 1000 vs 1006 -> bucket 1010 never compared). Now every
+    # event is scanned forward in time while t1-t0 <= 10min; link A and B ONLY when a
+    # WITHDRAW from A (dir0=="out") is followed by a DEPOSIT to B (dir1=="in"),
+    # w0!=w1, and the actual float amounts agree within +/-0.5% (capital hand-off).
+    # The 10-min window bounds the forward inner scan; total cost O(n log n + matches).
     AMT_TOL = 0.005
-    for bucket, evs in deposits_by_bucket.items():
-        evs.sort()
-        for i, (t0, w0, dir0, amt0) in enumerate(evs):
-            for t1, w1, dir1, amt1 in evs[i+1:]:
-                if t1 - t0 > 600_000:
-                    break
-                if w0 == w1:
-                    continue
-                # strict: earlier=withdraw (out) -> later=deposit (in) only
-                if not (dir0 == "out" and dir1 == "in"):
-                    continue
-                ref = max(abs(amt0), abs(amt1), 1e-9)
-                if abs(amt0 - amt1) / ref <= AMT_TOL:
-                    union(w0, w1)
+    funder_events.sort()
+    n = len(funder_events)
+    for i in range(n):
+        t0, w0, dir0, amt0 = funder_events[i]
+        for j in range(i + 1, n):
+            t1, w1, dir1, amt1 = funder_events[j]
+            if t1 - t0 > 600_000:
+                break
+            if w0 == w1:
+                continue
+            # strict: earlier=withdraw (out) -> later=deposit (in) only
+            if not (dir0 == "out" and dir1 == "in"):
+                continue
+            ref = max(abs(amt0), abs(amt1), 1e-9)
+            if abs(amt0 - amt1) / ref <= AMT_TOL:
+                union(w0, w1)
 
     # collect components
     comp = defaultdict(list)
@@ -564,7 +577,19 @@ def run(wallets, lo_ms, hi_ms):
         # primary = best standalone directional (highest Sharpe that passes L3 standalone)
         passers = [w for w in members if scores[w].l3_pass_standalone]
         if not passers:
-            entity_excluded[eid] = "entity_no_l3_passer"
+            # codex r4 fix: distinguish "L3 known-and-failed" (genuinely neutral)
+            # from "L3 unknown" (NaN net_gross / price_var from thin/missing anchors).
+            # Only HARD-EXCLUDE when EVERY member has VALID L3 metrics and all failed
+            # (the entity is provably non-directional). If ANY member's L3 is unknown,
+            # we cannot prove non-directionality -> route to REVIEW, never hard-exclude
+            # a possibly-clean directional trader on missing data.
+            def _l3_known(w):
+                ng, pv = scores[w].net_gross_ratio, scores[w].price_pnl_var_frac
+                return ng == ng and pv == pv
+            if all(_l3_known(w) for w in members):
+                entity_excluded[eid] = "entity_no_l3_passer"       # hard exclude
+            else:
+                entity_excluded[eid] = "entity_l3_unknown_review"  # REVIEW
             continue
         primary = max(passers, key=lambda w: (scores[w].sharpe
                                               if scores[w].sharpe == scores[w].sharpe else -1e9))
