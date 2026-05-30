@@ -624,7 +624,10 @@ def run(wallets, lo_ms, hi_ms):
         # entity-level hard excludes (internal_hedge / no_l3_passer)
         ent_reason = entity_excluded.get(eid)
         is_too_big = (ent_reason == "entity_too_big_review")
-        if ent_reason and not is_too_big:
+        is_l3_unknown = (ent_reason == "entity_l3_unknown_review")
+        # review-only entity states are NOT hard excludes; only genuine entity hard
+        # reasons (internal_hedge / entity_no_l3_passer) become hard codes here.
+        if ent_reason and not is_too_big and not is_l3_unknown:
             hard_codes.append(ent_reason)
         # ISSUE A: entity fragment is a HARD exclude for non-primary wallets in a
         # multi-wallet entity — but a too-big entity has NO primary set, so EVERY
@@ -632,7 +635,7 @@ def run(wallets, lo_ms, hi_ms):
         # the intended REVIEW. For too-big entities, SKIP the fragment check (treat
         # as primary for fragment purposes) so a clean member routes to REVIEW
         # (entity_too_big); genuine per-wallet hard excludes below still fire.
-        if len(members) > 1 and not is_primary and not is_too_big:
+        if len(members) > 1 and not is_primary and not is_too_big and not is_l3_unknown:
             hard_codes.append("entity_fragment")
         # per-wallet hard excludes (all evaluated, all codes recorded)
         if s.unexecutable:
@@ -657,6 +660,8 @@ def run(wallets, lo_ms, hi_ms):
             # REVIEW reasons (only when NO hard exclude fired)
             if ent_reason == "entity_too_big_review":
                 verdict = "REVIEW"; rc.append("entity_too_big")
+            elif ent_reason == "entity_l3_unknown_review":
+                verdict = "REVIEW"; rc.append("entity_l3_unknown")
             elif s.confidence == "LOW":
                 verdict = "REVIEW"; rc.append(s.anchor_reason or "thin_history")
             elif ng != ng or pv != pv:
