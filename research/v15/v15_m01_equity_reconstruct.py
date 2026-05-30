@@ -719,17 +719,26 @@ def funding_cash_delta(e: dict) -> float:
 
 
 def positions_at(fills: list[dict], t_ms: int) -> dict[str, float]:
-    """Position per coin at time t = (last fill at-or-before t).startPosition +
-    its signed_sz. Uses HL's authoritative startPosition (handles pre-window
-    history). Spot/dropped already excluded at load."""
-    last_per_coin: dict[str, dict] = {}
+    """Position per coin at time t = (EARLIEST fill's startPosition) + cumulative
+    sum of all signed sizes at-or-before t.
+
+    CRITICAL (root-cause of large drift, fixed 2026-05-30): do NOT use the LAST
+    fill's startPosition + signed_sz. Large orders fill as a SAME-MILLISECOND
+    BURST against many makers, and the S3 by-wallet partition carries no `tid`,
+    so same-ms fills are in arbitrary order. Picking the "last" one grabs a
+    mid-burst startPosition and invents a phantom open position (observed: a flat
+    wallet reconstructed as -90,492 MERL because the last-by-order fill in a
+    closing burst had startPosition=-105,010). The cumulative sum from the
+    EARLIEST fill's startPosition is ORDER-INDEPENDENT and exact regardless of
+    intra-ms ordering or a missing tid. (fills are time-sorted on load.)"""
+    by_coin: dict[str, list[dict]] = {}
     for f in fills:
         if f["time"] > t_ms:
             break
-        last_per_coin[f["coin"]] = f
+        by_coin.setdefault(f["coin"], []).append(f)
     positions: dict[str, float] = {}
-    for coin, f in last_per_coin.items():
-        pos = f["startPosition"] + f["signed_sz"]
+    for coin, fs in by_coin.items():
+        pos = fs[0]["startPosition"] + sum(x["signed_sz"] for x in fs)
         if abs(pos) > 1e-9:
             positions[coin] = pos
     return positions
