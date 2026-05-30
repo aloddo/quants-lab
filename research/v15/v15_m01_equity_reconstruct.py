@@ -369,7 +369,7 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
             df["time"] = df["time"].astype("int64")
             df = df[(df["time"] >= t0) & (df["time"] <= t1)]
             fills = _normalize(df)
-            fills.sort(key=lambda x: x["time"])
+            fills.sort(key=lambda x: (x["time"], x["tid"]))
             return fills
         except Exception:
             fills = []
@@ -975,13 +975,19 @@ def reconstruct_wallet(args: tuple) -> dict:
     if not valid_anchors:
         return {"wallet": wallet, "error": "no_valid_anchors"}
 
-    # Reconstruct only up to the anchor fetch time (event data complete to here).
+    # Reconstruct (EMIT) only up to the anchor fetch time. But LOAD events through
+    # the anchor fetch time so a coin opened in the gap between mark-coverage-end
+    # (end_ms) and the later anchor fetch is NOT mis-classified as "never traded"
+    # and silently backfilled into history (codex P0). The walk filters events by
+    # t_ms <= walk_end_ms, so loading past walk_end_ms changes seed CLASSIFICATION
+    # only, never the emitted equity.
     walk_end_ms = min(end_ms, anchor.fetched_ms)
+    load_end_ms = max(walk_end_ms, int(anchor.fetched_ms))
 
-    # 2) Load local event sources.
-    fills = load_wallet_fills(wallet, start_ms, walk_end_ms)
-    funding = load_wallet_funding(wallet, start_ms, walk_end_ms)
-    ledger = load_wallet_ledger(wallet, start_ms, walk_end_ms)
+    # 2) Load local event sources (through fetch time; see note above).
+    fills = load_wallet_fills(wallet, start_ms, load_end_ms)
+    funding = load_wallet_funding(wallet, start_ms, load_end_ms)
+    ledger = load_wallet_ledger(wallet, start_ms, load_end_ms)
 
     stream: list[tuple[int, str, dict]] = []
     for f in fills:
