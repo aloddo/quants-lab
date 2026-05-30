@@ -115,7 +115,7 @@ MONGO_URI = "mongodb://localhost:27017/"
 # coin we have a mark for as markable by prefix-agnostic mark lookup, but we
 # EXCLUDE flx: at the fill-load boundary. Everything else is included if a mark
 # is available; unmarkable coins are flagged, not silently dropped.
-DROPPED_DEX_PREFIXES = ("flx:",)
+DROPPED_DEX_PREFIXES: tuple[str, ...] = ()  # ALL dexes in scope (Alberto 2026-05-30): nothing dropped, incl flx:
 
 # Liquidation `dir` values in the S3 fills (brain s3-data-reference + spec).
 LIQUIDATION_DIRS = frozenset(
@@ -231,33 +231,33 @@ def coin_dex(coin: str) -> str:
     return "main"
 
 
-# Explicit markable perp-dex allowlist (spec). main = unprefixed; the rest carry
-# a "<dex>:" prefix. flx: is dropped (Alberto). Anything outside this set (km:,
-# future dexes, spot @-tokens, USDC) is NOT part of the whole-account perp
-# reconstruction and must never silently leak into cash, positions, or funding.
-ALLOWED_PERP_PREFIXES = ("xyz:", "cash:", "hyna:", "para:", "vntl:")
-# Dex names (coin_dex output) whose USDC capital flows touch our reconstructed
-# perp cash. flx + spot are excluded; "" / "main" are the unprefixed main dex.
-INCLUDED_PERP_DEXES = frozenset(
-    {"", "main", "xyz", "cash", "hyna", "para", "vntl"}
-)
-# Dexes that have a row in wallet_anchor_state.parquet (position seed source).
-# Positions on any OTHER included dex (cash/hyna/para/vntl) can only be seeded
-# from fills -> if held statically with no in-window fill they are unprovable.
+# ALL DEXES IN SCOPE (Alberto 2026-05-30: "ALL dexes become IN SCOPE").
+# The only equity history HL gives is whole-account perpAllTime (the portfolio
+# `dex` param is IGNORED -> verified 2026-05-30, it returns the same whole-account
+# number for dex=main/xyz/default). So reconstructing EVERY perp dex makes our
+# equity match the anchor instead of fighting it. Any perp coin (any "<dex>:"
+# prefix, incl flx:, or unprefixed main) is in scope; only spot (@-tokens, USDC)
+# is excluded.
+# Dex names whose USDC capital flows touch our reconstructed perp cash = all perp
+# dexes (every non-spot dex). Used only as documentation now; send-cash logic
+# accepts all perp-dex USDC moves.
+INCLUDED_PERP_DEXES: frozenset[str] = frozenset()  # sentinel: empty => "all perp dexes" (see coin_dex_in_scope)
+# Dexes with a row in wallet_anchor_state.parquet (position seed source). main +
+# xyz + flx are seedable from the parquet; cash/hyna/para/vntl seed from fills
+# only (still IN SCOPE, just no static-anchor seed -> rely on fills + drift gate).
 ANCHOR_COVERED_DEXES = frozenset({"main", "xyz", "flx"})
 
 
 def coin_is_allowed_perp(coin: str) -> bool:
-    """True only for coins in the explicit markable perp allowlist.
+    """True for ANY perp coin (all dexes in scope). Excludes only spot (@/USDC)."""
+    return not coin_is_spot(coin)
 
-    main (unprefixed) or one of ALLOWED_PERP_PREFIXES. Excludes spot (@/USDC),
-    dropped flx:, and any unlisted prefix (km: etc.).
-    """
-    if coin_is_spot(coin) or coin_is_dropped(coin):
-        return False
-    if ":" not in coin:
-        return True  # main
-    return coin.startswith(ALLOWED_PERP_PREFIXES)
+
+def dex_in_scope(dex: str) -> bool:
+    """A dex name (coin_dex output / ledger sourceDex) is in scope if it is any
+    perp dex. Spot markers are out. All perp dexes are in scope."""
+    d = (dex or "").strip().lower()
+    return d not in ("spot", "@")
 
 
 # --------------------------------------------------------------------------- #
@@ -516,10 +516,12 @@ def load_wallet_anchor(wallet: str, anchor_df: pd.DataFrame) -> Optional[AnchorS
         ts_ms = int(float(row["fetched_at_ts"]) * 1000)
         fetched_ms = max(fetched_ms, ts_ms)
         if dex == "flx":
+            # flx is now IN SCOPE (all dexes). Record presence AND seed its
+            # positions from the anchor row (flx has a parquet row + marks).
             has_flx_anchor = acct_val > 1.0 or int(row["n_positions"]) > 0
-            continue  # flx dropped from reconstruction
-        # An anchor row on a dex we cannot position-seed from the parquet
-        # (anything outside main/xyz/flx) is an unsupported-dex signal.
+        # An anchor row on a dex without a parquet seed source (outside main/xyz/
+        # flx) is informational only now (all dexes in scope; such positions seed
+        # from fills, not the parquet).
         if dex not in ANCHOR_COVERED_DEXES:
             if acct_val > 1.0 or int(row["n_positions"]) > 0:
                 has_unmarkable_dex_anchor = True
@@ -616,13 +618,12 @@ def ledger_cash_delta(e: dict, wallet_lc: str) -> LedgerDelta:
         dst_dex = str(d.get("destinationDex", "")).strip().lower()
         amt = _f("usdcValue", "amount")
         fee = _f("fee")
-        # Whole-account perp: USDC leaving/entering ANY included perp dex
-        # (main/xyz/cash/hyna/para/vntl) moves our reconstructed cash. Only
-        # spot/flx/untracked dexes are excluded.
+        # Whole-account perp (all dexes in scope): USDC leaving/entering ANY perp
+        # dex moves our reconstructed cash. Only spot is excluded.
         c = 0.0
-        if user == wallet_lc and src_dex in INCLUDED_PERP_DEXES:
+        if user == wallet_lc and dex_in_scope(src_dex):
             c -= amt + fee
-        if dest == wallet_lc and dst_dex in INCLUDED_PERP_DEXES:
+        if dest == wallet_lc and dex_in_scope(dst_dex):
             c += amt
         return LedgerDelta(c, c)
     if k == "internalTransfer":
@@ -1006,13 +1007,14 @@ def reconstruct_wallet(args: tuple) -> dict:
     source_dexes = sorted({coin_dex(f["coin"]) for f in fills} | {
         coin_dex(c) for c in anchor.positions
     })
-    # Included perp dexes the wallet actually touches that have NO row in the
-    # anchor parquet (cash/hyna/para/vntl). Pre-anchor positions on these can
-    # only ever be seeded from fills -> a statically-held position with no
-    # in-window fill is unrecoverable, so the whole wallet is low-confidence.
+    # Perp dexes the wallet touches that have NO row in the anchor parquet
+    # (cash/hyna/para/vntl). All dexes are IN SCOPE and reconstructed from fills;
+    # this is now an INFORMATIONAL flag (not a hard quarantine), since a position
+    # we cannot see at all only mis-states equity if it MOVES -> which surfaces as
+    # inter-anchor drift and quarantines via the drift/missing-mark gate anyway.
     extradex_no_anchor = sorted(
         d for d in source_dexes
-        if d in INCLUDED_PERP_DEXES and d not in ANCHOR_COVERED_DEXES
+        if dex_in_scope(d) and d not in ANCHOR_COVERED_DEXES
     )
     has_extradex_no_anchor = bool(extradex_no_anchor)
 
@@ -1118,13 +1120,14 @@ def reconstruct_wallet(args: tuple) -> dict:
         "frac_incomplete_rows": float(n_incomplete_rows / len(df_out)) if len(df_out) else np.nan,
         "source_dexes": ",".join(source_dexes),
     }
-    # Quarantine if equity cannot be trusted: unknown ledger types, OR any
-    # extra-dex (cash/hyna/para/vntl) position with no anchor coverage, OR a
-    # material fraction of rows had incomplete seeding / missing marks (P0).
+    # Quarantine only when equity genuinely cannot be trusted: unknown ledger
+    # types, OR a material fraction of rows had missing marks / incomplete seeding
+    # (P0). All dexes are in scope now, so merely touching a no-anchor-row dex
+    # (cash/hyna/para/vntl) is NOT a quarantine -> those positions reconstruct
+    # from fills, and any unseen/moving exposure surfaces as inter-anchor drift.
     audit["quarantined"] = bool(
         had_unknown_any
         or audit["unknown_ledger_types"]
-        or has_extradex_no_anchor
         or (audit["frac_incomplete_rows"] == audit["frac_incomplete_rows"]
             and audit["frac_incomplete_rows"] > 0.10)
     )
@@ -1295,7 +1298,7 @@ def today_crosscheck(
         out["main_xyz_anchor_snapshot_pct"] = np.nan
 
     # Live clearinghouse sum-of-dexes (informational; time-stale by design).
-    dexes = [None, "xyz", "cash", "hyna", "para", "vntl"]
+    dexes = [None, "xyz", "cash", "hyna", "para", "vntl", "flx"]
     total = 0.0
     got_any = False
     for dex in dexes:
