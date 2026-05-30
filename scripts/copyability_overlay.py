@@ -623,7 +623,9 @@ def parse_args():
     p.add_argument("--latencies", default=DEFAULT_LATENCIES, help="comma-sep seconds")
     p.add_argument("--capital-scales", default=DEFAULT_CAPITAL_SCALES,
                    help="comma-sep USD capital scales for the sweep")
-    p.add_argument("--out-prefix", required=True, help="output prefix e.g. /tmp/cop_apr_train")
+    p.add_argument("--out-prefix", required=True,
+                   help="output prefix e.g. app/data/v13/copyability/cop_apr_train "
+                        "(NOT /tmp/ — lost on reboot per 2026-05-29 OOM-2 lesson)")
     p.add_argument("--min-journeys", type=int, default=10)
     p.add_argument("--fee-rt-bps", type=float, default=FEE_RT_BPS_DEFAULT,
                    help="OUR copy fee per RT in bps (Alberto-locked 8.64; graduate later)")

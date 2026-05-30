@@ -517,7 +517,15 @@ def main():
     ap.add_argument("--journeys-glob", default="app/data/v13/journey_chunks/chunk_*.parquet")
     ap.add_argument("--marks-npz-dir", required=True)
     ap.add_argument("--variant", required=True,
-                    choices=["V-A", "V-A2", "V-B", "V-C", "V-G", "V-H", "V-I"])
+                    choices=["V-A", "V-A2", "V-B", "V-C", "V-G", "V-H", "V-I", "V15-CUSTOM"])
+    ap.add_argument("--pool-csv", default=None,
+                    help="V15: comma-separated wallet list overriding select_pool (variant becomes label only).")
+    ap.add_argument("--use-prop-sizing", action="store_true",
+                    help="V15: enable source-proportional sizing capped at 1/K_target.")
+    ap.add_argument("--chain-equity", action="store_true",
+                    help="V15: chain starting_cash across folds. Apply 50pct intra-fold kill rule.")
+    ap.add_argument("--intra-fold-kill-pct", type=float, default=0.50,
+                    help="V15: if fold max_dd_pct >= this, treat fold ROE as the kill loss (no recovery).")
     ap.add_argument("--latency-s", type=int, default=60)
     ap.add_argument("--cooldown-s", type=int, default=1800)
     ap.add_argument("--starting-cash", type=float, default=10_000.0)
@@ -533,12 +541,22 @@ def main():
     args = ap.parse_args()
 
     sweep = pd.read_parquet(args.sweep_results)
-    selected = select_pool(sweep, args.variant)
-    K_target = max(1, len(selected))
-    logger.info(f"Variant {args.variant}: pool size {len(selected)}, K_target={K_target}")
-    for w in selected:
-        sc = float(sweep[sweep["wallet"] == w]["copy_score"].iloc[0])
-        logger.info(f"  {w[:18]}...  copy_score={sc:.5f}")
+    if args.pool_csv:
+        selected = [w.strip().lower() for w in args.pool_csv.split(",") if w.strip()]
+        K_target = max(1, len(selected))
+        logger.info(f"V15 custom pool: {len(selected)} wallets, K_target={K_target}, "
+                    f"PROP={args.use_prop_sizing}, CHAIN={args.chain_equity}")
+        for w in selected:
+            row = sweep[sweep["wallet"] == w]
+            sc = float(row["copy_score"].iloc[0]) if len(row) else float("nan")
+            logger.info(f"  {w[:18]}...  copy_score={sc:.5f}")
+    else:
+        selected = select_pool(sweep, args.variant)
+        K_target = max(1, len(selected))
+        logger.info(f"Variant {args.variant}: pool size {len(selected)}, K_target={K_target}")
+        for w in selected:
+            sc = float(sweep[sweep["wallet"] == w]["copy_score"].iloc[0])
+            logger.info(f"  {w[:18]}...  copy_score={sc:.5f}")
 
     # Load journeys for selected wallets only
     chunks = sorted(glob.glob(args.journeys_glob))
@@ -589,6 +607,9 @@ def main():
     fold_results: list[FoldResult] = []
     all_entry_records: list[dict] = []
     fold_summaries_full = []
+    chained_equity_curve = []  # V15: list of (fold_n, start_eq, end_eq, applied_kill)
+    current_eq = float(args.starting_cash)
+    intra_fold_kill_pct = float(args.intra_fold_kill_pct)
 
     for fold in folds:
         logger.info(f"=== Fold {fold.n}: test {fold.test_start} → {fold.test_end} ===")
@@ -607,6 +628,8 @@ def main():
             regime_tags = {"trend": "UNKNOWN", "vol": "UNKNOWN"}
 
         t0 = time.time()
+        # V15: chained equity uses prior fold's end as this fold's start
+        fold_starting_cash = current_eq if args.chain_equity else float(args.starting_cash)
         try:
             fold_sim = run_entry_only_fold(
                 fold_n=fold.n,
@@ -618,9 +641,10 @@ def main():
                 K_target=K_target,
                 latency_s=args.latency_s,
                 cooldown_s=args.cooldown_s,
-                starting_cash_usd=args.starting_cash,
+                starting_cash_usd=fold_starting_cash,
                 coin_info_by_coin=coin_info,
                 regime_tags=regime_tags,
+                source_proportional_sizing=bool(args.use_prop_sizing),
             )
         except Exception as e:
             logger.error(f"  fold {fold.n} sim failed: {e}", exc_info=True)
@@ -646,10 +670,33 @@ def main():
             regime_tags=regime_tags,
             anti_corr_pruned=False,
         ))
+        # V15: chained equity bookkeeping with 50pct intra-fold kill rule.
+        fold_net_pnl = float(fold_sim.summary.get("net_pnl", 0.0))
+        fold_max_dd = float(fold_sim.summary.get("max_dd_pct", 0.0))
+        applied_kill = False
+        if args.chain_equity:
+            if fold_max_dd >= intra_fold_kill_pct:
+                # No hindsight recovery: kill at -intra_fold_kill_pct, no further fold PnL.
+                next_eq = fold_starting_cash * (1.0 - intra_fold_kill_pct)
+                applied_kill = True
+            else:
+                next_eq = fold_starting_cash + fold_net_pnl
+            current_eq = max(0.0, next_eq)
+        chained_equity_curve.append({
+            "fold_n": fold.n,
+            "start_eq": fold_starting_cash,
+            "end_eq": current_eq if args.chain_equity else fold_starting_cash + fold_net_pnl,
+            "net_pnl": fold_net_pnl,
+            "max_dd_pct": fold_max_dd,
+            "applied_kill": applied_kill,
+        })
         fold_summaries_full.append({
             "fold_n": fold.n,
             "test_start": str(fold.test_start),
             "test_end": str(fold.test_end),
+            "starting_cash": fold_starting_cash,
+            "end_cash": current_eq if args.chain_equity else fold_starting_cash + fold_net_pnl,
+            "applied_kill": applied_kill,
             "summary": fold_sim.summary,
             "regime_tags": regime_tags,
         })
@@ -668,15 +715,47 @@ def main():
     logger.info(f"  failures: {decision.failures}")
     logger.info(f"  summary: {decision.summary}")
 
+    # V15: chained equity summary
+    chained_summary = None
+    if args.chain_equity:
+        start_eq = float(args.starting_cash)
+        end_eq = chained_equity_curve[-1]["end_eq"] if chained_equity_curve else start_eq
+        chained_roe = (end_eq - start_eq) / start_eq if start_eq > 0 else 0.0
+        running_peak = start_eq
+        running_dd = 0.0
+        max_chained_dd = 0.0
+        chained_eq_pts = [start_eq]
+        for fld in chained_equity_curve:
+            chained_eq_pts.append(fld["end_eq"])
+        for pt in chained_eq_pts:
+            running_peak = max(running_peak, pt)
+            running_dd = (pt - running_peak) / running_peak if running_peak > 0 else 0.0
+            max_chained_dd = min(max_chained_dd, running_dd)
+        n_kills = sum(1 for f in chained_equity_curve if f["applied_kill"])
+        n_pos_folds = sum(1 for f in chained_equity_curve if f["net_pnl"] > 0 and not f["applied_kill"])
+        chained_summary = {
+            "start_eq": start_eq,
+            "end_eq": end_eq,
+            "chained_6m_ROE": chained_roe,
+            "max_chained_dd_pct": float(abs(max_chained_dd)),
+            "n_kills": n_kills,
+            "n_pos_folds": n_pos_folds,
+            "intra_fold_kill_pct": intra_fold_kill_pct,
+        }
+
     out = {
         "variant": args.variant,
         "pool_size": len(selected),
         "pool_wallets": selected,
         "K_target": K_target,
+        "use_prop_sizing": bool(args.use_prop_sizing),
+        "chain_equity": bool(args.chain_equity),
         "latency_s": args.latency_s,
         "cooldown_s": args.cooldown_s,
         "n_folds": args.n_folds,
         "fold_summaries": fold_summaries_full,
+        "chained_equity_curve": chained_equity_curve,
+        "chained_summary": chained_summary,
         "decision": {
             "go": decision.go,
             "failures": list(decision.failures),
@@ -696,3 +775,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# V15 pool picks (return-ranked, DD-survivable) — appended 2026-05-30

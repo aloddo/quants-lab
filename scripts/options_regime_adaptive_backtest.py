@@ -347,8 +347,11 @@ def main():
     print("\n=== Regime-Adaptive Backtest (per-regime routing per options_v4 spec) ===")
     df = regime_adaptive_backtest(candles, dvol, params)
     print_results(df, "Full backtest")
-    df.to_csv("/tmp/options_regime_backtest.csv", index=False)
-    print(f"\nWrote per-trade detail to /tmp/options_regime_backtest.csv ({len(df)} rows)")
+    # Moved off /tmp after 2026-05-29 OOM-2 reboot lost /tmp staging files.
+    out_path = Path("app/data/options/regime_backtest.csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print(f"\nWrote per-trade detail to {out_path} ({len(df)} rows)")
 
 
 if __name__ == "__main__":

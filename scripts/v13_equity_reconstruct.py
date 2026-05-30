@@ -137,6 +137,10 @@ def install_memory_guards(rlimit_data_gb: float = 6.0, rss_abort_gb: float = 4.0
 _FILLS_COLS_DEFAULT = [
     "wallet", "coin", "side", "size", "price", "time",
     "dir", "closedPnl", "hash", "source", "notional",
+    # 2026-05-28: added enriched fee fields (per Alberto TG 7549 + 7565+).
+    # Wallet realized PnL = closedPnl - (fee + builderFee + deployerFee).
+    # Requires FILLS_DIR = hl_s3_fills_v2/ which contains these columns.
+    "fee", "builderFee", "deployerFee",
 ]
 
 logging.basicConfig(
@@ -146,7 +150,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
-FILLS_DIR = ROOT / "app" / "data" / "hl_s3_fills"
+# 2026-05-28: switched FILLS_DIR to hl_s3_fills_v2/ for enriched fee fields
+# (fee, builderFee, deployerFee). Required for accurate wallet realized PnL
+# = closedPnl - fees (Alberto TG 7549). v1 path was hl_s3_fills/.
+FILLS_DIR = ROOT / "app" / "data" / "hl_s3_fills_v2"
 DEFAULT_OUTPUT = ROOT / "app" / "data" / "v13" / "wallet_equity_series.parquet"
 
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
@@ -1290,28 +1297,36 @@ def reconstruct_one_wallet(
             cb = cost_basis.get(coin, 0.0)
             new_pos = pos + signed
 
-            realized_today = 0.0
+            # 2026-05-28 (Alberto TG 7568): use HL's per-fill closedPnl + fees
+            # directly instead of recomputing realized via (price-cb) walk.
+            # The recomputed walk under-counted realized PnL by ~89% on test
+            # wallet 0xe3dff077 (HL says +$20,936 in window, walker said +$2,625)
+            # because pre-window carry-in cost_basis defaulted to 0.
+            # HL's closedPnl IS the realized PnL per fill; trust it.
+            # Wallet net realized = closedPnl - (fee + builderFee + deployerFee).
+            closed_pnl_raw = float(r.get("closedPnl", 0.0) or 0.0)
+            fee_raw = float(r.get("fee", 0.0) or 0.0)
+            builder_fee_raw = float(r.get("builderFee", 0.0) or 0.0)
+            deployer_fee_raw = float(r.get("deployerFee", 0.0) or 0.0)
+            realized_today = closed_pnl_raw - fee_raw - builder_fee_raw - deployer_fee_raw
+
+            # Still maintain position + cost_basis for end-of-day MTM (unrealized PnL)
+            # below. The cb walk is only used for unrealized; realized is now direct.
             if abs(pos) < EPS:
                 cb = price
             elif (pos > 0 and signed > 0) or (pos < 0 and signed < 0):
-                # Same-direction add.
+                # Same-direction add — weighted-avg cost basis.
                 total_qty = abs(new_pos)
                 cb = (cb * abs(pos) + price * abs(signed)) / total_qty if total_qty > EPS else price
             elif abs(new_pos) < EPS:
-                # Full close.
-                realized_today = (price - cb) * pos    # signed: long * (price - cb) = profit if price>cb
+                # Full close — cost basis irrelevant after flat.
                 cb = 0.0
             elif (pos > 0 and new_pos > 0) or (pos < 0 and new_pos < 0):
-                # Trim (partial close, same side remains).
-                closed_qty = abs(signed)
-                # Realized PnL of the closed portion: sign(pos) * (price - cb) * closed_qty
-                realized_today = (price - cb) * (closed_qty if pos > 0 else -closed_qty)
-                # cost basis unchanged
+                # Trim (partial close, same-side remains) — cost basis unchanged.
+                pass
             else:
-                # Reverse: close existing leg fully + open new leg at price.
-                close_qty = abs(pos)
-                realized_today = (price - cb) * pos     # closes the leg
-                cb = price                              # new leg starts here
+                # Reverse (sign flip): new leg starts at fill price.
+                cb = price
             position[coin] = new_pos
             cost_basis[coin] = cb
             daily_realized[d] = daily_realized.get(d, 0.0) + realized_today
@@ -1636,9 +1651,22 @@ def main():
     # Missing-data guard: if reconstruction runs to today and any daily parquet
     # in the [start, today] window is missing, the equity series silently
     # treats that day as zero activity. Hard-fail before reconstruction.
+    #
+    # Codex r3 fix 2026-05-27: TODAY is excluded from the check. Today's fills
+    # may not be downloaded yet (S3 publishes hourly throughout the day; the
+    # last few hours often missing). Today is the ANCHOR day — equity is set
+    # from live HL state API, not from today's fills. The back-solve walks
+    # from today's anchor BACKWARDS using prior days' fills. Missing today's
+    # fills means only that the anchor's intra-day PnL since 00:00 UTC isn't
+    # captured in the cum_realized series — acceptable for a backtest that
+    # trims output to end_requested anyway.
+    today_utc_date = datetime.now(timezone.utc).date()
     missing_days = []
     cur = start
     while cur <= end:
+        if cur.date() == today_utc_date:
+            cur += timedelta(days=1)
+            continue
         if not (FILLS_DIR / f"{cur.strftime('%Y%m%d')}.parquet").exists():
             missing_days.append(cur.date())
         cur += timedelta(days=1)

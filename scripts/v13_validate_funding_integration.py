@@ -44,7 +44,8 @@ def main():
                     help="Comma-separated wallet addresses to test")
     ap.add_argument("--start", required=True)
     ap.add_argument("--end", required=True)
-    ap.add_argument("--output", default="/tmp/v13_funding_val_equity.parquet")
+    ap.add_argument("--output", default="app/data/v13/validation/funding_val_equity.parquet",
+                    help="Default moved off /tmp after 2026-05-29 OOM-2")
     ap.add_argument("--audit-tolerance-pct", type=float, default=0.5,
                     help="Max acceptable audit_today_diff_pct (default 0.5%)")
     args = ap.parse_args()
@@ -53,7 +54,9 @@ def main():
     logger.info(f"Validating funding integration on {len(addrs)} wallets")
 
     # 1) Write wallets to a temp file for the reconstructor.
-    wallets_path = Path("/tmp/v13_funding_val_wallets.txt")
+    # Moved off /tmp after 2026-05-29 OOM-2 reboot lost prior /tmp staging files.
+    wallets_path = Path("app/data/v13/validation/funding_val_wallets.txt")
+    wallets_path.parent.mkdir(parents=True, exist_ok=True)
     with open(wallets_path, "w") as f:
         for a in addrs:
             f.write(a + "\n")

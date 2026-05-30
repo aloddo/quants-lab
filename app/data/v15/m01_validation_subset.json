@@ -1,0 +1,13 @@
+{
+  "1_main_low_activity": "0x5a51244d7792ba67e3077b77bfacf16285739e43",
+  "2_funding_cap_hit": "0xa9881f6f5493fed3ce3346c5cb1a1e9ba80f7060",
+  "3_main_plus_xyz": "0x3e516cf3c9d4f29fae6c1324c2414dc872fc9c09",
+  "4_deposit_withdraw": "0x9c085ba26e54718d4182a789075e89f324abaef0",
+  "5_liquidation_fills": "0xdaf50e499dcaff47f284833920c02cde439b6e4f",
+  "6_broken_tail_gt100": "0xe2af8f54b54dd85978147ec505b63a77bdbde205",
+  "7_subaccount_xfer": "0x250dce15e302705384fa768eab025b9c26f309cb",
+  "8_highlev_deep_dd": "0x4ac21adc3154ce2d1187d3f7da0b46a29f9ff079",
+  "9_genuine_10x": "0x384142ceb6e83e12dcea8399dba6d5996b0d434e",
+  "11_xyz_dominant": "0x2fcb6898d5a0623de19c3691904927685014c4d8",
+  "12_zero_ledger": "0x3f5a5c6b29a95dc27f33b257ac216d4b922a9b0d"
+}

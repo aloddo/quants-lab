@@ -171,12 +171,19 @@ app/data/cache/
 
 # Local data caches (raw fills, ledgers, dbs, parquet outputs — never commit)
 app/data/hl_s3_fills/
+app/data/hl_s3_fills_v2/
+app/data/hl_s3_fills_v2_by_wallet/
 app/data/v13/
+app/data/v14_shadow_postmortem/
 app/data/wallet_alpha/
 app/data/*.parquet
+app/data/**/*.parquet
+app/data/**/*.npz
 app/data/*.db
 app/data/raw_ledger_cache_20k/
 app/data/raw_funding_cache_20k/
+# Keep small curated inputs under app/data/v15 (wallet lists) but never the parquet outputs
+app/data/v15/*.parquet
 
 # Operational lock files
 .claude/scheduled_tasks.lock

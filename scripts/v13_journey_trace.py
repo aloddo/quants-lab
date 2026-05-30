@@ -99,7 +99,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
-FILLS_DIR = ROOT / "app" / "data" / "hl_s3_fills"
+FILLS_DIR = ROOT / "app" / "data" / "hl_s3_fills_v2"   # codex m02 r2 BLOCKER fix 2026-05-29: was hl_s3_fills (old), caused carry-in walkback to silently fail with KeyError on missing fee/builderFee/deployerFee columns. v2 has 22 cols including the fee fields that _FILLS_COLS_DEFAULT requires.
 DEFAULT_OUTPUT = ROOT / "app" / "data" / "v13" / "wallet_journeys_costed.parquet"
 FUNDING_CACHE_DIR = ROOT / "app" / "data" / "v13" / "funding_cache"
 
@@ -135,8 +135,35 @@ def _classify_fee_scope(dir_val: str, coin: str) -> str:
 
 
 def _fill_fee_usd(notional: float) -> float:
-    """Compute per-fill fee in USD. notional must be positive (|signed_size| * price)."""
+    """LEGACY estimator: per-fill fee in USD = notional × FEE_RATE (4.32 bps source-assumed-taker).
+    Used as fallback when v2 fee fields are unavailable. Per codex m02 r2 BLOCKER 2 (2026-05-29),
+    when fee/builderFee/deployerFee are present in the fill row, use them directly via
+    _fill_fee_usd_actual() instead — they reflect HL's actual charged fees (including referral
+    discount, builder splits, deployer fees) rather than the assumed-taker conservative estimate.
+    """
     return abs(notional) * FEE_RATE
+
+
+def _fill_fee_usd_actual(row) -> float | None:
+    """Per codex m02 r2 BLOCKER 2 (2026-05-29) + Alberto TG 7549: use v2-fills enriched fee fields.
+    Wallet realized PnL = closedPnl - (fee + builderFee + deployerFee).
+    Returns None if ANY fee field is missing/NaN (caller falls back to _fill_fee_usd estimator).
+    codex m02 r3 CODE-BUG 5 fix (2026-05-29): use pd.isna check, not None/falsy.
+    """
+    import math as _m
+    fee = getattr(row, "fee", None)
+    builder_fee = getattr(row, "builderFee", None)
+    deployer_fee = getattr(row, "deployerFee", None)
+    # pd.isna for pandas missing-value detection (NaN is the actual missing sentinel)
+    def _is_missing(x):
+        if x is None: return True
+        try:
+            return bool(_m.isnan(float(x)))
+        except (TypeError, ValueError):
+            return False
+    if _is_missing(fee) or _is_missing(builder_fee) or _is_missing(deployer_fee):
+        return None
+    return float(fee) + float(builder_fee) + float(deployer_fee)
 
 
 def _fetch_funding_for_wallet(
@@ -223,6 +250,223 @@ def _funding_for_journey(
 # ---------------------------------------------------------------------------
 # Loader for equity series
 # ---------------------------------------------------------------------------
+
+def _fetch_current_positions(wallets: list[str]) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
+    """codex m02 r2 BLOCKER 1 alternative-C (2026-05-29): fetch CURRENT perp position state per wallet
+    from HL info.user_state(). Returns ({wallet → {coin → signed_qty}}, {wallet → snapshot_ms}).
+    Per-wallet HTTP; sequential with backoff. ~1s per wallet for 1K-wallet chunk = ~17min naive.
+    Cached at app/data/v13/current_positions_cache/ keyed by wallet (refreshed daily).
+
+    codex m02 r4 CODE-BUG 2 fix: cache MUST record per-wallet snapshot_ms (instant of fetch).
+    Caller bounds post-window fill load to MIN(snapshot_ms) so we never subtract a fill that
+    occurred AFTER the snapshot (the snapshot already reflects it; subtracting again is double-count).
+
+    codex m02 r4 CODE-BUG 3 fix: distinguish UNKNOWN (fetch failure) from EMPTY (real no-positions).
+    Cache requires explicit `__fetch_ok__: true`; otherwise re-fetch. On permanent failure, wallet
+    is OMITTED from the returned dict → caller treats carry-in as INCOMPLETE for that wallet.
+    """
+    import requests
+    import json
+    import time as _t
+    cache_dir = ROOT / "app" / "data" / "v13" / "current_positions_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    out: dict[str, dict[str, float]] = {}
+    snapshot_ts_by_wallet: dict[str, int] = {}
+    for wallet in wallets:
+        cache_path = cache_dir / f"{wallet}_{today_str}.json"
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text())
+                # Cache schema v2 (m02 r5 fix): snapshot_ms MUST be from HL server `time` field,
+                # not local pre-request ts. Old v1 caches are invalidated.
+                if (cached.get("__fetch_ok__") is True
+                        and isinstance(cached.get("snapshot_ms"), int)
+                        and cached.get("__schema__") == "v2_hl_server_time"):
+                    out[wallet] = cached.get("positions", {})
+                    snapshot_ts_by_wallet[wallet] = cached["snapshot_ms"]
+                    continue
+            except Exception:
+                pass
+        positions: dict[str, float] = {}
+        fetch_ok = False
+        snapshot_ms = 0
+        for retry in range(3):
+            try:
+                # codex m02 r5 CODE-BUG fix: use AUTHORITATIVE server-side `time` from
+                # clearinghouseState response (HL stamps the snapshot moment). Local pre-request
+                # ts was unsafe: any fill landing on HL between request-start and the actual
+                # server snapshot could be IN positions but EXCLUDED from post_window_fills
+                # capped at the local ts → carry-in under-subtracted. Server `time` removes
+                # this uncertainty band.
+                r = requests.post(
+                    "https://api.hyperliquid.xyz/info",
+                    json={"type": "clearinghouseState", "user": wallet},
+                    timeout=10,
+                )
+                if r.status_code == 429:
+                    _t.sleep(2 ** retry); continue
+                if r.status_code != 200:
+                    break  # non-200 → fetch_ok stays False
+                state = r.json()
+                # Server-side snapshot timestamp (ms). Required by m02 r5 fix.
+                snapshot_ms = int(state.get("time") or 0)
+                if snapshot_ms <= 0:
+                    # No server time → cannot safely bound post-window load. Fail this wallet.
+                    logger.warning(f"clearinghouseState for {wallet[:10]} missing 'time' field; marking incomplete")
+                    break
+                for asset_pos in state.get("assetPositions", []):
+                    pos = asset_pos.get("position", {})
+                    coin = pos.get("coin")
+                    szi = float(pos.get("szi", 0))
+                    if coin and abs(szi) > EPS:
+                        positions[coin] = szi
+                fetch_ok = True
+                break
+            except Exception:
+                _t.sleep(1)
+        if fetch_ok:
+            out[wallet] = positions
+            snapshot_ts_by_wallet[wallet] = snapshot_ms
+            try:
+                cache_path.write_text(json.dumps({
+                    "__fetch_ok__": True,
+                    "__schema__": "v2_hl_server_time",
+                    "positions": positions,
+                    "snapshot_ms": snapshot_ms,
+                    "ts": today_str,
+                }))
+            except Exception:
+                pass
+        else:
+            # CRITICAL: do NOT cache empty on failure. Leave wallet missing from out → caller treats as "unknown".
+            logger.warning(f"current-position fetch FAILED for {wallet[:10]}; will treat carry-in as INCOMPLETE for this wallet")
+    return out, snapshot_ts_by_wallet
+
+
+def _compute_carry_in_via_backwalk(
+    fills: pd.DataFrame,
+    wallets: list[str],
+    current_positions: dict[str, dict[str, float]],
+    post_window_fills: pd.DataFrame | None = None,   # NEW per codex m02 r3 CODE-BUG 1
+    snapshot_ts_by_wallet: dict[str, int] | None = None,   # NEW per codex m02 r6 CODE-BUG
+) -> dict[tuple[str, str], tuple[float, float, str]]:
+    """codex m02 r2 BLOCKER 1 alternative-C + codex m02 r3 CODE-BUGS 1+2 corrected:
+    derive carry-in by walking BACKWARD from CURRENT position state.
+
+    position_at_window_start[wallet, coin] = current_qty
+                                              - sum(signed_sz of in-window fills)
+                                              - sum(signed_sz of POST-window fills, if any)
+
+    Post-window fills (between window_end and "now" when current_positions was fetched)
+    are needed because current_qty reflects them, but our in-window fills exclude them.
+    Without subtracting, position_at_start would be off by the post-window net.
+
+    SPOT FILTER (codex m02 r3 CODE-BUG 2): _fetch_current_positions reads PERP only via
+    clearinghouseState. Spot coins (`@` prefix, dir=Buy/Sell) have current_qty=0 by definition
+    in our query. Iterating over them with nonzero in-window net would fabricate opposite
+    carry-in. Filter them OUT — spot is not tracked by this carry-in mechanism (it's also
+    excluded from journey trace main loop via coin_is_spot).
+
+    Returns {(wallet, coin): (carry_in_position, carry_in_cost_basis, carry_in_status)}.
+
+    carry_in_status:
+        "carry_resolved"   wallet had position before window_start (verified)
+        "no_carry"         wallet was flat at window_start (current - all_fills == 0)
+    """
+    def _is_spot_coin(c: str) -> bool:
+        # HL spot coin encoding: @ prefix. Also coin == "USDC" treated as cash, not perp.
+        return c.startswith("@") or c == "USDC"
+
+    out: dict[tuple[str, str], tuple[float, float, str]] = {}
+    wallets_set = set(wallets)
+
+    # In-window net per (wallet, coin)
+    fills_w = fills[fills["wallet"].isin(wallets_set)].copy()
+    # Filter spot OUT (codex m02 r3 CODE-BUG 2)
+    fills_w = fills_w[~fills_w["coin"].apply(_is_spot_coin)]
+
+    # codex m02 r7 CODE-BUG-CRITICAL fix: PRECOMPUTE coins-per-wallet from UNFILTERED fills_w
+    # BEFORE applying snapshot bound. The r6 fix dropped all fills from snapshot-failed wallets,
+    # which broke downstream incomplete propagation (which derived coin set from in_window_net).
+    # codex m02 r8 PERF: single groupby instead of per-wallet loc scan (O(F) vs O(W*F)).
+    coins_by_wallet_all: dict[str, set[str]] = {
+        w: set(g["coin"].unique().tolist())
+        for w, g in fills_w.groupby("wallet", sort=False)
+    }
+    # Ensure every requested wallet has an entry (empty set if no fills loaded).
+    for wallet in wallets:
+        coins_by_wallet_all.setdefault(wallet, set())
+
+    # codex m02 r6 CODE-BUG fix: BOUND in_window_net to per-wallet snapshot_ms. current_qty
+    # reflects state AT snapshot_ms; fills with time > snapshot_ms are NOT in current_qty
+    # (they happened after) → subtracting them from current_qty would OVER-subtract and
+    # fabricate negative carry-in. Only fills with time <= snapshot_ms contribute to the
+    # backwalk arithmetic.
+    if snapshot_ts_by_wallet:
+        snapshot_series = fills_w["wallet"].map(snapshot_ts_by_wallet)
+        # Wallets without a snapshot_ts (fetch failed) are handled separately as incomplete;
+        # their fills get dropped from in_window_net here (mapped to -1 → filtered out).
+        carry_mask = fills_w["time"].astype("int64") <= snapshot_series.fillna(-1).astype("int64")
+        pre_n = len(fills_w)
+        fills_w_carry = fills_w[carry_mask].reset_index(drop=True)
+        if pre_n != len(fills_w_carry):
+            logger.info(
+                f"  in_window snapshot filter: dropped {pre_n - len(fills_w_carry):,} fills past per-wallet snapshot"
+            )
+    else:
+        fills_w_carry = fills_w
+    fills_w_carry["signed_sz"] = fills_w_carry.apply(
+        lambda r: float(r["size"]) if r["side"] == "B" else -float(r["size"]), axis=1
+    )
+    in_window_net = fills_w_carry.groupby(["wallet", "coin"])["signed_sz"].sum().to_dict()
+    # First-fill price still uses the full fills_w (snapshot bound is for arithmetic only;
+    # first-fill price is a seed for cost-basis, valid even if the fill is past snapshot —
+    # though practically first fills are window-start, well before snapshot).
+
+    # First-fill price per (wallet, coin) for cost-basis seed
+    fills_w_sorted = fills_w.sort_values(["wallet", "coin", "time"], kind="stable")
+    first_prices = fills_w_sorted.groupby(["wallet", "coin"]).first()["price"].to_dict()
+
+    # POST-window net (codex m02 r3 CODE-BUG 1) — already snapshot-bounded by caller
+    post_window_net = {}
+    if post_window_fills is not None and not post_window_fills.empty:
+        pwf = post_window_fills[post_window_fills["wallet"].isin(wallets_set)].copy()
+        pwf = pwf[~pwf["coin"].apply(_is_spot_coin)]
+        # Caller already bounded post_window_fills to per-wallet snapshot_ms; no additional filter.
+        pwf["signed_sz"] = pwf.apply(
+            lambda r: float(r["size"]) if r["side"] == "B" else -float(r["size"]), axis=1
+        )
+        post_window_net = pwf.groupby(["wallet", "coin"])["signed_sz"].sum().to_dict()
+
+    for wallet in wallets:
+        # codex m02 r4 CODE-BUG 3 fix + r7 regression fix: if wallet missing from current_positions,
+        # fetch FAILED. Mark ALL pairs for this wallet as INCOMPLETE so downstream excludes them.
+        # MUST use coins_by_wallet_all (precomputed from UNFILTERED fills) because r6 snapshot bound
+        # drops failed-wallet fills from in_window_net.
+        if wallet not in current_positions:
+            coins_in_fills = coins_by_wallet_all.get(wallet, set())
+            for coin in coins_in_fills:
+                if not _is_spot_coin(coin):
+                    out[(wallet, coin)] = (0.0, 0.0, "incomplete")
+            continue
+        current = current_positions[wallet]
+        # Coins to consider: any with current_position OR any with in-window net OR any with post-window net
+        coins = set(current.keys()) | {c for (w, c) in in_window_net if w == wallet} | \
+                {c for (w, c) in post_window_net if w == wallet}
+        coins = {c for c in coins if not _is_spot_coin(c)}
+        for coin in coins:
+            current_qty = current.get(coin, 0.0)
+            net_in_window = in_window_net.get((wallet, coin), 0.0)
+            net_post_window = post_window_net.get((wallet, coin), 0.0)
+            position_at_start = current_qty - net_in_window - net_post_window
+            if abs(position_at_start) < EPS:
+                out[(wallet, coin)] = (0.0, 0.0, "no_carry")
+            else:
+                cost_basis_seed = float(first_prices.get((wallet, coin), 0.0))
+                out[(wallet, coin)] = (position_at_start, cost_basis_seed, "carry_resolved")
+    return out
+
 
 def load_equity_series(path: Path | None) -> dict:
     """Returns {wallet_lower: spot_usdc_today}.
@@ -329,7 +573,15 @@ def trace_journeys_for_pair(
         n_reverse = 0
         realized_pnl = 0.0
         fees_paid_usd = 0.0
-        fee_scope = "standard_perp"  # carry-in opener pre-window unknown; default
+        # codex m02 r2 MED 8 fix (2026-05-29): infer fee_scope from coin, NOT default to standard_perp.
+        # A carry-in for xyz: prefix is builder_perp; @ prefix coin is spot (but spot wouldn't make it
+        # to journey trace per coin_is_spot exclusion); otherwise standard_perp.
+        if coin.startswith("xyz:"):
+            fee_scope = "builder_perp"
+        elif coin.startswith("@"):
+            fee_scope = "spot"            # defensive — should not reach here per spot exclusion
+        else:
+            fee_scope = "standard_perp"
         addon_times: list[int] = []
         trim_times: list[int] = []
         # carry-in incompleteness propagates to all carry-in-touching journeys.
@@ -454,7 +706,10 @@ def trace_journeys_for_pair(
         # For non-REVERSE: full fill belongs to current journey.
         # For REVERSE: split below (closing_fee + opening_fee).
         fill_notional = abs(signed) * price
-        fill_fee = _fill_fee_usd(fill_notional)
+        # codex m02 r2 BLOCKER 2 fix (2026-05-29): prefer actual v2-fills fee fields
+        # over flat 4.32 bps estimate. Falls back to estimator if v2 fields absent.
+        actual_fee = _fill_fee_usd_actual(row)
+        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
         # Classify fee_scope from this row's dir/coin (codex r16 #7).
         row_dir = getattr(row, "dir", None) or ""
         row_scope = _classify_fee_scope(row_dir, coin)
@@ -511,12 +766,19 @@ def trace_journeys_for_pair(
             fees_paid_usd += fill_fee
         elif (position > 0 and new_pos < 0) or (position < 0 and new_pos > 0):
             # REVERSE: codex r16 #6 - split fee between closing leg and new (opening) leg
+            # codex m02 r2 BLOCKER 2 fix (2026-05-29): use actual v2 fees with notional split.
+            # Total fill notional = |signed| × price = (|position| + |new_pos|) × price (since signed crosses zero).
+            # Split actual_fee proportionally: closing_fee = actual_fee × |position| / (|position| + |new_pos|).
             n_reverse += 1
             realized_pnl += closed_pnl
-            # Closing portion fee: |position_before| * price * FEE_RATE
-            closing_fee = abs(position) * price * FEE_RATE
-            # Opening portion fee: |position_after| * price * FEE_RATE
-            opening_fee = abs(new_pos) * price * FEE_RATE
+            split_total_notional = (abs(position) + abs(new_pos))
+            if actual_fee is not None and split_total_notional > EPS:
+                closing_fee = actual_fee * (abs(position) / split_total_notional)
+                opening_fee = actual_fee * (abs(new_pos) / split_total_notional)
+            else:
+                # Fallback to estimator (FEE_RATE flat) per leg
+                closing_fee = abs(position) * price * FEE_RATE
+                opening_fee = abs(new_pos) * price * FEE_RATE
             fees_paid_usd += closing_fee
             j = _finalize_journey(ts)
             if j is not None:
@@ -562,6 +824,35 @@ def main():
     ap.add_argument("--equity-series", required=True, help="wallet_equity_series.parquet")
     ap.add_argument("--walkback-days", type=int, default=90)
     ap.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    ap.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=500,
+        help="Flush partial parquet every N completed wallets (default 500). "
+             "0 disables checkpointing.",
+    )
+    ap.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore any existing <output>.done_wallets.txt + .partial.parquet; "
+             "start fresh.",
+    )
+    ap.add_argument(
+        "--use-current-state-anchor",
+        action="store_true",
+        default=True,
+        help="codex m02 r2 alternative-C (2026-05-29): derive carry-in by walking BACKWARD from "
+             "current HL position state through in-window fills. No pre-window data dependency. "
+             "Replaces pre-window walkback (which always returned 0 because archive starts "
+             "2025-12-01). Default True. Pass --no-use-current-state-anchor to disable.",
+    )
+    ap.add_argument(
+        "--no-use-current-state-anchor",
+        dest="use_current_state_anchor",
+        action="store_false",
+        help="Disable current-state anchor; revert to pre-window walkback (only useful if you've "
+             "extended the S3 archive to cover pre-window dates).",
+    )
     args = ap.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -571,6 +862,63 @@ def main():
     if args.wallets:
         with open(args.wallets) as f:
             wallets_filter = {w.strip().lower() for w in f if w.strip()}
+
+    # ------------------------------------------------------------------
+    # Checkpoint / resume (OOM hardening, 2026-05-29)
+    # ------------------------------------------------------------------
+    out_path = Path(args.output)
+    partial_path = out_path.with_suffix(out_path.suffix + ".partial")
+    done_wallets_path = out_path.with_suffix(out_path.suffix + ".done_wallets.txt")
+
+    resumed_journeys: list[dict] = []
+    done_wallets: set[str] = set()
+    if not args.no_resume and done_wallets_path.exists() and partial_path.exists():
+        try:
+            with open(done_wallets_path) as f:
+                done_wallets = {w.strip().lower() for w in f if w.strip()}
+            partial_df = pd.read_parquet(partial_path)
+            resumed_journeys = partial_df.to_dict("records")
+            logger.info(
+                f"RESUME: loaded {len(resumed_journeys):,} journeys for "
+                f"{len(done_wallets):,} already-done wallets from {partial_path}"
+            )
+            if wallets_filter is None:
+                # Need to know the universe to skip done ones; if no filter given,
+                # we don't know yet; we'll handle skipping post-fill-load.
+                pass
+            else:
+                # codex m02 r3 CODE-BUG 4 fix: detect "all done" BEFORE filter empties wallets list.
+                # If supplied wallets are all in done_wallets, partial is the COMPLETE output; promote.
+                supplied_wallets_lc = wallets_filter  # before filtering
+                all_done = supplied_wallets_lc.issubset(done_wallets)
+                wallets_filter = {w for w in wallets_filter if w not in done_wallets}
+                if all_done:
+                    logger.warning(
+                        f"RESUME TERMINAL: all {len(supplied_wallets_lc):,} wallets in done list; "
+                        f"promoting partial ({len(resumed_journeys):,} journeys) → final and exiting."
+                    )
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_final = out_path.with_suffix(out_path.suffix + ".final.tmp")
+                    pd.DataFrame(resumed_journeys).to_parquet(tmp_final, index=False, compression="snappy")
+                    tmp_final.replace(out_path)
+                    if partial_path.exists(): partial_path.unlink()
+                    if done_wallets_path.exists(): done_wallets_path.unlink()
+                    return
+                logger.info(
+                    f"RESUME: reduced wallet filter to {len(wallets_filter):,} "
+                    f"(skipped {len(done_wallets):,} done)"
+                )
+        except Exception as e:
+            logger.error(f"RESUME failed reading {partial_path}/{done_wallets_path}: {e}")
+            logger.error("Refusing to start fresh on top of broken checkpoint. "
+                         "Either fix files or pass --no-resume.")
+            return
+    elif not args.no_resume and (done_wallets_path.exists() ^ partial_path.exists()):
+        logger.error(
+            f"CHECKPOINT INCONSISTENT: one of {partial_path}, {done_wallets_path} "
+            f"exists but not both. Refusing to proceed. Delete both or pass --no-resume."
+        )
+        return
 
     logger.info(f"Loading fills {start.date()} to {end.date()}")
     fills = load_fills_for_dates(start, end, wallets_filter)
@@ -586,9 +934,75 @@ def main():
     else:
         wallets = sorted(fills["wallet"].unique().tolist())
 
-    logger.info(f"Bulk-loading prior fills for carry-in walkback ({args.walkback_days} days)...")
-    prior_fills = load_prior_fills_for_wallets(set(wallets), FILLS_DIR, start, max_walkback_days=args.walkback_days)
-    logger.info(f"Bulk-loaded {len(prior_fills):,} prior fills")
+    # If resume and no explicit filter, skip done wallets from the discovered
+    # universe (the load above already paid the RAM cost; we still save compute).
+    if done_wallets and wallets_filter is None:
+        before = len(wallets)
+        wallets = [w for w in wallets if w not in done_wallets]
+        logger.info(
+            f"RESUME: skipping {before - len(wallets):,} done wallets in discovered universe"
+        )
+        # Also drop their fills so the loop ignores them.
+        fills = fills[~fills["wallet"].isin(done_wallets)].reset_index(drop=True)
+
+    # codex m02 r2 BLOCKER 1 fix (2026-05-29) ALTERNATIVE-C approach: rather than walking
+    # back through pre-window fills (which our S3 archive lacks — starts 2025-12-01), we
+    # derive carry-in by walking BACKWARD from CURRENT position state through in-window
+    # fills. position_at_window_start = current_position - sum(signed_sz of in-window fills).
+    # This requires:
+    #   - HL info.user_state(wallet) call per wallet (single HTTP per wallet)
+    #   - In-window fills already loaded (we have them)
+    # No pre-window data dependency.
+    if args.use_current_state_anchor:
+        logger.info(f"Using current-state anchor for carry-in (walks backward through in-window fills)...")
+        current_positions_by_wallet, snapshot_ts_by_wallet = _fetch_current_positions(wallets)
+        # codex m02 r3 CODE-BUG 1 fix + r4 CODE-BUG 1: load POST-window fills strictly AFTER end day.
+        # load_fills_for_dates is inclusive [t0, t1], so passing (end, today) double-counts end-day
+        # fills (they appear in both in_window AND post_window). Start at end + 1 day.
+        # codex m02 r4 CODE-BUG 2 fix: BOUND post-window load to MIN(snapshot_ms) across wallets
+        # so we never subtract a fill that occurred AFTER the snapshot (snapshot already reflects it).
+        today = datetime.now(timezone.utc)
+        post_window_start = end + timedelta(days=1)
+        if snapshot_ts_by_wallet:
+            min_snapshot_ms = min(snapshot_ts_by_wallet.values())
+            anchor_dt = datetime.fromtimestamp(min_snapshot_ms / 1000, tz=timezone.utc)
+            post_window_end = min(today, anchor_dt)
+        else:
+            post_window_end = today
+            logger.warning("No snapshot timestamps captured; using `today` as post-window upper bound (LESS SAFE)")
+        if post_window_end >= post_window_start:
+            logger.info(f"Loading post-window fills {post_window_start.date()} → {post_window_end.date()} (snapshot-bounded) for carry-in correction...")
+            post_window_fills = load_fills_for_dates(post_window_start, post_window_end, set(wallets))
+            if not post_window_fills.empty:
+                post_window_fills = validate_and_normalize_fills(post_window_fills)
+                # Also strict-filter by per-wallet snapshot_ms (more precise than the loose min-snapshot bound).
+                if snapshot_ts_by_wallet:
+                    snapshot_series = post_window_fills["wallet"].map(snapshot_ts_by_wallet)
+                    # Drop fills past per-wallet snapshot; also drop fills for wallets with no snapshot.
+                    keep_mask = post_window_fills["time"].astype("int64") <= snapshot_series.fillna(-1).astype("int64")
+                    pre_n = len(post_window_fills)
+                    post_window_fills = post_window_fills[keep_mask].reset_index(drop=True)
+                    if pre_n != len(post_window_fills):
+                        logger.info(f"  dropped {pre_n - len(post_window_fills):,} fills past per-wallet snapshot")
+                logger.info(f"  loaded {len(post_window_fills):,} post-window fills (bounded)")
+        else:
+            post_window_fills = pd.DataFrame()
+        # Compute carry-in per (wallet, coin) by walking backward (snapshot-bounded — m02 r6 fix)
+        carry_in_by_wallet_coin = _compute_carry_in_via_backwalk(
+            fills, wallets, current_positions_by_wallet,
+            post_window_fills=post_window_fills,
+            snapshot_ts_by_wallet=snapshot_ts_by_wallet,
+        )
+        prior_fills = pd.DataFrame()  # not used in this path
+        prior_by_wallet = {}
+        logger.info(
+            f"Carry-in derived for {len(carry_in_by_wallet_coin):,} (wallet, coin) pairs via current-state anchor"
+        )
+    else:
+        logger.info(f"Bulk-loading prior fills for carry-in walkback ({args.walkback_days} days)...")
+        prior_fills = load_prior_fills_for_wallets(set(wallets), FILLS_DIR, start, max_walkback_days=args.walkback_days)
+        logger.info(f"Bulk-loaded {len(prior_fills):,} prior fills")
+        carry_in_by_wallet_coin = None
 
     equity_lookup = load_equity_series(Path(args.equity_series))
     logger.info(f"Loaded {len(equity_lookup):,} equity-series rows")
@@ -611,18 +1025,120 @@ def main():
     end_ms = int((end + timedelta(days=1)).timestamp() * 1000)
     logger.info(f"Fetching funding events per wallet (disk-cached at {FUNDING_CACHE_DIR})...")
 
+    # Seed with resumed journeys (if any) so the final write is the full set.
+    # codex m02 r4 CODE-BUG 4 fix: dedup the seed by (wallet, coin, journey_id).
+    # If we crashed AFTER partial parquet rename but BEFORE done_wallets rename, the wallet's
+    # journeys exist in partial yet wallet is missing from done. On restart, fills for that
+    # wallet are re-processed and re-extended into all_journeys → duplicates. Dedup at seed time
+    # keeps the FIRST occurrence (which is the prior-flushed version); the same wallet, if
+    # re-processed below, will produce identical journey_ids that we drop on a second dedup pass
+    # at the end before writing the final parquet (belt-and-suspenders).
+    seen_keys: set[tuple[str, str, int]] = set()
     all_journeys: list[dict] = []
+    n_dups_seed = 0
+    for j in resumed_journeys:
+        k = (str(j.get("wallet", "")).lower(), str(j.get("coin", "")), int(j.get("journey_id", -1)))
+        if k in seen_keys:
+            n_dups_seed += 1
+            continue
+        seen_keys.add(k)
+        all_journeys.append(j)
+    if n_dups_seed:
+        logger.warning(
+            f"RESUME DEDUP: dropped {n_dups_seed:,} duplicate journeys from partial parquet seed"
+        )
+
+    # codex m02 r4 CODE-BUG 5 fix: filter SPOT coins from the journey trace main loop.
+    # Spot coins (@-prefix or "USDC") are NOT tracked in clearinghouseState (perps only) and
+    # would otherwise be processed with carry_in=0, fabricating fake short journeys when a spot
+    # sell from pre-window inventory shows up in in-window fills. Carry-in path already filters
+    # spot; main loop must match. Excluded coins are out-of-scope for V13 (perp copy strategy).
+    def _coin_is_spot(c: str) -> bool:
+        return isinstance(c, str) and (c.startswith("@") or c == "USDC")
+    pre_filter_n = len(fills)
+    spot_mask = fills["coin"].apply(_coin_is_spot)
+    if spot_mask.any():
+        n_spot = int(spot_mask.sum())
+        n_spot_wallets = int(fills.loc[spot_mask, "wallet"].nunique())
+        n_spot_coins = int(fills.loc[spot_mask, "coin"].nunique())
+        fills = fills[~spot_mask].reset_index(drop=True)
+        logger.info(
+            f"SPOT FILTER: dropped {n_spot:,} spot fills "
+            f"({n_spot_wallets:,} wallets × {n_spot_coins:,} coins); "
+            f"{pre_filter_n - n_spot:,} perp fills remain"
+        )
+
     pair_groups = fills.groupby(["wallet", "coin"], sort=False)
     n_pairs = pair_groups.ngroups
-    logger.info(f"Tracing journeys across {n_pairs:,} (wallet,coin) pairs...")
+    logger.info(
+        f"Tracing journeys across {n_pairs:,} (wallet,coin) pairs "
+        f"(checkpoint_every={args.checkpoint_every} wallets, "
+        f"resumed={len(resumed_journeys):,} journeys)..."
+    )
 
     processed = 0
     carry_in_incomplete_count = 0
     incomplete_journeys_excluded = 0
     funding_cache_per_wallet: dict[str, list] = {}
+    # Track wallet completion for checkpointing.
+    current_wallet: str | None = None
+    new_done_wallets: list[str] = []
+    journeys_at_checkpoint_start = len(all_journeys)
+
+    def _flush_checkpoint(reason: str) -> None:
+        nonlocal journeys_at_checkpoint_start
+        if args.checkpoint_every <= 0:
+            return
+        if not new_done_wallets:
+            return
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        # codex m02 r3 CODE-BUG 3 fix (2026-05-29): atomic pair via .tmp + .tmp.done + double rename.
+        # We collect ALL done wallets (prior + new) into a fresh tmp file, write fresh tmp partial,
+        # then rename both. If crash between renames: the prior partial+done pair is still consistent.
+        tmp_partial = partial_path.with_suffix(partial_path.suffix + ".tmp")
+        tmp_done = done_wallets_path.with_suffix(done_wallets_path.suffix + ".tmp")
+        # Write fresh done_wallets file with prior content + new
+        prior_done: list[str] = []
+        if done_wallets_path.exists():
+            with open(done_wallets_path) as _f:
+                prior_done = [l.strip() for l in _f if l.strip()]
+        with open(tmp_done, "w") as _f:
+            for w in prior_done:
+                _f.write(f"{w}\n")
+            for w in new_done_wallets:
+                _f.write(f"{w}\n")
+        # Write fresh tmp partial
+        pd.DataFrame(all_journeys).to_parquet(
+            tmp_partial, index=False, compression="snappy"
+        )
+        # Atomic rename: partial FIRST (consumers that resume read both; if we crash here,
+        # done_wallets is stale-low, resume re-processes some wallets — duplicate-prevention
+        # via dedup at the all_journeys side rather than missing data).
+        tmp_partial.replace(partial_path)
+        tmp_done.replace(done_wallets_path)
+        added_journeys = len(all_journeys) - journeys_at_checkpoint_start
+        logger.info(
+            f"CHECKPOINT [{reason}]: {len(new_done_wallets)} new wallets, "
+            f"+{added_journeys:,} journeys → {partial_path.name} "
+            f"({len(all_journeys):,} total)"
+        )
+        new_done_wallets.clear()
+        journeys_at_checkpoint_start = len(all_journeys)
+
     for (wallet, coin), grp in pair_groups:
-        prior_for_wallet = prior_by_wallet.get(wallet, pd.DataFrame())
-        pos_in, cb_in, ci_status = find_carry_in_state_from_prior(wallet, coin, prior_for_wallet)
+        # Wallet boundary: mark previous wallet as done; checkpoint if needed.
+        if current_wallet is not None and wallet != current_wallet:
+            new_done_wallets.append(current_wallet)
+            if (args.checkpoint_every > 0
+                    and len(new_done_wallets) >= args.checkpoint_every):
+                _flush_checkpoint(f"every {args.checkpoint_every} wallets")
+        current_wallet = wallet
+        # codex m02 r2 BLOCKER 1 alternative-C (2026-05-29): use current-state anchor when enabled
+        if args.use_current_state_anchor and carry_in_by_wallet_coin is not None:
+            pos_in, cb_in, ci_status = carry_in_by_wallet_coin.get((wallet, coin), (0.0, 0.0, "no_carry"))
+        else:
+            prior_for_wallet = prior_by_wallet.get(wallet, pd.DataFrame())
+            pos_in, cb_in, ci_status = find_carry_in_state_from_prior(wallet, coin, prior_for_wallet)
         if ci_status == "incomplete":
             carry_in_incomplete_count += 1
         # Fetch funding once per wallet (memoized across coins of the same wallet)
@@ -648,20 +1164,60 @@ def main():
             kept = [j for j in js if j.get("carry_in_status") != "incomplete"]
             incomplete_journeys_excluded += (len(js) - len(kept))
             js = kept
-        all_journeys.extend(js)
+        # codex m02 r4 CODE-BUG 4 fix: per-pair dedup against the running seen_keys set
+        # (catches duplicates between resumed seed and freshly-traced output).
+        new_js = []
+        for j in js:
+            k = (str(j.get("wallet", "")).lower(), str(j.get("coin", "")), int(j.get("journey_id", -1)))
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            new_js.append(j)
+        all_journeys.extend(new_js)
         processed += 1
         if processed % 5000 == 0:
             logger.info(f"  {processed:,}/{n_pairs:,} pairs, {len(all_journeys):,} journeys, carry_incomplete_pairs={carry_in_incomplete_count}, excluded_journeys={incomplete_journeys_excluded}")
+
+    # Mark the last wallet as done.
+    if current_wallet is not None:
+        new_done_wallets.append(current_wallet)
+    # Final flush (covers any remainder under checkpoint_every).
+    if new_done_wallets and args.checkpoint_every > 0:
+        _flush_checkpoint("final")
+
+    # codex m02 r2 HIGH 4 fix (2026-05-29): handle resume terminal-state. If all wallets
+    # were already done (checkpoint complete but final write failed), promote partial → final
+    # without requiring any additional fills processing.
+    if not all_journeys and partial_path.exists() and len(done_wallets) > 0:
+        logger.warning(
+            f"RESUME: all {len(done_wallets):,} wallets already in partial parquet; "
+            f"promoting partial → final without re-tracing."
+        )
+        all_journeys = partial_df.to_dict("records") if 'partial_df' in dir() else []
+        if not all_journeys:
+            try:
+                all_journeys = pd.read_parquet(partial_path).to_dict("records")
+            except Exception as e:
+                logger.error(f"Failed to re-load partial for terminal promotion: {e}")
+                return
 
     if not all_journeys:
         logger.error("Zero journeys extracted.")
         return
 
     out = pd.DataFrame(all_journeys)
-    out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(out_path, index=False, compression="snappy")
+    # codex m02 r2 HIGH 5 fix (2026-05-29): atomic write via tmp+rename to prevent
+    # corrupt final parquet on crash mid-write.
+    tmp_final = out_path.with_suffix(out_path.suffix + ".final.tmp")
+    out.to_parquet(tmp_final, index=False, compression="snappy")
+    tmp_final.replace(out_path)
     logger.info(f"Wrote {len(out):,} journeys to {out_path}")
+    # Clean up checkpoint artifacts on successful completion.
+    if partial_path.exists():
+        partial_path.unlink()
+    if done_wallets_path.exists():
+        done_wallets_path.unlink()
 
     # Summary.
     logger.info("Journey class distribution:")

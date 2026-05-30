@@ -74,10 +74,12 @@ def main():
                     help="Number of parallel subprocesses (default 10)")
     ap.add_argument("--output", required=True,
                     help="Final concatenated parquet path")
-    ap.add_argument("--shard-dir", default="/tmp/v13_equity_shards",
-                    help="Per-chunk shard directory (default /tmp/v13_equity_shards)")
-    ap.add_argument("--chunk-list-dir", default="/tmp/v13_equity_chunks",
-                    help="Per-chunk wallet list directory (default /tmp/v13_equity_chunks)")
+    ap.add_argument("--shard-dir", default="app/data/v13/equity_shards_parallel",
+                    help="Per-chunk shard directory (default app/data/v13/equity_shards_parallel; "
+                         "moved off /tmp after 2026-05-29 OOM-2 lost 5h compute)")
+    ap.add_argument("--chunk-list-dir", default="app/data/v13/equity_chunk_lists",
+                    help="Per-chunk wallet list directory (default app/data/v13/equity_chunk_lists; "
+                         "moved off /tmp after 2026-05-29 OOM-2)")
     ap.add_argument("--log-dir", default=None,
                     help="Per-chunk log directory (default <output_dir>/logs/parallel)")
     ap.add_argument("--resume", action="store_true",

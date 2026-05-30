@@ -1300,7 +1300,12 @@ class CopyTrader:
                 _risk_exit_attempted = True
                 wallet_group = self.wallet_groups.get(wallet, "unknown")
                 logger.warning(f"HARD SL: {coin} at {current_pnl_bps:.0f}bps (limit: {sl_bps}bps) [{wallet_group}]")
-                _tg(f"HARD SL: {coin} at {current_pnl_bps:.0f}bps [{wallet_group}]")
+                # TG cooldown: prevents per-loop spam when exit fails and trigger persists.
+                # Fix 2026-05-27 (Alberto TG 7510/7512): xyz:MRVL was firing every second.
+                _now_ts = time.time()
+                if (_now_ts - pos.get("_last_hard_sl_tg_ts", 0)) >= 300:
+                    _tg(f"HARD SL: {coin} at {current_pnl_bps:.0f}bps [{wallet_group}]")
+                    pos["_last_hard_sl_tg_ts"] = _now_ts
                 exited = await self._exit_position(pos)
                 if exited:
                     acc_key = (wallet, coin)
@@ -1321,7 +1326,12 @@ class CopyTrader:
                         f"TRAILING STOP: {coin} peak={peak_pnl_bps:.0f}bps, "
                         f"current={current_pnl_bps:.0f}bps, trail={trail_dist}bps [{wallet_group}]"
                     )
-                    _tg(f"TRAILING STOP: {coin} peak={peak_pnl_bps:.0f} now={current_pnl_bps:.0f}bps [{wallet_group}]")
+                    # TG cooldown: prevents per-loop spam when exit fails and trigger persists.
+                    # Fix 2026-05-27 (Alberto TG 7510/7512): xyz:MRVL was firing every second.
+                    _now_ts = time.time()
+                    if (_now_ts - pos.get("_last_trail_tg_ts", 0)) >= 300:
+                        _tg(f"TRAILING STOP: {coin} peak={peak_pnl_bps:.0f} now={current_pnl_bps:.0f}bps [{wallet_group}]")
+                        pos["_last_trail_tg_ts"] = _now_ts
                     exited = await self._exit_position(pos)
                     if exited:
                         acc_key = (wallet, coin)

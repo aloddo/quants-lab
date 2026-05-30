@@ -20,7 +20,7 @@ Stage 3 (later): wallet correlation matrix + anti-corr greedy pick.
 
 Run:
   python scripts/copyability_eval.py --start 2026-04-01 --end 2026-04-30 \
-      --min-journeys 50 --min-coins 3 --out /tmp/copyability_eval_apr2026.parquet
+      --min-journeys 50 --min-coins 3 --out app/data/v13/copyability/eval_apr2026.parquet
 """
 from __future__ import annotations
 
