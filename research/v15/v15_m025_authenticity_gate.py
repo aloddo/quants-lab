@@ -515,7 +515,13 @@ def internal_hedge(fillsA, fillsB, lo_ms, hi_ms):
     while t <= hi_ms:
         posA = m01.positions_at(fillsA, t)
         posB = m01.positions_at(fillsB, t)
-        if posA and posB:
+        # codex r6 fix: positions_at can return a dict with ZERO sizes (traded then
+        # flattened). Count a wallet active only if it holds REAL nonzero exposure;
+        # otherwise flat timestamps inflate both_active and dilute the hedge fraction,
+        # letting a genuinely hedged entity slip the gate.
+        activeA = any(abs(x) > 1e-12 for x in posA.values())
+        activeB = any(abs(x) > 1e-12 for x in posB.values())
+        if activeA and activeB:
             both_active += 1
             shared = [c for c in (set(posA) & set(posB))
                       if abs(posA[c]) > 1e-12 and abs(posB[c]) > 1e-12]
