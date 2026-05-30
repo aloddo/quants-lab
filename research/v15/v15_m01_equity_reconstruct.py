@@ -268,8 +268,32 @@ def dex_in_scope(dex: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+PERP_ANCHOR_CACHE = Path(
+    "/Users/hermes/quants-lab/app/data/v15/perp_anchor_cache"
+)
+
+
 def get_portfolio_perp(wallet: str, retries: int = 4) -> list[tuple[int, float]]:
-    """perpAllTime accountValueHistory as (ts_ms, value), whole-account perp."""
+    """perpAllTime accountValueHistory as (ts_ms, value), whole-account perp.
+
+    DISK-CACHED (2026-05-30): the per-wallet HL `portfolio` API call was the M01
+    bottleneck (~0.3-0.7s each, network-bound, 20k wallets sequential = hours).
+    We now persist each wallet's perpAllTime history to
+    app/data/v15/perp_anchor_cache/{wallet}.json on first fetch and read it back
+    on every subsequent run -> future M01 runs do ZERO API calls for anchors.
+    Raw data, never auto-deleted. Delete the dir to force a refresh.
+    """
+    wallet_lc = wallet.lower()
+    cache_fp = PERP_ANCHOR_CACHE / f"{wallet_lc}.json"
+    if cache_fp.exists():
+        try:
+            with open(cache_fp) as f:
+                return [(int(t), float(v)) for t, v in json.load(f)]
+        except Exception:
+            pass  # corrupt cache -> refetch
+
+    result: list[tuple[int, float]] = []
+    fetched = False
     for i in range(retries):
         try:
             r = requests.post(
@@ -279,17 +303,32 @@ def get_portfolio_perp(wallet: str, retries: int = 4) -> list[tuple[int, float]]
                 time.sleep(2**i)
                 continue
             if r.status_code != 200:
-                return []
+                fetched = False
+                break
             for window_name, wd in r.json():
                 if window_name == "perpAllTime":
-                    return [
+                    result = [
                         (int(x[0]), float(x[1]))
                         for x in wd.get("accountValueHistory", [])
                     ]
-            return []
+                    break
+            fetched = True
+            break
         except Exception:
             time.sleep(1)
-    return []
+
+    # Persist only a genuine API response (incl. legitimately-empty histories) so
+    # we never cache a transient network failure as "no anchors".
+    if fetched:
+        try:
+            PERP_ANCHOR_CACHE.mkdir(parents=True, exist_ok=True)
+            tmp = cache_fp.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump([[int(t), float(v)] for t, v in result], f)
+            tmp.replace(cache_fp)
+        except Exception:
+            pass
+    return result
 
 
 def get_clearinghouse(wallet: str, dex: Optional[str], retries: int = 3) -> Optional[dict]:
