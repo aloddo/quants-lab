@@ -38,10 +38,17 @@ running processes are unaffected and pick up the new path on next restart. The
 currently loaded (V11 runs manually).
 
 ## CANONICAL research modules (V15 pipeline)
+Pipeline order: **M01 equity -> M02 authenticity gate -> ranking -> M03 sizing -> sim -> shadow-live.**
+(The gate was briefly mislabeled "M02.5"; it is the gate that runs BEFORE ranking, so
+nothing can be sized until it filters. File still named v15_m025_* for now.)
+
 | module | canonical file | status |
 |---|---|---|
-| M01 equity reconstruct | `research/v15/v15_m01_equity_reconstruct.py` | 14 codex bugs fixed 2026-05-30; subset-proven |
+| M01 equity reconstruct | `research/v15/v15_m01_equity_reconstruct.py` | DONE. 14 codex bugs fixed; full 20,378-wallet run done (app/data/v15/m01_universe_20k_series.parquet). Anchor disk cache added. Accurate at true weekly anchors (drift is parked intra-week marks only). |
+| M02 authenticity gate | `research/v15/v15_m025_authenticity_gate.py` | DONE. Codex SHIP after 7-round loop. Entity/hedge/funding-farm/wash/neutral detection. Output app/data/v15/m025_authenticity.parquet. |
+| anchor prefetch | `research/v15/v15_prefetch_anchors.py` | warms perp_anchor_cache (zero-API future runs) |
 | M01 validation subset | `app/data/v15/m01_validation_wallets.txt` | 11 archetypes |
+| M03 sizing | (not built) | NEXT after gate full run + Alberto review |
 | G5 source-quality filter | `research/v15/v15_g5_filter.py` | |
 | source ROE enrichment | `research/v15/v15_source_roe_enrichment.py` | |
 | V13 predecessor (reference) | `research/v13/v13_equity_reconstruct_v8.py` | superseded by v15_m01 |
