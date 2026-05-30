@@ -55,12 +55,15 @@ MIN_ANCHORS = 8
 MIN_ACTIVE_DAYS = 30
 MIRROR_NET_GROSS = 0.15
 MIRROR_HOURS_FRAC = 0.60
+HEDGE_SIZE_TOL = 0.35           # FIX 4: per-coin abs-size match for exposure hedge
 ENTITY_MAX_WALLETS = 8
 SHARPE_FLAG = 5.0
 LEV_FLAG = 5.0
-# Non-executable HIP-3 dexes (we cannot place orders there). main/xyz tradeable subset
-# kept conservative: anything outside this set, if >90% of gross, is unexecutable.
+# Only the "main" HL perp dex is executable via our connector for now; other perp
+# dexes (HIP-3) cannot be mirrored. Anything outside this set, if >90% of gross, is
+# flagged unexecutable.
 EXECUTABLE_DEXES = frozenset({"main"})
+FUNDING_FARM_FRAC = 0.5  # FIX 7(b): |funding| as fraction of |total pnl| above this -> EXCLUDE
 
 
 @dataclass
@@ -86,22 +89,66 @@ class WalletScores:
     is_entity_primary: bool = True
     verdict: str = "PASS"
     reason_codes: list = field(default_factory=list)
+    # FIX 1(c): distinguishes anchor_cache_missing vs anchors_out_of_window vs thin
+    anchor_reason: str = ""
 
 
 # --------------------------------------------------------------------------- #
 # STAGE A — per-wallet scalars
 # --------------------------------------------------------------------------- #
 
+def _anchor_window(wallet, lo_ms, hi_ms):
+    """FIX 1: select usable weekly anchors for [lo_ms, hi_ms].
+
+    (a) Normalize anchor timestamps to ms (a value < 1e12 looks like seconds ->
+        multiply by 1000).
+    (b) Include the single anchor immediately BEFORE lo_ms so the first in-window
+        week has a valid left edge for its delta.
+    (c) Report flags so the caller can distinguish:
+          - anchor_cache_missing  : 0 raw anchors (disk cache not warmed)
+          - anchors_out_of_window : >=2 raw anchors but <2 fall in the window
+          - thin_history          : genuinely few anchors
+
+    Returns (selected, flags); selected = sorted [(ts_ms, val)],
+    flags = {n_raw_anchors, n_in_window}.
+    """
+    raw = m01.get_portfolio_perp(wallet) or []
+    norm = []
+    for t, v in raw:
+        if not (v > 0.01):
+            continue
+        t = int(t)
+        if t < 1_000_000_000_000:  # < 1e12 -> seconds, convert to ms
+            t *= 1000
+        norm.append((t, v))
+    norm.sort()
+    flags = {"n_raw_anchors": len(norm), "n_in_window": 0}
+    in_window = [(t, v) for t, v in norm if lo_ms <= t <= hi_ms]
+    flags["n_in_window"] = len(in_window)
+    before = [(t, v) for t, v in norm if t < lo_ms]
+    selected = ([before[-1]] + in_window) if before else in_window
+    selected.sort()
+    return selected, flags
+
+
 def _weekly_anchor_series(wallet, fills, funding, ledger, lo_ms, hi_ms):
     """Return (anchor_ts, total_change, funding_in_week, residual) arrays.
 
     residual = total_change - funding - net_external_flow  (trading/price PnL).
     Uses TRUE perpAllTime anchor values (cached) + funding + ledger ext-flow.
+
+    FIX 1: anchors now come from _anchor_window (ms-normalized + the anchor just
+    before lo_ms as the first week's left edge). On failure this returns
+    (status, flags) where status in {"cache_missing","out_of_window","thin"} so the
+    caller can emit a distinct reason code; on success returns ("ok", payload...).
     """
-    avh = [(t, v) for t, v in m01.get_portfolio_perp(wallet)
-           if v > 0.01 and lo_ms <= t <= hi_ms]
+    avh, _flags = _anchor_window(wallet, lo_ms, hi_ms)
     if len(avh) < 2:
-        return None
+        if _flags["n_raw_anchors"] == 0:
+            return ("cache_missing", _flags)
+        if _flags["n_raw_anchors"] >= 2 and _flags["n_in_window"] < 2:
+            return ("out_of_window", _flags)
+        return ("thin", _flags)
     avh.sort()
     ts = [t for t, _ in avh]
     vals = [v for _, v in avh]
@@ -118,11 +165,26 @@ def _weekly_anchor_series(wallet, fills, funding, ledger, lo_ms, hi_ms):
         total_change.append(tc)
         fund_week.append(fw)
         resid.append(tc - fw - ef)
-    return (np.array(ts[1:]), np.array(total_change), np.array(fund_week),
+    return ("ok", np.array(ts[1:]), np.array(total_change), np.array(fund_week),
             np.array(resid), np.array(vals))
 
 
-def _net_gross_ratio(fills):
+def _last_price_by_coin(*fill_lists):
+    """Last known fill price per coin across the given fill lists (by time)."""
+    px = {}  # coin -> (time, price)
+    for fills in fill_lists:
+        for f in fills:
+            c = f["coin"]
+            p = float(f.get("price", 0) or 0)
+            if p <= 0:
+                continue
+            t = f["time"]
+            if c not in px or t > px[c][0]:
+                px[c] = (t, p)
+    return {c: p for c, (_, p) in px.items()}
+
+
+def _net_gross_ratio(fills, lo_ms=None, hi_ms=None, seed_pos=None):
     """Book-level time-weighted |net dollar delta| / gross, over open-position time.
 
     Per coin, maintain cumulative position from fills; between events position is
@@ -131,17 +193,36 @@ def _net_gross_ratio(fills):
     NOT cancel within a coin (per-coin scalar); book-level offsets DO net (intended:
     flat-book farmer -> ~0). Paired with price_pnl_var_frac via AND so a real
     relative-value trader with price PnL survives.
+
+    FIX 2: ``fills`` may now span a pre-window history (lo_ms - 365d). Only the
+    window [lo_ms, hi_ms] is time-weighted; ``seed_pos`` (from m01.positions_at at
+    lo_ms) seeds the position carried into the window so exposure does not start
+    flat at 0. When lo_ms/hi_ms are None the legacy whole-series behaviour is kept.
+
+    ISSUE C: the held exposure from the last in-window fill to ``win_hi`` is now
+    time-weighted with one final segment, so exposure at window end is not ignored.
     """
     # merged event timeline
     ev = sorted(fills, key=lambda f: f["time"])
     if len(ev) < 2:
         return float("nan")
-    pos = defaultdict(float)
+    # FIX 2: seed pre-window position; restrict accumulation to the window.
+    pos = defaultdict(float, dict(seed_pos) if seed_pos else {})
     last_px = {}
+    # prime last_px from pre-window fills so the seeded position has a price.
+    win_lo = lo_ms if lo_ms is not None else ev[0]["time"]
+    win_hi = hi_ms if hi_ms is not None else ev[-1]["time"]
+    for f in ev:
+        if f["time"] < win_lo:
+            last_px[f["coin"]] = f["price"]
     num = den = 0.0
-    prev_t = ev[0]["time"]
+    prev_t = win_lo
     for f in ev:
         t = f["time"]
+        if t < win_lo:
+            continue
+        if t > win_hi:
+            break
         dt = t - prev_t
         if dt > 0:
             book_net = sum(pos[c]*last_px.get(c, 0.0) for c in pos)
@@ -152,6 +233,15 @@ def _net_gross_ratio(fills):
         pos[f["coin"]] += f["signed_sz"]
         last_px[f["coin"]] = f["price"]
         prev_t = t
+    # ISSUE C: final segment from the last in-window fill (prev_t) to win_hi so the
+    # exposure HELD at window end is time-weighted (same book_net/book_gross logic).
+    dt = win_hi - prev_t
+    if dt > 0:
+        book_net = sum(pos[c]*last_px.get(c, 0.0) for c in pos)
+        book_gross = sum(abs(pos[c]*last_px.get(c, 0.0)) for c in pos)
+        if book_gross > 1.0:
+            num += dt * abs(book_net)
+            den += dt * book_gross
     return (num/den) if den > 0 else float("nan")
 
 
@@ -191,12 +281,23 @@ def _wash_frac(fills):
 
 def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
     s = WalletScores(wallet=wallet)
-    fills = m01.load_wallet_fills(wallet, lo_ms, hi_ms)
+    # FIX 2 + ISSUE B: load fills from 365 days BEFORE lo_ms so positions opened
+    # up to a year before the window are seeded. The position carried into lo_ms
+    # seeds the net/gross and leverage accumulators; only the window [lo_ms, hi_ms]
+    # is time-weighted.
+    PRE_WINDOW_MS = 365 * 86_400_000
+    all_fills = m01.load_wallet_fills(wallet, lo_ms - PRE_WINDOW_MS, hi_ms)
+    fills = [f for f in all_fills if lo_ms <= f["time"] <= hi_ms]
     s.n_fills = len(fills)
     if not fills:
         s.confidence = "LOW"
         s.reason_codes.append("no_fills")
         return s
+    # FIX 2: position carried into the window from pre-window fills (fills_ctx spans
+    # lo_ms-30d..hi_ms). seed = cumulative per-coin position held AT lo_ms, so the
+    # net/gross and leverage accumulators start from real carried exposure instead
+    # of flat 0. m01.positions_at is order-independent (cumulative signed_sz).
+    seed_pos = m01.positions_at(all_fills, lo_ms)
     funding = m01.load_wallet_funding(wallet, lo_ms, hi_ms)
     ledger = m01.load_wallet_ledger(wallet, lo_ms, hi_ms)
     last_t = max(f["time"] for f in fills)
@@ -215,24 +316,39 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
         if s.dex_concentration > DEX_CONC and top_dex not in EXECUTABLE_DEXES:
             s.unexecutable = True
 
-    s.net_gross_ratio = _net_gross_ratio(fills)
+    # FIX 2: pass full (pre-window + window) fills with the window bounds and the
+    # seeded carry-in position; only the window is time-weighted.
+    s.net_gross_ratio = _net_gross_ratio(all_fills, lo_ms, hi_ms, seed_pos=seed_pos)
     s.wash_frac = _wash_frac(fills)
 
+    # FIX 1(c): _weekly_anchor_series returns a status string first. On failure,
+    # record WHY anchors are insufficient (cache vs window vs thin) so COMBINE can
+    # emit a distinct reason code.
     wk = _weekly_anchor_series(wallet, fills, funding, ledger, lo_ms, hi_ms)
-    if wk is not None:
-        anchor_ts, total_change, fund_week, resid, vals = wk
+    if wk[0] != "ok":
+        s.anchor_reason = {"cache_missing": "anchor_cache_missing",
+                           "out_of_window": "anchors_out_of_window",
+                           "thin": "thin_history"}.get(wk[0], "thin_history")
+    else:
+        _status, anchor_ts, total_change, fund_week, resid, vals = wk
         s.n_anchors = len(vals)
         var_tot = float(np.var(total_change)) if len(total_change) >= 2 else 0.0
         if var_tot > 1e-9:
             s.price_pnl_var_frac = float(np.var(resid))/var_tot
-        s.funding_frac = (float(np.sum(fund_week)) /
-                          float(np.sum(np.abs(total_change)))
-                          if np.sum(np.abs(total_change)) > 1e-9 else float("nan"))
+        # FIX 7(a) + ISSUE F: absolute funding contribution as a fraction of the
+        # TRADING+FUNDING pnl, EXCLUDING external deposits/withdrawals. resid =
+        # total_change - fund_week - ext_flow (trading/price pnl), so trading+funding
+        # pnl per week = resid + fund_week. funding_frac = sum(|fund_week|) /
+        # sum(|resid + fund_week|). Guard ~0 denominator -> nan.
+        trade_fund_pnl = resid + fund_week
+        denom = float(np.sum(np.abs(trade_fund_pnl)))
+        s.funding_frac = (float(np.sum(np.abs(fund_week))) / denom
+                          if denom > 1e-9 else float("nan"))
         # weekly return Sharpe + leverage flag
         rets = total_change/np.maximum(vals[:-1], 1e-9)
         if len(rets) >= MIN_ANCHORS and np.std(rets) > 1e-9:
             s.sharpe = float(np.mean(rets)/np.std(rets)*np.sqrt(52))
-            gross_hr = _median_leverage(fills, vals)
+            gross_hr = _median_leverage(fills, vals, seed_pos=seed_pos)
             s.median_lev = gross_hr
             max_dd = _max_weekly_dd(vals)
             if (s.sharpe >= SHARPE_FLAG and (gross_hr == gross_hr)
@@ -250,12 +366,16 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
     return s
 
 
-def _median_leverage(fills, vals):
-    """Median (gross open notional / equity). Rough: peak gross per week vs anchor."""
+def _median_leverage(fills, vals, seed_pos=None):
+    """Median (gross open notional / equity). Rough: peak gross per week vs anchor.
+
+    FIX 2: ``seed_pos`` seeds the position carried into the window so peak gross
+    notional reflects pre-window holdings rather than starting at 0.
+    """
     if len(vals) < 2:
         return float("nan")
     # use mean gross position notional proxy / median equity
-    pos = defaultdict(float)
+    pos = defaultdict(float, dict(seed_pos) if seed_pos else {})
     last_px = {}
     peak_gross = 0.0
     for f in sorted(fills, key=lambda x: x["time"]):
@@ -316,19 +436,34 @@ def build_entities(wallets, lo_ms, hi_ms):
                 except (TypeError, ValueError):
                     amt = 0.0
                 if amt > 1.0:
-                    bucket = round(amt, -1)  # 10-USDC bucket key (hash bucket, codex note 3)
+                    # FIX 3: round(amt,-1) is ONLY a hash prefilter to bound the
+                    # O(n^2) scan; the real float amount is carried for an exact
+                    # within-bucket comparison below.
+                    bucket = round(amt, -1)  # 10-USDC hash bucket (prefilter only)
                     deposits_by_bucket[bucket].append(
-                        (int(e["time"]), w, "out" if typ == "withdraw" else "in"))
+                        (int(e["time"]), w, "out" if typ == "withdraw" else "in", amt))
 
-    # temporal funder match: within an amount bucket, a withdraw then a deposit
-    # within +/-10min and amount +/-0.5% links the two wallets (capital hand-off).
+    # FIX 3 + ISSUE E: temporal funder match. Inside a hash bucket, link A and B
+    # ONLY when a WITHDRAW from A is followed by a DEPOSIT to B within +/-10min AND
+    # the actual float amounts agree within +/-0.5% (capital hand-off). The rounded
+    # bucket no longer drives linkage; it just narrows the candidate set before
+    # comparing real amounts. STRICT chronological direction: only union when the
+    # EARLIER event (t0) is the withdraw ("out") and the LATER (t1) is the deposit
+    # ("in"). The reverse (in -> out) is NOT a capital hand-off and is rejected.
+    AMT_TOL = 0.005
     for bucket, evs in deposits_by_bucket.items():
         evs.sort()
-        for i, (t0, w0, dir0) in enumerate(evs):
-            for t1, w1, dir1 in evs[i+1:]:
+        for i, (t0, w0, dir0, amt0) in enumerate(evs):
+            for t1, w1, dir1, amt1 in evs[i+1:]:
                 if t1 - t0 > 600_000:
                     break
-                if w0 != w1 and dir0 != dir1:
+                if w0 == w1:
+                    continue
+                # strict: earlier=withdraw (out) -> later=deposit (in) only
+                if not (dir0 == "out" and dir1 == "in"):
+                    continue
+                ref = max(abs(amt0), abs(amt1), 1e-9)
+                if abs(amt0 - amt1) / ref <= AMT_TOL:
                     union(w0, w1)
 
     # collect components
@@ -348,28 +483,44 @@ def build_entities(wallets, lo_ms, hi_ms):
 # STAGE C — within-entity mirror
 # --------------------------------------------------------------------------- #
 
-def internal_hedge(wA_fills, wB_fills):
-    """True if the pair is an internal hedge: per coin per hour, summed signed
-    notional across the pair nets to ~0 (<MIRROR_NET_GROSS) over >=MIRROR_HOURS_FRAC
-    of overlapping active hours."""
-    def hourly(fills):
-        h = defaultdict(lambda: defaultdict(float))  # hour -> coin -> signed notional
-        for f in fills:
-            hr = f["time"]//3_600_000
-            h[hr][f["coin"]] += f["signed_sz"]*f["price"]
-        return h
-    a, b = hourly(wA_fills), hourly(wB_fills)
-    hrs = set(a) & set(b)
-    if not hrs:
+def internal_hedge(fillsA, fillsB, lo_ms, hi_ms):
+    """FIX 4: exposure-based (not flow-based) internal-hedge test.
+
+    ISSUE D(2): sample timestamps every 6 HOURS across [lo_ms, hi_ms] (denser grid
+    than the prior daily sampling). At each t, reconstruct the HELD
+    position of each wallet (m01.positions_at -> coin -> signed size). A coin is
+    "hedged" at t when A and B hold OPPOSITE signs and their magnitudes (abs size)
+    are within HEDGE_SIZE_TOL of each other. A sampled timestamp is "predominantly
+    hedged" when, among coins both wallets have exposure to, the majority are hedged.
+    The PAIR is an internal hedge when, over sampled timestamps where BOTH wallets
+    have any exposure, the fraction of predominantly-hedged timestamps is
+    >= MIRROR_HOURS_FRAC. Coins are NOT netted across each other."""
+    if hi_ms <= lo_ms:
         return False
-    hedge_hours = 0
-    for hr in hrs:
-        coins = set(a[hr]) | set(b[hr])
-        net = sum(a[hr].get(c, 0)+b[hr].get(c, 0) for c in coins)
-        gross = sum(abs(a[hr].get(c, 0))+abs(b[hr].get(c, 0)) for c in coins)
-        if gross > 1.0 and abs(net)/gross < MIRROR_NET_GROSS:
-            hedge_hours += 1
-    return hedge_hours/len(hrs) >= MIRROR_HOURS_FRAC
+    both_active = hedged_ts = 0
+    t = lo_ms
+    while t <= hi_ms:
+        posA = m01.positions_at(fillsA, t)
+        posB = m01.positions_at(fillsB, t)
+        if posA and posB:
+            both_active += 1
+            shared = [c for c in (set(posA) & set(posB))
+                      if abs(posA[c]) > 1e-12 and abs(posB[c]) > 1e-12]
+            if shared:
+                coin_hedged = 0
+                for c in shared:
+                    a, b = posA[c], posB[c]
+                    if (a > 0) == (b > 0):
+                        continue  # same sign -> not a hedge on this coin
+                    ref = max(abs(a), abs(b), 1e-9)
+                    if abs(abs(a) - abs(b)) / ref <= HEDGE_SIZE_TOL:
+                        coin_hedged += 1
+                if coin_hedged * 2 >= len(shared):  # predominantly hedged
+                    hedged_ts += 1
+        t += 21_600_000  # ISSUE D(2): every 6 hours
+    if both_active == 0:
+        return False
+    return hedged_ts / both_active >= MIRROR_HOURS_FRAC
 
 
 # --------------------------------------------------------------------------- #
@@ -394,8 +545,11 @@ def run(wallets, lo_ms, hi_ms):
     fills_cache = {}
 
     def get_fills(w):
+        # ISSUE D(1): load from 365d before lo_ms so m01.positions_at sees positions
+        # opened pre-window (held exposure carried into the window is visible to the
+        # internal-hedge exposure test).
         if w not in fills_cache:
-            fills_cache[w] = m01.load_wallet_fills(w, lo_ms, hi_ms)
+            fills_cache[w] = m01.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
         return fills_cache[w]
 
     entity_excluded = {}   # entity_id -> reason ("internal_hedge"/"no_l3_passer"/"too_big")
@@ -419,7 +573,7 @@ def run(wallets, lo_ms, hi_ms):
         for other in members:
             if other == primary:
                 continue
-            if internal_hedge(get_fills(primary), get_fills(other)):
+            if internal_hedge(get_fills(primary), get_fills(other), lo_ms, hi_ms):
                 entity_excluded[eid] = "internal_hedge"
                 break
 
@@ -432,44 +586,64 @@ def run(wallets, lo_ms, hi_ms):
         eid = s.entity_id
         members = ent_members.get(eid, [w])
 
-        # entity-level hard excludes
-        if eid in entity_excluded:
-            reason = entity_excluded[eid]
-            if reason == "entity_too_big_review":
-                verdict = "REVIEW"; rc.append("entity_too_big")
-            else:
-                verdict = "EXCLUDE"; rc.append(reason)
-        # entity fragment: non-primary in a multi-wallet entity
         is_primary = (entity_primary.get(eid) == w) if len(members) > 1 else True
         s.is_entity_primary = is_primary
-        if verdict == "PASS" and len(members) > 1 and not is_primary:
-            verdict = "EXCLUDE"; rc.append("entity_fragment")
 
-        # per-wallet hard excludes
-        if verdict == "PASS":
-            if s.unexecutable:
-                verdict = "EXCLUDE"; rc.append("unexecutable_dex")
-            elif s.days_since_last_fill > STALE_DAYS:
-                verdict = "EXCLUDE"; rc.append("stale")
-            elif s.wash_frac > WASH_EXCLUDE:
-                verdict = "EXCLUDE"; rc.append("wash")
-            else:
-                ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
-                if (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL):
-                    verdict = "EXCLUDE"; rc.append("delta_neutral")
+        # FIX 5: HARD EXCLUDES ALWAYS WIN. Evaluate every hard-exclude condition
+        # FIRST, independent of any entity REVIEW (e.g. entity_too_big). Only if NO
+        # hard exclude fires do we fall through to REVIEW reasons. This fixes the
+        # prior bug where an entity REVIEW (entity_too_big) short-circuited the
+        # per-wallet hard excludes via `if verdict == "PASS"`.
+        hard_codes = []
 
-        # REVIEW conditions (only if not already excluded)
-        if verdict == "PASS":
-            if s.confidence == "LOW":
-                verdict = "REVIEW"; rc.append("thin_history")
-            elif s.net_gross_ratio != s.net_gross_ratio or s.price_pnl_var_frac != s.price_pnl_var_frac:
+        # entity-level hard excludes (internal_hedge / no_l3_passer)
+        ent_reason = entity_excluded.get(eid)
+        is_too_big = (ent_reason == "entity_too_big_review")
+        if ent_reason and not is_too_big:
+            hard_codes.append(ent_reason)
+        # ISSUE A: entity fragment is a HARD exclude for non-primary wallets in a
+        # multi-wallet entity — but a too-big entity has NO primary set, so EVERY
+        # member would wrongly trip entity_fragment and get hard-EXCLUDED, defeating
+        # the intended REVIEW. For too-big entities, SKIP the fragment check (treat
+        # as primary for fragment purposes) so a clean member routes to REVIEW
+        # (entity_too_big); genuine per-wallet hard excludes below still fire.
+        if len(members) > 1 and not is_primary and not is_too_big:
+            hard_codes.append("entity_fragment")
+        # per-wallet hard excludes (all evaluated, all codes recorded)
+        if s.unexecutable:
+            hard_codes.append("unexecutable_dex")
+        if s.days_since_last_fill > STALE_DAYS:
+            hard_codes.append("stale")
+        if s.wash_frac > WASH_EXCLUDE:
+            hard_codes.append("wash")
+        ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
+        # FIX 6: delta-neutral hard exclude requires BOTH low net-gross AND low
+        # price-PnL variance.
+        if (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL):
+            hard_codes.append("delta_neutral")
+        # FIX 7(b): funding farm — |funding| dominates |total pnl|.
+        if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:
+            hard_codes.append("funding_farm")
+
+        if hard_codes:
+            verdict = "EXCLUDE"
+            rc.extend(hard_codes)
+        else:
+            # REVIEW reasons (only when NO hard exclude fired)
+            if ent_reason == "entity_too_big_review":
+                verdict = "REVIEW"; rc.append("entity_too_big")
+            elif s.confidence == "LOW":
+                verdict = "REVIEW"; rc.append(s.anchor_reason or "thin_history")
+            elif ng != ng or pv != pv:
                 verdict = "REVIEW"; rc.append("nan_metric")
             elif s.sharpe_vs_lev_flag:
                 verdict = "REVIEW"; rc.append("sharpe_too_smooth")
             elif WASH_REVIEW < s.wash_frac <= WASH_EXCLUDE:
                 verdict = "REVIEW"; rc.append("wash_borderline")
-            elif (s.net_gross_ratio == s.net_gross_ratio
-                  and NET_GROSS_NEUTRAL <= s.net_gross_ratio < NET_GROSS_BORDER):
+            # FIX 6: low net-gross alone (price PnL var present) -> REVIEW, not PASS.
+            elif ng == ng and ng < NET_GROSS_NEUTRAL:
+                verdict = "REVIEW"; rc.append("low_net_gross")
+            elif ng == ng and NET_GROSS_NEUTRAL <= ng < NET_GROSS_BORDER:
                 verdict = "REVIEW"; rc.append("net_gross_borderline")
 
         s.verdict = verdict
@@ -509,7 +683,7 @@ def main():
 
     # codex note 5: sanity assertions
     hard = {"entity_fragment", "entity_no_l3_passer", "internal_hedge", "delta_neutral",
-            "wash", "unexecutable_dex", "stale"}
+            "wash", "unexecutable_dex", "stale", "funding_farm"}
     for _, r in df.iterrows():
         codes = set(c for c in r["reason_codes"].split(",") if c)
         if r["verdict"] == "EXCLUDE":
