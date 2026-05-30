@@ -9,7 +9,7 @@ set -euo pipefail
 
 WORKDIR="/Users/hermes/quants-lab"
 PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
-SCRIPT="scripts/hl_copy_trader_v11.py"
+SCRIPT="strategies/live/hl_copy_trader_v11.py"
 CONFIG="config/copy_trader_wallets.json"
 
 cd "$WORKDIR"

@@ -149,7 +149,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 # 2026-05-28: switched FILLS_DIR to hl_s3_fills_v2/ for enriched fee fields
 # (fee, builderFee, deployerFee). Required for accurate wallet realized PnL
 # = closedPnl - fees (Alberto TG 7549). v1 path was hl_s3_fills/.

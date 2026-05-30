@@ -63,7 +63,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_OUTPUT = ROOT / "app" / "data" / "v13" / "wallet_metrics.parquet"
 
 HL_FEE_BPS_PER_SIDE = 4.32

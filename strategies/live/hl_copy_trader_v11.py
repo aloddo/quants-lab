@@ -3326,8 +3326,15 @@ if __name__ == "__main__":
 
     config_path = args.config
     if not os.path.isabs(config_path):
-        # Resolve relative to repo root
-        repo_root = Path(__file__).resolve().parent.parent
+        # Resolve relative to repo root. Walk up to the ancestor that holds the
+        # repo markers (config/ + app/) so this works regardless of how deep the
+        # script lives (it moved scripts/ -> strategies/live/ in the 2026-05-30
+        # restructure; a hardcoded parent.parent would silently mis-resolve).
+        repo_root = Path(__file__).resolve().parent
+        for _ in range(6):
+            if (repo_root / "config").is_dir() and (repo_root / "app").is_dir():
+                break
+            repo_root = repo_root.parent
         config_path = str(repo_root / config_path)
 
     if not os.path.exists(config_path):

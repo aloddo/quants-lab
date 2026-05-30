@@ -8,7 +8,7 @@ set -euo pipefail
 
 WORKDIR="/Users/hermes/quants-lab"
 PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
-SCRIPT="scripts/listing_monitor.py"
+SCRIPT="data_pipeline/listing_monitor.py"
 
 cd "$WORKDIR"
 

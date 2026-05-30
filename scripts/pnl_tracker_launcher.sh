@@ -3,7 +3,7 @@
 set -euo pipefail
 WORKDIR="/Users/hermes/quants-lab"
 PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
-SCRIPT="scripts/pnl_tracker.py"
+SCRIPT="tools/pnl_tracker.py"
 cd "$WORKDIR"
 if [ -f .env ]; then set -a; source .env; set +a; fi
 echo "[$(date '+%F %T %Z')] pnl_tracker_launcher: starting $SCRIPT --tg --epoch --loop 15"

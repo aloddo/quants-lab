@@ -4,7 +4,7 @@ set -euo pipefail
 
 WORKDIR="/Users/hermes/quants-lab"
 PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
-SCRIPT="scripts/hl_wallet_collector.py"
+SCRIPT="data_pipeline/hl_wallet_collector.py"
 
 cd "$WORKDIR"
 

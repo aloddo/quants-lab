@@ -98,7 +98,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 FILLS_DIR = ROOT / "app" / "data" / "hl_s3_fills_v2"   # codex m02 r2 BLOCKER fix 2026-05-29: was hl_s3_fills (old), caused carry-in walkback to silently fail with KeyError on missing fee/builderFee/deployerFee columns. v2 has 22 cols including the fee fields that _FILLS_COLS_DEFAULT requires.
 DEFAULT_OUTPUT = ROOT / "app" / "data" / "v13" / "wallet_journeys_costed.parquet"
 FUNDING_CACHE_DIR = ROOT / "app" / "data" / "v13" / "funding_cache"

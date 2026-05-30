@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("v13_concat")
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 DEFAULT_CHUNKS_DIR = REPO / "app" / "data" / "v13" / "journey_chunks"
 DEFAULT_OUTPUT = REPO / "app" / "data" / "v13" / "wallet_journeys_costed.parquet"
 
