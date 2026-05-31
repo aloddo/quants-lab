@@ -985,8 +985,16 @@ class CopyTrader:
 
     # ── Entry ────────────────────────────────────────────────────────────────
 
-    async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None):
-        """Place an order to copy the target wallet's trade. Supports add-ons per wallet config."""
+    async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None,
+                              skip_cooldown: bool = False):
+        """Place an order to copy the target wallet's trade. Supports add-ons per wallet config.
+
+        skip_cooldown: set True when the CALLER already checked + set the (wallet,coin) cooldown
+        immediately before spawning this task. The instant-entry handler does exactly that ("Fix #5:
+        set cooldown BEFORE async task"); without this flag _enter_position re-reads the just-set
+        cooldown, sees elapsed ~= 0 < cooldown_s, and returns before placing the order -- which
+        silently blocked ALL instant-mode (original_v10) entries (2026-05-31 incident).
+        """
         if getattr(self, '_kill_switch_active', False):
             logger.debug(f"Entry blocked (kill switch active): {coin}")
             return
@@ -996,9 +1004,9 @@ class CopyTrader:
         wc = self._wallet_config(twap_wallet)
         cooldown_s = self.global_config["cooldown_s"]
 
-        # Cooldown check
+        # Cooldown check (skipped when the caller already gated + set it -- see skip_cooldown docstring)
         cooldown_key = (twap_wallet, coin)
-        if now - self.last_entry.get(cooldown_key, 0) < cooldown_s:
+        if not skip_cooldown and now - self.last_entry.get(cooldown_key, 0) < cooldown_s:
             logger.debug(f"Cooldown active for {coin} from {twap_wallet[:10]}")
             return
 
@@ -2074,7 +2082,8 @@ class CopyTrader:
         acc_key = (wallet, coin)
         self._position_accumulated[acc_key] = self._position_accumulated.get(acc_key, 0) + notional
         asyncio.get_event_loop().create_task(
-            self._enter_position(coin, is_buy, twap_dedup_key=dedup_key, wallet=wallet)
+            self._enter_position(coin, is_buy, twap_dedup_key=dedup_key, wallet=wallet,
+                                 skip_cooldown=True)  # handler already gated+set the cooldown above
         )
 
     def _handle_twap_entry(self, wallet: str, coin: str, is_buy: bool,
