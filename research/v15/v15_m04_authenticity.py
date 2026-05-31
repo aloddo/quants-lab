@@ -97,6 +97,14 @@ def _stage_a_worker(args):
     return w, g.stage_a(w, lo_ms, hi_ms)
 
 
+def _fills_worker(args):
+    """Top-level (picklable) worker: load one wallet's fills (the slow sequential I/O in STAGE C's
+    internal-hedge check). Returns (wallet, fills_list). Logic-neutral: only the I/O is parallelized;
+    the hedge COMPUTATION stays in the main loop, unchanged."""
+    w, lo_ms, hi_ms = args
+    return w, m01.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
+
+
 def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
     # NOTE: default procs=1 (sequential) so in-process callers + monkeypatched tests work; main()
     # passes --procs (default 8) for the real parallel run. Pool workers are separate processes and
@@ -128,6 +136,18 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
 
     log.info("STAGE C: entity resolution + internal-hedge")
     fills_cache = {}
+
+    # PERF: the hedge check loads fills per multi-wallet-entity member — the dominant sequential I/O.
+    # Pre-load those fills IN PARALLEL into the cache (logic-neutral: the hedge computation below is
+    # unchanged and just reads the cache). Single-wallet entities never hedge-check, so skip them.
+    hedge_wallets = sorted({w for _eid, mem in ent_members.items() if len(mem) > 1 for w in mem})
+    if hedge_wallets and procs > 1:
+        tc = time.time()
+        with Pool(procs) as pool:
+            for w, fl in pool.imap_unordered(_fills_worker,
+                                             [(w, lo_ms, hi_ms) for w in hedge_wallets], chunksize=8):
+                fills_cache[w] = fl
+        log.info(f"  pre-loaded fills for {len(hedge_wallets)} multi-entity members in {(time.time()-tc)/60:.1f}min (parallel)")
 
     def get_fills(w):
         if w not in fills_cache:
