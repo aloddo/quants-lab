@@ -181,6 +181,29 @@ def test_backstop_on_crash_isolation_invariant():
     assert s["final_equity"] >= -1e-6
 
 
+def test_im_admissibility_rejects_on_tier_jump():
+    # codex code-r3: total resulting-position IM (tier-correct), not marginal-on-delta. Adding into a
+    # >100k notional re-rates the WHOLE position to the higher tier; if cash can't fund it -> reject.
+    class TierMeta(FakeMeta):
+        def init_margin_rate(self, coin, notional):
+            return 0.1 if abs(notional) <= 100_000 else 0.2
+        def maint_rate(self, coin, notional):
+            return self.init_margin_rate(coin, notional) / 2
+        def tier_maxlev(self, coin, notional):
+            return 1.0 / self.init_margin_rate(coin, notional)
+    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 20, 100.0), adv=1e12)
+    md.meta = TierMeta(); md.meta.coin_szdec["BTC"] = 3
+    st = E.AccountState(cross_collateral={"main": 14000.0})
+    st.positions["BTC"] = E.Position("BTC", szi=900.0, entry_px=100.0, mode="cross", leverage=10.0)
+    summary = E._new_summary(None, None, 14000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+    summary["_fills_ref"] = []
+    fills, events = [], []
+    # add 200 -> new notional 110k, total IM = 22k > ~14k cash -> must reject
+    E._apply_order(st, md, "BTC", 200.0, 100.0, T0 + 5 * E.MS_MIN, {"ts": T0 + 5 * E.MS_MIN},
+                   E.EngineParams(copy_latency_ms=0), 1.0, fills, events, summary)
+    assert summary["n_rejected"] == 1 and len(fills) == 0
+
+
 def test_market_liquidation_path_produces_liq_fill():
     # moderate drop: cross account breaches maintenance but stays ABOVE 2/3 maint -> market-liq order
     # (not backstop). 5x exposure, maxlev 10 (maint 5%). px 100 -> 84 lands in the market-liq band.
@@ -284,6 +307,107 @@ def test_pure_does_not_mutate_caller_state():
     E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0), end_ts_ms=END, start_state=start)
     assert start.cross_collateral == {"main": 10_000.0}
     assert start.positions == {}
+
+
+def test_start_state_open_position_advances_risk_with_no_actions():
+    # codex code-r2 #2: a carried start_state position must accrue risk + liquidate even with ZERO
+    # actions, anchored at start_ts. Crash after start -> liquidation/backstop without any action.
+    n = 400
+    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+    px = np.full(n, 100.0); px[150:] = 55.0
+    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+    start = E.AccountState(cross_collateral={"main": 2000.0})
+    start.positions["BTC"] = E.Position("BTC", szi=400.0, entry_px=100.0, mode="cross", leverage=10.0)  # $40k @ 5% maint
+    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+                            end_ts_ms=T0 + 390 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+    s = res["summary"]
+    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+    # purity: caller start_state untouched
+    assert start.positions["BTC"].szi == 400.0
+
+
+def test_funding_stops_after_liquidation():
+    # chronological: a position liquidated early should not keep accruing funding to fold end.
+    n = 400
+    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+    px = np.full(n, 100.0); px[120:] = 50.0
+    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())},
+                        funding={"BTC": (np.array([T0 + h * E.MS_HOUR for h in range(1, 7)], "int64"),
+                                          np.array([0.001] * 6))}, maxlev=10.0)
+    start = E.AccountState(cross_collateral={"main": 2000.0})
+    start.positions["BTC"] = E.Position("BTC", szi=400.0, entry_px=100.0, mode="cross", leverage=10.0)
+    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+                            end_ts_ms=T0 + 390 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+    # liquidated around the crash; funding only accrues on hours BEFORE liquidation, not all 6
+    assert set(res["summary"]["outcome_states"]) & {"backstop", "position_liquidated", "account_ruin"}
+
+
+def test_post_funding_boundary_liquidation():
+    # codex code-r4 #1: a settled funding payment at the fold boundary can push below maintenance;
+    # must liquidate, not report 'survived' with an insolvent open position. Flat price, large
+    # positive funding at the last hour, position sized so funding eats the maintenance buffer.
+    n = 200
+    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+    px = np.full(n, 100.0)
+    last_h = ((T0 // E.MS_HOUR) + 2) * E.MS_HOUR     # a settlement inside the window
+    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())},
+                        funding={"BTC": (np.array([last_h], "int64"), np.array([0.5]))},  # huge rate
+                        maxlev=10.0)
+    start = E.AccountState(cross_collateral={"main": 600.0})       # thin buffer over maint
+    start.positions["BTC"] = E.Position("BTC", szi=100.0, entry_px=100.0, mode="cross", leverage=10.0)  # $10k, maint $500
+    res = E.step_subaccount(pd.DataFrame([]), md, 600.0, E.EngineParams(copy_latency_ms=0),
+                            end_ts_ms=last_h + E.MS_MIN, start_ts_ms=T0, start_state=start)
+    s = res["summary"]
+    assert s["total_funding"] < 0                       # paid the funding
+    assert "survived" not in s["outcome_states"]        # not silently solvent
+    assert set(s["outcome_states"]) & {"backstop", "position_liquidated", "account_ruin"}
+
+
+def test_liquidation_cooldown_no_same_ts_double_fill():
+    # codex code-r5 #1: a >100k partial liquidation (20%) must NOT be immediately followed by a full
+    # close at the SAME timestamp (30s cooldown). Assert market_liq_order fills have distinct our_ts.
+    n = 200
+    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+    px = np.full(n, 100.0); px[20:] = 99.0          # mild breach -> market-liq band for a >100k pos
+    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+    start = E.AccountState(cross_collateral={"main": 8000.0})
+    start.positions["BTC"] = E.Position("BTC", szi=1500.0, entry_px=100.0, mode="cross", leverage=10.0)  # $150k
+    res = E.step_subaccount(pd.DataFrame([]), md, 8000.0, E.EngineParams(copy_latency_ms=0),
+                            end_ts_ms=T0 + 190 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+    liq_ts = [f["our_ts"] for f in res["fills"] if f["fill_type"] == "market_liq_order"]
+    assert len(liq_ts) == len(set(liq_ts))           # no two forced fills at the same instant
+
+
+def test_no_same_ts_double_when_funding_at_fold_end():
+    # codex code-r6 #1: when the funding settlement == fold end (t1), the in-loop post-funding check
+    # and the terminal fold-boundary check must not BOTH liquidate the same >100k position at the
+    # same ts (the second would full-close inside the 30s cooldown).
+    t1 = ((T0 // E.MS_HOUR) + 1) * E.MS_HOUR        # a funding hour that we also use as fold end
+    n = int((t1 - T0) // E.MS_MIN) + 5
+    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+    px = np.full(n, 100.0)
+    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())},
+                        funding={"BTC": (np.array([t1], "int64"), np.array([0.5]))}, maxlev=10.0)
+    start = E.AccountState(cross_collateral={"main": 7600.0})
+    start.positions["BTC"] = E.Position("BTC", szi=1500.0, entry_px=100.0, mode="cross", leverage=10.0)  # $150k
+    res = E.step_subaccount(pd.DataFrame([]), md, 7600.0, E.EngineParams(copy_latency_ms=0),
+                            end_ts_ms=t1, start_ts_ms=T0, start_state=start)
+    liq_ts = [f["our_ts"] for f in res["fills"] if f["fill_type"] == "market_liq_order"]
+    assert len(liq_ts) == len(set(liq_ts))           # no same-ts double at the funding==fold-end boundary
+
+
+def test_carry_in_seeds_short_not_long():
+    # codex code-r4 #3: a SHORT carry-in must seed a NEGATIVE szi (signed exposure, no double-flip).
+    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 100, 100.0))
+    # source carried a short, then adds -10 to -110 with signed (negative) exposure% post-action
+    act = _action("BTC", T0 + 5 * E.MS_MIN, -1.0, "ADDON", position_after=-110.0, signed_size=-10.0,
+                  carry_in_status="carry")
+    res = E.step_subaccount(pd.DataFrame([act]), md, 10_000.0,
+                            E.EngineParams(copy_latency_ms=0, start_policy="causal_carry_in"),
+                            end_ts_ms=T0 + 20 * E.MS_MIN)
+    # ending position is a SHORT (negative szi), ~the source's -110/-100 ratio scaled to our equity
+    bt = res["ending_account_state"]["positions"].get("BTC")
+    assert bt is not None and bt["szi"] < 0
 
 
 def test_empty_actions_survives_flat():

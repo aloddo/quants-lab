@@ -28,6 +28,7 @@ import argparse
 import copy
 import json
 import logging
+import os
 import urllib.parse as _ulib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,6 +98,41 @@ def _f(x) -> float:
         return float(x)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def build_ohlc_cache(coins: list[str], out_dir: Path = OHLC_CACHE_DIR,
+                     mongo_uri: str = "mongodb://localhost:27017", force: bool = False) -> int:
+    """Precompute per-coin 1m (minute, open, high, low, close) arrays to .npy (page-cached, shared,
+    read with mmap) so the engine inner loop reads marks/extremes with NO per-row Mongo (CLAUDE.md
+    Key Rule 8). Idempotent: skips coins already cached unless force. Returns #coins written."""
+    import pymongo
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    db = pymongo.MongoClient(mongo_uri)["quants_lab"]
+    n = 0
+    for coin in coins:
+        p = out_dir / f"{_ulib.quote(coin, safe='')}.npy"
+        if p.exists() and not force:
+            continue
+        cur = db.hyperliquid_candles.find(
+            {"coin": coin, "interval": "1m"},
+            projection={"timestamp_utc": 1, "open": 1, "high": 1, "low": 1, "close": 1, "_id": 0},
+        ).sort("timestamp_utc", 1)
+        mins, o, h, lo, c = [], [], [], [], []
+        for d in cur:
+            t = d.get("timestamp_utc")
+            if t is None:
+                continue
+            mins.append(int(t)); o.append(_f(d.get("open"))); h.append(_f(d.get("high")))
+            lo.append(_f(d.get("low"))); c.append(_f(d.get("close")))
+        arr = np.vstack([np.asarray(mins, "float64"), np.asarray(o, "float64"), np.asarray(h, "float64"),
+                         np.asarray(lo, "float64"), np.asarray(c, "float64")]) if mins else np.empty((5, 0), "float64")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        with open(tmp, "wb") as fh:
+            np.save(fh, arr)
+        tmp.replace(p)
+        n += 1
+    logger.info("build_ohlc_cache: wrote %d coin OHLC series to %s", n, out_dir)
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -266,10 +302,13 @@ class MarketData:
         return None if v != v else float(v)
 
     def funding_series(self, coin: str) -> tuple:
+        # NOTE (codex code-r3): funding is NOT gated by require_cache. It is loaded ONCE per coin from
+        # Mongo and memoized -- a per-coin PRECOMPUTE (the runner warms it before stepping), NOT a
+        # per-row inner-loop DB hit. require_cache only governs the hot OHLC/mark path.
         s = self._funding.get(coin)
         if s is not None:
             return s
-        if self._require_cache or not self._allow_mongo:
+        if not self._allow_mongo:
             s = (np.empty(0, "int64"), np.empty(0, "float64"))
         else:
             cur = self._mongo().hyperliquid_funding_rates.find(
@@ -365,10 +404,13 @@ class EngineParams:
 # The engine core — step_subaccount (pure function; design §0/§3-§7)
 # --------------------------------------------------------------------------- #
 def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, params: EngineParams,
-                    end_ts_ms: int, start_state: Optional[AccountState] = None,
+                    end_ts_ms: int, start_ts_ms: Optional[int] = None,
+                    start_state: Optional[AccountState] = None,
                     entity_id=None, fold_id=None) -> dict:
     """Step ONE subaccount through its fold-frozen action stream to end_ts_ms. PURE: never mutates the
-    caller's start_state (deep-copied). Returns fills/events/equity/ending_account_state/summary."""
+    caller's start_state (deep-copied). `start_ts_ms` anchors the risk cursor (fold start) so carried
+    start_state positions accrue funding/MTM/liquidation even when there are no actions (M9 chaining).
+    Returns fills/events/equity/ending_account_state/summary."""
     st = copy.deepcopy(start_state) if start_state is not None else AccountState(cross_collateral={"main": float(start_equity)})
     if not st.cross_collateral:
         st.cross_collateral = {"main": float(start_equity)}
@@ -383,7 +425,14 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     peak_equity = float(start_equity)
 
     rows = actions.sort_values(["ts", "event_order"]).to_dict("records") if not actions.empty else []
-    prev_ts = int(rows[0]["ts"]) + params.copy_latency_ms if rows else None
+    # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
+    # zero actions (codex code-r2 #2). Falls back to the first action time, then end_ts.
+    if start_ts_ms is not None:
+        prev_ts = int(start_ts_ms)
+    elif rows:
+        prev_ts = int(rows[0]["ts"]) + params.copy_latency_ms
+    else:
+        prev_ts = end_ts_ms
 
     # causal_carry_in: seed the opening position from the first action's pre-state (design D9)
     if rows and params.start_policy == "causal_carry_in":
@@ -435,8 +484,9 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             break
         prev_ts = our_ts
 
-    # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end
-    if not summary["ruin"] and prev_ts is not None and end_ts_ms > prev_ts:
+    # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
+    # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
+    if not summary["ruin"] and end_ts_ms > prev_ts:
         _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary)
         marks = _marks(st, md, end_ts_ms)
         eq = st.equity(marks)
@@ -486,17 +536,29 @@ def _seed_carry_in(st, md, first_row, params, summary):
     mark = md.mark(coin, our_ts)
     if mark is None or mark != mark or mark <= 0:
         return
-    pre_pct = _f(first_row.get("target_exposure_pct"))     # exposure already held at first observation
-    pa = _f(first_row.get("position_after"))
-    ss = _f(first_row.get("signed_size"))
-    if pa == pa and ss == ss and pa != ss:                  # had a prior position
+    post_pct = _f(first_row.get("target_exposure_pct"))    # SIGNED exposure% AFTER the first action
+    pa = _f(first_row.get("position_after"))               # source signed size after the first action
+    ss = _f(first_row.get("signed_size"))                  # the first action's own signed delta
+    if post_pct == post_pct and pa == pa and ss == ss and pa != 0 and pa != ss:  # had a prior position
         eq = sum(st.cross_collateral.values())
-        seed_szi = (pre_pct * eq / mark) * (1.0 if pa > 0 else -1.0) if pre_pct == pre_pct else 0.0
-        # net out this first action's own delta so the loop's first order adds correctly
-        seed_szi -= ss / pa * (pre_pct * eq / mark) if pa else 0.0
+        # source exposure% BEFORE the first observed action = post% scaled by the pre/post size ratio.
+        # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
+        # shorts -- codex code-r4 #3). The main loop's first order then trades to the post target.
+        pre_pct = post_pct * (pa - ss) / pa
+        seed_szi = pre_pct * eq / mark
         if abs(seed_szi) > 0:
             mode = default_margin_mode(coin)
-            st.positions[coin] = Position(coin, seed_szi, mark, mode, md.meta.max_leverage(coin))
+            pos = Position(coin, seed_szi, mark, mode, md.meta.max_leverage(coin))
+            if mode == "isolated":
+                # post isolated IM from main at the causal mark (codex code-r2 #6) -- never seed an
+                # isolated position with 0 margin (would liquidate instantly). Reject if main can't fund.
+                im = abs(seed_szi) * mark * md.meta.init_margin_rate(coin, abs(seed_szi) * mark)
+                if st.cross_collateral.get("main", 0.0) < im:
+                    summary["outcome_states"].add("carry_in_rejected")
+                    return
+                st.cross_collateral["main"] -= im
+                pos.isolated_margin = im
+            st.positions[coin] = pos
             summary["outcome_states"].add("carry_in_seeded")
 
 
@@ -538,9 +600,47 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
     side = 1 if delta_szi > 0 else -1
     fill_px = mark * (1 + side * slip_bps / 1e4)
 
-    # pre-trade initial-margin admissibility for opens/adds on the bucket (design §4.4/D... ; codex #6)
     fee_rate = md.fees.taker(coin)
     fee = abs(delta_szi) * fill_px * fee_rate
+
+    # pre-trade INITIAL-MARGIN admissibility (design §4.4; codex code-r2 #3). Only gate orders that
+    # INCREASE exposure (reduces/closes free margin, always allowed). Reject if the required IM + fee
+    # exceeds available bucket collateral -> prevents driving main negative on isolated opens and
+    # caps cross leverage at the tier. Conservative: cross availability nets existing-position IM.
+    cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
+    new_szi = cur_szi + delta_szi
+    increasing = abs(new_szi) > abs(cur_szi) + 10 ** (-szdec)
+    if increasing:
+        # use the SLIPPAGE-ADJUSTED fill_px (codex code-r4 #2) so the gate matches what _book_fill
+        # actually posts/debits; also charge the immediate slippage loss on the new size.
+        new_notional = abs(new_szi) * fill_px
+        new_im = new_notional * md.meta.init_margin_rate(coin, new_notional)   # TOTAL IM (tier-correct; codex code-r3)
+        slip_cost = abs(delta_szi) * abs(fill_px - mark)
+        if mode == "isolated":
+            cur_im = st.positions[coin].isolated_margin if coin in st.positions else 0.0
+            if (new_im - cur_im) + fee + slip_cost > max(0.0, st.cross_collateral.get("main", 0.0)):
+                summary["n_rejected"] += 1
+                return
+        else:
+            # TOTAL cross IM of the scope AFTER the fill (existing positions re-rated at their tier)
+            # must not exceed scope equity (cash + uPnL) net of fee + immediate slippage cost.
+            scope_k = coin_dex(coin)
+            total_im = new_im
+            equity = st.cross_collateral.get(scope_k, 0.0) - fee - slip_cost
+            if coin in st.positions:          # uPnL on the pre-existing portion of this coin
+                equity += cur_szi * (mark - st.positions[coin].entry_px)
+            for cc in sorted(st.positions):
+                pp = st.positions[cc]
+                if pp.mode != "cross" or coin_dex(cc) != scope_k or cc == coin:
+                    continue
+                mm = md.mark(cc, our_ts)
+                base = mm if (mm is not None and mm == mm) else pp.entry_px
+                total_im += abs(pp.szi) * base * md.meta.init_margin_rate(cc, abs(pp.szi) * base)
+                equity += pp.szi * (base - pp.entry_px)
+            if total_im > max(0.0, equity):
+                summary["n_rejected"] += 1
+                return
+
     _book_fill(st, md, coin, delta_szi, fill_px, mode, fee, summary)
 
     summary["n_fills"] += 1
@@ -593,9 +693,12 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
     if (p.szi >= 0) == (new_szi >= 0) and abs(new_szi) > abs(p.szi):
         p.entry_px = (p.entry_px * abs(p.szi) + fill_px * abs(delta_szi)) / abs(new_szi)
         if p.mode == "isolated":
-            add_im = abs(delta_szi) * fill_px * md.meta.init_margin_rate(coin, abs(new_szi) * fill_px)
-            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - add_im - fee
-            p.isolated_margin += add_im
+            # post the TIER-CORRECT total IM for the resulting notional; draw the delta (incl any
+            # tier-jump re-rate of the existing portion) from main (codex code-r3 consistency).
+            new_notional = abs(new_szi) * fill_px
+            target_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
+            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - (target_im - p.isolated_margin) - fee
+            p.isolated_margin = target_im
         else:
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
     elif (p.szi >= 0) != (new_szi >= 0):
@@ -613,29 +716,63 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
     p.szi = new_szi
 
 
-def _advance_between(st, md, t0_ms, t1_ms, params, events, summary):
-    """Funding (hourly) + 3-valued maintenance-breach scan over (t0,t1]. Sets ruin on wipeout."""
-    if t0_ms is None or t1_ms <= t0_ms or not st.positions:
-        return
-    first_h = ((t0_ms // MS_HOUR) + 1) * MS_HOUR
-    for h in range(first_h, t1_ms + 1, MS_HOUR):
-        for coin in sorted(st.positions):
-            p = st.positions[coin]
-            rate = md.funding_rate_at(coin, h)
-            px = md.mark(coin, h, causal=True)
-            if px is None or px != px or rate == 0.0:
-                continue
-            fund = -(p.szi * px * rate)     # design §5/D10: long pays positive rate
-            if p.mode == "cross":
-                st.cross_collateral[coin_dex(coin)] = st.cross_collateral.get(coin_dex(coin), 0.0) + fund
-            else:
-                p.isolated_margin += fund
-            p.cum_funding += -fund
-            summary["total_funding"] += fund
+def _apply_funding(st, md, h, summary):
+    """Apply the hourly funding settlement to every open position (design §5/D10)."""
+    for coin in sorted(st.positions):
+        p = st.positions[coin]
+        rate = md.funding_rate_at(coin, h)
+        px = md.mark(coin, h, causal=True)
+        if px is None or px != px or rate == 0.0:
+            continue
+        fund = -(p.szi * px * rate)         # long pays positive rate
+        if p.mode == "cross":
+            st.cross_collateral[coin_dex(coin)] = st.cross_collateral.get(coin_dex(coin), 0.0) + fund
+        else:
+            p.isolated_margin += fund
+        p.cum_funding += -fund
+        summary["total_funding"] += fund
 
-    breach = _scan_breach(st, md, t0_ms, t1_ms, summary)
-    if breach is not None:
-        _run_liquidation(st, md, breach["ts"], params, events, summary)
+
+def _advance_between(st, md, t0_ms, t1_ms, params, events, summary):
+    """CHRONOLOGICAL event loop over (t0,t1] (codex code-r2 #1/#5): interleave hourly funding
+    settlements with repeated maintenance-breach scans + liquidations, in time order. A position
+    liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
+    fold end; the >100k 20%-then-30s-cooldown ladder advances bar-by-bar (the cursor jumps past the
+    cooldown so the next scan does the full close)."""
+    if t0_ms is None or t1_ms <= t0_ms:
+        return
+    cursor = t0_ms
+    guard = 0
+    while cursor < t1_ms and st.positions and not summary["ruin"]:
+        guard += 1
+        if guard > 200_000:                 # backstop against any pathological non-advance
+            logger.error("m07 _advance_between guard tripped (entity=%s fold=%s)",
+                         summary.get("entity_id"), summary.get("fold_id"))
+            break
+        next_funding = ((cursor // MS_HOUR) + 1) * MS_HOUR
+        seg_end = min(next_funding, t1_ms)
+        breach = _scan_breach(st, md, cursor, seg_end, summary)
+        if breach is not None:
+            _run_liquidation(st, md, breach["ts"], params, events, summary)
+            # resume AFTER this breach minute (and past any liq cooldown just set) so survivors are
+            # rescanned and the cooldown elapses before the next (full) liquidation step.
+            cursor = max(breach["ts"] + MS_MIN, st.cooldown_until_ms)
+        else:
+            # no breach this segment -> account healthy. Once the cooldown has elapsed, reset it so a
+            # later, independent breach starts fresh with a 20%-first step (not an immediate full close).
+            if st.cooldown_until_ms and st.cooldown_until_ms <= cursor:
+                st.cooldown_until_ms = 0
+            cursor = seg_end
+            if seg_end == next_funding and seg_end <= t1_ms:
+                _apply_funding(st, md, seg_end, summary)
+                # POST-FUNDING solvency check (codex code-r4 #1): a settlement can push below
+                # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
+                # any same-ts/within-30s double-fire on every caller path -- codex code-r5/r6/r7).
+                _check_maint_at(st, md, seg_end, params, events, summary)
+    # FOLD-BOUNDARY solvency: final point-in-time maintenance check at t1 (codex code-r4 #1). The
+    # cooldown guard makes this safe even if a post-funding liquidation just fired within 30s of t1.
+    if st.positions and not summary["ruin"]:
+        _check_maint_at(st, md, t1_ms, params, events, summary)
 
 
 def _scan_breach(st: AccountState, md: MarketData, t0_ms: int, t1_ms: int, summary: dict):
@@ -721,6 +858,36 @@ def _scan_breach(st: AccountState, md: MarketData, t0_ms: int, t1_ms: int, summa
     return best
 
 
+def _check_maint_at(st: AccountState, md: MarketData, ts_ms: int, params, events, summary):
+    """Point-in-time maintenance solvency check at the CAUSAL CLOSE mark at ts (codex code-r4 #1):
+    used after funding settlements and at the fold boundary, where a settled cash move (not a price
+    wick) can drop a scope/isolated bucket below maintenance. If breached, run liquidation (which
+    executes at the adverse mark, consistent + conservative). Detects via close; adverse <= close so
+    a close breach always also breaches under the adverse extreme."""
+    if not st.positions:
+        return
+    marks = _marks(st, md, ts_ms)
+    breached = False
+    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+        p = st.positions[coin]; m = marks.get(coin) or p.entry_px
+        notion = abs(p.szi) * m
+        if p.isolated_margin + p.szi * (m - p.entry_px) < notion * md.meta.maint_rate(coin, notion):
+            breached = True; break
+    if not breached:
+        for scope in st.cross_scopes():
+            coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+            if not coins:
+                continue
+            eq = st.cross_collateral.get(scope, 0.0) + sum(
+                st.positions[c].szi * ((marks.get(c) or st.positions[c].entry_px) - st.positions[c].entry_px) for c in coins)
+            maint = sum(abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)
+                        * md.meta.maint_rate(c, abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)) for c in coins)
+            if eq < maint:
+                breached = True; break
+    if breached:
+        _run_liquidation(st, md, ts_ms, params, events, summary)
+
+
 def _adverse_marks(st: AccountState, md: MarketData, ts_ms: int) -> dict:
     """Per-coin ADVERSE candle extreme at the minute covering ts (low for longs, high for shorts) —
     the realized worst price that drove the breach. Liquidation executes against THIS (consistent
@@ -785,33 +952,34 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
 
 
 def _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks):
-    """HL ladder (conservative, labeled approximation): most-marginal first; >100k notional -> 20%
-    first order (sets 30s cooldown), then full; <=100k -> full. Recorded as market_liq_order FILLS
-    with forced-liq slippage. Loops until maintenance restored or scope empty. At 1m resolution the
-    30s cooldown elapses by the next bar (interval-bounded)."""
-    guard = 0
-    while guard < 64:
-        guard += 1
-        coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
-        if not coins:
-            return
-        cash = st.cross_collateral.get(scope, 0.0)
-        eq = cash + sum(st.positions[c].szi * ((marks.get(c) or st.positions[c].entry_px) - st.positions[c].entry_px) for c in coins)
-        maint = sum(abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)
-                    * md.meta.maint_rate(c, abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)) for c in coins)
-        if eq >= maint:
-            return
-        c = max(sorted(coins), key=lambda x: abs(st.positions[x].szi) * (marks.get(x) or st.positions[x].entry_px))
-        p = st.positions[c]
-        m = marks.get(c) or p.entry_px
-        notion = abs(p.szi) * m
-        in_cooldown = ts_ms < st.cooldown_until_ms
-        if notion > PARTIAL_LIQ_NOTIONAL and not in_cooldown:
-            close_szi = -p.szi * PARTIAL_LIQ_FRACTION
-            st.cooldown_until_ms = ts_ms + LIQ_COOLDOWN_MS
-        else:
-            close_szi = -p.szi
-        _liq_close(st, md, c, m, ts_ms, summary=summary, close_szi=close_szi, scope=scope)
+    """ONE HL market-liquidation STEP for the breached cross scope (codex code-r2 #5): close the
+    most-marginal position by 20% if its notional > 100k and not in cooldown (then sets the 30s
+    cooldown), else full. The chronological event loop (_advance_between) re-invokes on the next bar
+    after the cooldown elapses, so the >100k 20%-then-full ladder advances bar-by-bar (interval-
+    bounded at 1m). Recorded as a market_liq_order FILL with the forced-liq slippage penalty."""
+    # SINGLE-POINT COOLDOWN ENFORCEMENT (codex code-r5/r6/r7): never issue a liquidation order while
+    # cooling down. This makes it IMPOSSIBLE for any caller path (price breach, post-funding, terminal
+    # fold-boundary, or their combinations at the same/sub-minute ts) to fire two orders within 30s.
+    # The position simply waits; the next eligible 1m bar (>=60s > 30s cooldown) issues the next order.
+    if ts_ms < st.cooldown_until_ms:
+        return
+    coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+    if not coins:
+        return
+    c = max(sorted(coins), key=lambda x: abs(st.positions[x].szi) * (marks.get(x) or st.positions[x].entry_px))
+    p = st.positions[c]
+    m = marks.get(c) or p.entry_px
+    notion = abs(p.szi) * m
+    # HL ladder: the FIRST liquidation order on the account is 20% (if >100k) and sets the 30s
+    # cooldown; SUBSEQUENT orders (after the cooldown elapses) are FULL. cooldown_until_ms==0 marks
+    # "no prior liquidation pending" (reset once the account is healthy for a full segment).
+    first_step = (st.cooldown_until_ms == 0)
+    if notion > PARTIAL_LIQ_NOTIONAL and first_step:
+        close_szi = -p.szi * PARTIAL_LIQ_FRACTION
+        st.cooldown_until_ms = ts_ms + LIQ_COOLDOWN_MS
+    else:
+        close_szi = -p.szi
+    _liq_close(st, md, c, m, ts_ms, summary=summary, close_szi=close_szi, scope=scope)
 
 
 def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
@@ -888,7 +1056,8 @@ def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
 # --------------------------------------------------------------------------- #
 def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, out_dir: Path,
                   band: str = "base", limit_entities: Optional[int] = None, start_equity: float = 10_000.0,
-                  flush_rows: int = 1_000_000, require_cache: bool = False):
+                  flush_rows: int = 1_000_000, require_cache: bool = True):
+    import shutil
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _streaming_io import ShardedParquetWriter, install_memory_guard
@@ -896,7 +1065,6 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
 
     install_memory_guard(soft_gb=12, label="m07")
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    md = MarketData(require_cache=require_cache)
 
     folds = pd.read_parquet(folds_path)
     fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
@@ -914,27 +1082,33 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
         seats_by_wallet.setdefault(r.primary_wallet, []).append((int(r.entity_id), int(r.fold_id)))
     logger.info("M7 runner: %d seats over %d wallets", len(sl), len(wallets))
 
-    # PRE-SHARD actions by wallet ONCE (streaming, bounded memory): one pass over the dataset filtered
-    # to shortlist wallets, partition rows into per-wallet parquet shards (codex code-r1 #7).
-    shard_dir = out_dir / "_m07_wallet_shards"; shard_dir.mkdir(parents=True, exist_ok=True)
+    # PRE-SHARD actions by wallet ONCE via pyarrow write_dataset (codex code-r2 #4): streaming,
+    # memory-bounded (no per-wallet writer held open buffering rows), FRESH dir each run (no stale
+    # shard contamination). Hive-partitioned by wallet.
+    shard_dir = out_dir / "_m07_wallet_shards"
+    if shard_dir.exists():
+        shutil.rmtree(shard_dir)
+    shard_dir.mkdir(parents=True, exist_ok=True)
     dataset = ds.dataset(actions_path, format="parquet")
     cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size", "position_after",
             "target_exposure_pct", "is_liquidation", "carry_in_status"]
-    wset = set(wallets)
-    writers: dict[str, ShardedParquetWriter] = {}
     scanner = dataset.scanner(columns=cols, filter=ds.field("wallet").isin(wallets), batch_size=200_000)
-    for batch in scanner.to_batches():
-        df = batch.to_pandas()
-        for w, g in df.groupby("wallet"):
-            if w not in wset:
-                continue
-            wpath = shard_dir / f"{_ulib.quote(w, safe='')}.parquet"
-            wr = writers.get(w)
-            if wr is None:
-                wr = ShardedParquetWriter(wpath, flush_rows=500_000); writers[w] = wr
-            wr.add_many(g.to_dict("records"))
-    for w, wr in writers.items():
-        wr.close()
+    ds.write_dataset(scanner, shard_dir, format="parquet", partitioning=["wallet"],
+                     partitioning_flavor="hive", existing_data_behavior="overwrite_or_ignore",
+                     max_rows_per_file=2_000_000, max_rows_per_group=200_000)
+    shard_ds = ds.dataset(shard_dir, format="parquet", partitioning="hive")
+
+    # PRELOAD market caches for the shortlist coin set so the inner loop never hits Mongo (codex
+    # code-r2 #7). Build the OHLC cache (close-only marks_cache is insufficient) if missing.
+    coins = set()
+    for b in dataset.scanner(columns=["coin", "wallet"], filter=ds.field("wallet").isin(wallets),
+                             batch_size=500_000).to_batches():
+        coins.update(c for c in b.column("coin").to_pylist() if c and not coin_is_spot(c))
+    logger.info("M7 runner: preloading OHLC+funding caches for %d coins", len(coins))
+    build_ohlc_cache(sorted(coins))
+    md = MarketData(require_cache=require_cache)
+    for c in sorted(coins):           # warm funding series into memo (one Mongo pass each, precompute)
+        md.funding_series(c)
 
     fw = ShardedParquetWriter(out_dir / "m07_fills.parquet", flush_rows=flush_rows)
     ew = ShardedParquetWriter(out_dir / "m07_events.parquet", flush_rows=flush_rows)
@@ -942,16 +1116,16 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     params = EngineParams(slippage_band=band)
 
     for w in wallets:
-        wpath = shard_dir / f"{_ulib.quote(w, safe='')}.parquet"
-        if not wpath.exists():
+        try:
+            wdf = shard_ds.to_table(filter=ds.field("wallet") == w).to_pandas()
+        except Exception:
             continue
-        wdf = pd.read_parquet(wpath)
+        if wdf.empty:
+            continue
         for entity_id, fold_id in sorted(seats_by_wallet.get(w, [])):
             t0ms, t1ms = fold_win[fold_id]
             adf = wdf[(wdf.ts >= t0ms) & (wdf.ts < t1ms)]
-            summary_fills: list = []
-            params2 = params
-            res = step_subaccount(adf, md, start_equity, params2, end_ts_ms=t1ms,
+            res = step_subaccount(adf, md, start_equity, params, end_ts_ms=t1ms, start_ts_ms=t0ms,
                                   entity_id=entity_id, fold_id=fold_id)
             fw.add_many(res["fills"]); ew.add_many(res["events"])
             sm = res["summary"]; sm["outcome_states"] = ",".join(sm["outcome_states"])
