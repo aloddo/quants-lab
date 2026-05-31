@@ -38,21 +38,27 @@ running processes are unaffected and pick up the new path on next restart. The
 currently loaded (V11 runs manually).
 
 ## CANONICAL research modules (V15 pipeline)
-Pipeline order (Alberto-locked, projects/quant/v15/sizing-locks):
-**M01 equity -> authenticity gate -> ranking -> M02 sizing -> sim -> shadow-live.**
-The authenticity gate is the UNNUMBERED gate between M01 and ranking (informally "M2.5"
-since it precedes the real M02). M02 = SIZING (Alberto's locked numbering). Do NOT renumber.
+CANONICAL V13->V15 module numbering (map: projects/quant/v15/module-review-2026-05-30,
+confirmed via tests/v13/test_module_*.py imports). The V15 strategy
+(projects/quant/v15/strategy) INSERTS a NEW entity/authenticity layer "M0e" between
+M02 and M03. Full pipeline:
+**M01 equity -> M02 journey_trace -> M0e authenticity (NEW) -> M03 eligibility ->
+M04 ranker -> M05 exec-realism -> M06 cold-start -> M07 ledger -> M08 sim ->
+M09 walk-forward -> M10 gates -> M11 random-null.** Sizing lives inside M08 sim
+(PROP %-of-equity), constrained by projects/quant/v15/sizing-locks; it is NOT a
+separate numbered module. Do NOT renumber.
 
 | module | canonical file | status |
 |---|---|---|
-| M01 equity reconstruct | `research/v15/v15_m01_equity_reconstruct.py` | DONE. 14 codex bugs fixed; full 20,378-wallet run done (app/data/v15/m01_universe_20k_series.parquet). Anchor disk cache added. Accurate at true weekly anchors (drift is parked intra-week marks only). |
-| authenticity gate (pre-ranking) | `research/v15/v15_m025_authenticity_gate.py` | DONE. Codex SHIP after 7-round loop. Entity/hedge/funding-farm/wash/neutral detection. Output app/data/v15/m025_authenticity.parquet. NOT M02 — it's the gate before ranking. |
+| M01 equity reconstruct | `research/v15/v15_m01_equity_reconstruct.py` | DONE (V15). 14 codex bugs fixed; full 20,378-wallet run; anchor disk cache. Accurate at true weekly anchors. |
+| M02 journey_trace | `research/v13/v13_journey_trace.py` | EXISTS (V13, 1234 lines). NOT yet V15-ported (point-in-time equity for sizing; xyz; liquidation-close still TODO). |
+| M0e authenticity gate (NEW) | `research/v15/v15_m025_authenticity_gate.py` | DONE (V15). Codex SHIP, 7-round loop. Entity/hedge/funding-farm/wash/neutral detection. Output app/data/v15/m025_authenticity.parquet. (File keeps the "m025" name; logically M0e, sits between M02 and M03.) |
 | anchor prefetch | `research/v15/v15_prefetch_anchors.py` | warms perp_anchor_cache (zero-API future runs) |
-| M01 validation subset | `app/data/v15/m01_validation_wallets.txt` | 11 archetypes |
-| M02 sizing | (not built) | the ORIGINAL M02 per sizing-locks. NEXT after gate full run + ranking + Alberto review. Mirror = faithful whole-equity incl leverage + dry powder. |
+| M03 eligibility | `research/v13/v13_m03_v2.py` | EXISTS (V13). V15 align to G5 TODO. |
+| M04 ranker | `research/v13/v13_copy_ranker_v2.py` | EXISTS (V13). V15 rewrite to source_score TODO. |
+| M05-M11 | research/v13/v13_*.py (exec-realism, cold_start, portfolio_ledger, portfolio_simulator[+sizing], walk_forward_folds, pass_fail_gates, strict_random_null) | EXIST (V13). V15 revalidation TODO. |
 | G5 source-quality filter | `research/v15/v15_g5_filter.py` | |
 | source ROE enrichment | `research/v15/v15_source_roe_enrichment.py` | |
-| V13 predecessor (reference) | `research/v13/v13_equity_reconstruct_v8.py` | superseded by v15_m01 |
 
 V13: 42 research scripts (Sharpe-hunt + module pipeline). Superseded intermediates
 (equity_reconstruct v4/v5/v7) are in `archive/scripts/v13/`.
