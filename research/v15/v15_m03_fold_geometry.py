@@ -369,8 +369,11 @@ def main() -> None:
     logger.info(f"folds calendar -> {outdir/'m03_folds.parquet'} (8 folds, chained OOS "
                 f"{folds[0].test_start} .. {folds[-1].test_end_excl})")
 
-    actions = pd.read_parquet(args.actions)
-    journeys = pd.read_parquet(args.journeys)
+    # Memory-safe (CLAUDE.md Key Rule 8): read ONLY the columns the activity pass needs. The full
+    # m02_actions is 86M rows x 25 cols (~4.6GB on disk); loading all of it would strain RAM. M3
+    # needs only wallet+ts (actions) and wallet+entry_ts (journeys).
+    actions = pd.read_parquet(args.actions, columns=["wallet", "ts"])
+    journeys = pd.read_parquet(args.journeys, columns=["wallet", "entry_ts"])
     logger.info(f"loaded {len(actions):,} actions, {len(journeys):,} journeys")
     wide, summary = build_activity(folds, actions, journeys)
     wide.to_parquet(outdir / "m03_wallet_fold_activity.parquet", index=False)
