@@ -816,6 +816,7 @@ def seed_positions(
     fills: list[dict],
     anchor: AnchorState,
     anchor_ms: int,
+    causal_cutoff: bool = False,
 ) -> dict[str, float]:
     """Seed positions held at anchor_ms (adapts v8's three-case seeding).
 
@@ -823,33 +824,69 @@ def seed_positions(
     2. Coins first TRADED after anchor_ms: their first post-anchor fill's
        startPosition reveals the pre-anchor holding.
     3. Static no-fill positions from the anchor parquet. The parquet is a SINGLE
-       snapshot at anchor.fetched_ms, so a position in it is only PROVEN to exist
-       at fetch time. We therefore seed a static position ONLY when the weekly
-       anchor is within 24h of the parquet fetch (proximity heuristic) -- never
-       backfilled into far-earlier history (P0: projecting a later-opened
-       position backward inflates/deflates the cash snap and drifts the walk).
-       When a static position cannot be proven at this anchor, we trust
-       positions_at (flat) and leave it unseeded; any genuine hidden exposure
-       surfaces as inter-anchor DRIFT and is quarantined at the wallet level.
-       Coins with post-anchor fills are handled by case 2, not seeded here.
+
+    CAUSALITY (codex r4 BUG 1): case 2 seeds a coin's pre-anchor holding from a
+    fill that occurs AFTER the anchor. In the DAILY reconstruction (compute_eq_at)
+    that fill is always <= the walk endpoint t_ms, so it is causal for THAT walk.
+    But in the per-EVENT walk (compute_event_equity), equity_post(k) must use only
+    data with event-order <= k; a case-2 fill at order > k would leak a future-
+    known coin into equity at k (look-ahead). When ``causal_cutoff=True`` (set ONLY
+    by compute_event_equity) case 2 is DROPPED: a coin whose first fill is after
+    the anchor is not seeded from that future fill's startPosition; its position
+    materialises only when the replay applies its fill (order <= k). Cases 1 and 3
+    (fills <= anchor_ms, and the anchor's own static snapshot, both representing
+    state at/<=anchor_ts < ts) remain — they ARE causal. compute_eq_at keeps the
+    default (causal_cutoff=False) so the audited daily path is byte-for-byte
+    unchanged.
+
+    Case-3 detail: the parquet is a SINGLE snapshot at anchor.fetched_ms, so a
+    position in it is only PROVEN to exist at fetch time. We seed a static position
+    ONLY when the weekly anchor is within 24h of the parquet fetch (proximity
+    heuristic) -- never backfilled into far-earlier history (P0: projecting a
+    later-opened position backward inflates/deflates the cash snap and drifts the
+    walk). When a static position cannot be proven at this anchor, we trust
+    positions_at (flat) and leave it unseeded; any genuine hidden exposure surfaces
+    as inter-anchor DRIFT and is quarantined at the wallet level. Coins with
+    post-anchor fills are handled by case 2 (or, under causal_cutoff, by the
+    caller's event replay), not seeded here.
     """
     start_positions = positions_at(fills, anchor_ms)
 
     seen_pre = {f["coin"] for f in fills if f["time"] <= anchor_ms}
-    for f in fills:
-        if f["time"] <= anchor_ms:
-            continue
-        coin = f["coin"]
-        if coin in seen_pre or coin in start_positions:
-            continue
-        pos_pre = f["startPosition"]
-        if abs(pos_pre) > 1e-9:
-            start_positions[coin] = pos_pre
-        seen_pre.add(coin)
+    if not causal_cutoff:
+        # Case 2 (NON-causal for the per-event walk): seed a coin's pre-anchor
+        # holding from its first post-anchor fill's startPosition.
+        for f in fills:
+            if f["time"] <= anchor_ms:
+                continue
+            coin = f["coin"]
+            if coin in seen_pre or coin in start_positions:
+                continue
+            pos_pre = f["startPosition"]
+            if abs(pos_pre) > 1e-9:
+                start_positions[coin] = pos_pre
+            seen_pre.add(coin)
+
+    near_fetch = abs(anchor_ms - anchor.fetched_ms) <= 86_400_000
+
+    if causal_cutoff:
+        # FULLY-CAUSAL seed for the per-event walk (codex r2 BUG): the seed serves
+        # every event k in this anchor's segment and MUST NOT depend on any fill with
+        # time > anchor_ms (some are at order > k -> look-ahead). The non-causal path
+        # below consults post_anchor_coins AND any_fill_coins (both read fills >
+        # anchor_ms), so whether a snapshot coin is seeded would flip based on FUTURE
+        # trading. Causal seed = positions from fills <= anchor_ms (already in
+        # start_positions) + the anchor's OWN near-fetch snapshot, full stop. A
+        # far-from-fetch snapshot is not causal evidence at this anchor; any genuine
+        # unseen exposure surfaces as inter-anchor DRIFT and is quarantined.
+        if near_fetch:
+            for coin, szi in anchor.positions.items():
+                if coin not in start_positions and abs(szi) >= 1e-9:
+                    start_positions[coin] = float(szi)
+        return start_positions
 
     post_anchor_coins = {f["coin"] for f in fills if f["time"] > anchor_ms}
     any_fill_coins = {f["coin"] for f in fills}
-    near_fetch = abs(anchor_ms - anchor.fetched_ms) <= 86_400_000
     for coin, szi in anchor.positions.items():
         if coin in start_positions or abs(szi) < 1e-9:
             continue
@@ -1435,6 +1472,428 @@ def position_validation(
         "n_positions_checked": checked,
         "max_position_abs_err": max_abs_err,
         "position_validation_status": "ok",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# M02 BRIDGE — additive per-event equity series (NO reconstruction-MATH change)
+# --------------------------------------------------------------------------- #
+#
+# This block is ADDITIVE for V15 M02 (journey_trace). It does NOT touch the
+# existing daily/audit reconstruction above; it reuses the SAME helpers
+# (seed_positions, get_mark, fill/ledger/funding cash deltas) to emit, per
+# wallet, a PER-EVENT equity_post series in the TOTAL EVENT ORDER required by
+# the M02 design spec:
+#
+#   event_order key = (ts_ms, type_rank, source_seq)
+#     type_rank: ledger=0, fill=1, funding=2   (ledger settles, then trade,
+#                then funding accrues on the post-trade position)
+#     source_seq: HL tid for fills; stable per-type append index otherwise.
+#
+# For each event k we re-anchor to the last weekly anchor with anchor_ts
+# STRICTLY < ts(k) (codex r3: an anchor sharing the action's ms is NOT a valid
+# base), walk forward applying every event with order <= k (incl. this one),
+# then mark-to-market at ts(k). equity_post(k) therefore uses ONLY data with
+# order <= k — no look-ahead. We also emit the per-event reliability fields M02
+# needs to pick its equity-basis mode (markable_all, n_unmarkable, frozen
+# component value/age, age_since_anchor, mark_ts, anchor_ts) — all derived from
+# data <= k only.
+
+# type_rank for the total event order (codex r3/r4).
+_TYPE_RANK = {"ledger": 0, "fill": 1, "funding": 2}
+
+# STALE_CAP: fall back if reconstruction base anchor is older than one anchor
+# cycle (7d) while material unmarkable exposure exists. Tunable (spec).
+STALE_CAP_MS = 7 * 86_400_000
+
+SPOT_USDC_INVARIANT_NOTE = (
+    "HL is a unified wallet: spot USDC IS perp margin. The weekly perpAllTime "
+    "anchor (marginSummary.accountValue summed across perp dexes) already "
+    "includes collateral (USDC) + uPnL. Re-anchoring snaps cash := anchor_eq - "
+    "Sum pos*mark, so the spot-USDC/collateral component is captured inside "
+    "`cash` and carried causally by ledger deposit/withdraw/transfer deltas. "
+    "equity_post is therefore whole-account (collateral-inclusive) by "
+    "construction; see test_m01_spot_collateral_invariant."
+)
+
+
+def build_event_stream(
+    fills: list[dict],
+    funding: list[dict],
+    ledger: list[dict],
+) -> list[dict]:
+    """Merge fills+funding+ledger into the TOTAL EVENT ORDER (spec v4).
+
+    Returns a list of event dicts each carrying:
+        ts, type ('fill'|'funding'|'ledger'), type_rank, source_seq, ev (payload)
+    sorted by (ts, type_rank, source_seq). source_seq = tid for fills (HL
+    sequence), else a stable per-type append index so the order is deterministic
+    and reproducible across M01 (equity) and M02 (actions).
+
+    SAME-MS FILL IDENTITY (codex r4 BUG 2): the S3 by-wallet partition carries no
+    `tid`, so every same-ms fill would otherwise get source_seq=0 — colliding.
+    M02 rematched events->fills by (ts, source_seq) and silently overwrote the
+    duplicates (wrong action_type/position_after). FIX: give each fill a STABLE
+    UNIQUE per-wallet sequence. When tid is present/nonzero we keep it (HL order).
+    When tid is absent/0 we assign a stable index = the fill's position in the
+    deterministic (time, tid, original-load-order) sort, OFFSET past the tid space
+    so it can never alias a real tid. The same number is used as source_seq AND the
+    fill payload is carried on the event (`ev`) so M02 reads the fill DIRECTLY off
+    the ordered stream — no (ts, tid) rematch, no overwrite. M01's equity walk is
+    unaffected (it applies fills positionally; a same-ms reorder of position deltas
+    on the SAME book is commutative for cash + net position).
+    """
+    out: list[dict] = []
+    # Stable per-fill sequence. Deterministic key: (time, tid-or-0, load-order).
+    # Index in this order is a stable unique id; when a fill lacks a real tid we
+    # use NO_TID_BASE + index so it cannot collide with a genuine tid.
+    NO_TID_BASE = 1 << 60
+    order_key = sorted(
+        range(len(fills)),
+        key=lambda i: (int(fills[i]["time"]), int(fills[i].get("tid", 0) or 0), i),
+    )
+    stable_idx = {orig: rank for rank, orig in enumerate(order_key)}
+    for i, f in enumerate(fills):
+        tid = int(f.get("tid", 0) or 0)
+        seq = tid if tid != 0 else (NO_TID_BASE + stable_idx[i])
+        out.append(
+            {
+                "ts": int(f["time"]),
+                "type": "fill",
+                "type_rank": _TYPE_RANK["fill"],
+                "source_seq": seq,
+                "ev": f,
+            }
+        )
+    for i, e in enumerate(ledger):
+        out.append(
+            {
+                "ts": int(e["time"]),
+                "type": "ledger",
+                "type_rank": _TYPE_RANK["ledger"],
+                "source_seq": i,
+                "ev": e,
+            }
+        )
+    for i, e in enumerate(funding):
+        out.append(
+            {
+                "ts": int(e["time"]),
+                "type": "funding",
+                "type_rank": _TYPE_RANK["funding"],
+                "source_seq": i,
+                "ev": e,
+            }
+        )
+    out.sort(key=lambda x: (x["ts"], x["type_rank"], x["source_seq"]))
+    return out
+
+
+@dataclass
+class EventEquity:
+    """Per-event reconstruction output (whole-account, causal)."""
+
+    event_order: int           # strictly monotone index in the ordered stream
+    ts: int
+    type: str
+    source_seq: int
+    equity_post: float         # whole-account equity AFTER this event
+    cash: float
+    position_value: float
+    anchor_ts: Optional[int]   # base anchor (strictly < ts); None if no past anchor
+    anchor_equity: Optional[float]
+    age_since_anchor_ms: Optional[int]
+    mark_ts: Optional[int]     # latest mark <= ts across marked positions
+    markable_all: bool         # every held nonzero position markable at ts
+    n_unmarkable: int
+    no_extradex_without_anchor: bool
+    frozen_component_value: float   # last-known value of unmarkable positions
+    frozen_component_age_ms: int    # staleness of the frozen value at ts
+    has_past_anchor: bool
+    fill: Optional[dict] = None     # for type=='fill': the EXACT fill payload of
+                                    # this event (codex r4 BUG 2) — M02 consumes it
+                                    # directly off the stream, never rematching by
+                                    # (ts, tid). None for funding/ledger events.
+
+
+def compute_event_equity(
+    ordered: list[dict],
+    fills: list[dict],
+    anchor: "AnchorState",
+    wallet_lc: str,
+    window_anchors: list[tuple[int, float]],
+    extradex_no_anchor: bool,
+) -> list[EventEquity]:
+    """Walk the ordered event stream ONCE and emit equity_post per event.
+
+    Causal contract (spec NON-LOOK-AHEAD INVARIANTS):
+      * base anchor for event k = last weekly anchor with anchor_ts STRICTLY < ts(k).
+      * equity_post(k) = cash + Sum pos*mark(ts(k)) using ONLY events order <= k.
+      * mark_ts <= ts(k); anchor_ts < ts(k); event_order strictly monotone.
+
+    We re-seed/re-snap cash whenever the active base anchor changes (each weekly
+    anchor cycle), exactly like compute_eq_at, then incrementally apply each
+    event's cash/position delta. Mark-to-market is recomputed at each event ts
+    over the live positions, tracking unmarkable positions' last-known value
+    (the FROZEN component) so M02 can do PARTIAL_MTM without look-ahead.
+    """
+    results: list[EventEquity] = []
+
+    # Active base-anchor state. Re-initialised lazily when the base anchor for
+    # the current event differs from the one in force.
+    active_anchor_ts: Optional[int] = None
+    active_anchor_eq: Optional[float] = None
+    cash = 0.0
+    positions: dict[str, float] = {}
+    # last-known mark value per coin (for the frozen unmarkable component)
+    last_val: dict[str, float] = {}
+    last_val_ts: dict[str, int] = {}
+    # Coins whose carry-in (pre-anchor holding) has already been folded into the
+    # book+cash under the ACTIVE anchor. Reset per anchor cycle (codex r4 BUG 1).
+    carried_in: set[str] = set()
+
+    def _carry_in_fill(ev: dict) -> None:
+        """CAUSAL replacement for seed_positions case 2 (codex r4 BUG 1).
+
+        seed_positions(causal_cutoff=True) deliberately omits a coin first traded
+        AFTER the active anchor, to avoid look-ahead at earlier events. But that
+        coin DID hold a pre-anchor position (its first fill's startPosition), which
+        the anchor equity a_v already includes. The first time we REACH that coin's
+        fill in the ordered walk (order <= k = causal), we fold its carry-in in the
+        SAME way case 2 + the cash snap would have: add startPosition to the book
+        AND subtract its anchor-time value from cash (mark at active_anchor_ts < ts,
+        causal) so equity is not double-counted. Coins already in the anchor seed,
+        or already folded, are skipped. Identical end-state to compute_eq_at, but
+        revealed only at the causal moment instead of at the anchor (no leak at
+        earlier events)."""
+        nonlocal cash
+        coin = ev["coin"]
+        if coin in carried_in or active_anchor_ts is None:
+            return
+        carried_in.add(coin)
+        sp = float(ev.get("startPosition", 0.0) or 0.0)
+        if abs(sp) <= 1e-9:
+            return
+        positions[coin] = positions.get(coin, 0.0) + sp
+        m = get_mark(coin, active_anchor_ts)
+        if m is not None:
+            cash -= sp * m  # mirror the anchor cash snap for this carried-in coin
+            last_val[coin] = sp * m
+            last_val_ts.setdefault(coin, active_anchor_ts)
+
+    def _past_anchor(ts: int) -> Optional[tuple[int, float]]:
+        chosen = None
+        for a_t, a_v in window_anchors:
+            if a_t < ts:            # STRICT (codex r3)
+                chosen = (a_t, a_v)
+            else:
+                break
+        return chosen
+
+    for order, item in enumerate(ordered):
+        ts = item["ts"]
+        base = _past_anchor(ts)
+
+        if base is None:
+            # No past anchor → cannot reconstruct a causal denominator. Still
+            # advance the position book from startPosition-derived seeding so
+            # that once an anchor appears the book is correct, but emit
+            # has_past_anchor=False (M02 maps this to NO_ANCHOR).
+            # We seed positions at this ts from fills only (causal: positions_at
+            # uses startPosition + cumulative signed_sz, all <= ts).
+            ev = item["ev"]
+            if item["type"] == "fill":
+                positions[ev["coin"]] = positions.get(ev["coin"], 0.0) + ev["signed_sz"]
+                if abs(positions[ev["coin"]]) < 1e-9:
+                    positions.pop(ev["coin"], None)
+            results.append(
+                EventEquity(
+                    event_order=order, ts=ts, type=item["type"],
+                    source_seq=item["source_seq"], equity_post=float("nan"),
+                    cash=float("nan"), position_value=float("nan"),
+                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
+                    mark_ts=None, markable_all=False, n_unmarkable=0,
+                    no_extradex_without_anchor=(not extradex_no_anchor),
+                    frozen_component_value=0.0, frozen_component_age_ms=0,
+                    has_past_anchor=False,
+                    fill=(item["ev"] if item["type"] == "fill" else None),
+                )
+            )
+            continue
+
+        a_t, a_v = base
+        if a_t != active_anchor_ts:
+            # New base anchor cycle → re-seed positions at the anchor and snap
+            # cash, identically to compute_eq_at. This rebuild uses only fills
+            # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
+            active_anchor_ts = a_t
+            active_anchor_eq = a_v
+            seeded = seed_positions(fills, anchor, a_t, causal_cutoff=True)
+            anchor_pos_value = 0.0
+            for c, sz in seeded.items():
+                if abs(sz) < 1e-9:
+                    continue
+                m = get_mark(c, a_t)
+                if m is not None:
+                    anchor_pos_value += sz * m
+                    last_val[c] = sz * m
+                    last_val_ts[c] = a_t
+            cash = a_v - anchor_pos_value
+            positions = {c: s for c, s in seeded.items() if abs(s) > 1e-9}
+            # Coins already in the anchor seed are carried-in; their fills must NOT
+            # re-fold a startPosition. Coins NOT seeded (first traded after anchor)
+            # get folded causally at their first fill via _carry_in_fill.
+            carried_in = set(seeded.keys())
+            # Replay events strictly between the anchor and this event (anchor_ts
+            # < e_ts < ts) so the book/cash reflect everything order <= current.
+            for prev in ordered:
+                p_ts = prev["ts"]
+                if p_ts <= a_t:
+                    continue
+                # stop once we reach the current event's order position
+                if (p_ts, prev["type_rank"], prev["source_seq"]) >= (
+                    ts, item["type_rank"], item["source_seq"]
+                ):
+                    break
+                if prev["type"] == "fill":
+                    _carry_in_fill(prev["ev"])
+                _apply(prev, positions, last_val, last_val_ts, _cash_ref=None)
+                cash = _apply_cash(prev, cash, wallet_lc)
+
+        # Apply THIS event (order == k included).
+        if item["type"] == "fill":
+            _carry_in_fill(item["ev"])
+        _apply(item, positions, last_val, last_val_ts, _cash_ref=None)
+        cash = _apply_cash(item, cash, wallet_lc)
+
+        # Mark-to-market at ts over live positions; track frozen component.
+        pos_value = 0.0
+        n_unmarkable = 0
+        mark_ts_latest: Optional[int] = None
+        frozen_value = 0.0
+        frozen_age = 0
+        for c, sz in positions.items():
+            if abs(sz) < 1e-9:
+                continue
+            m = get_mark(c, ts)
+            if m is None:
+                n_unmarkable += 1
+                fv = last_val.get(c, 0.0)
+                frozen_value += fv
+                if c in last_val_ts:
+                    frozen_age = max(frozen_age, ts - last_val_ts[c])
+                continue
+            val = sz * m
+            pos_value += val
+            last_val[c] = val
+            last_val_ts[c] = ts
+            mk = ts // 60_000 * 60_000
+            mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
+
+        equity_post = cash + pos_value  # markable + cash; frozen excluded here
+        results.append(
+            EventEquity(
+                event_order=order, ts=ts, type=item["type"],
+                source_seq=item["source_seq"],
+                equity_post=equity_post + frozen_value,  # whole-account incl frozen
+                cash=cash, position_value=pos_value,
+                anchor_ts=a_t, anchor_equity=a_v,
+                age_since_anchor_ms=ts - a_t,
+                mark_ts=mark_ts_latest if mark_ts_latest is not None else (ts if not positions else None),
+                markable_all=(n_unmarkable == 0),
+                n_unmarkable=n_unmarkable,
+                no_extradex_without_anchor=(not extradex_no_anchor),
+                frozen_component_value=frozen_value,
+                frozen_component_age_ms=frozen_age,
+                has_past_anchor=True,
+                fill=(item["ev"] if item["type"] == "fill" else None),
+            )
+        )
+    return results
+
+
+def _apply(item: dict, positions: dict, last_val: dict, last_val_ts: dict, _cash_ref=None) -> None:
+    """Apply an event's POSITION delta (cash handled by _apply_cash)."""
+    if item["type"] == "fill":
+        ev = item["ev"]
+        coin = ev["coin"]
+        positions[coin] = positions.get(coin, 0.0) + ev["signed_sz"]
+        if abs(positions[coin]) < 1e-9:
+            positions.pop(coin, None)
+
+
+def _apply_cash(item: dict, cash: float, wallet_lc: str) -> float:
+    """Apply an event's CASH delta (mirrors compute_eq_at's walk)."""
+    t = item["type"]
+    ev = item["ev"]
+    if t == "fill":
+        return cash + fill_cash_delta(ev)
+    if t == "ledger":
+        return cash + ledger_cash_delta(ev, wallet_lc).cash
+    if t == "funding":
+        return cash + funding_cash_delta(ev)
+    return cash
+
+
+def reconstruct_wallet_event_equity(args: tuple) -> dict:
+    """M02 bridge driver: emit the per-event equity series + anchors for one wallet.
+
+    Returns {'wallet', 'events': [EventEquity...], 'weekly_anchors': [(ts,eq)],
+    'fills': [...], 'funding': [...], 'inter_anchor_drift': {...} (diagnostic
+    only, NEVER used to switch modes), 'extradex_no_anchor': bool}.
+    Mirrors reconstruct_wallet's loading + ordering exactly so equity_post is
+    consistent with the audited daily reconstruction.
+    """
+    wallet, anchor, start_ms, end_ms = args
+    wallet_lc = wallet.lower()
+    if anchor is None:
+        return {"wallet": wallet, "error": "no_anchor"}
+
+    avh = get_portfolio_perp(wallet)
+    valid_anchors = [(t, v) for t, v in avh if v > 0.01]
+    if not valid_anchors:
+        return {"wallet": wallet, "error": "no_valid_anchors"}
+
+    walk_end_ms = min(end_ms, anchor.fetched_ms)
+    load_end_ms = max(walk_end_ms, int(anchor.fetched_ms))
+
+    fills = load_wallet_fills(wallet, start_ms, load_end_ms)
+    funding = load_wallet_funding(wallet, start_ms, load_end_ms)
+    ledger = load_wallet_ledger(wallet, start_ms, load_end_ms)
+
+    window_anchors = [(t, v) for t, v in valid_anchors if start_ms <= t <= walk_end_ms]
+    if not window_anchors:
+        return {"wallet": wallet, "error": "no_window_anchors"}
+
+    source_dexes = sorted({coin_dex(f["coin"]) for f in fills} | {
+        coin_dex(c) for c in anchor.positions
+    })
+    extradex_no_anchor = bool([
+        d for d in source_dexes
+        if dex_in_scope(d) and d not in ANCHOR_COVERED_DEXES
+    ])
+
+    ordered = build_event_stream(fills, funding, ledger)
+    # Only emit events up to walk_end_ms (mark coverage); load_end may exceed it
+    # but those tail events have no marks and are not sizing-relevant for M02.
+    ordered = [e for e in ordered if e["ts"] <= walk_end_ms]
+
+    events = compute_event_equity(
+        ordered, fills, anchor, wallet_lc, window_anchors, extradex_no_anchor
+    )
+
+    # diagnostic only (never a mode switch): reuse the existing M01 drift calc.
+    stream = [(e["ts"], e["type"], e["ev"]) for e in ordered]
+    inter = inter_anchor_drift(stream, fills, anchor, wallet_lc, window_anchors)
+
+    return {
+        "wallet": wallet,
+        "events": events,
+        "weekly_anchors": window_anchors,
+        "fills": fills,
+        "funding": funding,
+        "extradex_no_anchor": extradex_no_anchor,
+        "inter_anchor_drift": inter,
     }
 
 

@@ -182,6 +182,8 @@ app/data/**/*.npz
 app/data/*.db
 app/data/raw_ledger_cache_20k/
 app/data/raw_funding_cache_20k/
+app/data/v15/perp_anchor_cache/
+app/data/v15/shards_20k/
 # Keep small curated inputs under app/data/v15 (wallet lists) but never the parquet outputs
 app/data/v15/*.parquet
 

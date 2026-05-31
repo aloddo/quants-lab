@@ -38,25 +38,26 @@ running processes are unaffected and pick up the new path on next restart. The
 currently loaded (V11 runs manually).
 
 ## CANONICAL research modules (V15 pipeline)
-CANONICAL V13->V15 module numbering (map: projects/quant/v15/module-review-2026-05-30,
-confirmed via tests/v13/test_module_*.py imports). The V15 strategy
-(projects/quant/v15/strategy) INSERTS a NEW entity/authenticity layer "M0e" between
-M02 and M03. Full pipeline:
-**M01 equity -> M02 journey_trace -> M0e authenticity (NEW) -> M03 eligibility ->
-M04 ranker -> M05 exec-realism -> M06 cold-start -> M07 ledger -> M08 sim ->
-M09 walk-forward -> M10 gates -> M11 random-null.** Sizing lives inside M08 sim
-(PROP %-of-equity), constrained by projects/quant/v15/sizing-locks; it is NOT a
-separate numbered module. Do NOT renumber.
+CANONICAL numbering = BY BUILD ORDER (Alberto 2026-05-31), 6 layers. Spine = projects/quant/v15/
+strategy Section 10. The OLD M01-M11 were V13 RUNTIME data-flow order; do NOT use that here.
+Build-order pipeline:
+**M1 equity -> M2 journeys+per-action sizing -> M3 fold geometry -> M4 authenticity kills + entity
+dedup -> M5 eligibility floors -> M6a cheap shortlist -> M7 engine -> M6b copyability-adjusted
+ranking -> M8 survival tiering -> M9 mirror sim -> M10 gates+matched-elite-null.** CHEAP selection
+(M3-M6a) slims ~18k -> broad ~3-5k with NO engine first. old->new map: M1<-M01, M2<-M02,
+M3<-old M09 (fold), M4<-M0e cheap stage, M5<-old M03, M6<-old M04, M7<-old M05+M07+M08-risk,
+M8<-M0e survival stage, M9<-old M06+M08, M10<-old M10+M11.
 
 | module | canonical file | status |
 |---|---|---|
-| M01 equity reconstruct | `research/v15/v15_m01_equity_reconstruct.py` | DONE (V15). 14 codex bugs fixed; full 20,378-wallet run; anchor disk cache. Accurate at true weekly anchors. |
-| M02 journey_trace | `research/v13/v13_journey_trace.py` | EXISTS (V13, 1234 lines). NOT yet V15-ported (point-in-time equity for sizing; xyz; liquidation-close still TODO). |
-| M0e authenticity gate (NEW) | `research/v15/v15_m025_authenticity_gate.py` | DONE (V15). Codex SHIP, 7-round loop. Entity/hedge/funding-farm/wash/neutral detection. Output app/data/v15/m025_authenticity.parquet. (File keeps the "m025" name; logically M0e, sits between M02 and M03.) |
+| M1 equity reconstruct | `research/v15/v15_m01_equity_reconstruct.py` | DONE (V15). 14 codex bugs; full 20,378-wallet run; anchor disk cache; causal per-event equity shipped for M2. |
+| M2 journeys + per-action sizing | `research/v15/v15_m02_journey_trace.py` | DONE (V15). codex-SHIP design(6)+code(3). 14 tests. 20k run IN FLIGHT -> m02_actions.parquet + m02_journeys.parquet. |
+| M3 fold geometry | `research/v15/v15_m03_fold_geometry.py` | DONE (V15). codex-SHIP design(r1-r3)+code(r1-r2). tests/v15/test_m03.py (9 pass). 8x{42/14/14}, 112d chained OOS. VALIDATE on 20k pending. |
+| M4 authenticity kills + entity dedup | `research/v15/v15_m025_authenticity_gate.py` (refactor) | NEXT. Existing m025 gate codex-SHIP (7 rounds, v2 all-dex PASS 11,079/EXCLUDE 3,928/REVIEW 2,973). Refactor to PROVABLE on-HL kills + confidence tier + entity dedup (survival -> M8). Approach: modules/m0e-design. |
 | anchor prefetch | `research/v15/v15_prefetch_anchors.py` | warms perp_anchor_cache (zero-API future runs) |
-| M03 eligibility_gates (SCREENING — a filter, NOT ranking) | `research/v13/v13_m03_v2.py` | EXISTS (V13, 352 lines). Wallet-universe pass/fail filter (active_days, trade_count, maxDD, flow-adjusted TWR ROE). V15: align gates to G5. |
-| M04 copy_ranker (RANKING) | `research/v13/v13_copy_ranker_v2.py` | STUB (main exits 2). V15: full rewrite to codex#7 source_score = source_6m_ROE x min(1,active_folds/6) x log1p(n_journeys) x clamp(1-maxDD). |
-| M05-M11 | research/v13/v13_*.py (exec-realism, cold_start, portfolio_ledger, portfolio_simulator[+sizing], walk_forward_folds, pass_fail_gates, strict_random_null) | EXIST (V13). V15 revalidation TODO. |
+| M5 eligibility floors | `research/v13/v13_m03_v2.py` (port) | EXISTS (V13, 352 lines). V15: align gates to G5. |
+| M6 ranking (a cheap shortlist / b post-engine) | `research/v13/v13_copy_ranker_v2.py` (rewrite) | STUB. V15: M6a source_score shortlist (~3-5k); M6b copyability-adjusted final ranking post-M7. |
+| M7-M10 | research/v13/v13_*.py (exec-realism, cold_start, portfolio_ledger, portfolio_simulator[+sizing], pass_fail_gates, strict_random_null) | EXIST (V13). V15 rebuild TODO (M7 engine, M8 survival, M9 sim, M10 gates+null). |
 | G5 source-quality filter | `research/v15/v15_g5_filter.py` | |
 | source ROE enrichment | `research/v15/v15_source_roe_enrichment.py` | |
 

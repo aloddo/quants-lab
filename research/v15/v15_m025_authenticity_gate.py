@@ -59,10 +59,11 @@ HEDGE_SIZE_TOL = 0.35           # FIX 4: per-coin abs-size match for exposure he
 ENTITY_MAX_WALLETS = 8
 SHARPE_FLAG = 5.0
 LEV_FLAG = 5.0
-# Only the "main" HL perp dex is executable via our connector for now; other perp
-# dexes (HIP-3) cannot be mirrored. Anything outside this set, if >90% of gross, is
-# flagged unexecutable.
-EXECUTABLE_DEXES = frozenset({"main"})
+# ALL DEXES ARE IN SCOPE (Alberto, 2026-05-31). No dex-based selection exclusion. This set
+# is retained only for reference/back-compat; it is no longer consulted (see stage_a, where
+# unexecutable is never set). Whole-account equity (M01) + whole-account anchors
+# (get_portfolio_perp) make every perp dex valid for selection.
+EXECUTABLE_DEXES = frozenset()  # unused — all dexes in scope
 FUNDING_FARM_FRAC = 0.5  # FIX 7(b): |funding| as fraction of |total pnl| above this -> EXCLUDE
 
 
@@ -316,8 +317,12 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
     if tot_gross > 0:
         top_dex, top_g = max(gross_by_dex.items(), key=lambda kv: kv[1])
         s.dex_concentration = top_g/tot_gross
-        if s.dex_concentration > DEX_CONC and top_dex not in EXECUTABLE_DEXES:
-            s.unexecutable = True
+        # ALL DEXES ARE IN SCOPE (Alberto, 2026-05-31). M01 reconstructs whole-account
+        # equity across every perp dex and get_portfolio_perp anchors are whole-account,
+        # so no wallet is dex-excluded from SELECTION. dex_concentration stays as an
+        # informational metric only. (Live execution capability per dex is a separate
+        # go-live concern, NOT a selection-gate filter.) unexecutable is never set ->
+        # the unexecutable_dex hard-exclude never fires.
 
     # FIX 2: pass full (pre-window + window) fills with the window bounds and the
     # seeded carry-in position; only the window is time-weighted.
