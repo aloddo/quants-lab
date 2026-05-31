@@ -29,6 +29,7 @@ import logging
 import sys
 import time
 from collections import Counter
+from multiprocessing import Pool
 from pathlib import Path
 
 import pandas as pd
@@ -89,14 +90,30 @@ def _own_tier(s: "g.WalletScores") -> tuple[str, list[str]]:
     return "UNCERTAIN", (["not_directional"] + rc)
 
 
-def run(wallets, lo_ms, hi_ms, as_of_ms):
-    log.info(f"STAGE A: {len(wallets)} wallets (as-of {as_of_ms})")
+def _stage_a_worker(args):
+    """Top-level (picklable) STAGE-A worker: pure per-wallet scalars (disk anchor cache + per-wallet
+    fills + page-cached marks; no shared global). Returns (wallet, WalletScores)."""
+    w, lo_ms, hi_ms = args
+    return w, g.stage_a(w, lo_ms, hi_ms)
+
+
+def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 8):
+    log.info(f"STAGE A: {len(wallets)} wallets (as-of {as_of_ms}), procs={procs}")
     scores = {}
     t0 = time.time()
-    for i, w in enumerate(wallets, 1):
-        scores[w] = g.stage_a(w, lo_ms, hi_ms)
-        if i % 500 == 0:
-            log.info(f"  A [{i}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+    if procs > 1:
+        tasks = [(w, lo_ms, hi_ms) for w in wallets]
+        with Pool(procs) as pool:
+            for i, (w, sc) in enumerate(pool.imap_unordered(_stage_a_worker, tasks, chunksize=16), 1):
+                scores[w] = sc
+                if i % 2000 == 0:
+                    log.info(f"  A [{i}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+    else:
+        for i, w in enumerate(wallets, 1):
+            scores[w] = g.stage_a(w, lo_ms, hi_ms)
+            if i % 500 == 0:
+                log.info(f"  A [{i}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+    log.info(f"STAGE A done in {(time.time()-t0)/60:.1f}min")
 
     log.info("STAGE B: entities (union-find)")
     ent_id, ent_members = g.build_entities(wallets, lo_ms, hi_ms)
@@ -256,6 +273,7 @@ def main():
     ap.add_argument("--entities-out", required=True)
     ap.add_argument("--as-of", required=True, help="YYYY-MM-DD; signals use only ts < this date")
     ap.add_argument("--lookback-days", type=int, default=g.LOOKBACK_DAYS)
+    ap.add_argument("--procs", type=int, default=8, help="parallel workers for STAGE A (per-wallet).")
     args = ap.parse_args()
 
     as_of_ms = int(pd.Timestamp(args.as_of, tz="UTC").timestamp() * 1000)
@@ -266,7 +284,7 @@ def main():
                if w.strip() and not w.startswith("#")]
     log.info(f"{len(wallets)} wallets, {args.lookback_days}d window ending as-of {args.as_of}")
 
-    df, edf = run(wallets, lo_ms, hi_ms, as_of_ms)
+    df, edf = run(wallets, lo_ms, hi_ms, as_of_ms, procs=args.procs)
 
     # sanity assertions
     for _, r in df.iterrows():
