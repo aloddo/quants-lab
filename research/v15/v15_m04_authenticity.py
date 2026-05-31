@@ -10,8 +10,9 @@ STAGE C internal-hedge) and REWRITES only the COMBINE step: PASS/EXCLUDE/REVIEW 
 CONFIDENCE TIER {KILL 0 / UNCERTAIN 0.25 / SUSPICIOUS 0.05-0.1 / CLEAN 1.0} that sets an
 ALLOCATION-WEIGHT multiplier, + a clean (lower-bound) entity-dedup map.
 
-Boundary (binding): M4 = DANGER only. NOT quality (-> M5), NOT copyability (-> M3), NOT survival
-(-> M8). KILL only on PROVABLE on-HL signals; inferential -> SUSPICIOUS; thin -> UNCERTAIN.
+Boundary (binding): M4 = DANGER only. NOT quality (-> M5), NOT copyability (-> M5: hold-time vs
+latency, liquidity, accessible mechanics), NOT survival (-> M8). (M3 = fold geometry, separate.)
+KILL only on PROVABLE on-HL signals; inferential -> SUSPICIOUS; thin -> UNCERTAIN.
 
 AS-OF: every signal uses only data with ts < as_of. Backtest fold k consumes the run as-of
 M3 test_start[k] (fold-pure). A full-window run (--as-of END) = ex-post universe curation (live).
