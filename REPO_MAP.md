@@ -55,7 +55,7 @@ M8<-M0e survival stage, M9<-old M06+M08, M10<-old M10+M11.
 | M3 fold geometry | `research/v15/v15_m03_fold_geometry.py` | DONE (V15). codex-SHIP design(r1-r3)+code(r1-r2). tests/v15/test_m03.py (9 pass). 8x{42/14/14}, 112d chained OOS. VALIDATE on 20k pending. |
 | M4 authenticity kills + entity dedup | `research/v15/v15_m04_authenticity.py` | DONE (V15). codex-SHIP design(r1-r3)+code(r1-r3). tests/v15/test_m04.py (16 pass). Reuses m025 helpers; danger-only confidence TIERS {KILL/UNCERTAIN/SUSPICIOUS/CLEAN} -> alloc_weight + entity dedup. as-of fold-pure. Validate on 20k/per-fold pending. modules/m4-design. |
 | anchor prefetch | `research/v15/v15_prefetch_anchors.py` | warms perp_anchor_cache (zero-API future runs) |
-| M5 eligibility floors | `research/v13/v13_m03_v2.py` (port) | EXISTS (V13, 352 lines). V15: align gates to G5. |
+| M5 eligibility + copyability floors | `research/v15/v15_m05_eligibility.py` | DONE (V15). codex-SHIP design(r1-r3)+code(r1-r3). tests/v15/test_m05.py (15 pass). Fold-pure per-fold floors (port of v13_m03_v2); HOLD_FLOOR=60s (V11-measured). Validate on 20k pending. modules/m05. |
 | M6 ranking (a cheap shortlist / b post-engine) | `research/v13/v13_copy_ranker_v2.py` (rewrite) | STUB. V15: M6a source_score shortlist (~3-5k); M6b copyability-adjusted final ranking post-M7. |
 | M7-M10 | research/v13/v13_*.py (exec-realism, cold_start, portfolio_ledger, portfolio_simulator[+sizing], pass_fail_gates, strict_random_null) | EXIST (V13). V15 rebuild TODO (M7 engine, M8 survival, M9 sim, M10 gates+null). |
 | G5 source-quality filter | `research/v15/v15_g5_filter.py` | |
