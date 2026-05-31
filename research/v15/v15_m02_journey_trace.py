@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -52,6 +53,7 @@ import pandas as pd
 # per-event equity bridge. NO M01 reconstruction MATH is changed here.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import v15_m01_equity_reconstruct as m01  # noqa: E402
+from _streaming_io import ShardedParquetWriter, install_memory_guard  # noqa: E402  MANDATORY (decisions/2026-05-31-mandatory-streaming-io)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -528,9 +530,12 @@ def trace_wallet(
 _ANCHOR_DF = None
 
 
-def _init_worker(anchor_parquet: str) -> None:
+def _init_worker(anchor_parquet: str, worker_mem_gb: float = 3.0) -> None:
     global _ANCHOR_DF
     _ANCHOR_DF = pd.read_parquet(anchor_parquet)
+    # codex perf-r1 #5: guard WORKERS too (per-wallet reconstruction + per-process mark-series cache
+    # live here). Backstop: abort a runaway worker loudly instead of a silent aggregate OS OOM.
+    install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
 
 
 def process_wallet(args: tuple) -> dict:
@@ -566,6 +571,14 @@ def main() -> None:
     ap.add_argument("--journeys-out", required=True)
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--anchor-parquet", default=str(m01.ANCHOR_PARQUET))
+    ap.add_argument("--flush-rows", type=int, default=2_000_000,
+                    help="MANDATORY streaming: flush a parquet part + free RAM every N buffered rows.")
+    ap.add_argument("--mem-soft-gb", type=float, default=12.0,
+                    help="Memory-guard soft cap (GB); abort loud above this instead of silent OOM kill.")
+    ap.add_argument("--skip-marks-cache", action="store_true",
+                    help="Skip the one-time marks-cache precompute (assumes app/data/v15/marks_cache is built+fresh).")
+    ap.add_argument("--rebuild-marks-cache", action="store_true",
+                    help="Force full rebuild of every coin's marks cache (use after a candle backfill).")
     args = ap.parse_args()
 
     start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
@@ -577,33 +590,54 @@ def main() -> None:
 
     tasks = [(w, start_ms, end_ms) for w in wallets]
     t0 = time.time()
-    results: list[dict] = []
+
+    # PRECOMPUTE marks cache ONCE (perf: avoids N workers each re-scanning Mongo for coin price
+    # series, which left the pool ~74% I/O-idle). Freshness-checked (codex perf-r1 #3): rebuild if
+    # the coin-set or latest candle changed since the cache was built.
+    if not args.skip_marks_cache:
+        tmc = time.time()
+        st = m01.marks_cache_status()
+        force = args.rebuild_marks_cache or not st["fresh"]
+        if force:
+            logger.info(f"marks cache rebuild (fresh={st['fresh']}, reason={st['reason']}, "
+                        f"age_days={st['age_days']})")
+            # force a full refresh when explicitly requested OR when stale due to NEW candles /
+            # changed coin-set (else force=False would skip the already-present-but-stale coins).
+            m01.build_marks_cache(force=True)
+        else:
+            logger.info(f"marks cache FRESH (age_days={st['age_days']:.1f}); reusing")
+        logger.info(f"marks cache ready in {time.time()-tmc:.0f}s")
+
+    # MANDATORY memory-safe streaming (decisions/2026-05-31-mandatory-streaming-io): never hold the
+    # full result set in RAM. Stream per-wallet actions/journeys to disk in bounded chunks; memory
+    # stays flat regardless of universe size. Backstop watchdog aborts loud (not silent SIGKILL).
+    install_memory_guard(soft_gb=args.mem_soft_gb, label="m02")
+    Path(args.actions_out).parent.mkdir(parents=True, exist_ok=True)
+    aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
+    jw = ShardedParquetWriter(args.journeys_out, flush_rows=args.flush_rows)
+    errors: list[tuple] = []
+
+    def _consume(r: dict) -> None:
+        if "error" in r:
+            errors.append((r["wallet"], r["error"]))
+        else:
+            aw.add_many(r.get("actions"))
+            jw.add_many(r.get("journeys"))
+        _log_one(r, len(wallets))
+
     if args.procs > 1:
         with Pool(args.procs, initializer=_init_worker, initargs=(args.anchor_parquet,)) as pool:
             for r in pool.imap_unordered(process_wallet, tasks):
-                results.append(r)
-                _log_one(r, len(wallets))
+                _consume(r)
     else:
         _init_worker(args.anchor_parquet)
         for tk in tasks:
-            r = process_wallet(tk)
-            results.append(r)
-            _log_one(r, len(wallets))
+            _consume(process_wallet(tk))
 
-    actions = [a for r in results if "actions" in r for a in r["actions"]]
-    journeys = [j for r in results if "journeys" in r for j in r["journeys"]]
-    errors = [(r["wallet"], r["error"]) for r in results if "error" in r]
-
-    if actions:
-        adf = pd.DataFrame(actions)
-        Path(args.actions_out).parent.mkdir(parents=True, exist_ok=True)
-        adf.to_parquet(args.actions_out, index=False, compression="snappy")
-        logger.info(f"Wrote {args.actions_out}: {len(adf):,} actions")
-    if journeys:
-        jdf = pd.DataFrame(journeys)
-        jdf.to_parquet(args.journeys_out, index=False, compression="snappy")
-        logger.info(f"Wrote {args.journeys_out}: {len(jdf):,} journeys")
-
+    n_actions = aw.close()
+    n_journeys = jw.close()
+    logger.info(f"Wrote {args.actions_out}: {n_actions:,} actions")
+    logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
     if errors:
         logger.warning(f"{len(errors)} wallet errors: {errors[:10]}")
     logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")

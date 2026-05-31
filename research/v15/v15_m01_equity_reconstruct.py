@@ -80,6 +80,7 @@ import argparse
 import glob
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -178,6 +179,11 @@ ZERO_LEDGER_TYPES = frozenset(
 
 _mongo: Optional[pymongo.database.Database] = None
 _mark_cache: dict[tuple[str, int], Optional[float]] = {}
+# Per-coin in-memory 1m close series for ASOF lookups (replaces per-action Mongo round-trips, which
+# were ~94% of M2 wall time: 1.3M find_one calls / 10 wallets). Each coin loaded ONCE (one indexed
+# range query) into sorted (minutes, closes) numpy arrays; get_mark then does a binary-search asof.
+# Bounded memory: only coins actually touched, one series each. (Perf decision 2026-05-31.)
+_mark_series: dict[str, tuple] = {}
 
 
 def get_mongo() -> pymongo.database.Database:
@@ -201,18 +207,139 @@ def get_mark(coin: str, ts_ms: int) -> Optional[float]:
     is the access proof), don't reconstruct backward.
     """
     minute_key = ts_ms // 60_000 * 60_000
-    key = (coin, minute_key)
-    if key in _mark_cache:
-        return _mark_cache[key]
+    mins, closes = _coin_series(coin)
+    if mins.size == 0:
+        return None
+    i = int(np.searchsorted(mins, minute_key, side="right")) - 1  # latest candle minute <= minute_key
+    if i < 0:
+        return None
+    px = closes[i]
+    return None if px != px else float(px)  # NaN-safe (missing close -> None)
+
+
+import urllib.parse as _ulib
+
+MARKS_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "marks_cache"
+
+
+def _coin_cache_path(coin: str) -> Path:
+    return MARKS_CACHE_DIR / f"{_ulib.quote(coin, safe='')}.npy"
+
+
+def _load_coin_from_mongo(coin: str) -> tuple:
     db = get_mongo()
-    doc = db.hyperliquid_candles.find_one(
-        {"coin": coin, "interval": "1m", "timestamp_utc": {"$lte": minute_key}},
-        sort=[("timestamp_utc", -1)],
-        projection={"close": 1},
-    )
-    px = float(doc["close"]) if doc else None
-    _mark_cache[key] = px
-    return px
+    cur = db.hyperliquid_candles.find(
+        {"coin": coin, "interval": "1m"},
+        projection={"timestamp_utc": 1, "close": 1, "_id": 0},
+    ).sort("timestamp_utc", 1)
+    mins_l: list[int] = []
+    closes_l: list[float] = []
+    for d in cur:
+        t = d.get("timestamp_utc")
+        if t is None:
+            continue
+        c = d.get("close")
+        mins_l.append(int(t))
+        closes_l.append(float(c) if c is not None else float("nan"))
+    return (np.asarray(mins_l, dtype="int64"), np.asarray(closes_l, dtype="float64"))
+
+
+def _marks_manifest_path(out_dir: Path) -> Path:
+    return out_dir / "_manifest.json"
+
+
+def marks_cache_status(out_dir: Path | None = None) -> dict:
+    """Cheap freshness check: compares the cached coin-set against Mongo's current 1m coin-set + the
+    latest 1m candle minute (indexed). Returns {fresh, age_days, reason}. (codex perf-r1 #3)"""
+    import json as _json
+    out_dir = Path(out_dir) if out_dir else MARKS_CACHE_DIR
+    mp = _marks_manifest_path(out_dir)
+    if not mp.exists():
+        return {"fresh": False, "age_days": None, "reason": "no manifest"}
+    man = _json.loads(mp.read_text())
+    db = get_mongo()
+    cur_coins = set(db.hyperliquid_candles.distinct("coin", {"interval": "1m"}))
+    # latest 1m candle minute overall (index-backed via the coin+interval+ts index is per-coin; use a
+    # bounded find sorted desc which the planner serves from the compound index).
+    latest = db.hyperliquid_candles.find_one({"interval": "1m"}, sort=[("timestamp_utc", -1)],
+                                             projection={"timestamp_utc": 1, "_id": 0})
+    cur_max = int(latest["timestamp_utc"]) if latest else 0
+    cur_total = int(db.hyperliquid_candles.estimated_document_count())  # O(1) metadata; catches backfills
+    import time as _t
+    age_days = (_t.time() - man.get("built_unix", 0)) / 86400.0
+    if set(man.get("coins", [])) != cur_coins:
+        return {"fresh": False, "age_days": age_days, "reason": f"coin set changed ({len(cur_coins)} now vs {len(man.get('coins', []))} cached)"}
+    if cur_max > int(man.get("max_minute", 0)):
+        return {"fresh": False, "age_days": age_days, "reason": f"new candles since build (max {cur_max} > {man.get('max_minute')})"}
+    # codex perf-r2 #3: total-count signature catches INTERIOR backfills (gap fills / corrections that
+    # add docs) that do NOT advance the global max minute. (In-place value overwrites that preserve
+    # doc count remain undetectable cheaply -> use --rebuild-marks-cache after any such correction.)
+    if "total_candles" not in man:
+        return {"fresh": False, "age_days": age_days, "reason": "manifest missing total_candles; rebuild required"}
+    if cur_total != int(man["total_candles"]):
+        return {"fresh": False, "age_days": age_days, "reason": f"candle count changed ({cur_total} vs {man['total_candles']}) -> possible backfill"}
+    return {"fresh": True, "age_days": age_days, "reason": "coin-set + max-minute + count match"}
+
+
+def build_marks_cache(out_dir: Path | None = None, force: bool = False) -> int:
+    """PRECOMPUTE ONCE (single process, one Mongo pass per coin): write each coin's 1m (minute,close)
+    series to a local .npy so the worker pool reads marks from local files instead of each of N
+    workers re-scanning Mongo (the 74%-idle I/O stall). Returns #coins written. Idempotent: skips
+    coins already cached unless force. Writes a manifest for freshness validation. Unique temp names
+    so concurrent builds never clobber. (Perf decision 2026-05-31; mandatory streaming-io sibling.)"""
+    import json as _json
+    import time as _t
+    out_dir = Path(out_dir) if out_dir else MARKS_CACHE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    db = get_mongo()
+    coins = db.hyperliquid_candles.distinct("coin", {"interval": "1m"})
+    n = 0
+    max_minute = 0
+    for coin in coins:
+        p = out_dir / f"{_ulib.quote(coin, safe='')}.npy"
+        if p.exists() and not force:
+            continue
+        mins, closes = _load_coin_from_mongo(coin)
+        if mins.size:
+            max_minute = max(max_minute, int(mins[-1]))
+        arr = np.vstack([mins.astype("float64"), closes]) if mins.size else np.empty((2, 0), dtype="float64")
+        # codex perf-r1 #4: unique tmp (pid) so concurrent builds/runs never race on one tmp name.
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        with open(tmp, "wb") as fh:   # file handle: np.save must NOT re-append .npy to the name
+            np.save(fh, arr)
+        tmp.replace(p)
+        n += 1
+    # manifest: record the full coin set + the latest candle minute observed (freshness signature).
+    latest = db.hyperliquid_candles.find_one({"interval": "1m"}, sort=[("timestamp_utc", -1)],
+                                             projection={"timestamp_utc": 1, "_id": 0})
+    cur_max = int(latest["timestamp_utc"]) if latest else max_minute
+    _marks_manifest_path(out_dir).write_text(_json.dumps({
+        "built_unix": _t.time(), "coins": list(coins), "n_coins": len(coins), "max_minute": cur_max,
+        "total_candles": int(db.hyperliquid_candles.estimated_document_count()),
+    }))
+    logger.info(f"build_marks_cache: wrote {n} coin series to {out_dir} ({len(coins)} coins total)")
+    return n
+
+
+def _coin_series(coin: str) -> tuple:
+    """Lazily load+cache a coin's FULL 1m (minute, close) series as sorted numpy arrays. Prefers the
+    local precomputed .npy (page-cached, shared across workers, NO Mongo); falls back to a one-shot
+    Mongo range query if the cache file is absent. Equivalent to the prior per-call
+    `timestamp_utc <= minute_key, sort desc, limit 1` lookup (proven byte-identical in validation)."""
+    s = _mark_series.get(coin)
+    if s is not None:
+        return s
+    p = _coin_cache_path(coin)
+    if p.exists():
+        try:
+            arr = np.load(p, mmap_mode="r")
+            s = (np.asarray(arr[0], dtype="int64"), np.asarray(arr[1], dtype="float64"))
+        except Exception:  # noqa: BLE001  corrupt cache -> Mongo fallback
+            s = _load_coin_from_mongo(coin)
+    else:
+        s = _load_coin_from_mongo(coin)
+    _mark_series[coin] = s
+    return s
 
 
 # --------------------------------------------------------------------------- #
