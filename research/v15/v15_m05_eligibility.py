@@ -93,7 +93,7 @@ def journey_metrics(jr: pd.DataFrame, lo_ms: int, hi_ms: int, accessible: set | 
         return _empty_jm()
     net_pnl = float(j["net_realized_pnl"].sum())
     n_j = int(len(j))
-    dur_s = (j["duration_hours"].astype(float) * 3600.0)
+    dur_s = (j["duration_h"].astype(float) * 3600.0)   # m02 emits duration_h (not duration_hours)
     median_hold_s = float(dur_s.median())
     share_below = float((dur_s < P95_COPY_LATENCY_S).mean())
     # accessibility by notional (max_position_notional proxy for journey size)

@@ -54,7 +54,7 @@ def test_twr_structural_ruin():
 def _jr(wallet, entry_d, exit_d, pnl, coin="BTC", notional=1000.0):
     return {"wallet": wallet, "coin": coin,
             "entry_ts": ms(entry_d), "exit_ts": ms(exit_d),
-            "duration_hours": (ms(exit_d) - ms(entry_d)) / 3.6e6,
+            "duration_h": (ms(exit_d) - ms(entry_d)) / 3.6e6,
             "net_realized_pnl": pnl, "max_position_notional": notional}
 
 
