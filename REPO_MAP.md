@@ -53,7 +53,7 @@ M8<-M0e survival stage, M9<-old M06+M08, M10<-old M10+M11.
 | M1 equity reconstruct | `research/v15/v15_m01_equity_reconstruct.py` | DONE (V15). 14 codex bugs; full 20,378-wallet run; anchor disk cache; causal per-event equity shipped for M2. |
 | M2 journeys + per-action sizing | `research/v15/v15_m02_journey_trace.py` | DONE (V15). codex-SHIP design(6)+code(3). 14 tests. 20k run IN FLIGHT -> m02_actions.parquet + m02_journeys.parquet. |
 | M3 fold geometry | `research/v15/v15_m03_fold_geometry.py` | DONE (V15). codex-SHIP design(r1-r3)+code(r1-r2). tests/v15/test_m03.py (9 pass). 8x{42/14/14}, 112d chained OOS. VALIDATE on 20k pending. |
-| M4 authenticity kills + entity dedup | `research/v15/v15_m025_authenticity_gate.py` (refactor) | NEXT. Existing m025 gate codex-SHIP (7 rounds, v2 all-dex PASS 11,079/EXCLUDE 3,928/REVIEW 2,973). Refactor to PROVABLE on-HL kills + confidence tier + entity dedup (survival -> M8). Approach: modules/m0e-design. |
+| M4 authenticity kills + entity dedup | `research/v15/v15_m04_authenticity.py` | DONE (V15). codex-SHIP design(r1-r3)+code(r1-r3). tests/v15/test_m04.py (16 pass). Reuses m025 helpers; danger-only confidence TIERS {KILL/UNCERTAIN/SUSPICIOUS/CLEAN} -> alloc_weight + entity dedup. as-of fold-pure. Validate on 20k/per-fold pending. modules/m4-design. |
 | anchor prefetch | `research/v15/v15_prefetch_anchors.py` | warms perp_anchor_cache (zero-API future runs) |
 | M5 eligibility floors | `research/v13/v13_m03_v2.py` (port) | EXISTS (V13, 352 lines). V15: align gates to G5. |
 | M6 ranking (a cheap shortlist / b post-engine) | `research/v13/v13_copy_ranker_v2.py` (rewrite) | STUB. V15: M6a source_score shortlist (~3-5k); M6b copyability-adjusted final ranking post-M7. |
