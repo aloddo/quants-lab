@@ -54,8 +54,8 @@ separate numbered module. Do NOT renumber.
 | M02 journey_trace | `research/v13/v13_journey_trace.py` | EXISTS (V13, 1234 lines). NOT yet V15-ported (point-in-time equity for sizing; xyz; liquidation-close still TODO). |
 | M0e authenticity gate (NEW) | `research/v15/v15_m025_authenticity_gate.py` | DONE (V15). Codex SHIP, 7-round loop. Entity/hedge/funding-farm/wash/neutral detection. Output app/data/v15/m025_authenticity.parquet. (File keeps the "m025" name; logically M0e, sits between M02 and M03.) |
 | anchor prefetch | `research/v15/v15_prefetch_anchors.py` | warms perp_anchor_cache (zero-API future runs) |
-| M03 eligibility | `research/v13/v13_m03_v2.py` | EXISTS (V13). V15 align to G5 TODO. |
-| M04 ranker | `research/v13/v13_copy_ranker_v2.py` | EXISTS (V13). V15 rewrite to source_score TODO. |
+| M03 eligibility_gates (SCREENING — a filter, NOT ranking) | `research/v13/v13_m03_v2.py` | EXISTS (V13, 352 lines). Wallet-universe pass/fail filter (active_days, trade_count, maxDD, flow-adjusted TWR ROE). V15: align gates to G5. |
+| M04 copy_ranker (RANKING) | `research/v13/v13_copy_ranker_v2.py` | STUB (main exits 2). V15: full rewrite to codex#7 source_score = source_6m_ROE x min(1,active_folds/6) x log1p(n_journeys) x clamp(1-maxDD). |
 | M05-M11 | research/v13/v13_*.py (exec-realism, cold_start, portfolio_ledger, portfolio_simulator[+sizing], walk_forward_folds, pass_fail_gates, strict_random_null) | EXIST (V13). V15 revalidation TODO. |
 | G5 source-quality filter | `research/v15/v15_g5_filter.py` | |
 | source ROE enrichment | `research/v15/v15_source_roe_enrichment.py` | |
