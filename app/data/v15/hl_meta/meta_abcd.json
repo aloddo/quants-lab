@@ -1,0 +1,1 @@
+{"universe": [{"szDecimals": 3, "name": "abcd:USA500", "maxLeverage": 25, "marginTableId": 25, "onlyIsolated": true, "isDelisted": true, "marginMode": "strictIsolated"}], "marginTables": [[50, {"description": "", "marginTiers": [{"lowerBound": "0.0", "maxLeverage": 50}]}]], "collateralToken": 0}
