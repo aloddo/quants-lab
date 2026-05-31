@@ -291,8 +291,12 @@ def main():
         assert r["alloc_weight"] == ALLOC_WEIGHT[r["tier"]]
         if r["tier"] == "KILL":
             assert not r["copyable"], f"KILL copyable: {r['wallet']}"
-        if r["tier"] == "CLEAN":
-            assert r["confidence"] != "LOW" and r["l3_pass_standalone"], f"bad CLEAN {r['wallet']}"
+        if r["tier"] == "CLEAN" and r["is_entity_primary"]:
+            # CLEAN-from-own-signals (primary/singleton) MUST have valid+confident directional
+            # evidence. A non-primary FRAGMENT INHERITS the primary's CLEAN (design §3f) and may
+            # itself be LOW-confidence; it is copyable=False, so the own-signal invariant does not
+            # apply to it. (Real-data edge: a thin fragment of a CLEAN entity.)
+            assert r["confidence"] != "LOW" and r["l3_pass_standalone"], f"bad CLEAN primary {r['wallet']}"
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(args.out, index=False, compression="snappy")
