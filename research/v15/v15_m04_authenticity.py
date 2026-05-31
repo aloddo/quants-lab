@@ -97,7 +97,10 @@ def _stage_a_worker(args):
     return w, g.stage_a(w, lo_ms, hi_ms)
 
 
-def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 8):
+def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
+    # NOTE: default procs=1 (sequential) so in-process callers + monkeypatched tests work; main()
+    # passes --procs (default 8) for the real parallel run. Pool workers are separate processes and
+    # do NOT see a parent monkeypatch of stage_a.
     log.info(f"STAGE A: {len(wallets)} wallets (as-of {as_of_ms}), procs={procs}")
     scores = {}
     t0 = time.time()

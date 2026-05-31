@@ -122,6 +122,23 @@ def test_run_entity_dedup_fragment(monkeypatch):
     assert edf.iloc[0]["n_members"] == 2 and edf.iloc[0]["primary_wallet"] == "0xa"
 
 
+def test_run_fragment_clean_low_confidence_is_valid(monkeypatch):
+    # REGRESSION (real-data crash 2026-05-31): a thin LOW-confidence FRAGMENT of a CLEAN entity
+    # legitimately inherits tier=CLEAN (copyable=False). The main() CLEAN-confidence assertion must
+    # apply to the PRIMARY only, not to such fragments.
+    sm = {"0xa": mk(wallet="0xa", sharpe=3.0),
+          "0xb": mk(wallet="0xb", sharpe=1.0, confidence="LOW")}
+    _patch(monkeypatch, sm, {"0xa": 0, "0xb": 0}, {0: ["0xa", "0xb"]})
+    df, _ = m4.run(["0xa", "0xb"], 0, 10, 10)
+    b = df[df["wallet"] == "0xb"].iloc[0]
+    assert b["tier"] == "CLEAN"                  # inherited from primary 0xa
+    assert not bool(b["is_entity_primary"])       # it's a fragment
+    assert not bool(b["copyable"])                # fragments are never copied
+    assert b["confidence"] == "LOW"               # own signals stay LOW -> the old assert wrongly fired
+    a = df[df["wallet"] == "0xa"].iloc[0]
+    assert a["tier"] == "CLEAN" and bool(a["is_entity_primary"]) and a["confidence"] != "LOW"
+
+
 def test_run_internal_hedge_entity_kill(monkeypatch):
     sm = {"0xa": mk(wallet="0xa", sharpe=3.0), "0xb": mk(wallet="0xb", sharpe=1.0)}
     _patch(monkeypatch, sm, {"0xa": 0, "0xb": 0}, {0: ["0xa", "0xb"]})
