@@ -1336,7 +1336,7 @@ def reconstruct_wallet(args: tuple) -> dict:
     """
     if len(args) == 5:
         wallet, anchor, start_ms, end_ms, validation_only = args
-        causal_seed = False
+        causal_seed = True
     else:
         wallet, anchor, start_ms, end_ms, validation_only, causal_seed = args
     wallet_lc = wallet.lower()
@@ -1417,7 +1417,7 @@ def reconstruct_wallet(args: tuple) -> dict:
             current_day = current_day + pd.Timedelta(days=1)
             continue
         anchor_t, anchor_v = before[-1]
-        # SELECTION series: optionally causal seed for downstream M5 eligibility.
+        # SELECTION series: causal seed by default for downstream M5 eligibility.
         # Anchor cash-snap marks remain point-in-time MTM via get_mark(..., causal=False).
         wr = compute_eq_at(
             stream, fills, anchor, wallet_lc, eod_ms, anchor_t, anchor_v,
@@ -1921,12 +1921,15 @@ def compute_event_equity(
     wallet_lc: str,
     window_anchors: list[tuple[int, float]],
     extradex_no_anchor: bool,
+    causal_mark: bool = True,
 ) -> list[EventEquity]:
     """Walk the ordered event stream ONCE and emit equity_post per event.
 
     Causal contract (spec NON-LOOK-AHEAD INVARIANTS):
       * base anchor for event k = last weekly anchor with anchor_ts STRICTLY < ts(k).
       * equity_post(k) = cash + Sum pos*mark(ts(k)) using ONLY events order <= k.
+        By default the terminal live-position MTM uses closed causal marks so
+        M02's sizing denominator matches its causal numerator.
       * mark_ts <= ts(k); anchor_ts < ts(k); event_order strictly monotone.
 
     We re-seed/re-snap cash whenever the active base anchor changes (each weekly
@@ -2073,7 +2076,7 @@ def compute_event_equity(
         for c, sz in positions.items():
             if abs(sz) < 1e-9:
                 continue
-            m = get_mark(c, ts)
+            m = get_mark(c, ts, causal=causal_mark)
             if m is None:
                 n_unmarkable += 1
                 fv = last_val.get(c, 0.0)
@@ -2084,8 +2087,8 @@ def compute_event_equity(
             val = sz * m
             pos_value += val
             last_val[c] = val
-            last_val_ts[c] = ts
-            mk = ts // 60_000 * 60_000
+            mk = ts // 60_000 * 60_000 - (60_000 if causal_mark else 0)
+            last_val_ts[c] = mk
             mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
 
         equity_post = cash + pos_value  # markable + cash; frozen excluded here
@@ -2258,9 +2261,13 @@ def main() -> None:
     ap.add_argument("--output", required=True, help="Output parquet path")
     ap.add_argument("--validate", action="store_true", help="Print accuracy table")
     ap.add_argument(
-        "--causal-seed",
+        "--ex-post-seed",
         action="store_true",
-        help="Build the emitted EOD selection series with causal position seeding; audit diagnostics keep ex-post seeding.",
+        help=(
+            "Use legacy ex-post position seeding for the emitted EOD selection series "
+            "(for reconcile/validate studies). Default is causal seeding; audit "
+            "diagnostics keep ex-post seeding."
+        ),
     )
     args = ap.parse_args()
 
@@ -2298,7 +2305,7 @@ def main() -> None:
     for j, w in enumerate(wallets, 1):
         anchor = load_wallet_anchor(w, anchor_df)
         try:
-            res = reconstruct_wallet((w, anchor, start_ms, end_ms, args.validate, args.causal_seed))
+            res = reconstruct_wallet((w, anchor, start_ms, end_ms, args.validate, not args.ex_post_seed))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"  wallet exception {w[:12]}: {e!r}")
             res = {"wallet": w, "error": f"exception:{e!r}"}

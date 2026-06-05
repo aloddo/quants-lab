@@ -32,7 +32,7 @@ FIXED_MARK = 100.0
 @pytest.fixture(autouse=True)
 def _patch_marks(monkeypatch):
     """Deterministic mark: $100 for BTC, None for an unmarkable exotic coin."""
-    def fake_mark(coin, ts_ms):
+    def fake_mark(coin, ts_ms, causal=False):
         if coin.startswith("EXOTIC"):
             return None
         return FIXED_MARK
@@ -245,7 +245,7 @@ def test_future_coin_does_not_affect_earlier_equity(monkeypatch):
     in the book at t1=2000 (position_value would include 10*50=500). After the fix
     ALT is absent at t1 and materialises only at its own fill (order <= k).
     """
-    def per_coin_mark(coin, ts_ms):
+    def per_coin_mark(coin, ts_ms, causal=False):
         return 50.0 if coin == "ALT" else 100.0
     monkeypatch.setattr(m01, "get_mark", per_coin_mark)
     monkeypatch.setattr(m02.m01, "get_mark", per_coin_mark)
@@ -335,7 +335,7 @@ def test_snapshot_seed_independent_of_future_fills(monkeypatch):
     contributes net PnL — otherwise a flat mark makes the seed net out of equity and
     the test cannot observe the bug."""
 
-    def mark(coin, ts_ms):
+    def mark(coin, ts_ms, causal=False):
         if coin == "ETH":
             return 100.0 if ts_ms <= 1000 else 120.0
         return 100.0  # BTC flat

@@ -484,6 +484,7 @@ def trace_wallet(
         basis = select_equity_basis(ee)
         # SIZING signal: use only a bar that has closed by ts.
         mark = m01.get_mark(coin, ts, causal=True)
+        sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
         if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
             target_pct = None
         else:
@@ -496,7 +497,7 @@ def trace_wallet(
             "action_type": action_type,
             "signed_size": signed, "price": price,
             "position_after": new_pos,
-            "mark": mark, "mark_ts": basis.mark_ts,
+            "mark": mark, "mark_ts": sizing_mark_ts,
             "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
             "anchor_ts": basis.anchor_ts,
             "equity_basis_mode": basis.mode,
