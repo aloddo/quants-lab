@@ -143,11 +143,29 @@ def _null_wallet(v) -> bool:
     return v == ""
 
 
+def _load_entities_by_fold(m04_dir: Path, folds: pd.DataFrame) -> dict[int, pd.DataFrame]:
+    out = {}
+    for fid in sorted(folds["fold_id"].astype(int).unique()):
+        p = m04_dir / f"m04_entities_f{fid}.parquet"
+        if not p.exists():
+            raise FileNotFoundError(f"missing fold-pure M4 entities file for fold {fid}: {p}")
+        out[int(fid)] = pd.read_parquet(p)
+    return out
+
+
+def _entity_maps(entities: pd.DataFrame) -> tuple[dict[int, object], dict[int, object], dict[int, object]]:
+    cop = dict(zip(entities["entity_id"].astype(int), entities["copyable"]))
+    prim = dict(zip(entities["entity_id"].astype(int), entities["primary_wallet"]))
+    alloc = dict(zip(entities["entity_id"].astype(int), entities["entity_alloc_weight"]))
+    return cop, prim, alloc
+
+
 # ---------------------------------------------------------------------------
 # Core run
 # ---------------------------------------------------------------------------
 def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
-        entities: pd.DataFrame, actions: pd.DataFrame, manifest: dict) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+        entities: pd.DataFrame | None, actions: pd.DataFrame, manifest: dict,
+        entities_by_fold: dict[int, pd.DataFrame] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     mode = manifest["mode"]
     if mode not in ("shortlist", "rank_only"):
         raise ValueError(f"manifest.mode must be 'shortlist' or 'rank_only', got {mode!r}")
@@ -169,15 +187,30 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
 
     # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
     #     primary_wallet matching m04 (codex code-r1 #5). ---
-    cop = dict(zip(entities["entity_id"].astype(int), entities["copyable"]))
-    prim = dict(zip(entities["entity_id"].astype(int), entities["primary_wallet"]))
-    alloc = dict(zip(entities["entity_id"].astype(int), entities["entity_alloc_weight"]))
+    if entities_by_fold is None:
+        if entities is None:
+            raise ValueError("run() requires either entities or entities_by_fold")
+        cop, prim, alloc = _entity_maps(entities)
+        maps_by_fold = None
+        logger.warning("LOUD WARNING: using a single M4 entities file for all folds; "
+                       "M6a M4 copyability/canonical-wallet checks are not fold-pure. Pass --m04-dir.")
+    else:
+        maps_by_fold = {int(fid): _entity_maps(df) for fid, df in entities_by_fold.items()}
+        cop = prim = alloc = None
+        logger.info("fold-pure M4 entities enabled for M6a: folds=%s", sorted(maps_by_fold))
+
+    def _maps_for_fold(fid: int):
+        if maps_by_fold is None:
+            return cop, prim, alloc
+        return maps_by_fold.get(int(fid), ({}, {}, {}))
+
     bad_cop, bad_wallet = [], []
     for _, r in elig[elig["eligible"] == True].iterrows():  # noqa: E712
         eid = int(r["entity_id"])
-        cv = cop.get(eid)
+        fcop, fprim, _ = _maps_for_fold(int(r["fold_id"]))
+        cv = fcop.get(eid)
         copyable_true = bool(cv) if pd.notna(cv) else False   # NA-safe (pd.NA copyable -> not copyable)
-        canon = prim.get(eid)
+        canon = fprim.get(eid)
         if not copyable_true or _null_wallet(canon):
             bad_cop.append(eid)
             continue
@@ -225,7 +258,8 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
         for _, r in sub.iterrows():
             eid = int(r["entity_id"])
             elig_row = bool(r["eligible"])
-            w = prim.get(eid)  # canonical primary wallet (validated above for eligible rows)
+            fcop, fprim, falloc = _maps_for_fold(int(fid))
+            w = fprim.get(eid)  # canonical primary wallet (validated above for eligible rows)
             ts_arr = act_by.get(w, np.empty(0, "int64"))
             pr = compute_persistence(ts_arr, test_start_ms, start_ms)
 
@@ -255,7 +289,7 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
             rows.append({
                 "entity_id": eid, "primary_wallet": w, "fold_id": int(fid),
                 "oos_chain_order": fold_chain[int(fid)],
-                "eligible": elig_row, "copyable": bool(cop.get(eid, False)),
+                "eligible": elig_row, "copyable": bool(fcop.get(eid, False)),
                 "has_primary": (w is not None) and not (isinstance(w, float) and pd.isna(w)) and w != "",
                 "recent_block_active": pr.recent_block_active,
                 "rankable": rankable,
@@ -268,7 +302,7 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
                 "persistence_coverage": pr.persistence_coverage,
                 "n_journeys_pretest": njr, "max_dd_pretest": dd, "dd_clamp_term": dd_term,
                 "m4_tier": r.get("m4_tier"),
-                "entity_alloc_weight": float(alloc.get(eid, np.nan)),
+                "entity_alloc_weight": float(falloc.get(eid, np.nan)),
                 # reporting-only (carried; never selects):
                 "source_6m_roe_full": float(pinfo.get("source_6m_roe_full", np.nan)) if len(pinfo) else np.nan,
                 "active_test_folds": pinfo.get("active_test_folds", np.nan) if len(pinfo) else np.nan,
@@ -365,7 +399,9 @@ def main():
     ap.add_argument("--eligibility", required=True, help="m05_eligibility.parquet")
     ap.add_argument("--pool-summary", required=True, help="m05_pool_summary.parquet")
     ap.add_argument("--folds", required=True, help="m03_folds.parquet")
-    ap.add_argument("--entities", required=True, help="m04_entities.parquet")
+    ap.add_argument("--entities", default=None, help="single m04_entities.parquet (compatibility mode)")
+    ap.add_argument("--m04-dir", default=None,
+                    help="directory with m04_entities_f{fold_id}.parquet for fold-pure M4")
     ap.add_argument("--actions", required=True, help="m02_actions.parquet")
     ap.add_argument("--manifest", default=None, help="JSON run manifest (N pre-registered). Omit -> default v1 N=1000.")
     ap.add_argument("--outdir", required=True)
@@ -379,11 +415,20 @@ def main():
     elig = pd.read_parquet(args.eligibility)
     pool = pd.read_parquet(args.pool_summary)
     folds = pd.read_parquet(args.folds)
-    entities = pd.read_parquet(args.entities)
+    if args.m04_dir:
+        entities_by_fold = _load_entities_by_fold(Path(args.m04_dir), folds)
+        entities = None
+    else:
+        if not args.entities:
+            raise ValueError("provide --m04-dir for fold-pure M4 or --entities for compatibility mode")
+        entities = pd.read_parquet(args.entities)
+        entities_by_fold = None
     actions = pd.read_parquet(args.actions, columns=["wallet", "ts"])
-    logger.info(f"elig={len(elig):,} pool={len(pool):,} folds={len(folds)} entities={len(entities):,} actions={len(actions):,}")
+    n_entities = sum(len(v) for v in entities_by_fold.values()) if entities_by_fold is not None else len(entities)
+    logger.info(f"elig={len(elig):,} pool={len(pool):,} folds={len(folds)} entities_rows={n_entities:,} actions={len(actions):,}")
 
-    sl, pool_df, waterfall = run(elig, pool, folds, entities, actions, manifest)
+    sl, pool_df, waterfall = run(elig, pool, folds, entities, actions, manifest,
+                                 entities_by_fold=entities_by_fold)
 
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     sl.to_parquet(outdir / "m06a_shortlist.parquet", index=False)

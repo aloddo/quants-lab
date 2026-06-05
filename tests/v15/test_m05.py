@@ -59,7 +59,8 @@ def _jr(wallet, entry_d, exit_d, pnl, coin="BTC", notional=1000.0):
 
 
 def _good_eqm():
-    return {"roe": 0.2, "max_dd": 0.3, "n_days": 50, "structural_ruin": False}
+    return {"roe": 0.2, "max_dd": 0.3, "n_days": 50, "structural_ruin": False,
+            "median_equity": 10000.0}
 
 
 def _good_jm():
@@ -95,6 +96,93 @@ def test_floor_fail_hft_holdtime():
 def test_floor_fail_share_below_latency():
     jm = _good_jm(); jm["share_below_latency"] = 0.4  # > 0.25
     assert not m5.apply_floors(_good_eqm(), jm)[0]
+
+
+def test_floor_fail_week_holder():
+    # median hold > 48h SWING_MAX_HOLD_S -> reject multi-day/week holder
+    jm = _good_jm(); jm["median_hold_s"] = 7 * 24 * 3600.0  # 7-day hold
+    ok, f = m5.apply_floors(_good_eqm(), jm)
+    assert not ok
+    assert any("hold_too_long" in x for x in f)
+
+
+def test_floor_fail_tiny_equity():
+    # pretest equity below MIN_EQUITY_USD ($2000) -> drop tiny degen account
+    e = _good_eqm(); e["median_equity"] = 276.0  # $276 degen account
+    ok, f = m5.apply_floors(e, _good_jm())
+    assert not ok
+    assert any("equity_too_small" in x for x in f)
+
+
+def test_floor_fast_wallet_still_passes():
+    # valid fast directional wallet: hours-scale hold, ample equity -> passes
+    jm = _good_jm(); jm["median_hold_s"] = 4 * 3600.0  # 4h hold (minutes-to-hours thesis)
+    e = _good_eqm(); e["median_equity"] = 8000.0
+    ok, f = m5.apply_floors(e, jm)
+    assert ok and not f
+
+
+def test_floor_fail_boundary_straddling_week_holder():
+    # codex finding a: a position OPENED in pretest still OPEN at test_start with a censored hold
+    # exceeding the swing cap is a week-holder, even though it's invisible to median_hold_s.
+    jm = _good_jm(); jm["censored_max_hold_s"] = 5 * 24 * 3600.0  # 5-day open straddle
+    ok, f = m5.apply_floors(_good_eqm(), jm)
+    assert not ok
+    assert any("hold_too_long_censored" in x for x in f)
+
+
+def test_journey_metrics_censored_hold_for_open_position():
+    # an open position (exit_ts NaN) opened in pretest -> censored_max_hold_s = hi - entry.
+    lo = ms(date(2025, 12, 1)); hi = ms(date(2025, 12, 30))
+    jr = pd.DataFrame([{
+        "wallet": "0xw", "coin": "BTC",
+        "entry_ts": ms(date(2025, 12, 2)), "exit_ts": np.nan,
+        "duration_h": np.nan, "net_realized_pnl": 0.0, "max_position_notional": 1000.0,
+    }])
+    jm = m5.journey_metrics(jr, lo, hi, None)
+    expected = (hi - ms(date(2025, 12, 2))) / 1000.0
+    assert abs(jm["censored_max_hold_s"] - expected) < 1.0
+    # straddling position (exit AFTER hi) also counts as censored.
+    jr2 = pd.DataFrame([{
+        "wallet": "0xw", "coin": "BTC",
+        "entry_ts": ms(date(2025, 12, 2)), "exit_ts": ms(date(2026, 1, 15)),
+        "duration_h": 1000.0, "net_realized_pnl": 50.0, "max_position_notional": 1000.0,
+    }])
+    jm2 = m5.journey_metrics(jr2, lo, hi, None)
+    assert abs(jm2["censored_max_hold_s"] - expected) < 1.0
+    assert jm2["n_journeys"] == 0  # not closed-in-pretest -> excluded from count/PnL
+
+
+def test_data_gap_account_not_falsely_failed():
+    # codex finding b: a data gap (missing equity_usd day) must NOT drag median_equity to 0 via the
+    # 0.0-fill. Raw non-null median stays well above the $2k floor.
+    df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=5, freq="D").date,
+        "equity_usd": [10000.0, np.nan, 10000.0, np.nan, 10000.0],
+        "ext_flow_cum": [0.0, 0.0, 0.0, 0.0, 0.0],
+    })
+    r = m5.flow_adjusted_twr(df)
+    # raw non-null median = 10000 (NOT the 0-filled median ~10000 dragged down by zeros)
+    assert r["median_equity"] == 10000.0
+    ok, f = m5.apply_floors(r, _good_jm())
+    assert not any("equity_too_small" in x for x in f)
+
+
+def test_median_equity_emitted_in_elig_rows():
+    # codex finding c: median_equity_pretest is a column in elig_df for auditability.
+    journeys = pd.DataFrame([
+        _jr("0xg", date(2025, 12, 5), date(2025, 12, 6), 100),
+        _jr("0xg", date(2025, 12, 10), date(2025, 12, 11), 100),
+        _jr("0xg", date(2026, 1, 2), date(2026, 1, 3), 100),
+        _jr("0xg", date(2026, 1, 8), date(2026, 1, 9), 100),
+    ])
+    eq = pd.DataFrame({"wallet": "0xg",
+                       "date": pd.date_range("2025-12-01", "2026-01-25", freq="D").date,
+                       "equity_usd": np.linspace(10000, 13000, 56), "ext_flow_cum": 0.0})
+    elig, pool, wf = m5.run(FOLDS, journeys, eq, _m04(["0xg"]))
+    assert "median_equity_pretest" in elig.columns
+    f1 = elig[(elig["primary_wallet"] == "0xg") & (elig["fold_id"] == 1)].iloc[0]
+    assert f1["median_equity_pretest"] > 2000.0
 
 
 def test_floor_accessibility_unknown_does_not_fail():
@@ -137,7 +225,7 @@ def test_run_fold_pure_and_entity_unit():
     journeys = pd.DataFrame(g_journeys)
     eq = pd.DataFrame({"wallet": "0xg",
                        "date": pd.date_range("2025-12-01", "2026-01-25", freq="D").date,
-                       "equity_usd": np.linspace(1000, 1300, 56), "ext_flow_cum": 0.0})
+                       "equity_usd": np.linspace(10000, 13000, 56), "ext_flow_cum": 0.0})
     m04 = _m04(["0xg"], killed_wallet="0xk")
     elig, pool, wf = m5.run(FOLDS, journeys, eq, m04)
     # KILL wallet 0xk never evaluated (not copyable)

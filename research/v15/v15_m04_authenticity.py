@@ -37,6 +37,7 @@ import pandas as pd
 sys.path.insert(0, "/Users/hermes/quants-lab/research/v15")
 import v15_m025_authenticity_gate as g  # noqa: E402  (codex-SHIP helpers)
 import v15_m01_equity_reconstruct as m01  # noqa: E402
+from _streaming_io import install_memory_guard  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [m04] %(message)s", stream=sys.stdout)
 log = logging.getLogger("m04")
@@ -97,6 +98,13 @@ def _stage_a_worker(args):
     return w, g.stage_a(w, lo_ms, hi_ms)
 
 
+def _worker_init(label: str = "m04-worker") -> None:
+    """Pool initializer: install the Rule 8 memory guard ONCE at worker-process start (not per
+    task — a per-call guard would leak a watchdog thread per imap chunk). Each Pool worker is a
+    separate process and needs its own guard so a runaway aborts LOUDLY, not via silent SIGKILL."""
+    install_memory_guard(soft_gb=12.0, label=label)
+
+
 def _fills_worker(args):
     """Top-level (picklable) worker: load one wallet's fills (the slow sequential I/O in STAGE C's
     internal-hedge check). Returns (wallet, fills_list). Logic-neutral: only the I/O is parallelized;
@@ -114,7 +122,7 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
     t0 = time.time()
     if procs > 1:
         tasks = [(w, lo_ms, hi_ms) for w in wallets]
-        with Pool(procs) as pool:
+        with Pool(procs, initializer=_worker_init, initargs=("m04-stageA",)) as pool:
             for i, (w, sc) in enumerate(pool.imap_unordered(_stage_a_worker, tasks, chunksize=16), 1):
                 scores[w] = sc
                 if i % 2000 == 0:
@@ -143,7 +151,7 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
     hedge_wallets = sorted({w for _eid, mem in ent_members.items() if len(mem) > 1 for w in mem})
     if hedge_wallets and procs > 1:
         tc = time.time()
-        with Pool(procs) as pool:
+        with Pool(procs, initializer=_worker_init, initargs=("m04-fills",)) as pool:
             for w, fl in pool.imap_unordered(_fills_worker,
                                              [(w, lo_ms, hi_ms) for w in hedge_wallets], chunksize=8):
                 fills_cache[w] = fl
