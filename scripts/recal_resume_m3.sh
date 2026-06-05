@@ -39,6 +39,6 @@ $SAFE --label m07_ -- $PY research/v15/v15_m07_engine.py --actions $D/m02_action
 log "M6b ranking"
 $SAFE --label m06b -- $PY research/v15/v15_m06b_ranking.py --m07-dir $D/m07_pretest_final --m04-dir $D --out $D --fee-schedule-version hl_fee_schedule_2026-06-01 2>&1 | tail -3
 log "M8 survival"
-$SAFE --label m08_ -- $PY research/v15/v15_m08_survival.py --m07-dir $D/m07_pretest_final --out $D --slip-calib $D/slippage_calib_v11.json 2>&1 | tail -3
+$SAFE --label m08_ -- $PY research/v15/v15_m08_survival.py --m07-dir $D/m07_pretest_final --out $D --m04-dir $D --slip-calib $D/slippage_calib_v11.json 2>&1 | tail -3
 log "M3->M8 CHAIN DONE. Next: M9/M10 via v15_forward_select.py"
 echo "RECAL_CHAIN_DONE"

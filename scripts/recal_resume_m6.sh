@@ -28,6 +28,6 @@ $SAFE --label m07_ -- $PY research/v15/v15_m07_engine.py --actions $D/m02_action
 log "M6b ranking (now cost-calibrated)"
 $SAFE --label m06b -- $PY research/v15/v15_m06b_ranking.py --m07-dir $D/m07_pretest_final --m04-dir $D --out $D --fee-schedule-version hl_fee_schedule_2026-06-01 2>&1 | tail -3
 log "M8 survival"
-$SAFE --label m08_ -- $PY research/v15/v15_m08_survival.py --m07-dir $D/m07_pretest_final --out $D --slip-calib $SLIP 2>&1 | tail -3
+$SAFE --label m08_ -- $PY research/v15/v15_m08_survival.py --m07-dir $D/m07_pretest_final --out $D --m04-dir $D --slip-calib $SLIP 2>&1 | tail -3
 log "M6a->M8 (calibrated) DONE"
 echo "RECAL_M6_DONE"
