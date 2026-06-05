@@ -292,6 +292,7 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
             "entity_link_evidence": entity_evidence.get(eid, "none"),
             "entity_confidence": entity_conf.get(eid, "high"),
             "copyable": (etier != "KILL") and (primary is not None),
+            "as_of_ms": as_of_ms,  # fold-pure provenance (M6b --m04-dir requires it; codex M4 re-review)
         })
     edf = pd.DataFrame(erows)
     return df, edf
