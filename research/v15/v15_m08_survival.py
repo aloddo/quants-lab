@@ -241,6 +241,17 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
                                  pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()}
     conf_map = {"CLEAN": 1.0, "UNCERTAIN": 0.25, "SUSPICIOUS": 0.10, "KILL": 0.0}
     pool = pool.merge(ent, on=["entity_id", "fold_id"] if m04_fold_pure else ["entity_id"], how="left")
+    if m04_fold_pure:
+        # FAIL-CLOSED provenance (codex M8 re-review): in fold-pure mode every pooled (entity_id, fold_id)
+        # MUST have a matching fold-pure M4 entity row. A left-merge miss would silently become str(NaN)->
+        # default 0.25 confidence (m4_tier="nan"). Refuse to proceed instead of fabricating confidence.
+        _missing = pool[pool["entity_tier"].isna()]
+        if len(_missing):
+            _ex = _missing[["entity_id", "fold_id"]].head(3).to_dict("records")
+            raise ValueError(
+                f"M8 fold-pure M4 provenance: {len(_missing)} pooled (entity_id,fold_id) rows lack a "
+                f"fold-pure M4 entity row (e.g. {_ex}). Rebuild per-fold M4 via build_m4_perfold.sh so "
+                f"every pooled entity-fold is covered. Fail-closed (no fabricated confidence).")
     if not m.inferential_layer_active:
         logger.warning("LOUD WARNING: M8 inferential layer is inactive (phase2_stub); stubbed no_flag "
                        "is capped at uncertain and must not be read as verified-safe.")
