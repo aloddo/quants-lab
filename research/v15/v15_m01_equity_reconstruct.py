@@ -92,6 +92,9 @@ import pandas as pd
 import pymongo
 import requests
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _streaming_io import ShardedParquetWriter, install_memory_guard  # noqa: E402
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -193,20 +196,42 @@ def get_mongo() -> pymongo.database.Database:
     return _mongo
 
 
-def get_mark(coin: str, ts_ms: int) -> Optional[float]:
+def get_mark(coin: str, ts_ms: int, causal: bool = False) -> Optional[float]:
     """1m candle close at-or-before ts_ms (latest). None if no candle covers it.
 
     Works for any prefix (main + xyz:/cash:/hyna:/para:/vntl:/flx:/km:) since the
     candle ``coin`` carries the full prefixed symbol.
 
-    NOTE (2026-05-30 decision): exotic HIP-3 coins' true oracle (explorer_blocks
-    setOracle) was explored as a precise mark. It was PARKED: ranking uses HL-exact
-    weekly anchors and risk is enforced live + via exact event data (liquidations,
-    deposits), so intra-week mark precision is not a capital-risk control. If wanted
-    later, capture the oracle feed FORWARD (research/v13/v13_extract_oracle_marks.py
-    is the access proof), don't reconstruct backward.
+    EXACT-MARK FIX (2026-06-04, Alberto "reconcile to the cent"): for EXOTIC HIP-3
+    coins (prefixed dexes xyz:/cash:/flx:/vntl:/km:/para:/hyna:) the trade-candle close
+    diverges materially from HL's setOracle mark (observed xyz:SILVER -12.8%, xyz:GOLD
+    -4.7% on 2026-03-04) -> on leveraged positions this is a dominant equity-recon drift
+    source. HL computes accountValue on the MARK (oracle), not the last trade. So we now
+    PREFER the oracle mark (hyperliquid_oracle, from v13_extract_oracle_marks setOracle)
+    for prefixed coins, with a candle fallback when oracle is absent/stale. Main-dex
+    (unprefixed) coins keep the trade-candle close (their oracle is consensus-level, not
+    in explorer_blocks; main mark precision tracked separately via asset_ctxs).
+
+    Set causal=True for forward decisions: use the last one-minute bar whose
+    close time is <= ts_ms, matching M07's convention (bar_open <= ts - 60s).
+    Keep causal=False for point-in-time MTM where the mark genuinely existed at ts_ms.
     """
-    minute_key = ts_ms // 60_000 * 60_000
+    lookup_ms = (ts_ms // 60_000) * 60_000 - 60_000 if causal else ts_ms
+    # EXACT MARK first: exotic (prefixed) coins -> setOracle oracle; MAIN (unprefixed) coins ->
+    # asset_ctxs mark_px (HL's exact per-minute mark, the price accountValue uses). Candle fallback.
+    if ":" in coin:
+        # HL values accountValue/uPnL at the MARK price (markPxs[0]); ORACLE px is FUNDING-ONLY
+        # and is WRONG for m2m (robust-price-indices doc; Alberto, repeatedly). markPx ONLY here --
+        # NO oracle in the m2m path. If markPx is absent, fall through to the trade-candle last
+        # resort (still imperfect on thin books, but never the funding oracle).
+        mkpx = _markpx_lookup(coin, lookup_ms, ORACLE_MAX_AGE_MS)
+        if mkpx is not None:
+            return mkpx
+    else:
+        mpx = _assetctx_lookup(coin, lookup_ms, ASSETCTX_MAX_AGE_MS)
+        if mpx is not None:
+            return mpx
+    minute_key = lookup_ms // 60_000 * 60_000
     mins, closes = _coin_series(coin)
     if mins.size == 0:
         return None
@@ -215,6 +240,155 @@ def get_mark(coin: str, ts_ms: int) -> Optional[float]:
         return None
     px = closes[i]
     return None if px != px else float(px)  # NaN-safe (missing close -> None)
+
+
+# Oracle (setOracle) mark series, per-coin in-memory asof cache. Mirrors _coin_series.
+# Oracle is the EXACT mark HL uses for accountValue on HIP-3 dexes. ORACLE_MAX_AGE_MS
+# caps how stale an at-or-before oracle point may be before we fall back to the candle
+# (extract cadence is 30-60min; slow exotic commodities -> a few hours is safe).
+_oracle_series: dict[str, tuple] = {}
+ORACLE_MAX_AGE_MS = 6 * 3600 * 1000  # 6h staleness cap
+
+
+def _load_oracle_from_mongo(coin: str) -> tuple:
+    db = get_mongo()
+    cur = db.hyperliquid_oracle.find(
+        {"coin": coin}, projection={"timestamp_utc": 1, "oracle_px": 1, "_id": 0}
+    )
+    pts: list[tuple[int, float]] = []
+    for d in cur:
+        t = d.get("timestamp_utc")
+        p = d.get("oracle_px")
+        if t is None or p is None:
+            continue
+        try:
+            pts.append((int(t), float(p)))
+        except (TypeError, ValueError):
+            continue
+    pts.sort(key=lambda x: x[0])
+    if not pts:
+        return (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+    return (np.asarray([x[0] for x in pts], dtype="int64"),
+            np.asarray([x[1] for x in pts], dtype="float64"))
+
+
+def _oracle_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+    s = _oracle_series.get(coin)
+    if s is None:
+        s = _load_oracle_from_mongo(coin)
+        _oracle_series[coin] = s
+    ts_arr, px = s
+    if ts_arr.size == 0:
+        return None
+    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1  # latest oracle point <= ts_ms
+    if i < 0:
+        return None
+    if ts_ms - int(ts_arr[i]) > max_age_ms:  # too stale -> let caller fall back to candle
+        return None
+    v = px[i]
+    return None if v != v else float(v)
+
+
+# setOracle MARK price (markPxs[0]) -- the price HL uses for accountValue/uPnL (oracle is funding-only).
+# Mirrors _oracle_lookup; reads the mark_px field written by scripts/pull_oracle_targeted.py.
+_markpx_series: dict[str, tuple] = {}
+
+
+def _load_markpx_from_mongo(coin: str) -> tuple:
+    db = get_mongo()
+    cur = db.hyperliquid_oracle.find(
+        {"coin": coin, "mark_px": {"$ne": None}},
+        projection={"timestamp_utc": 1, "mark_px": 1, "_id": 0},
+    )
+    pts: list[tuple[int, float]] = []
+    for d in cur:
+        t = d.get("timestamp_utc")
+        p = d.get("mark_px")
+        if t is None or p is None:
+            continue
+        try:
+            pts.append((int(t), float(p)))
+        except (TypeError, ValueError):
+            continue
+    pts.sort(key=lambda x: x[0])
+    if not pts:
+        return (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+    return (np.asarray([x[0] for x in pts], dtype="int64"),
+            np.asarray([x[1] for x in pts], dtype="float64"))
+
+
+def _markpx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+    s = _markpx_series.get(coin)
+    if s is None:
+        s = _load_markpx_from_mongo(coin)
+        _markpx_series[coin] = s
+    ts_arr, px = s
+    if ts_arr.size == 0:
+        return None
+    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1
+    if i < 0:
+        return None
+    if ts_ms - int(ts_arr[i]) > max_age_ms:
+        return None
+    v = px[i]
+    return None if v != v else float(v)
+
+
+# asset_ctxs EXACT mark for MAIN coins: per-coin (minute_ms, mark_px) .npy written by
+# scripts/extract_asset_ctx_marks.py. 1-min granularity -> tight staleness cap. Mirrors _coin_series.
+_assetctx_series: dict[str, tuple] = {}
+ASSETCTX_MAX_AGE_MS = 15 * 60 * 1000  # 15min (asset_ctxs is 1-min; small cap)
+ASSETCTX_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "assetctx_marks"
+
+
+def _assetctx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+    s = _assetctx_series.get(coin)
+    if s is None:
+        p = ASSETCTX_DIR / f"{_ulib.quote(coin, safe='')}.npy"
+        if p.exists():
+            try:
+                arr = np.load(p, mmap_mode="r")
+                s = (np.asarray(arr[0], dtype="int64"), np.asarray(arr[1], dtype="float64"))
+            except Exception:  # noqa: BLE001
+                s = (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+        else:
+            s = (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+        _assetctx_series[coin] = s
+    ts_arr, px = s
+    if ts_arr.size == 0:
+        return None
+    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1
+    if i < 0:
+        return None
+    if ts_ms - int(ts_arr[i]) > max_age_ms:
+        return None
+    v = px[i]
+    return None if v != v else float(v)
+
+
+# Earliest ms at which a coin has ANY price (candle minute, else oracle ts). A coin cannot be
+# held before it has a price (its listing) -> used to bound phantom position back-projection in
+# seed_positions. None = no price source ever. Cached.
+_coin_first_price: dict[str, Optional[int]] = {}
+
+
+def _coin_first_price_ms(coin: str) -> Optional[int]:
+    if coin in _coin_first_price:
+        return _coin_first_price[coin]
+    fp: Optional[int] = None
+    mins, _ = _coin_series(coin)
+    if mins.size:
+        fp = int(mins[0])
+    if fp is None:  # no candle -> try oracle series
+        oser = _oracle_series.get(coin)
+        if oser is None:
+            oser = _load_oracle_from_mongo(coin)
+            _oracle_series[coin] = oser
+        ts_arr, _ = oser
+        if ts_arr.size:
+            fp = int(ts_arr[0])
+    _coin_first_price[coin] = fp
+    return fp
 
 
 import urllib.parse as _ulib
@@ -945,100 +1119,88 @@ def seed_positions(
     anchor_ms: int,
     causal_cutoff: bool = False,
 ) -> dict[str, float]:
-    """Seed positions held at anchor_ms (adapts v8's three-case seeding).
+    """Seed positions held at anchor_ms.
 
-    1. Positions implied by fills at-or-before anchor_ms (positions_at).
-    2. Coins first TRADED after anchor_ms: their first post-anchor fill's
-       startPosition reveals the pre-anchor holding.
-    3. Static no-fill positions from the anchor parquet. The parquet is a SINGLE
+    TWO paths:
+    * causal_cutoff=True (per-EVENT walk): fully causal -- positions_at(fills<=anchor)
+      + the anchor's OWN near-fetch snapshot. MUST NOT use any fill with time>anchor_ms
+      (look-ahead). Unchanged.
+    * causal_cutoff=False (daily reconstruction + cent reconciliation): EX-POST
+      BURST-AWARE seed. pos = P0 + cumsum(signed_sz of fills<=anchor), where P0 (the
+      pre-first-fill carry) is taken from the clean earliest-fill startPosition, EXCEPT
+      when that earliest fill is a same-millisecond BURST (no tid -> arbitrary order ->
+      mid-burst garbage startPosition), in which case P0 is anchored to the authoritative
+      fetch-time snapshot: P0 = snapshot_position - sum(ALL signed_sz). This kills the
+      phantom-seed leak (e2af8f54's 83-fill same-ms first DOGE fill read startPosition
+      1.79M -> 1.79M DOGE seeded at a Dec anchor where the wallet held zero). Cumulative
+      signed_sz is order-independent so only P0 needed the fix. Coins in the snapshot but
+      never traded in-window (Case A) are seeded at the snapshot size at every anchor.
 
-    CAUSALITY (codex r4 BUG 1): case 2 seeds a coin's pre-anchor holding from a
-    fill that occurs AFTER the anchor. In the DAILY reconstruction (compute_eq_at)
-    that fill is always <= the walk endpoint t_ms, so it is causal for THAT walk.
-    But in the per-EVENT walk (compute_event_equity), equity_post(k) must use only
-    data with event-order <= k; a case-2 fill at order > k would leak a future-
-    known coin into equity at k (look-ahead). When ``causal_cutoff=True`` (set ONLY
-    by compute_event_equity) case 2 is DROPPED: a coin whose first fill is after
-    the anchor is not seeded from that future fill's startPosition; its position
-    materialises only when the replay applies its fill (order <= k). Cases 1 and 3
-    (fills <= anchor_ms, and the anchor's own static snapshot, both representing
-    state at/<=anchor_ts < ts) remain — they ARE causal. compute_eq_at keeps the
-    default (causal_cutoff=False) so the audited daily path is byte-for-byte
-    unchanged.
-
-    Case-3 detail: the parquet is a SINGLE snapshot at anchor.fetched_ms, so a
-    position in it is only PROVEN to exist at fetch time. We seed a static position
-    ONLY when the weekly anchor is within 24h of the parquet fetch (proximity
-    heuristic) -- never backfilled into far-earlier history (P0: projecting a
-    later-opened position backward inflates/deflates the cash snap and drifts the
-    walk). When a static position cannot be proven at this anchor, we trust
-    positions_at (flat) and leave it unseeded; any genuine hidden exposure surfaces
-    as inter-anchor DRIFT and is quarantined at the wallet level. Coins with
-    post-anchor fills are handled by case 2 (or, under causal_cutoff, by the
-    caller's event replay), not seeded here.
+    NOTE: this CHANGES the daily reconstruction output (it was wrong: phantom positions).
+    Re-run M2->M10 on the corrected equity. The per-event causal path is byte-unchanged.
     """
-    start_positions = positions_at(fills, anchor_ms)
-
-    seen_pre = {f["coin"] for f in fills if f["time"] <= anchor_ms}
-    if not causal_cutoff:
-        # Case 2 (NON-causal for the per-event walk): seed a coin's pre-anchor
-        # holding from its first post-anchor fill's startPosition.
-        for f in fills:
-            if f["time"] <= anchor_ms:
-                continue
-            coin = f["coin"]
-            if coin in seen_pre or coin in start_positions:
-                continue
-            pos_pre = f["startPosition"]
-            if abs(pos_pre) > 1e-9:
-                start_positions[coin] = pos_pre
-            seen_pre.add(coin)
-
     near_fetch = abs(anchor_ms - anchor.fetched_ms) <= 86_400_000
 
     if causal_cutoff:
         # FULLY-CAUSAL seed for the per-event walk (codex r2 BUG): the seed serves
         # every event k in this anchor's segment and MUST NOT depend on any fill with
-        # time > anchor_ms (some are at order > k -> look-ahead). The non-causal path
-        # below consults post_anchor_coins AND any_fill_coins (both read fills >
-        # anchor_ms), so whether a snapshot coin is seeded would flip based on FUTURE
-        # trading. Causal seed = positions from fills <= anchor_ms (already in
-        # start_positions) + the anchor's OWN near-fetch snapshot, full stop. A
-        # far-from-fetch snapshot is not causal evidence at this anchor; any genuine
-        # unseen exposure surfaces as inter-anchor DRIFT and is quarantined.
+        # time > anchor_ms (look-ahead). Causal seed = positions from fills <= anchor_ms
+        # + the anchor's OWN near-fetch snapshot, full stop. A far-from-fetch snapshot is
+        # not causal evidence; any genuine unseen exposure surfaces as inter-anchor DRIFT.
+        start_positions = positions_at(fills, anchor_ms)
         if near_fetch:
             for coin, szi in anchor.positions.items():
                 if coin not in start_positions and abs(szi) >= 1e-9:
                     start_positions[coin] = float(szi)
         return start_positions
 
-    post_anchor_coins = {f["coin"] for f in fills if f["time"] > anchor_ms}
-    any_fill_coins = {f["coin"] for f in fills}
-    for coin, szi in anchor.positions.items():
-        if coin in start_positions or abs(szi) < 1e-9:
+    # ----- EX-POST BURST-AWARE seed (causal_cutoff=False; daily + reconciliation) ----- #
+    # pos(anchor) = P0 + cumulative signed_sz of fills at-or-before the anchor. The
+    # cumulative sum is order-independent and robust. P0 (pre-first-fill carry) was the
+    # leak: M1 took it from the earliest fill's startPosition, but large orders fill as
+    # SAME-MILLISECOND bursts and the S3 by-wallet partition carries no tid -> the fills
+    # are in arbitrary order, so a burst startPosition is mid-burst GARBAGE. Observed
+    # (Alberto "reconcile to the cent", 2026-06-04): e2af8f54's first DOGE fill is an
+    # 83-fill same-ms burst reading startPosition 1,792,138 -> the old seed put 1.79M DOGE
+    # at a December anchor where the wallet held ZERO (phantom; its mark drift == the
+    # inter-anchor residual to the dollar). Same for SOL/kPEPE/MON. FIX: when the earliest
+    # fill is a same-ms burst, take P0 from the AUTHORITATIVE fetch-time snapshot instead:
+    # P0 = snapshot_position(coin) - sum(ALL signed_sz) (order-independent, ground-truth-
+    # anchored). reconstruct_wallet loads fills through fetched_ms so the sum reaches the
+    # snapshot. A CLEAN earliest fill keeps the forward startPosition (the snapshot carries
+    # minor fetch-instant noise that would otherwise leak into every anchor, e.g. the
+    # main-only wallet a9881f6f: backward-everywhere regressed it from $0.04 to $272 median,
+    # burst-aware preserves $0.04). Validated: a9881f6f $0.04 max $2.10 PRESERVED; e2af8f54
+    # median $18,628 -> $2.28; daf50e49 $4,787 -> $710; 4ac21adc $9,311 -> $99.
+    by_coin: dict[str, list[dict]] = {}
+    for f in fills:
+        by_coin.setdefault(f["coin"], []).append(f)  # already time-sorted on load
+    cur = anchor.positions
+    start_positions = {}
+    for coin, fs in by_coin.items():
+        if not coin_is_allowed_perp(coin):
             continue
-        if coin in post_anchor_coins:
-            continue  # case 2 already recovered the pre-anchor holding
-        if coin not in any_fill_coins:
-            # Case A: the coin has NO fill anywhere in the loaded window, yet it
-            # is in the fetch-time snapshot -> the position was established before
-            # the window and held constant throughout (no trades = no size
-            # change). It was therefore held at EVERY in-window anchor. Safe to
-            # seed at any anchor. (Residual gap risk: a coin opened in
-            # (walk_end, fetched_ms] would look never-traded; the window is ~1d
-            # and bounded, surfaced via has_extradex/quarantine, not here.)
+        t0 = fs[0]["time"]
+        burst = sum(1 for f in fs if f["time"] == t0) > 1
+        net_all = 0.0
+        cum_le = 0.0
+        for f in fs:
+            net_all += f["signed_sz"]
+            if f["time"] <= anchor_ms:
+                cum_le += f["signed_sz"]
+        if burst:
+            p0 = float(cur.get(coin, 0.0)) - net_all  # backward: snapshot-anchored
+        else:
+            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill
+        pos = p0 + cum_le
+        if abs(pos) > 1e-9:
+            start_positions[coin] = pos
+    # Case A: coins in the fetch snapshot but NEVER traded in-window -> established
+    # before the window and held constant (no trades = no size change) -> seed the
+    # snapshot size at every anchor.
+    for coin, szi in cur.items():
+        if coin not in by_coin and coin_is_allowed_perp(coin) and abs(szi) >= 1e-9:
             start_positions[coin] = float(szi)
-        elif near_fetch:
-            # Case B near fetch: coin traded pre-anchor but closed before any
-            # post-anchor fill; provable only when the anchor ~ the snapshot.
-            start_positions[coin] = float(szi)
-        # Case B far from fetch: positions_at (authoritative startPosition) shows
-        # this coin FLAT at the anchor; the later snapshot holding it just means
-        # it was re-opened after this anchor. Trust positions_at -> do NOT
-        # backfill the snapshot position into far history (P0 #3). A proven-flat
-        # coin is not an incompleteness. Genuinely-hidden exposure (a no-anchor-row
-        # dex position with no fills) cannot be seen here; it surfaces as
-        # inter-anchor DRIFT and is quarantined at the wallet level.
     return start_positions
 
 
@@ -1050,6 +1212,7 @@ def compute_eq_at(
     t_ms: int,
     anchor_ms: int,
     anchor_eq: float,
+    causal_seed: bool = False,
 ) -> WalkResult:
     """Re-anchored forward walk from anchor_ms to t_ms.
 
@@ -1059,7 +1222,7 @@ def compute_eq_at(
     Missing marks are COUNTED (n_unmarkable) and their notional estimated, but
     not silently zeroed into equity; the caller decides whether to flag the day.
     """
-    start_positions = seed_positions(fills, anchor, anchor_ms)
+    start_positions = seed_positions(fills, anchor, anchor_ms, causal_cutoff=causal_seed)
 
     # Snap cash to the anchor equity using marked position value at anchor_ms.
     # If a SEEDED position has no mark at anchor_ms, the cash snap silently
@@ -1171,7 +1334,11 @@ def reconstruct_wallet(args: tuple) -> dict:
     In validate mode (validation_only=True) the series is still built (needed
     for the accuracy table) but accuracy functions are computed and surfaced.
     """
-    wallet, anchor, start_ms, end_ms, validation_only = args
+    if len(args) == 5:
+        wallet, anchor, start_ms, end_ms, validation_only = args
+        causal_seed = False
+    else:
+        wallet, anchor, start_ms, end_ms, validation_only, causal_seed = args
     wallet_lc = wallet.lower()
 
     if anchor is None:
@@ -1250,8 +1417,11 @@ def reconstruct_wallet(args: tuple) -> dict:
             current_day = current_day + pd.Timedelta(days=1)
             continue
         anchor_t, anchor_v = before[-1]
+        # SELECTION series: optionally causal seed for downstream M5 eligibility.
+        # Anchor cash-snap marks remain point-in-time MTM via get_mark(..., causal=False).
         wr = compute_eq_at(
-            stream, fills, anchor, wallet_lc, eod_ms, anchor_t, anchor_v
+            stream, fills, anchor, wallet_lc, eod_ms, anchor_t, anchor_v,
+            causal_seed=causal_seed,
         )
         had_unknown_any = had_unknown_any or wr.had_unknown_ledger
         # Row is incomplete only if we genuinely cannot value the book this day
@@ -1297,7 +1467,8 @@ def reconstruct_wallet(args: tuple) -> dict:
 
     df_out = pd.DataFrame(rows)
 
-    # 4) Accuracy diagnostics.
+    # 4) Accuracy diagnostics. These are audit-only and intentionally preserve
+    # the reconcile-to-the-cent ex-post seed path; they are not selection inputs.
     inter = inter_anchor_drift(stream, fills, anchor, wallet_lc, window_anchors)
     recon = segment_reconcile(
         stream, fills, anchor, wallet_lc, window_anchors, fills
@@ -2086,7 +2257,15 @@ def main() -> None:
     ap.add_argument("--end", default="2026-05-23", help="YYYY-MM-DD (clamped to mark coverage)")
     ap.add_argument("--output", required=True, help="Output parquet path")
     ap.add_argument("--validate", action="store_true", help="Print accuracy table")
+    ap.add_argument(
+        "--causal-seed",
+        action="store_true",
+        help="Build the emitted EOD selection series with causal position seeding; audit diagnostics keep ex-post seeding.",
+    )
     args = ap.parse_args()
+
+    # Rule 8 (mandatory streaming I/O): abort LOUDLY on runaway RSS instead of silent OS SIGKILL.
+    install_memory_guard(soft_gb=12.0, label="m01")
 
     start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
     end_ms = int((pd.Timestamp(args.end, tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000 - 1)
@@ -2102,44 +2281,64 @@ def main() -> None:
     anchor_df = pd.read_parquet(ANCHOR_PARQUET)
     logger.info(f"Loaded anchor parquet: {len(anchor_df):,} rows")
 
-    results: list[dict] = []
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Rule 8: stream per-wallet series to disk in bounded chunks via ShardedParquetWriter; NEVER
+    # concat all wallet-days into one DataFrame in RAM. We keep ONLY the lightweight per-wallet
+    # audit/error records (one row per wallet, bounded) for the audit parquet + validate table.
+    series_writer = ShardedParquetWriter(out_path, flush_rows=2_000_000)
+    audits: list[dict] = []
+    results_lite: list[dict] = []          # only wallet/error/audit keys (NO heavy series) for table
+    n_with_series = 0
+    uniq_wallets: set = set()
+    uniq_dates: set = set()
+
     t0 = time.time()
     for j, w in enumerate(wallets, 1):
         anchor = load_wallet_anchor(w, anchor_df)
         try:
-            res = reconstruct_wallet((w, anchor, start_ms, end_ms, args.validate))
+            res = reconstruct_wallet((w, anchor, start_ms, end_ms, args.validate, args.causal_seed))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"  wallet exception {w[:12]}: {e!r}")
             res = {"wallet": w, "error": f"exception:{e!r}"}
-        results.append(res)
+
         if "error" in res:
             logger.warning(f"  [{j}/{len(wallets)}] {w[:12]} -> {res['error']}")
+            results_lite.append({"wallet": res["wallet"], "error": res["error"]})
         else:
+            df_w = res["series"]
             logger.info(
-                f"  [{j}/{len(wallets)}] {w[:12]} -> {len(res['series'])} rows, "
+                f"  [{j}/{len(wallets)}] {w[:12]} -> {len(df_w)} rows, "
                 f"inter-drift med {res['audit'].get('median_inter_anchor_drift_pct', float('nan'))*100:.2f}%"
             )
-
-    series = [r["series"] for r in results if "series" in r]
-    audits = [{"wallet": r["wallet"], **r["audit"]} for r in results if "audit" in r]
+            # stream this wallet's rows to disk, then drop the DataFrame (bounded RAM)
+            if len(df_w):
+                series_writer.add_many(df_w.to_dict("records"))
+                n_with_series += 1
+                uniq_wallets.add(w)
+                uniq_dates.update(df_w["date"].tolist())
+            audits.append({"wallet": res["wallet"], **res["audit"]})
+            results_lite.append({"wallet": res["wallet"], "audit": res["audit"]})
 
     if args.validate:
-        _print_accuracy_table(results)
+        _print_accuracy_table(results_lite)
 
-    if series:
-        out_df = pd.concat(series, ignore_index=True)
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_df.to_parquet(out_path, index=False, compression="snappy")
+    if n_with_series:
+        total_rows = series_writer.close()
         audit_df = pd.DataFrame(audits)
         audit_df.to_parquet(out_path.with_suffix(".audit.parquet"), index=False, compression="snappy")
         logger.info(
-            f"\nWrote {out_path}: {len(out_df):,} rows "
-            f"({out_df['wallet'].nunique()} wallets x {out_df['date'].nunique()} days)"
+            f"\nWrote {out_path}: {total_rows:,} rows "
+            f"({len(uniq_wallets)} wallets x {len(uniq_dates)} days)"
         )
         logger.info(f"Wrote audit: {out_path.with_suffix('.audit.parquet')}")
     else:
-        logger.error("No series produced for any wallet.")
+        # codex finding a: do NOT write args.output on this failure path. close() would stitch an
+        # EMPTY no-schema parquet to out_path and CLOBBER a prior valid artifact. abort() discards the
+        # (empty) staging parts and leaves out_path untouched -> the old artifact is preserved.
+        series_writer.abort()
+        logger.error("No series produced for any wallet. args.output left untouched (prior artifact preserved).")
         sys.exit(2)
 
     logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")
