@@ -38,9 +38,12 @@ if ls $SHARDDIR/shard_*.parquet >/dev/null 2>&1; then
   mkdir -p $ARCH && mv $SHARDDIR/shard_*.parquet $ARCH/
   log "archived $(ls $ARCH/*.parquet 2>/dev/null | grep -vc audit) prior M1 shards -> $ARCH"
 fi
-# 1) split the wallet universe into NSHARD ~equal pieces (deterministic, line-based)
+# 1) split the wallet universe into NSHARD ~equal pieces (deterministic, line-based).
+#    BSD/macOS split has NO -n l/N (GNU-only); use -l lines-per-shard = ceil(total/NSHARD).
 TMPSPLIT=$(mktemp -d)
-split -n l/$NSHARD -a 2 $WALLETS $TMPSPLIT/wal_
+_TOTAL=$(wc -l < $WALLETS)
+_PERSHARD=$(( (_TOTAL + NSHARD - 1) / NSHARD ))
+split -l $_PERSHARD -a 2 $WALLETS $TMPSPLIT/wal_
 i=0
 for part in $TMPSPLIT/wal_*; do
   sfx=$(printf "%02d" $i)
