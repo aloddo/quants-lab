@@ -276,7 +276,18 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
         md.set_slip_calib(per_fold.get(fid), cal.get("version") if slip_calib_path else None)
         wdf = acts_ds.to_table(filter=ds.field("wallet") == r.primary_wallet).to_pandas()
         adf = wdf[(wdf.ts >= t0) & (wdf.ts < t1)]
-        m4_conf = conf_map.get(str(r.entity_tier), 0.25)
+        # TIER-DOMAIN FAIL-CLOSED (codex M8 confirm): a non-canonical entity_tier (e.g. a literal "nan"
+        # string or unknown label from corrupted/nonstandard M4 input) must NOT silently get the 0.25
+        # default. Canonical M4 writes only CLEAN/UNCERTAIN/SUSPICIOUS/KILL; anything else -> 0.0 (KILL-
+        # equivalent, fail-closed conservative) + loud warning, so a bad tier excludes the entity rather
+        # than fabricating mid confidence.
+        _tier = str(r.entity_tier)
+        if _tier not in conf_map:
+            logger.warning(f"M8: non-canonical entity_tier {_tier!r} for entity {int(r.entity_id)} fold "
+                           f"{fid} -> fail-closed to 0.0 confidence (expected one of {sorted(conf_map)})")
+            m4_conf = 0.0
+        else:
+            m4_conf = conf_map[_tier]
         pre_max_raw = entity_pre_m8_max(r.quality_weight, m4_conf, m)   # codex r1#4: store the RAW formula
         # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
         # gets a meaningful stress test; the RAW value is persisted unchanged.
