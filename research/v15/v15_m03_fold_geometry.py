@@ -374,7 +374,13 @@ def main() -> None:
     # needs only wallet+ts (actions) and wallet+entry_ts (journeys).
     actions = pd.read_parquet(args.actions, columns=["wallet", "ts"])
     journeys = pd.read_parquet(args.journeys, columns=["wallet", "entry_ts"])
-    logger.info(f"loaded {len(actions):,} actions, {len(journeys):,} journeys")
+    # MEMORY (2026-06-06): the 86M-row object-string `wallet` column was ~4GB and peaked M3 at 10.2GB
+    # (OOM-killed by mem_safe_run alongside the 5.4GB standing pipeline). wallet has ~18k uniques ->
+    # category dtype cuts it to ~350MB. Groupbys here are SINGLE-key (.groupby('wallet')) so the
+    # categorical observed= cartesian footgun does NOT apply (no multi-key groupby). Logic-neutral.
+    actions["wallet"] = actions["wallet"].astype("category")
+    journeys["wallet"] = journeys["wallet"].astype("category")
+    logger.info(f"loaded {len(actions):,} actions, {len(journeys):,} journeys (wallet=category)")
     wide, summary = build_activity(folds, actions, journeys)
     wide.to_parquet(outdir / "m03_wallet_fold_activity.parquet", index=False)
     summary.to_parquet(outdir / "m03_wallet_activity_summary.parquet", index=False)
