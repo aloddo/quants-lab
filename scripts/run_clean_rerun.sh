@@ -27,7 +27,9 @@ SHARDDIR=$D/m01_rerun
 log(){ echo "[clean-rerun $(date +%H:%M:%S)] $*"; }
 
 # Guard: refuse to run if the live copy trader is somehow active (this is research; bot must stay paused).
-if pgrep -f hl_prop_copy.py >/dev/null; then echo "ABORT: live trader running; this is a research re-run, bot must be paused."; exit 3; fi
+# self-match-proof: only a REAL python trader counts (bare pgrep self-matches our own check-shells).
+if ps -axo command | grep -v grep | grep "strategies/live/hl_prop_copy.py" | grep -qi "python"; then
+  echo "ABORT: live trader running; this is a research re-run, bot must be paused."; exit 3; fi
 
 log "Clean re-run START. $(wc -l < $WALLETS) wallets, $NSHARD shards, procs=$PROCS, ceil=${CEIL}GB."
 mkdir -p $SHARDDIR
