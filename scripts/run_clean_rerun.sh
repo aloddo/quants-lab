@@ -60,5 +60,11 @@ log "M1 causal sharded reconstruction DONE ($i shards). Handing to recal_pipelin
 #    then runs the fold-pure M2->M8 chain. Pass through wallets/procs/ceil.
 bash scripts/recal_pipeline.sh "$WALLETS" "$PROCS" "$CEIL"
 
-log "CLEAN RE-RUN COMPLETE. Next: run the two-regime test (Dec-May M7 -> June live) for the verdict."
+log "CLEAN RE-RUN COMPLETE. Running the two-regime VERDICT (Dec-May clean M7 -> June live realized PnL)."
+# Regime-2 = genuinely-future post-pipeline window. --since = day after the pipeline end (2026-05-23).
+$PY research/v15/v15_two_regime_test.py \
+  --m07-test $D/m07_test_final/m07_summary.parquet \
+  --m04-entities $D/m04_entities_f8.parquet \
+  --since 2026-05-24 --min-fills 5 --out $D/two_regime_verdict.parquet 2>&1 | tail -20
+log "Two-regime verdict above is the deciding evidence. Done."
 echo "CLEAN_RERUN_DONE"
