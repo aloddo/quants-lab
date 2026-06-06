@@ -22,14 +22,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from pybit.unified_trading import HTTP
 
-from scripts.options_v4.regime import (
+from research.options_v4.regime import (
     Regime, RegimeFeatures, compute_features, classify, should_kill,
 )
-from scripts.options_v4.execution import (
+from research.options_v4.execution import (
     SpreadIntent, create_intent, execute_spread, get_open_intents, update_intent,
     IntentStatus, get_db,
 )
-from scripts.options_v4.risk import (
+from research.options_v4.risk import (
     RiskConfig, AccountState, fetch_account, check_pretrade,
     check_liquidity, check_instrument,
 )
