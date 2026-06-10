@@ -281,6 +281,8 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
         raise SystemExit(f"too few wallets with fills ({len(wallets)}); widen candidates/window")
 
     aw = ShardedParquetWriter(out_path, flush_rows=200_000)
+    by_wallet_path = out_path.replace(".parquet", "_bywallet.parquet")
+    bw = ShardedParquetWriter(by_wallet_path, flush_rows=200_000)
     t = start_ms
     n_dec = 0
     while t + hold_ms <= end_ms:
@@ -303,11 +305,23 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             nq = min(5, max(1, tn.nunique()))
             bkt = pd.qcut(tn.rank(method="first"), q=nq, labels=False) if nq > 1 else pd.Series([0] * len(elig))
             w_bucket = {w: int(b) for w, b in zip(elig, bkt)}
-            # 2) forward edge for top decile (causal: copy_edge only sees (t, t+hold])
+            # 2) forward edge for top decile (causal: copy_edge only sees (t, t+hold]). Record
+            #    PER-WALLET forward edge so concentration (codex criterion #5) is computable offline.
             top_lots = []
+            top_wallet_rows = []
             for w in top:
                 _, lots = copy_edge(wf[w], t, t + hold_ms, lat_ms, adverse_bps)
                 top_lots += lots
+                if lots:
+                    we = float(np.mean([l["net"] for l in lots]))
+                    wb = beta_edge_for_lots(lots, t, t + hold_ms)
+                    top_wallet_rows.append({
+                        "decision_ts": t, "wallet": w, "n_lots": len(lots),
+                        "fwd_edge_bps": we * 1e4,
+                        "beta_bps": (wb * 1e4) if wb is not None else None,
+                        "trailing_edge_bps": trailing[w] * 1e4})
+            if top_wallet_rows:
+                bw.add_many(top_wallet_rows)
             top_edge = float(np.mean([l["net"] for l in top_lots])) if top_lots else None
             beta = beta_edge_for_lots(top_lots, t, t + hold_ms) if top_lots else None
             # 3) matched null: rank-eligible NON-top wallets, matched on causal trailing-activity bucket
@@ -350,7 +364,8 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
                 log.info(f"  decisions {n_dec} (t={pd.to_datetime(t, unit='ms')})")
         t += HOUR_MS
     n = aw.close()
-    log.info(f"streamed {n} decision rows -> {out_path}")
+    nb = bw.close()
+    log.info(f"streamed {n} decision rows -> {out_path}; {nb} per-wallet rows -> {by_wallet_path}")
     return out_path
 
 
