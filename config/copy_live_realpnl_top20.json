@@ -1,0 +1,28 @@
+{
+  "method": "recent_30d_realized_net_pnl",
+  "as_of": "through_20260527",
+  "min_closes": 40,
+  "note": "LIVE bot MUST apply runtime bag-guard (skip wallet if holding material open uPnL loss)",
+  "wallets": [
+    "0xdd7a372377fc633f74ab6e20963803d52f448830",
+    "0x179c17d04be626561b0355a248d6055a80456aa5",
+    "0xd67ca2c6f8bc84acf4fa4472b82a8740dc0a53ff",
+    "0xe4d83945c0322f3d340203a7129b7eb5cacae847",
+    "0xc619b01f1a4f894c5e83338c42f98dcb82b710f5",
+    "0xbb34960afec64f3f1cc78b0c9c342c4657021696",
+    "0x27bcf8047c6fda384f8a93a6e5a140b878fab691",
+    "0x18b8539261cf9e760e7fec4a8a73c50f0ae7babe",
+    "0x999510ad3dd8c94a6659d6401d983137565283e3",
+    "0xa99c9e5484e5b26635c07876d0859a1819ff40d5",
+    "0xa4beb4fbe651b00bc16d472e2e1aa1c26b3d90aa",
+    "0x2c5dc7e67fce4bc252221c46c1cdc7651838b2d8",
+    "0x6bea81d7a0c5939a5ce5552e125ab57216cc597f",
+    "0x7f47bf4025bd2178741058a10cd829e406ef4d0c",
+    "0x12808ee0d6b9fd4723487b3dc110452b2bf75fba",
+    "0x9836e286fbf4f71998827d4bd6ea3b470c26457e",
+    "0x4f24303e0af2e4a94abcd516a3c80d38262bde6a",
+    "0x7e19c25679a5f4cc1351e80d428ebe6df929adb1",
+    "0xe2823659be02e0f48a4660e4da008b5e1abfdf29",
+    "0x63d417a577b50c96f4f09148d4e4d70950db0522"
+  ]
+}

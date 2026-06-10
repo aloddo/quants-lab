@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
@@ -249,6 +250,7 @@ class PnLTracker:
                                 "entry_px": float(p["entryPx"]),
                                 "upnl": float(p["unrealizedPnl"]),
                                 "notional": float(p["positionValue"]),
+                                "margin_used": float(p.get("marginUsed", 0) or 0),
                             })
                     success = True
                     break
@@ -352,7 +354,7 @@ class PnLTracker:
         net = stats["total_pnl"] - stats["total_fees"]
 
         lines = []
-        lines.append("V12 PnL Report")
+        lines.append("V15 PnL Report")
         lines.append("")
 
         # Strategy totals
@@ -397,16 +399,58 @@ class PnLTracker:
             lines.append(f"OPEN: {len(positions)} pos, ${total_notional:.0f} notional, uPnL ${total_upnl:.2f}")
             for p in sorted(positions, key=lambda x: abs(x["notional"]), reverse=True):
                 side = "LONG" if p["size"] > 0 else "SHORT"
-                lines.append(f"  {p['coin']} {side} ${abs(p['notional']):.0f} uPnL ${p['upnl']:.2f}")
+                ep = p.get("entry_px", 0.0)
+                eps = (f"{ep:.6g}" if ep else "?")          # avg entry / breakeven price
+                lines.append(f"  {p['coin']} {side} ${abs(p['notional']):.0f} @ {eps} uPnL ${p['upnl']:.2f}")
         # Surface incomplete-report warning if any dex query failed all retries
         if incomplete_info:
             failed = incomplete_info[0].get("failed_dexes", [])
             lines.append("")
             lines.append(f"⚠ REPORT INCOMPLETE: dex query failed for {failed} (HL rate limit?). Re-run for full view.")
 
-        # Equity (HL only for copy trading report)
+        # Equity (HL spot USDC only, rule 16). Report TRUE margin used (sum of per-position
+        # HL marginUsed == marginSummary.totalMarginUsed), NOT notional/equity (that is gross
+        # leverage, which was previously mislabeled "Margin"). Alberto correction 2026-06-02.
         if equity > 0:
-            lines.append(f"\nEQUITY: ${equity:.2f} | Margin: {total_notional/equity*100:.0f}%")
+            total_margin = sum(p.get("margin_used", 0) for p in positions)
+            mu_pct = total_margin / equity * 100
+            gross_x = total_notional / equity
+            lines.append(f"\nEQUITY: ${equity:.2f} | Margin used: ${total_margin:.0f} ({mu_pct:.0f}%) | Gross: {gross_x:.1f}x")
+            # Fold in the live copy-trading status (PnL%/peak/DD/stop/leaders) that the engine persists,
+            # so this single PNG report carries everything the old (now-disabled) engine text report had.
+            try:
+                _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                _sp = os.path.join(_repo, "app", "data", "v15", "v15_live_status.json")
+                if os.path.exists(_sp):
+                    with open(_sp) as _sf:
+                        st = json.load(_sf)
+                    if time.time() - st.get("ts", 0) <= 1200:  # fresh within a report cycle
+                        dist = (st["total_value"] - st["stop_at"]) / st["total_value"] * 100 if st.get("total_value") else 0
+                        lines.append(
+                            f"Account ${st['total_value']:.2f} (spot+uPnL) | PnL {st['pnl_pct']:+.1f}% | "
+                            f"peak ${st['peak']:.2f} | DD {st['dd_pct']:.1f}%")
+                        lines.append(
+                            f"Stop -{st['stop_pct']*100:.0f}% @ ${st['stop_at']:.2f} (dist {dist:.0f}%)"
+                            + (" | HALTED" if st.get("halted") else "")
+                            + f" | Leaders {st['n_active']}/{st['n_leaders']}")
+                        # PER-LEADER breakdown (their live book + THEIR uPnL) -- Alberto 2026-06-02.
+                        leaders = st.get("leaders") or []
+                        if leaders:
+                            lines.append("\nPER-LEADER — their book | contribution to OUR book:")
+                            for L in leaders:
+                                if not L.get("ok"):
+                                    lines.append(f"  {L['addr']}: stale")
+                                    continue
+                                av = L["av"]
+                                avs = f"${av/1000:.1f}k" if av >= 1000 else f"${av:.0f}"
+                                coins = ",".join(L.get("coins") or []) or "flat"
+                                ours = L.get("our_notional", 0)
+                                ourup = L.get("our_upnl", 0.0)
+                                lines.append(
+                                    f"  {L['addr']}: {avs} their-uPnL ${L['upnl']:+.0f} ({L['upnl_pct']:+.0f}%) | "
+                                    f"OURS ${ours:.0f} uPnL ${ourup:+.1f} | {coins}")
+            except Exception as _e:
+                logger.warning(f"status fold-in failed: {_e}")
 
         return "\n".join(lines)
 
@@ -558,7 +602,7 @@ class PnLTracker:
             )
 
         ax.set_title(
-            f"Copy Trader V12 -- {closed_count} closed, {open_count} open",
+            f"Copy Trader V15 -- {closed_count} closed, {open_count} open",
             fontsize=13, fontweight="bold",
         )
         ax.set_ylabel("Cumulative PnL ($)")
@@ -594,7 +638,7 @@ class PnLTracker:
                     else:
                         requests.post(
                             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
-                            data={"chat_id": TG_CHAT_ID, "caption": "V12 Equity Curve"},
+                            data={"chat_id": TG_CHAT_ID, "caption": "V15 Equity Curve"},
                             files={"photo": photo},
                             timeout=15,
                         )
@@ -638,7 +682,7 @@ def main():
             dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             since_ms = int(dt.timestamp() * 1000)
         elif args.epoch:
-            since_ms = 1779018120000  # May 17 11:42 UTC 2026
+            since_ms = 1780374300000  # V15 launch 2026-06-02 04:25 UTC (V15 prop-copy go-live)
         elif args.daily:
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             since_ms = int(today.timestamp() * 1000)

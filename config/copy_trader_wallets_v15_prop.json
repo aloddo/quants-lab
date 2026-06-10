@@ -1,0 +1,49 @@
+{
+  "global": {
+    "sizing_mode": "proportional",
+    "gross_cap": 1000000000.0,
+    "max_margin_util": 0.95,
+    "max_daily_loss": -15.0,
+    "order_size_usd": 11.0,
+    "min_entry_notional": 10.0,
+    "target_equity_max_age_s": 120,
+    "max_leverage_cap": 40,
+    "cooldown_s": 30,
+    "exit_poll_s": 10,
+    "exit_min_trim_pct": 0.05,
+    "exit_min_trim_usd": 3.0,
+    "max_chase_bps": 15,
+    "max_spread_bps": 20,
+    "min_book_depth_usd": 3000,
+    "global_stop_pct": 0.15,
+    "leader_drop_upnl_pct": -0.35,
+    "leader_reinclude_upnl_pct": -0.1,
+    "mark_max_age_s": 30,
+    "trim_over_frac": 0.2,
+    "margin_reserve_max_lev": 10,
+    "gross_backstop_x": 1000000000.0,
+    "sizing_leverage": 1.0
+  },
+  "defaults": {
+    "group": "v15_survivors",
+    "entry_mode": "instant",
+    "twap_window_s": 0,
+    "min_twap_notional": 0,
+    "max_addon_multiplier": 50,
+    "max_coin_concentration": 1.0,
+    "exit_type": "FIRST_CLOSE",
+    "sl_bps": -1500,
+    "trail_activate_bps": null,
+    "trail_bps": null,
+    "max_hold_s": 604800,
+    "exit_twap_min_notional": 50
+  },
+  "wallets": {
+    "0xc22db2c04e054786426671cec0b766c07304fb20": {
+      "group": "v15_copy_edge"
+    },
+    "0x61cc8482401e12fb70f03dff2fa1c326c434e60f": {
+      "group": "v15_copy_edge"
+    }
+  }
+}

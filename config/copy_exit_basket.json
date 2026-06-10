@@ -1,0 +1,10 @@
+{
+  "method": "venue_native_exit_copy_v1",
+  "note": "Venue-native qualifying wallets (codex eligibility gates: >=10 builder cycles, >=50% liquid-builder notional, positive gross cycle expectancy, no single cycle >50% PnL) on xyz:CL/xyz:SILVER. Seed basket from the sample scan (app/data/v15/venue_native_sample_quals.json) + 0xfa1690f2 (frozen-set qualifier). Full universe scan (app/data/v15/venue_native_quals_full.json) will expand this.",
+  "wallets": [
+    "0xfa1690f2778f1f78c24da9f33eb63c8965293e84",
+    "0xb69f4adea35510b9ce0dd45522a62443ce1380fb",
+    "0x7812c1c1803821a418a088bb3a523fdd63e5a512",
+    "0xe49408ce9aa0dfa8648b7960955c4869786bcba9"
+  ]
+}

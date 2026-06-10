@@ -84,9 +84,12 @@ def main():
         return h, blk
 
     def oracle_at(target):
-        """Latest setOracle price per coin at-or-before target. Scan target's file;
-        if empty (no setOracle in this ~window) step back a file (~100 blocks)."""
+        """Latest setOracle ORACLE and MARK price per coin at-or-before target. Scan target's
+        file; if empty (no setOracle in this ~window) step back a file (~100 blocks).
+        mark = markPxs[0] (the price HL uses for accountValue/uPnL; oracle is FUNDING-only and
+        WRONG for m2m -- this mark_px is the field M01 get_mark/_markpx_lookup reads)."""
         out: dict[str, float] = {}
+        mark: dict[str, float] = {}
         h, blk = height_for_time(target)
         for _ in range(4):
             for b in blk:
@@ -96,13 +99,22 @@ def main():
                 for tx in b.get("txs", []):
                     for a in tx.get("actions", []):
                         if isinstance(a, dict) and "setOracle" in a:
-                            for coin, px in a["setOracle"]["oraclePxs"]:
+                            so = a["setOracle"]
+                            for coin, px in so.get("oraclePxs", []):
                                 out[coin] = float(px)
+                            # markPxs: outer list len 0/1/2; [0] is the per-coin [coin, px] mark list
+                            mp = so.get("markPxs") or []
+                            if mp:
+                                for coin, px in mp[0]:
+                                    try:
+                                        mark[coin] = float(px)
+                                    except (TypeError, ValueError):
+                                        pass
             if out:
                 break
             h -= 100
             blk = readf(h)
-        return out
+        return out, mark
 
     coll = MongoClient(args.mongo_uri)[args.mongo_db][args.collection]
     coll.create_index([("coin", 1), ("timestamp_utc", 1)], unique=True)
@@ -119,7 +131,7 @@ def main():
     n_snap = 0
     while cur <= end:
         try:
-            o = oracle_at(cur)
+            o, mk = oracle_at(cur)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"  {cur}: {e!r}")
             cur += cadence
@@ -129,7 +141,8 @@ def main():
             ops = [
                 UpdateOne(
                     {"coin": c, "timestamp_utc": ts_ms},
-                    {"$set": {"coin": c, "timestamp_utc": ts_ms, "oracle_px": px, "source": "s3_setOracle"}},
+                    {"$set": {"coin": c, "timestamp_utc": ts_ms, "oracle_px": px,
+                              "mark_px": mk.get(c), "source": "s3_setOracle"}},
                     upsert=True,
                 )
                 for c, px in o.items()

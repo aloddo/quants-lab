@@ -43,7 +43,9 @@ MIN_JOURNEYS_PRETEST = 3
 HOLD_FLOOR_S = 60.0                 # measured from V11 copy-path latency (p95~15s -> max(2*15,60)=60)
 SWING_MAX_HOLD_S = 48 * 3600.0      # upper hold gate: V15 copies FAST directional (minutes-to-hours);
                                     # reject multi-day/week holders (median hold > 48h)
-P95_COPY_LATENCY_S = 15.0           # WS copy path: median ~1s, but P95 tail can hit 15s (Alberto 2026-06-05)
+P95_COPY_LATENCY_S = 2.0            # Alberto 2026-06-09: real copy latency is max ~2s (not 15s). The 15s
+                                    # gate was rejecting wallets whose edge lands in the 2-15s window, which
+                                    # we CAN copy at 2s. M7's sim already uses copy_latency_ms=2000.
 SHARE_BELOW_LATENCY_CAP = 0.25
 ACCESSIBLE_FRAC_MIN = 0.80
 ROE_FULL_FLOOR_G5 = 0.50            # full-window pool gate only
@@ -182,8 +184,24 @@ def _empty_jm() -> dict:
             "censored_max_hold_s": 0.0}
 
 
+# Alberto 2026-06-09: M5 was doing TWO jobs -- copyability filtering (legit) AND performance pre-judging
+# (net_pnl/roe/days_green), which starves M6b ranking (only ~20 already-profitable wallets reach it) and
+# makes the pool artificially negative-mean OOS. COPYABILITY_ONLY mode (env M5_COPYABILITY_ONLY=1) keeps the
+# copyability/risk gates but does NOT let the performance gates block eligibility (they're still RECORDED in
+# fail_reasons for audit). This widens the eligible pool ~175 -> ~2,383 entity-folds so M6b can RANK
+# performance instead of M5 pre-gating it. Default OFF -> byte-identical to the strict pipeline.
+import os as _os
+COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+# performance fails (judged by ranking, not eligibility) vs risk/copyability fails (hard exclusions)
+_PERF_FAIL_PREFIXES = ("net_pnl<=0", "roe<=0", "days_green<")
+
+
 def apply_floors(eqm: dict, jm: dict) -> tuple[bool, list[str]]:
-    """Per-fold pretest floors. Returns (eligible, fail_reasons)."""
+    """Per-fold pretest floors. Returns (eligible, fail_reasons).
+
+    In COPYABILITY_ONLY mode, performance fails (net_pnl/roe/days_green) are recorded in fail_reasons but do
+    NOT block eligibility -- only risk/copyability fails do. structural_ruin STAYS a hard risk gate.
+    """
     f = []
     if jm["net_pnl"] <= 0:
         f.append(f"net_pnl<=0 ({jm['net_pnl']:.1f})")
@@ -226,6 +244,10 @@ def apply_floors(eqm: dict, jm: dict) -> tuple[bool, list[str]]:
     af = jm["accessible_frac_notional"]
     if af == af and af < ACCESSIBLE_FRAC_MIN:
         f.append(f"accessible_frac<{ACCESSIBLE_FRAC_MIN:.0%} ({af:.0%})")
+    if COPYABILITY_ONLY:
+        # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
+        blocking = [x for x in f if not x.startswith(_PERF_FAIL_PREFIXES)]
+        return (len(blocking) == 0, f)
     return (len(f) == 0, f)
 
 

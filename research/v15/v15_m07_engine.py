@@ -69,8 +69,15 @@ MIN_ORDER_NOTIONAL = 10.0                   # HL ~$10 min order
 SLIP_BANDS = {"low": 0.5, "base": 1.0, "high": 2.0}
 DEFAULT_IMPACT_K_BPS = 8.0
 DEFAULT_IMPACT_ALPHA = 0.5
+BLOCK_MS = 14 * 86_400_000        # CHANGE 1: 14d consistency sub-split block (M6b D4 anchor cadence)
 DEFAULT_HALF_SPREAD_BPS = 1.0
 CAPACITY_PARTICIPATION_CAP = 0.05           # execution-reality depth cap (NOT allocation)
+
+# CHANGE B: latency adverse-drift haircut tunable (latency_model="bar_drift_v1"). Multiplies the
+# fraction-of-a-1m-bar our copy latency spans by the bar's |directional move|, applied ALWAYS-adverse
+# to a late taker (a BUY in an up-bar / a SELL in a down-bar fills worse). 1m-RESOLUTION APPROXIMATION
+# pending real sub-minute (HL trades / L2 book) data -- see _apply_order.
+LAT_DRIFT_K = 1.0
 
 ISOLATED_ONLY_DEXES = {"xyz", "flx", "vntl", "hyna", "km", "abcd", "cash", "para"}
 
@@ -245,6 +252,16 @@ class MarketData:
         self._funding: dict[str, tuple] = {}
         self.meta = HLMeta().load()
         self.fees = FeeSchedule()
+        # D1: active per-coin slippage calibration table (set per-fold by the runner; default empty ->
+        # prior + uncalibrated for every coin = the shipped behavior).
+        self.slip_calib_table: dict = {}
+        self.slip_calib_version: Optional[str] = None
+
+    def set_slip_calib(self, table: Optional[dict], version: Optional[str]) -> None:
+        """Install the active per-coin calib table {coin -> {base_half_spread_bps, impact_k_bps,
+        impact_alpha, covered}} for the fold being stepped. None -> clears (prior-only)."""
+        self.slip_calib_table = table or {}
+        self.slip_calib_version = version
 
     def _mongo(self):
         if self._db is None:
@@ -338,21 +355,43 @@ class MarketData:
         """Strictly-trailing liquidity as of ts (only COMPLETED bars, i.e. bar_open <= ts-60s).
         Calibrated impact artifact would override k/alpha per bucket; absent -> conservative prior +
         uncalibrated flag (design D13)."""
+        # D1: a calibrated coin (covered in the active fold's calib table) overrides the prior
+        # half-spread + impact params and CLEARS uncalibrated. ADV/capacity stays bar-derived (V11
+        # fills only calibrate the spread INTERCEPT, not ADV/the impact slope -> those stay prior).
+        cal = self.slip_calib_table.get(coin)
+        cal_cov = bool(cal and cal.get("covered"))
         mins, _o, h, low, c = self.ohlc(coin)
         if mins.size == 0:
-            return {"adv": 0.0, "half_spread_bps": DEFAULT_HALF_SPREAD_BPS, "uncalibrated": True}
+            return self._liq_prior(0.0, cal, cal_cov)
         end_key = (ts_ms // MS_MIN) * MS_MIN - MS_MIN     # last completed bar
         i = int(np.searchsorted(mins, end_key, side="right"))   # exclusive upper on completed bars
         lo = max(0, i - 1440)
         if i <= lo:
-            return {"adv": 0.0, "half_spread_bps": DEFAULT_HALF_SPREAD_BPS, "uncalibrated": True}
+            return self._liq_prior(0.0, cal, cal_cov)
         cc, hh, ll = c[lo:i], h[lo:i], low[lo:i]
         mean_px = np.nanmean(cc) if cc.size else float("nan")
         rng = np.nanmean((hh - ll) / np.where(cc == 0, np.nan, cc)) if cc.size else float("nan")
-        half_spread_bps = float(np.clip((rng * 1e4) / 2.0 if rng == rng else DEFAULT_HALF_SPREAD_BPS,
+        bar_half_spread = float(np.clip((rng * 1e4) / 2.0 if rng == rng else DEFAULT_HALF_SPREAD_BPS,
                                         DEFAULT_HALF_SPREAD_BPS, 50.0))
         adv = float(mean_px) * 1440.0 if mean_px == mean_px else 0.0
-        return {"adv": adv, "half_spread_bps": half_spread_bps, "uncalibrated": True}
+        if cal_cov:
+            return {"adv": adv, "half_spread_bps": float(cal["base_half_spread_bps"]),
+                    "impact_k_bps": float(cal.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)),
+                    "impact_alpha": float(cal.get("impact_alpha", DEFAULT_IMPACT_ALPHA)),
+                    "uncalibrated": False}
+        return {"adv": adv, "half_spread_bps": bar_half_spread, "uncalibrated": True}
+
+    def _liq_prior(self, adv: float, cal: Optional[dict], cal_cov: bool) -> dict:
+        """No-bar fallback. CALIBRATION is a per-coin structural property (v2: every coin has a class
+        comp), independent of whether trailing bars exist at this ts -> a COVERED coin still returns
+        its calibrated half-spread with uncalibrated=False (adv=0 disables the bar-derived capacity/
+        impact, which stays prior). Only a coin with NO calibration flags uncalibrated."""
+        if cal_cov:
+            return {"adv": adv, "half_spread_bps": float(cal["base_half_spread_bps"]),
+                    "impact_k_bps": float(cal.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)),
+                    "impact_alpha": float(cal.get("impact_alpha", DEFAULT_IMPACT_ALPHA)),
+                    "uncalibrated": False}
+        return {"adv": adv, "half_spread_bps": DEFAULT_HALF_SPREAD_BPS, "uncalibrated": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -398,6 +437,10 @@ class EngineParams:
     slippage_band: str = "base"
     adl_stress: bool = False
     start_policy: str = "future_delta_only"   # future_delta_only | causal_carry_in (design D9)
+    follower_trail: Optional[float] = None     # FOLLOWER trailing exit ("exit before them"): if our copy
+    # equity draws down >= follower_trail from its running peak, FLATTEN all positions and sit out the rest
+    # of the fold (independent of source). None = disabled (copy source exposure verbatim). Checked at
+    # every action boundary + fold-end using REAL engine equity (fills/fees/funding/liq priced in).
 
 
 # --------------------------------------------------------------------------- #
@@ -423,6 +466,88 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
 
     band = SLIP_BANDS.get(params.slippage_band, 1.0)
     peak_equity = float(start_equity)
+    follower_halted = [False]   # follower trailing-exit latch (list for closure mutation)
+
+    def _flatten_all(ts):
+        """GUARANTEED close-all for the breaker (codex review bug #5). Closes EVERY open position in
+        full at ts via force_close (no min-notional / capacity skip). Pricing falls back causal mark ->
+        realized mark -> entry_px so a momentarily-uncovered coin is still closed (never silently left
+        open). Any sub-lot residual that force_close cannot book is dropped to cash at its entry value."""
+        for c in list(st.positions.keys()):
+            p = st.positions.get(c)
+            if p is None or p.szi == 0.0:
+                continue
+            m = md.mark(c, ts, causal=True)
+            if m is None or m != m or m <= 0:
+                m = md.mark(c, ts, causal=False)
+            if m is None or m != m or m <= 0:
+                m = p.entry_px      # last-resort: realize 0 PnL at entry rather than leave it open
+            if m is None or m != m or m <= 0:
+                continue            # cannot price at all (handled by residual drop below)
+            _apply_order(st, md, c, -p.szi, m, ts, {"action_type": "FOLLOWER_TRAIL_EXIT", "ts": ts},
+                         params, band, fills, events, summary, force_close=True)
+        # residual safety net: any position still open (unpriceable / sub-lot dust) -> drop to cash at
+        # entry value so NO exposure survives the halt and equity stays well-defined.
+        for c in list(st.positions.keys()):
+            p = st.positions.get(c)
+            if p is None:
+                continue
+            if p.mode == "isolated":
+                st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin
+            del st.positions[c]
+            _rt_close(summary, c)   # CHANGE A: residual flatten ends the round-trip
+
+    def _trail_fire(cur_eq, ts):
+        """FOLLOWER trailing-exit state machine. Updates the running peak from REAL equity at THIS
+        observation point (codex bug #4/#8), then if drawdown-from-peak >= params.follower_trail: flatten
+        ALL positions (guaranteed), latch halted (no un-halt this fold), record ruin if the post-flatten
+        equity is non-positive (codex bug #6). Returns post-flatten equity. No-op (and does NOT touch the
+        peak) when disabled -> the follower_trail=None path is byte-identical to pre-breaker."""
+        nonlocal peak_equity
+        if params.follower_trail is None or follower_halted[0]:
+            return cur_eq
+        if cur_eq > peak_equity:
+            peak_equity = cur_eq
+        if peak_equity <= 0 or (peak_equity - cur_eq) / peak_equity < params.follower_trail:
+            return cur_eq
+        _flatten_all(ts)
+        follower_halted[0] = True
+        post_eq = st.equity(_marks(st, md, ts))
+        events.append({"ts": ts, "event_type": "follower_trail_exit", "entity_id": entity_id,
+                       "fold_id": fold_id, "trail": params.follower_trail,
+                       "peak_equity": float(peak_equity), "trigger_equity": float(cur_eq)})
+        if post_eq <= 0 and not summary["ruin"]:
+            _ruin(st, md, summary, events, ts)
+        return post_eq
+
+    # CHANGE 1: block-boundary anchors b_k = start_ts + k*14d in [start_ts, end_ts) (fold_start = b_0;
+    # interior = block_boundary; the fold_end sample is the final anchor). `_emit` is a PURE-READ
+    # observer threaded into _advance_between: it appends boundary equity samples ONLY (never touches
+    # fills/events/summary/state) -> existing outputs byte-identical. Equity at b uses mark(b).
+    if start_ts_ms is not None:
+        _bstart = int(start_ts_ms)
+    elif not actions.empty:
+        _bstart = int(actions["ts"].min())
+    else:
+        _bstart = int(end_ts_ms)
+    boundaries_q = []
+    k = 0
+    while True:
+        b = _bstart + k * BLOCK_MS
+        if b >= end_ts_ms:
+            break
+        boundaries_q.append(b)
+        k += 1
+    _bi = [0]
+
+    def _emit(cursor_ts, state):
+        if cursor_ts is None:
+            return
+        while _bi[0] < len(boundaries_q) and boundaries_q[_bi[0]] <= cursor_ts:
+            b = boundaries_q[_bi[0]]; _bi[0] += 1
+            eqb = state.equity(_marks(state, md, b))
+            flag = "fold_start" if b == _bstart else "block_boundary"
+            equity_samples.append(_eq_sample(entity_id, fold_id, b, eqb, flag, state, summary["max_dd"]))
 
     rows = actions.sort_values(["ts", "event_order"]).to_dict("records") if not actions.empty else []
     # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
@@ -438,21 +563,55 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     if rows and params.start_policy == "causal_carry_in":
         _seed_carry_in(st, md, rows[0], params, summary)
 
+    # FOLLOWER-TRAIL peak init (codex review bug #8): when carrying state into the fold, the breaker peak
+    # must start from the REAL marked equity at fold start, not the caller's (possibly stale) start_equity
+    # scalar -- otherwise a chained fold can fire/suppress wrongly at t0. Gated on follower_trail so the
+    # disabled path keeps the original peak (max_dd byte-identical).
+    if params.follower_trail is not None and start_state is not None:
+        _pe = st.equity(_marks(st, md, prev_ts))
+        if _pe == _pe and _pe > peak_equity:
+            peak_equity = _pe
+
+    # CHANGE 2 tracking_error state: the SOURCE signed target vector + the open interval's L1/active.
+    src_target: dict = {}
+    te_prev_ts = None
+    te_prev_l1 = 0.0
+    te_prev_active = False
+
+    def _te_accrue(to_ts):
+        """accrue the open interval [te_prev_ts, to_ts) at the held L1 (active intervals only)."""
+        nonlocal te_prev_ts
+        if te_prev_ts is not None and to_ts > te_prev_ts and te_prev_active:
+            dt = to_ts - te_prev_ts
+            summary["_te_weighted_sum"] += dt * te_prev_l1
+            summary["tracking_error_active_ms"] += dt
+
     for a in rows:
         coin = a["coin"]
         if coin_is_spot(coin):
             continue
         our_ts = int(a["ts"]) + params.copy_latency_ms
 
-        _advance_between(st, md, prev_ts, our_ts, params, events, summary)
+        _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit)
         if summary["ruin"]:
             break
 
         marks = _marks(st, md, our_ts, extra=coin)
         cur_eq = st.equity(marks)
         if cur_eq <= 0:
-            _ruin(st, summary, events, our_ts)
+            _ruin(st, md, summary, events, our_ts)
             break
+
+        # FOLLOWER trailing exit: check on the freshly-advanced equity BEFORE copying this action. If we
+        # breach, flatten + latch; once halted we stop copying source entries for the rest of the fold.
+        cur_eq = _trail_fire(cur_eq, our_ts)
+        if summary["ruin"]:
+            break
+        if follower_halted[0]:
+            equity_samples.append(_eq_sample(entity_id, fold_id, our_ts, cur_eq, "action", st, summary["max_dd"]))
+            summary["_core_final_eq"] = cur_eq
+            prev_ts = our_ts
+            continue
 
         mark = marks.get(coin)
         if mark is None or mark != mark or mark <= 0:
@@ -467,7 +626,8 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         target_notional = tgt_pct * cur_eq
         target_szi = target_notional / mark
         cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
-        if str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0:
+        exit_cond = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
+        if exit_cond:
             target_szi = 0.0
         delta_szi = target_szi - cur_szi
 
@@ -478,22 +638,81 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         peak_equity = max(peak_equity, eq)
         if peak_equity > 0:
             summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
+        # FOLLOWER trailing exit POST-FILL (codex review bug #3): this action just changed exposure; the
+        # fill's fee/slippage/marking can itself breach the trail -> check again immediately so we never
+        # stay exposed past the threshold until the NEXT action.
+        eq = _trail_fire(eq, our_ts)
+        if peak_equity > 0:
+            summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
         equity_samples.append(_eq_sample(entity_id, fold_id, our_ts, eq, "action", st, summary["max_dd"]))
-        if eq <= 0:
-            _ruin(st, summary, events, our_ts)
+        summary["_core_final_eq"] = eq
+        # CHANGE 2: close the prior interval, fold in THIS action's source target, open a new interval.
+        _te_accrue(our_ts)
+        src_target[coin] = (0.0 if exit_cond else tgt_pct)
+        te_prev_l1, te_prev_active = _te_l1_active(st, md, src_target, our_ts)
+        te_prev_ts = our_ts
+        if eq <= 0 and not summary["ruin"]:
+            _ruin(st, md, summary, events, our_ts)
             break
+        if summary["ruin"] or follower_halted[0]:
+            prev_ts = our_ts
+            continue
         prev_ts = our_ts
 
     # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
     # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
     if not summary["ruin"] and end_ts_ms > prev_ts:
-        _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary)
+        _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary, _emit=_emit)
         marks = _marks(st, md, end_ts_ms)
         eq = st.equity(marks)
         peak_equity = max(peak_equity, eq)
         if peak_equity > 0:
             summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
+        # FOLLOWER trailing exit at FOLD END (codex review bug #2): catches a breach from a no-action
+        # fold, a single-action fold, or a post-last-action drawdown via funding/MTM/liquidation that the
+        # per-action checks cannot see. Flattens so the carried state into the next chained fold is flat.
+        eq = _trail_fire(eq, end_ts_ms)
+        if peak_equity > 0:
+            summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
         equity_samples.append(_eq_sample(entity_id, fold_id, end_ts_ms, eq, "fold_end", st, summary["max_dd"]))
+        summary["_core_final_eq"] = eq
+
+    # D2 post-ruin closeout: after ruin, _ruin() cleared positions + zeroed cash -> equity 0. Emit
+    # zero-equity samples at every REMAINING block boundary + a fold_end anchor so M6b block ROE has no
+    # silent gap (any block at/after ruin reads eq=0 -> -100%, counts as NON-positive, never positive).
+    if summary["ruin"]:
+        while _bi[0] < len(boundaries_q):
+            b = boundaries_q[_bi[0]]; _bi[0] += 1
+            equity_samples.append(_eq_sample(entity_id, fold_id, b, 0.0, "block_boundary", st, summary["max_dd"]))
+        equity_samples.append(_eq_sample(entity_id, fold_id, end_ts_ms, 0.0, "fold_end", st, summary["max_dd"]))
+
+    # CHANGE 2 TE finalize.
+    if not summary["ruin"]:
+        _te_accrue(end_ts_ms)                          # flush the open interval to fold end
+    else:
+        # D3: flush the pre-ruin interval to the ruin instant (our tracked exposure), then the SOURCE
+        # keeps trading while our exposure is forced 0 -> full penalty = sum|source target| accrued
+        # time-weighted to fold_end, advancing the source target vector read-only over later actions.
+        rt = int(summary.get("time_to_ruin_ms") or end_ts_ms)
+        _te_accrue(rt)
+        cur = rt
+        for a in rows:
+            ats = int(a["ts"]) + params.copy_latency_ms
+            if ats <= rt or coin_is_spot(a["coin"]):
+                continue
+            pen = sum(abs(v) for v in src_target.values() if v == v)
+            if ats > cur and pen > 0:
+                summary["_te_weighted_sum"] += (ats - cur) * pen
+                summary["tracking_error_active_ms"] += (ats - cur)
+            tp = _f(a.get("target_exposure_pct"))
+            if tp == tp:
+                ex = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
+                src_target[a["coin"]] = (0.0 if ex else tp)
+            cur = ats
+        pen = sum(abs(v) for v in src_target.values() if v == v)
+        if end_ts_ms > cur and pen > 0:
+            summary["_te_weighted_sum"] += (end_ts_ms - cur) * pen
+            summary["tracking_error_active_ms"] += (end_ts_ms - cur)
 
     return _finalize(st, fills, events, equity_samples, summary, md, start_equity)
 
@@ -508,6 +727,20 @@ def _new_summary(entity_id, fold_id, start_equity, n_actions, params, md):
         "slippage_band": params.slippage_band, "start_policy": params.start_policy,
         "slippage_uncalibrated": False, "metadata_uncertain": False, "mode_uncertain": False,
         "fee_unversioned": (not md.fees.versioned), "ruin": False,
+        "slippage_calibration_version": None,
+        # CHANGE 2 tracking_error accumulators (finalized in _finalize): time-weighted L1 signed
+        # portfolio-vector error over ACTIVE intervals + the active-time denominator.
+        "_te_weighted_sum": 0.0, "tracking_error_active_ms": 0,
+        # CHANGE 1: final_equity/roe_engine come from the ORIGINAL sample sites (action + non-ruin
+        # fold_end) ONLY -> the new boundary/ruin-drain samples never change them (byte-identical).
+        "_core_final_eq": float(start_equity),
+        # CHANGE A (round-trip aggregates for M6b): realized PnL after OUR costs per CLOSED round-trip
+        # (a coin's position opening from flat and returning to ~0). `_rt` holds the per-coin open
+        # accumulator (realized + funding - fees) since the position last opened from flat; finalized
+        # into the n_round_trips/wins/realized_pnl_total totals when the position closes. Popped in
+        # _finalize. Latency cost is ALREADY priced into each fill_px (CHANGE B), so the accumulated
+        # realized PnL is genuinely after fees+funding+latency.
+        "_rt": {}, "n_round_trips": 0, "n_round_trip_wins": 0, "realized_pnl_total": 0.0,
     }
 
 
@@ -516,9 +749,56 @@ def _eq_sample(entity_id, fold_id, ts, eq, flag, st, dd):
             "event_flag": flag, "n_open_positions": len(st.positions), "dd_from_peak": dd}
 
 
+def _bar_vol_proxy(md: MarketData, coin: str, ts_ms: int) -> float:
+    """CHANGE B helper (CAUSAL FIX, codex finding #3): an UNSIGNED causal volatility proxy = the
+    |return| of the PRIOR COMPLETED 1m bar (bar_open <= ts - 60s), i.e. the last bar that has closed
+    BEFORE our fill timestamp. Using the CONTAINING bar's (close-open) was non-causal (within-minute
+    future info / look-ahead). The prior bar is fully observable before our_ts, so it removes the
+    look-ahead while preserving the discriminating power: high prior-bar vol = scalper/UHFT territory
+    is still penalized. This is a conservative CAUSAL VOL-PROXY APPROXIMATION of the unknown realized
+    within-minute drift our late fill eats, pending real sub-minute (HL trades / L2) data. Always >= 0
+    (magnitude only); the adverse SIGN is applied by the caller via the order side. NaN if the prior
+    bar is uncovered/zero-priced (-> no haircut)."""
+    mins, o, h, low, c = md.ohlc(coin)
+    if mins.size == 0:
+        return float("nan")
+    key = (ts_ms // MS_MIN) * MS_MIN - MS_MIN     # the bar that CLOSED before ts (prior completed bar)
+    i = int(np.searchsorted(mins, key, side="right")) - 1
+    if i < 0:
+        return float("nan")
+    op, cl = o[i], c[i]
+    if op != op or cl != cl or op == 0.0:
+        # fall back to the prior bar's high-low range as the vol proxy if open/close are degenerate
+        hi, lo = h[i], low[i]
+        if hi != hi or lo != lo or op == 0.0:
+            return float("nan")
+        return abs(float((hi - lo) / op)) if op != 0.0 else float("nan")
+    return abs(float((cl - op) / op))
+
+
 def _marks(st: AccountState, md: MarketData, ts_ms: int, extra: Optional[str] = None) -> dict:
     coins = set(st.positions) | ({extra} if extra else set())
     return {c: md.mark(c, ts_ms) for c in sorted(coins)}
+
+
+def _te_l1_active(st, md, src_target: dict, ts_ms: int) -> tuple:
+    """CHANGE 2: the L1 SIGNED portfolio-vector tracking error at ts + whether the interval is ACTIVE.
+    our_pct_c = signed szi_c * mark_c / equity; target_pct_c = the source's signed target exposure.
+    L1 = sum_c |our_pct_c - target_pct_c| (long-vs-short mismatch ADDITIVE, no cancel). active iff
+    EITHER our or target exposure is non-flat (a fully-flat interval is excluded from the TE denom).
+    On equity<=0 our_pct=0 (full penalty = sum|target|)."""
+    marks = _marks(st, md, ts_ms)
+    eq = st.equity(marks)
+    our = {}
+    if eq > 1e-9:
+        for c, p in st.positions.items():
+            m = marks.get(c)
+            if m is not None and m == m:
+                our[c] = p.szi * m / eq
+    tgt = {c: v for c, v in src_target.items() if v == v and v != 0.0}
+    coins = set(our) | set(tgt)
+    l1 = sum(abs(our.get(c, 0.0) - tgt.get(c, 0.0)) for c in coins)
+    return l1, bool(coins)
 
 
 def _seed_carry_in(st, md, first_row, params, summary):
@@ -562,10 +842,17 @@ def _seed_carry_in(st, md, first_row, params, summary):
             summary["outcome_states"].add("carry_in_seeded")
 
 
-def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary):
+def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary,
+                 force_close=False):
     """Order lifecycle (design §4.4): lot round -> min-notional skip -> leverage/IM check -> capacity
     cap (execution depth, recorded) -> fill at slippage price -> versioned fee -> position+bucket
-    update."""
+    update.
+
+    force_close (codex follower-trail review bug #5): a RISK exit (breaker flatten) must reliably close
+    the full position. It still pays realistic fee + slippage, but is NOT blocked by the min-notional
+    skip and is NOT downsized by the participation/capacity cap (you can always market-close in reality;
+    the cap models impact, not an inability to exit). Impact slippage is still charged, with participation
+    clamped to the capacity cap so a forced close eats bounded-realistic (not unbounded) impact."""
     if abs(delta_szi) < 1e-15:
         return
     szdec = md.meta.szdec(coin)
@@ -573,16 +860,18 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
     if abs(delta_szi) < 10 ** (-szdec):
         return
     delta_notional = abs(delta_szi) * mark
-    if delta_notional < MIN_ORDER_NOTIONAL:
+    if delta_notional < MIN_ORDER_NOTIONAL and not force_close:
         return
 
     mode = default_margin_mode(coin)
     liq = md.liquidity(coin, our_ts)
     if liq.get("uncalibrated"):
         summary["slippage_uncalibrated"] = True
+    elif getattr(md, "slip_calib_version", None) is not None:
+        summary["slippage_calibration_version"] = md.slip_calib_version
     adv = liq.get("adv", 0.0)
     capacity_capped = False
-    if adv > 0:
+    if adv > 0 and not force_close:
         max_notional = CAPACITY_PARTICIPATION_CAP * adv
         if delta_notional > max_notional:
             delta_szi *= max_notional / delta_notional
@@ -594,11 +883,36 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
                 return
 
     participation = (delta_notional / adv) if adv > 0 else CAPACITY_PARTICIPATION_CAP
-    impact_bps = DEFAULT_IMPACT_K_BPS * (participation ** DEFAULT_IMPACT_ALPHA) * band
+    if force_close:
+        participation = min(participation, CAPACITY_PARTICIPATION_CAP)   # bounded-realistic exit impact
+    impact_k = liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)        # D1: calibrated-or-prior slope
+    impact_alpha = liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA)
+    impact_bps = impact_k * (participation ** impact_alpha) * band
     half_spread_bps = liq.get("half_spread_bps", DEFAULT_HALF_SPREAD_BPS) * band
     slip_bps = half_spread_bps + impact_bps
     side = 1 if delta_szi > 0 else -1
     fill_px = mark * (1 + side * slip_bps / 1e4)
+
+    # CHANGE B: explicit ADVERSE LATENCY DRIFT (latency_model="bar_drift_v1"). At a 1m mark resolution a
+    # 2s copy latency resolves to the same bar-close price as 0s ~97% of the time, so the latency cost is
+    # otherwise invisible. We charge a haircut = LAT_DRIFT_K * (latency as a fraction of a 1m bar) *
+    # |causal vol proxy|, applied ALWAYS-adverse to a late taker: a BUY fills higher, a SELL fills lower.
+    # CAUSAL FIX (codex finding #3): the vol proxy is the PRIOR COMPLETED bar's |return| (fully known
+    # before our_ts), NOT the containing bar's (close-open) which was within-minute future info (look-
+    # ahead). High prior-bar vol = scalper/UHFT territory is still penalized -> the discriminating power
+    # is preserved while the look-ahead is removed. Conservative CAUSAL VOL-PROXY APPROXIMATION pending
+    # real sub-minute (HL trades / L2 book) data. Determinism: derived from the frozen OHLC cache + the
+    # fixed copy_latency_ms only.
+    lat_frac = min(1.0, params.copy_latency_ms / 60_000.0)   # fraction of a 1m bar our latency spans
+    vol_proxy = _bar_vol_proxy(md, coin, our_ts)             # UNSIGNED |return| of the PRIOR closed bar
+    latency_drift_bps = 0.0
+    if lat_frac > 0.0 and vol_proxy == vol_proxy:
+        # ALWAYS a cost: magnitude scales with the prior-bar vol proxy, and `side` makes it adverse to
+        # our trade. Large exactly on fast directional bars; charged on every copied fill so the latency
+        # haircut is never silently zero.
+        latency_drift = LAT_DRIFT_K * lat_frac * vol_proxy
+        latency_drift_bps = latency_drift * 1e4   # for the slip diagnostic (codex finding #4)
+        fill_px *= (1 + side * latency_drift)
 
     fee_rate = md.fees.taker(coin)
     fee = abs(delta_szi) * fill_px * fee_rate
@@ -646,7 +960,10 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
     summary["n_fills"] += 1
     summary["total_fees"] += fee
     summary["notional_traded"] += delta_notional
-    summary["slip_bps_notional_sum"] += slip_bps * delta_notional
+    # FIX (codex finding #4): include the latency-drift bps in the notional-weighted slip diagnostic so
+    # the reported execution haircut isn't understated (the drift is a real per-fill execution cost
+    # already priced into fill_px above; it must show up in slip_bps_notional_weighted too).
+    summary["slip_bps_notional_sum"] += (slip_bps + latency_drift_bps) * delta_notional
     fills.append({
         "entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
         "our_ts": our_ts, "source_ts": int(a["ts"]), "side": "buy" if side > 0 else "sell",
@@ -654,6 +971,55 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
         "half_spread_bps": float(half_spread_bps), "impact_bps": float(impact_bps), "fee": float(fee),
         "fill_type": "normal", "capacity_capped": bool(capacity_capped), "margin_mode": mode,
     })
+
+
+# --------------------------------------------------------------------------- #
+# CHANGE A — realized round-trip accounting (per-coin accumulator -> M6b aggregates)
+# --------------------------------------------------------------------------- #
+def _rt_open(summary: dict, coin: str):
+    """Start (or re-arm) the round-trip accumulator for `coin` when its position opens from flat."""
+    summary["_rt"][coin] = {"realized": 0.0, "fee": 0.0, "funding": 0.0}
+
+
+def _rt_add(summary: dict, coin: str, realized: float = 0.0, fee: float = 0.0, funding: float = 0.0):
+    """Accumulate realized PnL / fee / funding onto the open round-trip for `coin` (no-op if no open
+    round-trip is being tracked, e.g. a carried-in position seeded before tracking started)."""
+    acc = summary["_rt"].get(coin)
+    if acc is None:
+        return
+    acc["realized"] += realized
+    acc["fee"] += fee
+    acc["funding"] += funding
+
+
+def _rt_realize_terminal(summary: dict, p: "Position", terminal_px: float, extra_loss: float = 0.0):
+    """CHANGE A FIX (codex finding #1): book the FULL terminal loss of a force-closed position into its
+    open round-trip BEFORE _rt_close, so a RUIN / BACKSTOP / LIQUIDATION wipe is correctly a LOSS in
+    realized_pnl_total + round_trip_win_rate (otherwise the RT had only entry-fee/funding and could
+    score as a win). terminal_px is the (adverse / causal) price the position is wiped at; the realized
+    MTM = szi*(terminal_px - entry_px) (signed; deeply negative for the move that wiped it). extra_loss
+    (>=0) is any additional penalty/fee the forced close eats (e.g. liquidation slippage already in
+    terminal_px, so pass 0 there) charged as a positive cost. No-op if no RT is open for the coin."""
+    acc = summary["_rt"].get(p.coin)
+    if acc is None:
+        return
+    realized = p.szi * (terminal_px - p.entry_px)
+    acc["realized"] += realized
+    if extra_loss:
+        acc["fee"] += float(extra_loss)
+
+
+def _rt_close(summary: dict, coin: str):
+    """Finalize a CLOSED round-trip: realized PnL after OUR costs = realized - fees + funding (funding
+    is already signed: negative = paid). Pushes into the summary totals and clears the accumulator."""
+    acc = summary["_rt"].pop(coin, None)
+    if acc is None:
+        return
+    pnl = acc["realized"] - acc["fee"] + acc["funding"]
+    summary["n_round_trips"] += 1
+    if pnl > 0:
+        summary["n_round_trip_wins"] += 1
+    summary["realized_pnl_total"] += pnl
 
 
 def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fill_px: float,
@@ -673,6 +1039,8 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
         else:
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
         st.positions[coin] = new
+        _rt_open(summary, coin)            # CHANGE A: round-trip opens from flat
+        _rt_add(summary, coin, fee=fee)    # entry fee is a round-trip cost
         return
 
     reducing = (p.szi > 0 and delta_szi < 0) or (p.szi < 0 and delta_szi > 0)
@@ -688,6 +1056,8 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
         else:
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
         del st.positions[coin]
+        _rt_add(summary, coin, realized=realized, fee=fee)   # CHANGE A: book exit realized + fee
+        _rt_close(summary, coin)                             # ...and finalize the closed round-trip
         return
 
     if (p.szi >= 0) == (new_szi >= 0) and abs(new_szi) > abs(p.szi):
@@ -701,14 +1071,31 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
             p.isolated_margin = target_im
         else:
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
+        _rt_add(summary, coin, fee=fee)    # CHANGE A: add into open round-trip (no realized)
     elif (p.szi >= 0) != (new_szi >= 0):
         p.entry_px = fill_px      # flipped through zero
         if p.mode == "isolated":
             p.isolated_margin += realized - fee
         else:
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+        # CHANGE A: flip-through-zero CLOSES the prior round-trip (the closed portion's realized + fee)
+        # and OPENS a new one for the residual that re-entered on the opposite side.
+        # FIX (codex finding #2): SPLIT the single flip-order fee by closing vs opening notional so each
+        # round-trip bears ITS OWN fee. Previously the WHOLE fee was charged to the closing RT and the
+        # new opposite-side RT opened fee-free -> the closing RT was over-penalized and the new RT was
+        # under-costed (mis-ranking both legs). delta is the flip order; |p.szi| closes, |new_szi| opens.
+        closed_sz = abs(p.szi)
+        opened_sz = abs(new_szi)
+        total_sz = closed_sz + opened_sz
+        close_fee = fee * (closed_sz / total_sz) if total_sz > 0 else fee
+        open_fee = fee - close_fee
+        _rt_add(summary, coin, realized=realized, fee=close_fee)
+        _rt_close(summary, coin)
+        _rt_open(summary, coin)
+        _rt_add(summary, coin, fee=open_fee)   # the opposite-side RT bears its own entry fee
     else:
         # reducing (same side, smaller): realize to bucket
+        _rt_add(summary, coin, realized=realized, fee=fee)   # CHANGE A: partial realized + fee
         if p.mode == "isolated":
             p.isolated_margin += realized - fee
         else:
@@ -731,17 +1118,26 @@ def _apply_funding(st, md, h, summary):
             p.isolated_margin += fund
         p.cum_funding += -fund
         summary["total_funding"] += fund
+        _rt_add(summary, coin, funding=fund)   # CHANGE A: funding is a round-trip cost (signed)
 
 
-def _advance_between(st, md, t0_ms, t1_ms, params, events, summary):
+def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None):
     """CHRONOLOGICAL event loop over (t0,t1] (codex code-r2 #1/#5): interleave hourly funding
     settlements with repeated maintenance-breach scans + liquidations, in time order. A position
     liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
     fold end; the >100k 20%-then-30s-cooldown ladder advances bar-by-bar (the cursor jumps past the
-    cooldown so the next scan does the full close)."""
+    cooldown so the next scan does the full close).
+
+    `_emit(cursor_ts, st)` (CHANGE 1): a PURE-READ boundary-equity observer. Called at each cursor
+    position; it appends to a NEW equity-samples list ONLY (never touches fills/events/summary/state)
+    -> existing outputs are byte-identical. It records equity at any pending block boundary <= cursor."""
     if t0_ms is None or t1_ms <= t0_ms:
+        if _emit is not None:
+            _emit(t0_ms if t0_ms is not None else t1_ms, st)
         return
     cursor = t0_ms
+    if _emit is not None:
+        _emit(cursor, st)
     guard = 0
     while cursor < t1_ms and st.positions and not summary["ruin"]:
         guard += 1
@@ -757,6 +1153,8 @@ def _advance_between(st, md, t0_ms, t1_ms, params, events, summary):
             # resume AFTER this breach minute (and past any liq cooldown just set) so survivors are
             # rescanned and the cooldown elapses before the next (full) liquidation step.
             cursor = max(breach["ts"] + MS_MIN, st.cooldown_until_ms)
+            if _emit is not None:
+                _emit(cursor, st)
         else:
             # no breach this segment -> account healthy. Once the cooldown has elapsed, reset it so a
             # later, independent breach starts fresh with a 20%-first step (not an immediate full close).
@@ -769,10 +1167,14 @@ def _advance_between(st, md, t0_ms, t1_ms, params, events, summary):
                 # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
                 # any same-ts/within-30s double-fire on every caller path -- codex code-r5/r6/r7).
                 _check_maint_at(st, md, seg_end, params, events, summary)
+            if _emit is not None:
+                _emit(cursor, st)
     # FOLD-BOUNDARY solvency: final point-in-time maintenance check at t1 (codex code-r4 #1). The
     # cooldown guard makes this safe even if a post-funding liquidation just fired within 30s of t1.
     if st.positions and not summary["ruin"]:
         _check_maint_at(st, md, t1_ms, params, events, summary)
+    if _emit is not None:
+        _emit(t1_ms, st)
 
 
 def _scan_breach(st: AccountState, md: MarketData, t0_ms: int, t1_ms: int, summary: dict):
@@ -927,7 +1329,9 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
             events.append(_evt(summary, ts_ms, "backstop_transfer", coin, coin_dex(coin)))
             summary["n_backstop_transfer"] += 1
             summary["outcome_states"].add("backstop")
+            _rt_realize_terminal(summary, p, m)   # CHANGE A FIX #1: realize the wipe loss FIRST
             del st.positions[coin]
+            _rt_close(summary, coin)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
         elif iso_eq < maint:
             _liq_close(st, md, coin, m, ts_ms, summary=summary)
 
@@ -943,7 +1347,10 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
         if eq < BACKSTOP_MAINT_FRACTION * maint:
             for c in sorted(coins):
                 events.append(_evt(summary, ts_ms, "backstop_transfer", c, scope))
+                _rt_realize_terminal(summary, st.positions[c],
+                                     marks.get(c) or st.positions[c].entry_px)   # CHANGE A FIX #1
                 del st.positions[c]
+                _rt_close(summary, c)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
             st.cross_collateral[scope] = 0.0
             summary["n_backstop_transfer"] += 1
             summary["outcome_states"].add("backstop")
@@ -999,6 +1406,7 @@ def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
         st.cross_collateral[sc] = st.cross_collateral.get(sc, 0.0) + realized
     else:
         p.isolated_margin += realized
+    _rt_add(summary, coin, realized=realized)   # CHANGE A: forced-liq realized (no fee on liq orders)
     new_szi = p.szi + close_szi
     fl = summary.get("_fills_ref")
     if fl is not None:
@@ -1013,6 +1421,7 @@ def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
         if p.mode == "isolated":
             st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + max(0.0, p.isolated_margin)
         del st.positions[coin]
+        _rt_close(summary, coin)   # CHANGE A: forced full close ends the round-trip
     else:
         p.szi = new_szi
 
@@ -1022,25 +1431,58 @@ def _evt(summary, ts_ms, etype, coin, scope):
             "event_type": etype, "coin": coin, "scope": scope}
 
 
-def _ruin(st: AccountState, summary: dict, events: list, ts_ms: int):
+def _ruin(st: AccountState, md: "MarketData", summary: dict, events: list, ts_ms: int):
     summary["ruin"] = True
     summary["outcome_states"].add("account_ruin")
     if summary["time_to_ruin_ms"] is None:
         summary["time_to_ruin_ms"] = ts_ms
     events.append(_evt(summary, ts_ms, "account_ruin", "", ""))
+    for c in list(st.positions):           # CHANGE A: close any still-open round-trips on ruin
+        p = st.positions[c]
+        # CHANGE A FIX #1: realize the FULL terminal MTM loss vs entry before closing so a ruined
+        # round-trip is a LOSS, not a near-flat win. Price at the causal mark at the ruin instant;
+        # fall back to entry_px only if uncovered (degenerate -> 0 realized, still not a spurious win).
+        m = md.mark(c, ts_ms, causal=True)
+        if m is None or m != m or m <= 0:
+            m = md.mark(c, ts_ms, causal=False)
+        if m is None or m != m or m <= 0:
+            m = p.entry_px
+        _rt_realize_terminal(summary, p, m)
+        _rt_close(summary, c)
     st.positions.clear()
     for k in list(st.cross_collateral):
         st.cross_collateral[k] = 0.0
+    # FIX (codex regression): the action/non-ruin sample sites stamped _core_final_eq with the LAST
+    # positive pre-ruin equity. After ruin the post-ruin closeout emits equity=0 samples, but _finalize
+    # reads _core_final_eq -> summary.final_equity/roe_engine were left STALE (positive). Stamp the
+    # post-ruin equity (0) here so final_equity~=0 and roe_engine~=-1.0, consistent with the realized
+    # round-trip terminal loss already booked. Non-ruin path is untouched (this runs only on ruin).
+    summary["_core_final_eq"] = 0.0
 
 
 def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
     summary.pop("_fills_ref", None)     # internal handle; never written to the summary parquet
-    final_eq = equity_samples[-1]["subaccount_equity"] if equity_samples else float(start_equity)
+    # CHANGE 2: finalize tracking_error = active-time-weighted mean L1 vector error. None when no
+    # active exposure time accrued (-> M6b fidelity stays provisional, never a misleading 0).
+    te_active = summary.get("tracking_error_active_ms", 0)
+    te_sum = summary.pop("_te_weighted_sum", 0.0)
+    summary["tracking_error"] = (te_sum / te_active) if te_active > 0 else None
+    # final_eq from the ORIGINAL sample sites only (byte-identical with the shipped path); the new
+    # boundary/ruin-drain samples never participate.
+    final_eq = float(summary.pop("_core_final_eq", float(start_equity)))
     final_eq = max(0.0, final_eq)   # isolation invariant: equity floored at 0
     summary["final_equity"] = float(final_eq)
     summary["roe_engine"] = (final_eq / start_equity - 1.0) if start_equity > 0 else 0.0
     summary["slip_bps_notional_weighted"] = (
         summary["slip_bps_notional_sum"] / summary["notional_traded"] if summary["notional_traded"] > 0 else 0.0)
+    # CHANGE A: finalize realized round-trip aggregates (consumed by M6b). Any round-trip still OPEN at
+    # fold end (an un-closed carried position) is intentionally NOT counted -- only CLOSED round-trips.
+    summary.pop("_rt", None)
+    nrt = summary["n_round_trips"]
+    summary["round_trip_win_rate"] = (summary["n_round_trip_wins"] / nrt) if nrt > 0 else 0.0
+    summary["realized_roe"] = (summary["realized_pnl_total"] / start_equity) if start_equity > 0 else 0.0
+    # CHANGE B: declare the latency-cost model used to price every fill (see _apply_order).
+    summary["latency_model"] = "bar_drift_v1"
     if not summary["outcome_states"]:
         summary["outcome_states"].add("survived")
     summary["outcome_states"] = sorted(summary["outcome_states"])
@@ -1056,7 +1498,9 @@ def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
 # --------------------------------------------------------------------------- #
 def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, out_dir: Path,
                   band: str = "base", limit_entities: Optional[int] = None, start_equity: float = 10_000.0,
-                  flush_rows: int = 1_000_000, require_cache: bool = True):
+                  flush_rows: int = 1_000_000, require_cache: bool = True, window: str = "test",
+                  slip_calib_path: Optional[str] = None, follower_trail: Optional[float] = None,
+                  copy_latency_ms: int = 2_000):
     import shutil
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1067,9 +1511,17 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     folds = pd.read_parquet(folds_path)
-    fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
-                                 int(pd.Timestamp(r.test_end_excl).timestamp() * 1000))
-                for r in folds.itertuples()}
+    # window selects the simulated span per fold: "test" = OOS [test_start,test_end) (M9 eval input);
+    # "pretest" = [train_start,test_start) (M6b fold-pure ranking input). Same shipped engine; only the
+    # window differs. start_ts_ms anchors risk at the window start.
+    if window == "pretest":
+        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+                                     int(pd.Timestamp(r.test_start).timestamp() * 1000))
+                    for r in folds.itertuples()}
+    else:
+        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
+                                     int(pd.Timestamp(r.test_end_excl).timestamp() * 1000))
+                    for r in folds.itertuples()}
 
     sl = pd.read_parquet(shortlist_path, columns=["entity_id", "primary_wallet", "fold_id", "in_shortlist"])
     sl = sl[sl.in_shortlist].copy()
@@ -1110,10 +1562,20 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     for c in sorted(coins):           # warm funding series into memo (one Mongo pass each, precompute)
         md.funding_series(c)
 
+    # D1: optional slippage calibration (per-fold as-of). Installed per seat by fold_id.
+    calib_per_fold: dict = {}
+    calib_version = None
+    if slip_calib_path:
+        cal = json.loads(Path(slip_calib_path).read_text())
+        calib_version = cal.get("version")
+        calib_per_fold = {int(k): v for k, v in cal.get("per_fold_asof", {}).items()}
+        logger.info("M7 slippage calib loaded: version=%s, %d folds", calib_version, len(calib_per_fold))
+
     fw = ShardedParquetWriter(out_dir / "m07_fills.parquet", flush_rows=flush_rows)
     ew = ShardedParquetWriter(out_dir / "m07_events.parquet", flush_rows=flush_rows)
     sw = ShardedParquetWriter(out_dir / "m07_summary.parquet", flush_rows=200_000)
-    params = EngineParams(slippage_band=band)
+    qw = ShardedParquetWriter(out_dir / "m07_equity.parquet", flush_rows=flush_rows)  # CHANGE 1
+    params = EngineParams(slippage_band=band, follower_trail=follower_trail, copy_latency_ms=copy_latency_ms)
 
     for w in wallets:
         try:
@@ -1124,15 +1586,16 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
             continue
         for entity_id, fold_id in sorted(seats_by_wallet.get(w, [])):
             t0ms, t1ms = fold_win[fold_id]
+            md.set_slip_calib(calib_per_fold.get(int(fold_id)), calib_version)   # D1 per-fold as-of
             adf = wdf[(wdf.ts >= t0ms) & (wdf.ts < t1ms)]
             res = step_subaccount(adf, md, start_equity, params, end_ts_ms=t1ms, start_ts_ms=t0ms,
                                   entity_id=entity_id, fold_id=fold_id)
-            fw.add_many(res["fills"]); ew.add_many(res["events"])
+            fw.add_many(res["fills"]); ew.add_many(res["events"]); qw.add_many(res["equity"])
             sm = res["summary"]; sm["outcome_states"] = ",".join(sm["outcome_states"])
             sw.add(sm)
-    nf, ne, ns = fw.close(), ew.close(), sw.close()
-    logger.info("M7 runner done: %d fills, %d events, %d summaries", nf, ne, ns)
-    return {"fills": nf, "events": ne, "summaries": ns}
+    nf, ne, ns, nq = fw.close(), ew.close(), sw.close(), qw.close()
+    logger.info("M7 runner done: %d fills, %d events, %d summaries, %d equity", nf, ne, ns, nq)
+    return {"fills": nf, "events": ne, "summaries": ns, "equity": nq}
 
 
 def main():
@@ -1146,10 +1609,17 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--start-equity", type=float, default=10_000.0)
     ap.add_argument("--require-cache", action="store_true")
+    ap.add_argument("--window", default="test", choices=["test", "pretest"])
+    ap.add_argument("--slip-calib", default=None, help="path to slippage_calib_v11.json (D1)")
+    ap.add_argument("--follower-trail", type=float, default=None,
+                    help="follower trailing-exit threshold (e.g. 0.07 = flatten+halt on 7% copy-equity DD)")
+    ap.add_argument("--copy-latency-ms", type=int, default=2_000,
+                    help="copy entry lag in ms (2000=typical, 15000=P95 tail stress)")
     args = ap.parse_args()
     run_shortlist(Path(args.actions), Path(args.shortlist), Path(args.folds), Path(args.out),
                   band=args.band, limit_entities=args.limit, start_equity=args.start_equity,
-                  require_cache=args.require_cache)
+                  require_cache=args.require_cache, window=args.window, slip_calib_path=args.slip_calib,
+                  follower_trail=args.follower_trail, copy_latency_ms=args.copy_latency_ms)
 
 
 if __name__ == "__main__":

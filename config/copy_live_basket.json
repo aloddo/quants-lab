@@ -1,0 +1,78 @@
+{
+  "global": {
+    "sizing_mode": "proportional",
+    "sizing_leverage": 10.0,
+    "gross_cap": 100000000.0,
+    "gross_backstop_x": 5.0,
+    "max_margin_util": 0.9,
+    "max_leverage_cap": 40,
+    "max_daily_loss": -60.0,
+    "global_stop_pct": 0.1,
+    "pos_trailing_stop_pct": 0.12,
+    "leader_drop_upnl_pct": -100.0,
+    "leader_reinclude_upnl_pct": -100.0,
+    "order_size_usd": 11.0,
+    "min_entry_notional": 10.0,
+    "target_equity_max_age_s": 120,
+    "cooldown_s": 30,
+    "exit_poll_s": 10,
+    "exit_min_trim_pct": 0.05,
+    "exit_min_trim_usd": 3.0,
+    "max_chase_bps": 15,
+    "max_spread_bps": 25,
+    "min_book_depth_usd": 2000,
+    "mark_max_age_s": 30,
+    "trim_over_frac": 0.2,
+    "margin_reserve_max_lev": 10,
+    "ws_max_age_s": 90.0
+  },
+  "defaults": {
+    "group": "live_basket",
+    "entry_mode": "instant",
+    "twap_window_s": 0,
+    "min_twap_notional": 0,
+    "max_addon_multiplier": 50,
+    "max_coin_concentration": 1.0,
+    "exit_type": "FIRST_CLOSE",
+    "sl_bps": -2000,
+    "trail_activate_bps": null,
+    "trail_bps": null,
+    "max_hold_s": 604800,
+    "exit_twap_min_notional": 50
+  },
+  "wallets": {
+    "0x3ea004bbb1004936e526bf97cbd796f0c78273d7": {
+      "group": "HYPE_shadowwinner"
+    },
+    "0x53b63a30a688beb53b5dc7bd731c661d678c555c": {
+      "group": "HYPE_v11tagged"
+    },
+    "0xdc899ed4a80e7bbe7c86307715507c828901f196": {
+      "group": "HYPE_lowdd"
+    },
+    "0x115849ce84370f25cadcf0d348510d73837e1aa5": {
+      "group": "BTC_3M"
+    },
+    "0x5dca68cb6acd425549a7eceebb0baf33e7c9a055": {
+      "group": "BTC"
+    },
+    "0xfb2b387c95e1b1f25901cf3f72efdfcd9053082d": {
+      "group": "ETH_edge480"
+    },
+    "0x6b3008d6e60617f44b1135ffc669fc87caec75b2": {
+      "group": "ETH_lowdd"
+    },
+    "0x71acae4aacaf4956ac31e09b18cbc33ae49dd8b3": {
+      "group": "SOL_310k"
+    },
+    "0x5d7aa52919bc325a150faa7c8a8f403f695b5a44": {
+      "group": "SOL"
+    },
+    "0x1edb2ab45c2326985021b37529c7f8d34989f5d8": {
+      "group": "XRP"
+    },
+    "0xcf75d37154240a64efd59849e1d5e9b29743de71": {
+      "group": "AVAX_513k"
+    }
+  }
+}

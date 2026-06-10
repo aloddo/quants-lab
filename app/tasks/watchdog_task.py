@@ -52,8 +52,10 @@ CRITICAL_TASKS = list(CRITICAL_TASK_THRESHOLDS.keys())
 
 # V11 process health monitoring (live strategy)
 V11_LOG_PATH = "/private/tmp/ql-v12-copy-trader-launchd.log"
-V11_STATS_STALE_MINUTES = 5  # V11 emits STATS every minute; >5min = sync issue
-V11_PROCESS_NAME = "hl_copy_trader_v11.py"
+# V15 (hl_prop_copy) is SILENT when idle (no per-minute STATS), so log-staleness is a weak signal:
+# 30min, and even then it only fires if the in-process watchdog (90s force-restart) ALSO failed.
+V11_STATS_STALE_MINUTES = 30
+V11_PROCESS_NAME = "hl_prop_copy.py"   # V15 live copy trader (replaced hl_copy_trader_v11.py 2026-06-04)
 
 # Self-healing limits
 HB_MAX_RESTARTS_PER_6H = 2
@@ -470,13 +472,13 @@ class WatchdogTask(BaseTask):
                 capture_output=True, text=True, timeout=5
             )
             if ps_out.returncode != 0 or not ps_out.stdout.strip():
-                issues.append(f"V11 PROCESS DOWN: {V11_PROCESS_NAME} not running")
+                issues.append(f"V15 PROCESS DOWN: {V11_PROCESS_NAME} not running")
                 return issues
 
             # Check 2: V11 log fresh
             log_path = Path(V11_LOG_PATH)
             if not log_path.exists():
-                issues.append(f"V11 log file missing: {V11_LOG_PATH}")
+                issues.append(f"V15 log file missing: {V11_LOG_PATH}")
                 return issues
 
             log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime, tz=timezone.utc)
@@ -484,7 +486,7 @@ class WatchdogTask(BaseTask):
             age_min = (now - log_mtime).total_seconds() / 60
             if age_min > V11_STATS_STALE_MINUTES:
                 issues.append(
-                    f"V11 LOG STALE: last write {age_min:.0f}min ago (threshold {V11_STATS_STALE_MINUTES}min)"
+                    f"V15 LOG STALE: last write {age_min:.0f}min ago (threshold {V11_STATS_STALE_MINUTES}min)"
                 )
 
             # Check 3: SYNC STALE in last 10 minutes
@@ -493,17 +495,17 @@ class WatchdogTask(BaseTask):
                     f.seek(-50_000, 2)  # last 50KB
                     tail = f.read().decode("utf-8", errors="ignore")
                 lines = tail.splitlines()[-200:]
-                recent_sync_stale = [l for l in lines if "SYNC STALE" in l]
-                if len(recent_sync_stale) >= 3:
+                recent_sync_stale = [l for l in lines if "WS state stale" in l]
+                if len(recent_sync_stale) >= 10:
                     issues.append(
-                        f"V11 SYNC STALE: {len(recent_sync_stale)} blocks in last log tail "
-                        f"- HL API rate-limit blocking new entries"
+                        f"V15 WS-STALL: {len(recent_sync_stale)} 'WS state stale' blocks in last log tail "
+                        f"- WS feed degraded (in-process watchdog should auto-restart if the loop freezes)"
                     )
             except (OSError, ValueError):
                 pass
         except Exception as e:
             logger.error(f"V11 health check failed: {e}")
-            issues.append(f"V11 watchdog check failed: {e}")
+            issues.append(f"V15 watchdog check failed: {e}")
 
         return issues
 

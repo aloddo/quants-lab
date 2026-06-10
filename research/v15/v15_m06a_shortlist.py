@@ -51,6 +51,12 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [v15_m06a] %(message)s")
 logger = logging.getLogger("v15_m06a")
 
+# Alberto 2026-06-09: when M5 runs copyability-only (M5_COPYABILITY_ONLY=1), eligible rows may have roe<=0
+# (M5 no longer floors performance). M6a then RANKS performance instead of asserting it. Default OFF =
+# strict behavior byte-identical.
+import os as _os
+COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+
 # === Constants (LOCKED by design r6) ===
 BLOCK_DAYS = 14
 HORIZON_DAYS = 168            # ~6mo intended persistence lookback (archive is 174d -> natural cap)
@@ -275,11 +281,18 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
             dd_term = _clamp(1.0 - dd, DD_LO, 1.0) if np.isfinite(dd) else np.nan
             # eligible rows MUST have finite, positive required inputs (M5 floors net_pnl>0, roe>0,
             # n_journeys>=3, max_dd<=0.80). A violation is an upstream contract breach -> hard-fail.
+            # COPYABILITY_ONLY (Alberto 2026-06-09): M5 no longer floors performance, so eligible rows may
+            # have roe<=0. M6a then RANKS performance (it does not require it): the score is monotone in roe,
+            # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
+            # the real post-engine ranking. We still require FINITE inputs (NaN would be a true data breach).
             if elig_row:
-                if not (np.isfinite(roe) and roe > 0):
-                    raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (M5 guarantees finite roe>0).")
+                if not np.isfinite(roe):
+                    raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
                 if not (np.isfinite(dd) and njr_finite and njr_n >= 0):
                     raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd/n_journeys (dd={dd_n}, nj={njr_n}).")
+                if not COPYABILITY_ONLY and roe <= 0:
+                    raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
+                # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.
                 score = roe * pr.persistence_term * math.log1p(njr) * dd_term
             else:
                 score = float("nan")

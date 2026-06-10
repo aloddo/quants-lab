@@ -1,0 +1,193 @@
+{
+  "global": {
+    "max_margin_util": 0.95,
+    "max_daily_loss": -15.0,
+    "order_size_usd": 40.0,
+    "max_leverage_cap": 10,
+    "cooldown_s": 30,
+    "exit_poll_s": 10,
+    "exit_min_trim_pct": 0.05,
+    "exit_min_trim_usd": 3.0,
+    "max_chase_bps": 15,
+    "max_spread_bps": 20,
+    "min_book_depth_usd": 3000
+  },
+  "defaults": {
+    "group": "default",
+    "entry_mode": "twap",
+    "twap_window_s": 120,
+    "min_twap_notional": 100,
+    "max_addon_multiplier": 15,
+    "max_coin_concentration": 0.3,
+    "exit_type": "FIRST_CLOSE",
+    "sl_bps": -500,
+    "trail_activate_bps": null,
+    "trail_bps": null,
+    "max_hold_s": 604800,
+    "exit_twap_min_notional": 200
+  },
+  "wallets": {
+    "0x53b63a30a688beb53b5dc7bd731c661d678c555c": {
+      "group": "original_v9"
+    },
+    "0x0884051c662892bfcd8a132d1404ab8a3a409cea": {
+      "group": "original_v9"
+    },
+    "0xcbf77db37dce8a92bf1d98fae655f1e8e16825d5": {
+      "group": "original_v9",
+      "exit_type": "GRADUAL"
+    },
+    "0x8a806bc475331f20022d897e4f9dc066bf0324c8": {
+      "group": "original_v9"
+    },
+    "0x76eed6343d4c0944b4ffb74d6e6cdc5ba6223154": {
+      "group": "original_v9"
+    },
+    "0x80f42017b39882a6a877b38368310925663064c8": {
+      "group": "pipeline_v1",
+      "sl_bps": -500,
+      "trail_activate_bps": 100,
+      "trail_bps": 200,
+      "max_hold_s": 259200
+    },
+    "0x925d9ae9c68f5a395ffe1ce957b79c26689f632e": {
+      "group": "pipeline_v1",
+      "sl_bps": -500,
+      "trail_activate_bps": 100,
+      "trail_bps": 250,
+      "max_hold_s": 432000
+    },
+    "0x31440bcc76c4b4b15290b709b33d2194d52b78ff": {
+      "group": "pipeline_v1",
+      "sl_bps": -500,
+      "trail_activate_bps": 80,
+      "trail_bps": 200,
+      "max_hold_s": 259200
+    },
+    "0xcb8a6cb5d937a26217c9cdc827bbb6bf10af448d": {
+      "group": "pipeline_v1",
+      "sl_bps": -800,
+      "trail_activate_bps": 100,
+      "trail_bps": 300,
+      "max_hold_s": 518400
+    },
+    "0xe65b9c86755e4b48ee56ef5960b364425c2e3e99": {
+      "group": "original_v10",
+      "entry_mode": "instant",
+      "twap_window_s": 0,
+      "min_twap_notional": 0,
+      "exit_twap_min_notional": 50
+    },
+    "0xbbf7d7a9d0eaeab4115f022a6863450296112422": {
+      "group": "original_v10",
+      "entry_mode": "instant",
+      "twap_window_s": 0,
+      "min_twap_notional": 0,
+      "exit_twap_min_notional": 50
+    },
+    "0x627f2d53236ff3e4c36ea3f9ca411bc2576a53b8": {
+      "group": "pipeline_v1_momentum",
+      "entry_mode": "instant",
+      "twap_window_s": 0,
+      "min_twap_notional": 0,
+      "sl_bps": -400,
+      "trail_activate_bps": 15,
+      "trail_bps": 20,
+      "max_hold_s": 600,
+      "exit_twap_min_notional": 50
+    },
+    "0x1f9e2e25e2aca439d91807d845df531404937be0": {
+      "group": "pipeline_v1_momentum",
+      "entry_mode": "instant",
+      "twap_window_s": 0,
+      "min_twap_notional": 0,
+      "sl_bps": -500,
+      "trail_activate_bps": 30,
+      "trail_bps": 25,
+      "max_hold_s": 1800,
+      "exit_twap_min_notional": 50
+    },
+    "0x827772b207d8b040584ed78af17b1d5b328c18d4": {
+      "group": "pipeline_alpha",
+      "sl_bps": -400,
+      "trail_activate_bps": 60,
+      "trail_bps": 150,
+      "max_hold_s": 3600,
+      "exit_twap_min_notional": 100
+    },
+    "0xae8e9f2138fa301fa745ede429c06fa38d2a4854": {
+      "group": "pipeline_v2_alpha",
+      "sl_bps": -500,
+      "trail_activate_bps": 80,
+      "trail_bps": 200,
+      "max_hold_s": 86400
+    },
+    "0xaf3434560dae7c6ec1b66707d4a36127fa7f387a": {
+      "group": "pipeline_v2_alpha",
+      "entry_mode": "instant",
+      "twap_window_s": 0,
+      "min_twap_notional": 0,
+      "sl_bps": -400,
+      "trail_activate_bps": 20,
+      "trail_bps": 30,
+      "max_hold_s": 7200,
+      "exit_twap_min_notional": 50
+    },
+    "0x9e897322ae0e75b1eb3d86668d34f2271260b706": {
+      "group": "pipeline_v2_alpha",
+      "sl_bps": -600,
+      "trail_activate_bps": 100,
+      "trail_bps": 250,
+      "max_hold_s": 259200
+    },
+    "0xa1227c759983e0c0696100ad15dedc6547f5624d": {
+      "group": "pipeline_v2_alpha",
+      "sl_bps": -500,
+      "trail_activate_bps": 80,
+      "trail_bps": 200,
+      "max_hold_s": 86400
+    },
+    "0x5038b86302bc1d7aecbc8441e65cea4fe2e0fe04": {
+      "group": "pipeline_v2_alpha",
+      "sl_bps": -500,
+      "trail_activate_bps": 100,
+      "trail_bps": 300,
+      "max_hold_s": 518400
+    },
+    "0x676751fe55f734245651fb781908befff96eed8f": {
+      "group": "v15_survivors",
+      "sl_bps": -700,
+      "trail_activate_bps": 100,
+      "trail_bps": 200,
+      "max_hold_s": 432000
+    },
+    "0x3319ddeb6349db6abbacc1d46e972bcdae42dac1": {
+      "group": "v15_survivors",
+      "sl_bps": -700,
+      "trail_activate_bps": 100,
+      "trail_bps": 200,
+      "max_hold_s": 432000
+    },
+    "0xe6e65bce41e7b66997da4a043a7683b1c5fdf7b3": {
+      "group": "v15_survivors",
+      "sl_bps": -700,
+      "trail_activate_bps": 100,
+      "trail_bps": 200,
+      "max_hold_s": 432000
+    },
+    "0xc22db2c04e054786426671cec0b766c07304fb20": {
+      "group": "v15_survivors",
+      "sl_bps": -700,
+      "trail_activate_bps": 100,
+      "trail_bps": 200,
+      "max_hold_s": 432000
+    },
+    "0x088aec78ffd804142fad9facb580b667aaa09104": {
+      "group": "v15_survivors",
+      "sl_bps": -700,
+      "trail_activate_bps": 100,
+      "trail_bps": 200,
+      "max_hold_s": 432000
+    }
+  }
+}
