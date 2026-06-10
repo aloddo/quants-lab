@@ -171,11 +171,16 @@ def load_events_from_m02(wallet_set: set[str], start_ms: int, end_ms: int,
       ENTRY -> is_long = signed_size > 0 ; EXIT -> is_long = signed_size < 0 (selling closes a long).
     Liquidations excluded by default (not copyable signal)."""
     import pyarrow.parquet as pq
+    from array import array
     cols = ["wallet", "coin", "ts", "action_type", "signed_size", "is_liquidation"]
     pf = pq.ParquetFile(str(M02_ACTIONS))
-    # accumulate compact tuples per wallet (ts, coin_id, is_open, is_long) -> ~72B/event transient,
-    # converted to numpy WalletEvents at the end (~12B/event). Avoids 30M dicts.
-    acc: dict[str, list] = {}
+    # MEMORY: m02 has ~86M rows. Accumulating per-wallet as Python tuple-lists peaked ~5.5GB (and
+    # Python retains it as RSS -> tripped the guard). Instead accumulate into typed array.array
+    # (raw C values, ~12B/event = same as the final numpy), so the load peak ~= the final size (~1GB).
+    a_ts: dict[str, array] = {}
+    a_c: dict[str, array] = {}
+    a_o: dict[str, array] = {}
+    a_l: dict[str, array] = {}
     for batch in pf.iter_batches(batch_size=1_000_000, columns=cols):
         d = batch.to_pydict()
         ws, cs, ts, at, sz, liq = (d["wallet"], d["coin"], d["ts"], d["action_type"],
@@ -194,11 +199,18 @@ def load_events_from_m02(wallet_set: set[str], start_ms: int, end_ms: int,
             if s is None or s == 0:
                 continue
             is_long = (s > 0) if is_open else (s < 0)
-            acc.setdefault(w, []).append((int(tt), _coin_id(cs[i]), is_open, is_long))
+            if w not in a_ts:
+                a_ts[w] = array('q'); a_c[w] = array('h'); a_o[w] = array('b'); a_l[w] = array('b')
+            a_ts[w].append(int(tt)); a_c[w].append(_coin_id(cs[i]))
+            a_o[w].append(1 if is_open else 0); a_l[w].append(1 if is_long else 0)
     out: dict[str, WalletEvents] = {}
-    for w, tuples in acc.items():
-        tuples.sort(key=lambda x: x[0])
-        out[w] = WalletEvents.from_tuples(tuples)
+    for w in list(a_ts.keys()):
+        ts_a = np.frombuffer(a_ts.pop(w), dtype=np.int64).copy()
+        cid = np.frombuffer(a_c.pop(w), dtype=np.int16).copy()
+        op = np.frombuffer(a_o.pop(w), dtype=np.int8).astype(np.bool_)
+        lg = np.frombuffer(a_l.pop(w), dtype=np.int8).astype(np.bool_)
+        order = np.argsort(ts_a, kind="stable")    # ts not guaranteed sorted across row groups
+        out[w] = WalletEvents(ts_a[order], cid[order], op[order], lg[order])
     return out
 
 
