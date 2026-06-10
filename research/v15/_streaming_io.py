@@ -118,6 +118,14 @@ class ShardedParquetWriter:
         logger.info(f"ShardedParquetWriter -> {self.out} ({self.total_rows:,} rows, {len(parts)} parts stitched)")
         return self.total_rows
 
+    def abort(self) -> None:
+        """Discard any buffered + flushed parts WITHOUT writing the main output parquet. Use on a
+        failure path where writing an empty/no-schema artifact to ``self.out`` would CLOBBER a prior
+        valid artifact. Leaves ``self.out`` untouched; removes the .parts staging dir."""
+        self._buf.clear()
+        parts = sorted(self.parts_dir.glob("part_*.parquet"))
+        self._cleanup_parts(parts)
+
     def _cleanup_parts(self, parts) -> None:
         if self.keep_parts:
             return
@@ -164,3 +172,127 @@ def install_memory_guard(soft_gb: float = 12.0, label: str = "proc", poll_s: int
                 os._exit(137)
     threading.Thread(target=_watch, daemon=True, name=f"memguard-{label}").start()
     logger.info(f"[memory_guard:{label}] installed (soft cap {soft_gb}GB, poll {poll_s}s)")
+
+
+def _available_ram_gb() -> float:
+    """Best-effort AVAILABLE (free + reclaimable) system RAM in GB. Falls back to a small
+    conservative value if psutil is missing, so the budget errs toward fewer procs."""
+    try:
+        import psutil  # type: ignore
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        logger.warning("[mem_budget] psutil unavailable; assuming 4GB free (conservative)")
+        return 4.0
+
+
+class MemoryBudgetError(RuntimeError):
+    """Raised when a fan-out run cannot fit in RAM even at the minimum (main + one worker). Aborting
+    BEFORE any work starts is the whole point: on a no-swap box, 'run serial and hope the guard
+    catches it' is exactly the OOM that jetsam-killed gbrain-postgres on 2026-06-10."""
+
+
+class MemBudget:
+    """Result of plan_memory_budget: a composable AGGREGATE memory plan for a fan-out run.
+
+    Per-process guards do NOT compose: main(parent) + N workers x per_worker_gb + live baseline can
+    blow past physical RAM and get jetsam-killed. This computes one plan from ACTUAL available RAM
+    and caps the worker count so the WHOLE run fits WITHOUT relying on the (15s-poll) guard firing.
+
+    Enforced invariant (codex 2026-06-10):
+        procs * (per_worker_gb * worker_margin) + main_reserve_gb + headroom_gb <= free_gb
+    The soft caps (main_soft_gb / worker_soft_gb) are DIAGNOSTIC tripwires only, never above what the
+    plan grants. Memory safety comes from the procs cap, not the guard."""
+
+    __slots__ = ("procs", "main_soft_gb", "worker_soft_gb", "free_gb", "per_worker_gb",
+                 "requested_procs", "headroom_gb", "main_reserve_gb", "usable_gb", "worker_planned_gb")
+
+    def __init__(self, procs, main_soft_gb, worker_soft_gb, free_gb, per_worker_gb,
+                 requested_procs, headroom_gb, main_reserve_gb, usable_gb, worker_planned_gb):
+        self.procs = procs
+        self.main_soft_gb = main_soft_gb
+        self.worker_soft_gb = worker_soft_gb
+        self.free_gb = free_gb
+        self.per_worker_gb = per_worker_gb
+        self.requested_procs = requested_procs
+        self.headroom_gb = headroom_gb
+        self.main_reserve_gb = main_reserve_gb
+        self.usable_gb = usable_gb
+        self.worker_planned_gb = worker_planned_gb
+
+    def planned_peak_gb(self) -> float:
+        """The RAM this plan expects to consume (excl. headroom): main + procs margined workers."""
+        return self.main_reserve_gb + self.procs * self.worker_planned_gb
+
+    def __repr__(self):
+        return (f"MemBudget(free={self.free_gb:.1f}GB headroom={self.headroom_gb:.1f}GB "
+                f"main_reserve={self.main_reserve_gb:.1f}GB usable={self.usable_gb:.1f}GB "
+                f"requested={self.requested_procs} -> procs={self.procs} "
+                f"planned_peak={self.planned_peak_gb():.1f}GB "
+                f"main_soft={self.main_soft_gb:.1f}GB worker_soft={self.worker_soft_gb:.1f}GB)")
+
+
+def plan_memory_budget(requested_procs: int,
+                       per_worker_gb: float,
+                       headroom_gb: float = 6.0,
+                       free_gb: float | None = None,
+                       main_reserve_gb: float = 1.5,
+                       main_soft_cap: float = 12.0,
+                       worker_margin: float = 1.25) -> MemBudget:
+    """Compute an AGGREGATE memory plan for a parallel fan-out run, capping worker count so the WHOLE
+    job (main parent + workers) fits in available RAM, WITHOUT relying on the slow guard to fire.
+
+    Memory model (all GB):
+        free_gb            AVAILABLE system RAM. psutil.virtual_memory().available already nets out
+                           the CURRENT live baseline (agents/mongod/postgres/etc).
+        headroom_gb        EXTRA safety reserved for mid-run GROWTH of that baseline + FS cache. This
+                           is NOT the current baseline (that is already excluded from `available`).
+        main_reserve_gb    expected peak RSS of the MAIN/parent process (it holds the marks cache +
+                           the Pool parent + streaming writers).
+        per_worker_gb      expected peak RSS of ONE worker. worker_planned = per_worker_gb*worker_margin.
+        usable_gb          = free_gb - headroom_gb - main_reserve_gb  (RAM left for workers)
+        procs              = min(requested, floor(usable_gb / worker_planned))
+
+    If procs < 1 (not even main + one margined worker fits), raise MemoryBudgetError -> abort BEFORE
+    any work starts. There is deliberately NO serial fallback in this helper: 'run serial and hope
+    the guard fires' is the exact OOM we are preventing. A caller that wants a risky override can
+    catch MemoryBudgetError itself.
+
+    Soft caps returned are DIAGNOSTIC tripwires only (15s poll), never set above the plan/grant:
+        worker_soft_gb = worker_planned
+        main_soft_gb   = min(main_soft_cap, free_gb - headroom_gb)   # never above what is grantable
+
+    Raises ValueError on requested_procs<=0, per_worker_gb<=0, worker_margin<=0, headroom_gb<0,
+    or main_reserve_gb<0."""
+    if requested_procs <= 0:
+        raise ValueError("requested_procs must be > 0")
+    if per_worker_gb <= 0:
+        raise ValueError("per_worker_gb must be > 0")
+    if worker_margin <= 0:
+        raise ValueError("worker_margin must be > 0")
+    if headroom_gb < 0:
+        raise ValueError("headroom_gb must be >= 0")
+    if main_reserve_gb < 0:
+        raise ValueError("main_reserve_gb must be >= 0")
+    if free_gb is None:
+        free_gb = _available_ram_gb()
+
+    grantable_gb = free_gb - headroom_gb                 # physically grantable after safety headroom
+    usable_gb = grantable_gb - main_reserve_gb           # left for workers after the main process
+    worker_planned_gb = per_worker_gb * worker_margin
+
+    if grantable_gb < main_reserve_gb or usable_gb < worker_planned_gb:
+        msg = (f"infeasible: free={free_gb:.1f} - headroom={headroom_gb:.1f} - "
+               f"main_reserve={main_reserve_gb:.1f} = usable {usable_gb:.1f}GB < one worker "
+               f"{worker_planned_gb:.1f}GB. Free RAM first or lower headroom/per-worker.")
+        logger.error(f"[mem_budget] ABORT (infeasible): {msg}")
+        raise MemoryBudgetError(msg)
+    procs = min(int(requested_procs), int(usable_gb // worker_planned_gb))
+
+    worker_soft_gb = worker_planned_gb
+    main_soft_gb = min(main_soft_cap, max(0.0, grantable_gb))   # tripwire, never above grantable
+    b = MemBudget(procs=procs, main_soft_gb=main_soft_gb, worker_soft_gb=worker_soft_gb,
+                  free_gb=free_gb, per_worker_gb=per_worker_gb, requested_procs=int(requested_procs),
+                  headroom_gb=headroom_gb, main_reserve_gb=main_reserve_gb, usable_gb=usable_gb,
+                  worker_planned_gb=worker_planned_gb)
+    logger.info(f"[mem_budget] {b}")
+    return b

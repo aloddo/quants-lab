@@ -93,7 +93,7 @@ import pymongo
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _streaming_io import ShardedParquetWriter, install_memory_guard  # noqa: E402
+from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -632,6 +632,60 @@ def get_portfolio_perp(wallet: str, retries: int = 4) -> list[tuple[int, float]]
     return result
 
 
+WHOLE_ANCHOR_CACHE = Path(
+    "/Users/hermes/quants-lab/app/data/v15/whole_anchor_cache"
+)
+
+
+def get_portfolio_all(wallet: str, retries: int = 4) -> list[tuple[int, float]]:
+    """`allTime` WHOLE-ACCOUNT accountValueHistory as (ts_ms, value).
+
+    2026-06-08 (SOLVED -- spot inclusion): the perpAllTime anchor is PERP-ONLY, but many wallets hold
+    most of their equity in SPOT (e.g. 0x292ae77a: $10,941 total / $877 perp). Reconstructing perp-only
+    against a perp-only anchor while the spot side dominates produced the large inter-anchor drift. We now
+    reconstruct the WHOLE ACCOUNT (perp + spot, both marked) and anchor to HL's `allTime` series, which
+    sits in the SAME portfolio response next to perpAllTime. Cached separately so perpAllTime is preserved.
+    Raw data, never auto-deleted. Delete the dir to force a refresh.
+    """
+    wallet_lc = wallet.lower()
+    cache_fp = WHOLE_ANCHOR_CACHE / f"{wallet_lc}.json"
+    if cache_fp.exists():
+        try:
+            with open(cache_fp) as f:
+                return [(int(t), float(v)) for t, v in json.load(f)]
+        except Exception:
+            pass
+    result: list[tuple[int, float]] = []
+    fetched = False
+    for i in range(retries):
+        try:
+            r = requests.post(HL_URL, json={"type": "portfolio", "user": wallet}, timeout=20)
+            if r.status_code == 429:
+                time.sleep(2**i)
+                continue
+            if r.status_code != 200:
+                fetched = False
+                break
+            for window_name, wd in r.json():
+                if window_name == "allTime":
+                    result = [(int(x[0]), float(x[1])) for x in wd.get("accountValueHistory", [])]
+                    break
+            fetched = True
+            break
+        except Exception:
+            time.sleep(1)
+    if fetched:
+        try:
+            WHOLE_ANCHOR_CACHE.mkdir(parents=True, exist_ok=True)
+            tmp = cache_fp.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump([[int(t), float(v)] for t, v in result], f)
+            tmp.replace(cache_fp)
+        except Exception:
+            pass
+    return result
+
+
 def get_clearinghouse(wallet: str, dex: Optional[str], retries: int = 3) -> Optional[dict]:
     """Per-dex clearinghouseState snapshot (today cross-check). dex=None -> main."""
     body: dict = {"type": "clearinghouseState", "user": wallet}
@@ -677,8 +731,9 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
         out: list[dict] = []
         for rec in df.to_dict("records"):
             coin = str(rec["coin"])
-            if not coin_is_allowed_perp(coin):
-                continue
+            # WHOLE-ACCOUNT (2026-06-08): keep spot fills (tag is_spot) -- their USDC + token value are part
+            # of the allTime anchor we reconstruct against. coin_is_allowed_perp excludes ONLY spot.
+            is_spot = coin_is_spot(coin)
             size = float(rec["size"])
             try:
                 tid = int(rec.get("tid", 0) or 0)
@@ -700,6 +755,7 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
             }
             d["signed_sz"] = size if rec["side"] == "B" else -size
             d["is_liquidation"] = d["dir"] in LIQUIDATION_DIRS
+            d["is_spot"] = is_spot
             out.append(d)
         return out
 
@@ -947,28 +1003,35 @@ def ledger_cash_delta(e: dict, wallet_lc: str) -> LedgerDelta:
         c = -(_f("usdc") + _f("fee"))
         return LedgerDelta(c, c)
     if k == "accountClassTransfer":
-        # toPerp=True -> USDC moves INTO perp (+); False -> OUT (-).
-        amt = abs(_f("usdc", "amount"))
-        c = amt if bool(d.get("toPerp")) else -amt
-        return LedgerDelta(c, c)
+        # WHOLE-ACCOUNT (2026-06-08): spot<->perp class transfer is INTERNAL to the account (allTime
+        # already spans both) -> no effect on total equity. (Was +/- perp in the perp-only model.)
+        return LedgerDelta(0.0, 0.0)
     if k == "send":
         if d.get("token") != "USDC":
             return LedgerDelta(0.0, 0.0)
-        # Dex-scope: only main/empty source/destination dex touches our perp cash.
+        # WHOLE-ACCOUNT: a send moves USDC between THIS wallet (spot or perp) and a COUNTERPARTY. It only
+        # changes total equity when the counterparty is ANOTHER wallet (external); a self-send (spot<->perp
+        # or spot->spot within our account) is internal -> 0. Classify by counterparty, not by dex.
         user = (d.get("user") or "").lower()
         dest = (d.get("destination") or "").lower()
-        src_dex = str(d.get("sourceDex", "")).strip().lower()
-        dst_dex = str(d.get("destinationDex", "")).strip().lower()
         amt = _f("usdcValue", "amount")
         fee = _f("fee")
-        # Whole-account perp (all dexes in scope): USDC leaving/entering ANY perp
-        # dex moves our reconstructed cash. Only spot is excluded.
-        c = 0.0
-        if user == wallet_lc and dex_in_scope(src_dex):
-            c -= amt + fee
-        if dest == wallet_lc and dex_in_scope(dst_dex):
-            c += amt
-        return LedgerDelta(c, c)
+        if user == wallet_lc and dest != wallet_lc:
+            return LedgerDelta(-(amt + fee), -(amt + fee))   # external OUT
+        if dest == wallet_lc and user != wallet_lc:
+            return LedgerDelta(amt, amt)                     # external IN
+        return LedgerDelta(0.0, 0.0)                         # self -> internal
+    if k == "spotTransfer":
+        # WHOLE-ACCOUNT: token transfer in/out of our spot. External when counterparty != us.
+        user = (d.get("user") or "").lower()
+        dest = (d.get("destination") or "").lower()
+        amt = _f("usdcValue", "usdc", "amount")
+        fee = _f("fee")
+        if user == wallet_lc and dest != wallet_lc:
+            return LedgerDelta(-(amt + fee), -(amt + fee))
+        if dest == wallet_lc and user != wallet_lc:
+            return LedgerDelta(amt, amt)
+        return LedgerDelta(0.0, 0.0)
     if k == "internalTransfer":
         if d.get("token") not in (None, "USDC"):
             return LedgerDelta(0.0, 0.0)
@@ -1178,8 +1241,10 @@ def seed_positions(
     cur = anchor.positions
     start_positions = {}
     for coin, fs in by_coin.items():
-        if not coin_is_allowed_perp(coin):
-            continue
+        # WHOLE-ACCOUNT: spot tokens are seeded too (their value is in the allTime anchor). The fetch-time
+        # anchor snapshot (cur) is PERP-only, so spot has no snapshot -> burst-aware backward seed only
+        # applies to perp; spot uses the forward (earliest-fill startPosition) seed.
+        spot_coin = coin_is_spot(coin)
         t0 = fs[0]["time"]
         burst = sum(1 for f in fs if f["time"] == t0) > 1
         net_all = 0.0
@@ -1188,10 +1253,10 @@ def seed_positions(
             net_all += f["signed_sz"]
             if f["time"] <= anchor_ms:
                 cum_le += f["signed_sz"]
-        if burst:
-            p0 = float(cur.get(coin, 0.0)) - net_all  # backward: snapshot-anchored
+        if burst and not spot_coin:
+            p0 = float(cur.get(coin, 0.0)) - net_all  # backward: perp snapshot-anchored
         else:
-            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill
+            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill (always for spot)
         pos = p0 + cum_le
         if abs(pos) > 1e-9:
             start_positions[coin] = pos
@@ -1234,6 +1299,8 @@ def compute_eq_at(
         if abs(sz) < 1e-9:
             continue
         mark = get_mark(c, anchor_ms)
+        if mark is None and coin_is_spot(c):
+            mark = _last_fill_price(fills, c, anchor_ms) or None  # spot: candle may be absent -> fill price
         if mark is not None:
             anchor_pos_value += sz * mark
         else:
@@ -1268,6 +1335,8 @@ def compute_eq_at(
         if abs(sz) < 1e-9:
             continue  # dust; not a real position
         mark = get_mark(c, t_ms)
+        if mark is None and coin_is_spot(c):
+            mark = _last_fill_price(fills, c, t_ms) or None  # spot: candle may be absent -> fill price
         if mark is None:
             n_unmarkable += 1
             # Best-effort notional proxy: last in-window fill price for the coin;
@@ -1344,8 +1413,8 @@ def reconstruct_wallet(args: tuple) -> dict:
     if anchor is None:
         return {"wallet": wallet, "error": "no_anchor"}
 
-    # 1) Weekly anchor truth (whole-account perpAllTime).
-    avh = get_portfolio_perp(wallet)
+    # 1) Weekly anchor truth: WHOLE-ACCOUNT allTime (perp + spot) -- 2026-06-08 spot-inclusion fix.
+    avh = get_portfolio_all(wallet)
     n_sentinel_zeros = sum(1 for _, v in avh if v == 0.0)
     valid_anchors = [(t, v) for t, v in avh if v > 0.01]
     if not valid_anchors:
@@ -2269,10 +2338,18 @@ def main() -> None:
             "diagnostics keep ex-post seeding."
         ),
     )
+    ap.add_argument("--headroom-gb", type=float, default=6.0,
+                    help="RAM reserved for the live baseline (agents + mongod + postgres); the main "
+                         "memory-guard soft cap is lowered to (free - headroom) when RAM is tight.")
     args = ap.parse_args()
 
     # Rule 8 (mandatory streaming I/O): abort LOUDLY on runaway RSS instead of silent OS SIGKILL.
-    install_memory_guard(soft_gb=12.0, label="m01")
+    # 2026-06-10 OOM fix: m01 is single-process, so model the process itself as the one "worker"
+    # (main_reserve=0). Aborts BEFORE work if the box cannot fit it; else lowers the main guard to
+    # what is grantable (<= free - headroom) so it cannot exhaust a box running the live baseline.
+    _budget = plan_memory_budget(requested_procs=1, per_worker_gb=2.0, main_reserve_gb=0.0,
+                                 headroom_gb=args.headroom_gb, main_soft_cap=12.0)
+    install_memory_guard(soft_gb=_budget.main_soft_gb, label="m01")
 
     start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
     end_ms = int((pd.Timestamp(args.end, tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000 - 1)

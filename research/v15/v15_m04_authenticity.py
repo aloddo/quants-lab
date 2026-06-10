@@ -37,7 +37,7 @@ import pandas as pd
 sys.path.insert(0, "/Users/hermes/quants-lab/research/v15")
 import v15_m025_authenticity_gate as g  # noqa: E402  (codex-SHIP helpers)
 import v15_m01_equity_reconstruct as m01  # noqa: E402
-from _streaming_io import install_memory_guard  # noqa: E402
+from _streaming_io import install_memory_guard, plan_memory_budget  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [m04] %(message)s", stream=sys.stdout)
 log = logging.getLogger("m04")
@@ -98,11 +98,12 @@ def _stage_a_worker(args):
     return w, g.stage_a(w, lo_ms, hi_ms)
 
 
-def _worker_init(label: str = "m04-worker") -> None:
+def _worker_init(label: str = "m04-worker", soft_gb: float = 12.0) -> None:
     """Pool initializer: install the Rule 8 memory guard ONCE at worker-process start (not per
     task — a per-call guard would leak a watchdog thread per imap chunk). Each Pool worker is a
-    separate process and needs its own guard so a runaway aborts LOUDLY, not via silent SIGKILL."""
-    install_memory_guard(soft_gb=12.0, label=label)
+    separate process and needs its own guard so a runaway aborts LOUDLY, not via silent SIGKILL.
+    soft_gb comes from the aggregate plan_memory_budget so worker guards sum within physical RAM."""
+    install_memory_guard(soft_gb=soft_gb, label=label)
 
 
 def _fills_worker(args):
@@ -113,16 +114,16 @@ def _fills_worker(args):
     return w, m01.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
 
 
-def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
+def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float = 12.0):
     # NOTE: default procs=1 (sequential) so in-process callers + monkeypatched tests work; main()
-    # passes --procs (default 8) for the real parallel run. Pool workers are separate processes and
-    # do NOT see a parent monkeypatch of stage_a.
+    # passes the aggregate-budget-capped procs for the real parallel run. Pool workers are separate
+    # processes and do NOT see a parent monkeypatch of stage_a.
     log.info(f"STAGE A: {len(wallets)} wallets (as-of {as_of_ms}), procs={procs}")
     scores = {}
     t0 = time.time()
     if procs > 1:
         tasks = [(w, lo_ms, hi_ms) for w in wallets]
-        with Pool(procs, initializer=_worker_init, initargs=("m04-stageA",)) as pool:
+        with Pool(procs, initializer=_worker_init, initargs=("m04-stageA", worker_soft_gb)) as pool:
             for i, (w, sc) in enumerate(pool.imap_unordered(_stage_a_worker, tasks, chunksize=16), 1):
                 scores[w] = sc
                 if i % 2000 == 0:
@@ -151,7 +152,7 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1):
     hedge_wallets = sorted({w for _eid, mem in ent_members.items() if len(mem) > 1 for w in mem})
     if hedge_wallets and procs > 1:
         tc = time.time()
-        with Pool(procs, initializer=_worker_init, initargs=("m04-fills",)) as pool:
+        with Pool(procs, initializer=_worker_init, initargs=("m04-fills", worker_soft_gb)) as pool:
             for w, fl in pool.imap_unordered(_fills_worker,
                                              [(w, lo_ms, hi_ms) for w in hedge_wallets], chunksize=8):
                 fills_cache[w] = fl
@@ -305,8 +306,21 @@ def main():
     ap.add_argument("--entities-out", required=True)
     ap.add_argument("--as-of", required=True, help="YYYY-MM-DD; signals use only ts < this date")
     ap.add_argument("--lookback-days", type=int, default=g.LOOKBACK_DAYS)
-    ap.add_argument("--procs", type=int, default=8, help="parallel workers for STAGE A (per-wallet).")
+    ap.add_argument("--procs", type=int, default=8,
+                    help="REQUESTED parallel workers for STAGE A (ceiling; auto-capped to fit RAM).")
+    ap.add_argument("--per-worker-gb", type=float, default=2.0,
+                    help="Per-worker peak RSS (GB). MEASURED 2026-06-10: base 0.15GB + full marks-cache "
+                         "ceiling 0.73GB + transient per-wallet 365d fills -> ~1.3GB worst case; 2.0 adds "
+                         "~50%% margin. Aggregate budget caps procs by this.")
+    ap.add_argument("--headroom-gb", type=float, default=6.0,
+                    help="RAM reserved for the live baseline (agents + mongod + postgres).")
     args = ap.parse_args()
+
+    # AGGREGATE memory budget (2026-06-10 OOM fix): per-process guards do not compose; cap worker
+    # count from ACTUAL free RAM so N x per_worker + baseline cannot blow past physical RAM.
+    budget = plan_memory_budget(requested_procs=args.procs, per_worker_gb=args.per_worker_gb,
+                                headroom_gb=args.headroom_gb)
+    install_memory_guard(soft_gb=budget.main_soft_gb, label="m04-main")
 
     as_of_ms = int(pd.Timestamp(args.as_of, tz="UTC").timestamp() * 1000)
     hi_ms = as_of_ms - 1  # strict: ts < as_of (inclusive m01 loaders)
@@ -316,7 +330,8 @@ def main():
                if w.strip() and not w.startswith("#")]
     log.info(f"{len(wallets)} wallets, {args.lookback_days}d window ending as-of {args.as_of}")
 
-    df, edf = run(wallets, lo_ms, hi_ms, as_of_ms, procs=args.procs)
+    df, edf = run(wallets, lo_ms, hi_ms, as_of_ms, procs=budget.procs,
+                  worker_soft_gb=budget.worker_soft_gb)
 
     # sanity assertions
     for _, r in df.iterrows():

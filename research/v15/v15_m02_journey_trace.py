@@ -53,7 +53,7 @@ import pandas as pd
 # per-event equity bridge. NO M01 reconstruction MATH is changed here.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import v15_m01_equity_reconstruct as m01  # noqa: E402
-from _streaming_io import ShardedParquetWriter, install_memory_guard  # noqa: E402  MANDATORY (decisions/2026-05-31-mandatory-streaming-io)
+from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402  MANDATORY (decisions/2026-05-31-mandatory-streaming-io)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -571,7 +571,14 @@ def main() -> None:
     ap.add_argument("--end", default="2026-05-23")
     ap.add_argument("--actions-out", required=True)
     ap.add_argument("--journeys-out", required=True)
-    ap.add_argument("--procs", type=int, default=4)
+    ap.add_argument("--procs", type=int, default=4,
+                    help="REQUESTED workers (ceiling; auto-capped to fit RAM by the aggregate budget).")
+    ap.add_argument("--per-worker-gb", type=float, default=2.0,
+                    help="Per-worker peak RSS (GB). MEASURED 2026-06-10: base + 15MB anchor df + full "
+                         "marks-cache ceiling 0.73GB + transient per-wallet reconstruction -> ~1.3GB "
+                         "worst case; 2.0 adds ~50%% margin. Aggregate budget caps procs by this.")
+    ap.add_argument("--headroom-gb", type=float, default=6.0,
+                    help="RAM reserved for the live baseline (agents + mongod + postgres).")
     ap.add_argument("--anchor-parquet", default=str(m01.ANCHOR_PARQUET))
     ap.add_argument("--flush-rows", type=int, default=2_000_000,
                     help="MANDATORY streaming: flush a parquet part + free RAM every N buffered rows.")
@@ -613,7 +620,12 @@ def main() -> None:
     # MANDATORY memory-safe streaming (decisions/2026-05-31-mandatory-streaming-io): never hold the
     # full result set in RAM. Stream per-wallet actions/journeys to disk in bounded chunks; memory
     # stays flat regardless of universe size. Backstop watchdog aborts loud (not silent SIGKILL).
-    install_memory_guard(soft_gb=args.mem_soft_gb, label="m02")
+    # AGGREGATE memory budget (2026-06-10 OOM fix): per-process guards do not compose; cap worker
+    # count from ACTUAL free RAM so N x per_worker + baseline cannot blow past physical RAM.
+    # --mem-soft-gb acts as the upper cap on the main-process guard.
+    budget = plan_memory_budget(requested_procs=args.procs, per_worker_gb=args.per_worker_gb,
+                                headroom_gb=args.headroom_gb, main_soft_cap=args.mem_soft_gb)
+    install_memory_guard(soft_gb=budget.main_soft_gb, label="m02")
     Path(args.actions_out).parent.mkdir(parents=True, exist_ok=True)
     aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
     jw = ShardedParquetWriter(args.journeys_out, flush_rows=args.flush_rows)
@@ -627,12 +639,13 @@ def main() -> None:
             jw.add_many(r.get("journeys"))
         _log_one(r, len(wallets))
 
-    if args.procs > 1:
-        with Pool(args.procs, initializer=_init_worker, initargs=(args.anchor_parquet,)) as pool:
+    if budget.procs > 1:
+        with Pool(budget.procs, initializer=_init_worker,
+                  initargs=(args.anchor_parquet, budget.worker_soft_gb)) as pool:
             for r in pool.imap_unordered(process_wallet, tasks):
                 _consume(r)
     else:
-        _init_worker(args.anchor_parquet)
+        _init_worker(args.anchor_parquet, budget.worker_soft_gb)
         for tk in tasks:
             _consume(process_wallet(tk))
 
