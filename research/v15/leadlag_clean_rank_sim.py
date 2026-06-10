@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Lead-lag CLEAN-RANK salvage sim (codex loop-3 final test) -- memory-safe rebuild.
+
+CONTEXT (brain projects/quant/v15/2026-06-10-leadlag-newtrade-failed): the short-horizon
+wallet-momentum copy idea was killed once before. The cheap kill-test (+62bps) was realized-PnL
+inventory-close leakage. The DECISIVE new-trade-only test FAILED all 5 codex criteria when wallets
+were ranked by TOTAL trailing copy-net (inventory-contaminated). Codex loop-3 prescribed ONE more
+test: rank by the CLEAN new-trade-only trailing edge (not total), then forward new-trade-only copy
+vs a matched null AND a symbol/side-matched beta control (to separate wallet-skill from pure
+trend-following). If this fails too -> clean kill of copy-momentum.
+
+This is the rebuild of the sim that OOM-crashed the box on 2026-06-10 (it aggregated all rows in
+RAM). This version is MANDATORY-streaming (decisions/2026-05-31) + aggregate-memory-budgeted
+(decisions/2026-06-10): per-decision rows stream to disk; the wallet universe is bounded; the marks
+index is page-cached once (no per-row DB round-trip).
+
+SURVIVORSHIP CAVEAT (codex #6): the candidate universe is selected from m03 activity (wallets active
+into the window, ranked by total_journeys), a FUTURE-KNOWN active-wallet set. Acceptable ONLY for a
+conservative NEGATIVE kill: if the edge fails even on survivor-active wallets, the kill is stronger.
+A POSITIVE result here is NOT deployable without a point-in-time-eligible universe and conservative
+(sub-minute) execution marks.
+
+STATUS: codex-reviewed SHIP-TO-RUN (3 rounds; the close-handling look-ahead + decision-anchored beta
+were the key fixes). Run gated on free RAM (aggregate budget aborts if tight) + CoS sweep-hold.
+
+Data sources (faithful to the prior validated sim):
+  - Wallet fills: HL API userFillsByTime -> authoritative `dir` ("Open Long" / "Close Short" ...).
+    This is the only source with Open/Close labeling (hl_wallet_trades lacks `dir`).
+  - Marks: app/data/v15/assetctx_marks/COIN.npy, shape (2, N) = [ts_ms_row, price_row], 1-min.
+  - Candidate universe: app/data/v15/m03_wallet_activity_summary.parquet (cap by activity to fit RAM).
+
+Method per decision hour t (hourly grid, Apr1..May23 default):
+  1. CLEAN trailing rank signal: for each wallet, copy ONLY the opens it makes in (t-trail, t],
+     FIFO-close our own copied lots on the wallet's matching Close (else force-close at t), enter at
+     fill + latency with adverse bps + RT fee. Sum net = clean_trailing_edge[w]. (NOT total PnL.)
+  2. Rank wallets with >=1 trailing open by clean_trailing_edge; take the top fraction (decile).
+  3. FORWARD (t, t+hold]: copy ONLY opens the top-decile wallets make after t, same lot mechanics,
+     force-close survivors at t+hold. Aggregate net = top_fwd_edge (size-normalized, equal per lot).
+  4. MATCHED-NULL: random wallets NOT in the top decile, matched on the same activity bucket; same
+     forward procedure = null_fwd_edge.
+  5. BETA control (codex required): for the SAME (coin, side, entry_ts, exit_ts) lots the top-decile
+     opened forward, the pure market move (entry_mark -> exit_mark, no skill) = beta_edge. The
+     skill estimate is top_fwd - beta; trend-following alone would make top_fwd ~= beta.
+  Stream one row per decision hour. Aggregate (mean top-null, bootstrap, concentration, top-beta)
+  is done offline on the tiny streamed parquet.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+import urllib.request
+import json
+from bisect import bisect_right
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [leadlag] %(levelname)s: %(message)s")
+log = logging.getLogger("leadlag")
+
+HL_API = "https://api.hyperliquid.xyz/info"
+ASSETCTX_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "assetctx_marks"
+FEE_RT = 0.000864            # HL round-trip taker (CLAUDE.md)
+HOUR_MS = 3_600_000
+
+# ----- marks: page-cached per-coin asof index (no per-row DB round-trip) ---------------------- #
+_marks: dict[str, tuple] = {}   # coin -> (ts_array, px_array)
+
+
+def _load_marks(coin: str):
+    if coin in _marks:
+        return _marks[coin]
+    p = ASSETCTX_DIR / f"{coin}.npy"
+    if not p.exists():
+        _marks[coin] = None
+        return None
+    a = np.load(p, allow_pickle=False)            # (2, N): row0 ts_ms, row1 price
+    ts = a[0].astype(np.int64)
+    px = a[1].astype(np.float64)
+    _marks[coin] = (ts, px)
+    return _marks[coin]
+
+
+def mark_at(coin: str, ts_ms: int):
+    """Last mark at or before ts_ms (asof-backward). None if no coverage / coin absent."""
+    m = _load_marks(coin)
+    if m is None:
+        return None
+    ts, px = m
+    i = bisect_right(ts, ts_ms) - 1
+    if i < 0:
+        return None
+    return float(px[i])
+
+
+# ----- HL fills with authoritative Open/Close dir ------------------------------------------- #
+class FetchError(RuntimeError):
+    pass
+
+
+def _post(payload, tries=5):
+    body = json.dumps(payload).encode()
+    last = None
+    for k in range(tries):
+        try:
+            req = urllib.request.Request(HL_API, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (k + 1))
+    # codex #7: do NOT silently truncate a wallet's history on a transient API failure -> raise so the
+    # caller records the wallet as INCOMPLETE rather than treating it as "no more fills".
+    raise FetchError(f"HL /info failed after {tries} tries: {last}")
+
+
+def load_wallet_opens_closes(w: str, start_ms: int, end_ms: int) -> list[dict]:
+    """All fills in [start,end] as normalized lots: {ts, coin, is_open, is_long, px}. dir from HL API.
+    Deduped by (time, oid, tid). Sorted by ts."""
+    fills, s, seen = [], start_ms, set()
+    for _ in range(60):
+        rr = _post({"type": "userFillsByTime", "user": w, "startTime": s, "endTime": end_ms})
+        if not isinstance(rr, list):
+            # codex #7: a non-list 200 (error/rate-limit/malformed object) must NOT read as "done".
+            raise FetchError(f"wallet {w}: unexpected HL response (non-list): {str(rr)[:200]}")
+        if not rr:
+            break
+        fills += rr
+        if len(rr) < 2000:
+            break
+        s = max(f["time"] for f in rr) + 1
+    else:
+        # hit the page cap -> history may be truncated; surface it (codex #7).
+        raise FetchError(f"wallet {w}: paging cap hit, history likely truncated")
+    out = []
+    for f in fills:
+        k = (f.get("time"), f.get("oid"), f.get("tid"))
+        if k in seen:
+            continue
+        seen.add(k)
+        d = str(f.get("dir", ""))
+        coin = f.get("coin", "")
+        if not coin or (not d.startswith("Open") and not d.startswith("Close")):
+            continue
+        try:
+            px = float(f.get("px"))
+        except Exception:
+            continue
+        out.append({"ts": int(f["time"]), "coin": coin, "is_open": d.startswith("Open"),
+                    "is_long": ("Long" in d), "px": px})
+    out.sort(key=lambda x: x["ts"])
+    return out
+
+
+# ----- copy lot accounting ------------------------------------------------------------------ #
+def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adverse_bps: float):
+    """Copy ONLY opens whose ts is in (win_lo, win_hi]. Each open = one unit lot, entered at the
+    mark `latency_ms` after the fill, with `adverse_bps` adverse slippage on entry. Close our oldest
+    matching lot (FIFO, per coin+direction) when the wallet emits a matching Close; force-close any
+    survivor at win_hi mark. Net of RT fee. Returns (net_sum_per_lot_mean, lots) where each lot is
+    {coin, is_long, entry_ts, entry_px, exit_ts, exit_px, net}. Equal-weight per lot (size-normalized)."""
+    open_lots: dict[tuple, list] = {}     # (coin,is_long) -> [lot,...] FIFO
+    done = []
+    adv = adverse_bps / 10_000.0
+    for f in fills:
+        # codex #1 (CRITICAL look-ahead): fills are sorted; once past win_hi, NOTHING in the window
+        # may use it. A close after win_hi must NOT close an in-window lot (that was future leakage).
+        # Survivors are force-closed at win_hi below.
+        if f["ts"] > win_hi:
+            break
+        coin, is_long = f["coin"], f["is_long"]
+        if f["is_open"]:
+            # codex #2: entry mark is taken at fill+latency; for the rank to be causal at the decision
+            # boundary, require the ENTRY mark time to be within the window too (drops the last
+            # `latency` of opens, consistent across top/null/forward).
+            if not (win_lo < f["ts"] and f["ts"] + latency_ms <= win_hi):
+                continue
+            ent = mark_at(coin, f["ts"] + latency_ms)
+            if ent is None or ent <= 0:
+                continue
+            ent_adj = ent * (1 + adv) if is_long else ent * (1 - adv)   # adverse entry
+            open_lots.setdefault((coin, is_long), []).append(
+                {"coin": coin, "is_long": is_long, "entry_ts": f["ts"] + latency_ms, "entry_px": ent_adj})
+        else:
+            # wallet closes (ts <= win_hi only, guaranteed by the break above) -> FIFO-close our
+            # oldest copied lot of the SAME coin+direction.
+            key = (coin, is_long)
+            lots = open_lots.get(key)
+            if lots:
+                ex_ts = f["ts"] + latency_ms
+                if ex_ts > win_hi:
+                    continue   # exit mark would fall outside window; leave for force-close at win_hi
+                lot = lots.pop(0)
+                ex = mark_at(coin, ex_ts)
+                if ex is None or ex <= 0:
+                    lots.insert(0, lot)   # cannot price exit now; keep, force-close later
+                    continue
+                _finalize(lot, ex_ts, ex, done)
+    # force-close survivors at win_hi
+    for key, lots in open_lots.items():
+        for lot in lots:
+            ex = mark_at(lot["coin"], win_hi)
+            if ex is None or ex <= 0:
+                continue
+            _finalize(lot, win_hi, ex, done)
+    if not done:
+        return None, []
+    net_mean = float(np.mean([l["net"] for l in done]))
+    return net_mean, done
+
+
+def _finalize(lot, exit_ts, exit_px, done):
+    if lot["is_long"]:
+        gross = (exit_px - lot["entry_px"]) / lot["entry_px"]
+    else:
+        gross = (lot["entry_px"] - exit_px) / lot["entry_px"]
+    lot["exit_ts"] = exit_ts
+    lot["exit_px"] = exit_px
+    lot["net"] = gross - FEE_RT
+    done.append(lot)
+
+
+def beta_edge_for_lots(lots: list[dict], t0: int, t1: int) -> float | None:
+    """DECISION-ANCHORED beta (codex #3): for each top lot's (coin, side), the market return of just
+    BEING in that coin/side over the WHOLE forward window [t0, t1] -- entries NOT at the wallet's
+    chosen timestamp (which would just measure slippage). This is the trend available to anyone who
+    decided at t0 to hold those coins/sides. top_fwd - beta isolates the wallet's entry-TIMING and
+    exit-SELECTION skill above simply holding the basket the top decile traded.
+
+    One beta observation per (coin, side) the top lots touched (deduped), so a wallet opening the same
+    coin many times does not over-weight the basket. No adverse slippage (it is a reference, not a
+    tradetable copy); fees still subtracted so top_minus_beta cancels fees consistently."""
+    seen, rets = set(), []
+    for l in lots:
+        key = (l["coin"], l["is_long"])
+        if key in seen:
+            continue
+        seen.add(key)
+        e = mark_at(l["coin"], t0)
+        x = mark_at(l["coin"], t1)
+        if e is None or x is None or e <= 0:
+            continue
+        g = (x - e) / e if l["is_long"] else (e - x) / e
+        rets.append(g - FEE_RT)
+    return float(np.mean(rets)) if rets else None
+
+
+# ----- main sim ----------------------------------------------------------------------------- #
+def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, hold_min: int,
+        latency_s: int, adverse_bps: float, top_frac: float, null_mult: int, seed: int,
+        out_path: str) -> str:
+    trail_ms, hold_ms, lat_ms = trail_min * 60_000, hold_min * 60_000, latency_s * 1000
+    rng = np.random.default_rng(seed)
+
+    # bulk-load each candidate's fills ONCE for the whole window (bounded by len(candidates)).
+    # codex #7: a fetch failure marks the wallet INCOMPLETE and DROPS it (never silently truncated).
+    log.info(f"loading fills for {len(candidates)} candidate wallets ...")
+    wf: dict[str, list] = {}
+    n_incomplete = 0
+    for i, w in enumerate(candidates, 1):
+        try:
+            f = load_wallet_opens_closes(w, start_ms - trail_ms, end_ms + hold_ms)
+        except FetchError as e:
+            n_incomplete += 1
+            log.warning(f"  DROP incomplete wallet {w[:10]}: {e}")
+            f = None
+        if f:
+            wf[w] = f
+        if i % 50 == 0:
+            log.info(f"  fills {i}/{len(candidates)} ({len(wf)} ok, {n_incomplete} dropped-incomplete)")
+    log.info(f"{len(wf)} wallets with complete fills ({n_incomplete} dropped incomplete)")
+
+    wallets = list(wf.keys())
+    if len(wallets) < 20:
+        raise SystemExit(f"too few wallets with fills ({len(wallets)}); widen candidates/window")
+
+    aw = ShardedParquetWriter(out_path, flush_rows=200_000)
+    t = start_ms
+    n_dec = 0
+    while t + hold_ms <= end_ms:
+        # 1) CLEAN trailing rank (causal: copy_edge only sees fills <= t). Track edge AND trailing lot
+        #    count per wallet for a CAUSAL activity-matched null (codex #4/#5).
+        trailing, trail_n = {}, {}
+        for w in wallets:
+            edge, lots = copy_edge(wf[w], t - trail_ms, t, lat_ms, adverse_bps)
+            if edge is not None and lots:
+                trailing[w] = edge
+                trail_n[w] = len(lots)
+        if len(trailing) >= 10:
+            ranked = sorted(trailing, key=lambda w: trailing[w], reverse=True)
+            k = max(1, int(len(ranked) * top_frac))
+            top = ranked[:k]
+            top_set = set(top)
+            # CAUSAL activity buckets over the RANK-ELIGIBLE set only, on trailing lot count at t.
+            elig = list(trailing.keys())
+            tn = pd.Series([trail_n[w] for w in elig])
+            nq = min(5, max(1, tn.nunique()))
+            bkt = pd.qcut(tn.rank(method="first"), q=nq, labels=False) if nq > 1 else pd.Series([0] * len(elig))
+            w_bucket = {w: int(b) for w, b in zip(elig, bkt)}
+            # 2) forward edge for top decile (causal: copy_edge only sees (t, t+hold])
+            top_lots = []
+            for w in top:
+                _, lots = copy_edge(wf[w], t, t + hold_ms, lat_ms, adverse_bps)
+                top_lots += lots
+            top_edge = float(np.mean([l["net"] for l in top_lots])) if top_lots else None
+            beta = beta_edge_for_lots(top_lots, t, t + hold_ms) if top_lots else None
+            # 3) matched null: rank-eligible NON-top wallets, matched on causal trailing-activity bucket
+            null_lots = []
+            top_bucket_counts = {}
+            for w in top:
+                top_bucket_counts[w_bucket[w]] = top_bucket_counts.get(w_bucket[w], 0) + 1
+            pool_by_bucket = {}
+            for w in elig:
+                if w in top_set:
+                    continue
+                pool_by_bucket.setdefault(w_bucket[w], []).append(w)
+            for b, cnt in top_bucket_counts.items():
+                pool = pool_by_bucket.get(b, [])
+                if not pool:
+                    continue
+                pick = rng.choice(pool, size=min(len(pool), cnt * null_mult), replace=False)
+                for w in pick:
+                    _, lots = copy_edge(wf[w], t, t + hold_ms, lat_ms, adverse_bps)
+                    null_lots += lots
+            null_edge = float(np.mean([l["net"] for l in null_lots])) if null_lots else None
+            # diagnostics: symbol/side overlap between top and null forward baskets (codex #5)
+            top_keys = {(l["coin"], l["is_long"]) for l in top_lots}
+            null_keys = {(l["coin"], l["is_long"]) for l in null_lots}
+            overlap = len(top_keys & null_keys) / max(1, len(top_keys))
+            aw.add_many([{
+                "decision_ts": t, "n_eligible": len(trailing), "n_top": len(top),
+                "n_top_lots": len(top_lots), "n_null_lots": len(null_lots),
+                "top_null_symside_overlap": overlap,
+                "top_fwd_edge_bps": (top_edge * 1e4) if top_edge is not None else None,
+                "null_fwd_edge_bps": (null_edge * 1e4) if null_edge is not None else None,
+                "beta_edge_bps": (beta * 1e4) if beta is not None else None,
+                "top_minus_null_bps": ((top_edge - null_edge) * 1e4)
+                    if (top_edge is not None and null_edge is not None) else None,
+                "top_minus_beta_bps": ((top_edge - beta) * 1e4)
+                    if (top_edge is not None and beta is not None) else None,
+            }])
+            n_dec += 1
+            if n_dec % 50 == 0:
+                log.info(f"  decisions {n_dec} (t={pd.to_datetime(t, unit='ms')})")
+        t += HOUR_MS
+    n = aw.close()
+    log.info(f"streamed {n} decision rows -> {out_path}")
+    return out_path
+
+
+def pick_candidates(max_wallets: int, start_ms: int, end_ms: int) -> list[str]:
+    df = pd.read_parquet(ASSETCTX_DIR.parent / "m03_wallet_activity_summary.parquet")
+    df = df[df["key_kind"] == "wallet"].copy()
+    last = pd.to_datetime(df["last_seen_ts"], utc=True)
+    cutoff = pd.Timestamp(start_ms, unit="ms", tz="UTC")
+    df = df[last >= cutoff]                                     # active into the window
+    df = df.sort_values("total_journeys", ascending=False).head(max_wallets)
+    return df["key"].tolist()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Lead-lag clean-rank salvage sim (memory-safe)")
+    ap.add_argument("--start", default="2026-04-01")
+    ap.add_argument("--end", default="2026-05-23")
+    ap.add_argument("--max-wallets", type=int, default=300, help="candidate cap (bounds RAM + API).")
+    ap.add_argument("--candidates-file", default=None, help="optional: one wallet/line; else m03 top-N.")
+    ap.add_argument("--trail-min", type=int, default=60)
+    ap.add_argument("--hold-min", type=int, default=60)
+    ap.add_argument("--latency-s", type=int, default=2)
+    ap.add_argument("--adverse-bps", type=float, default=7.0)
+    ap.add_argument("--top-frac", type=float, default=0.10)
+    ap.add_argument("--null-mult", type=int, default=3, help="null wallets sampled per top wallet/bucket.")
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--headroom-gb", type=float, default=6.0)
+    ap.add_argument("--out", default="app/data/v15/leadlag_clean_rank.parquet")
+    args = ap.parse_args()
+
+    # memory budget: serial (one process); aborts before work if the box cannot fit it.
+    b = plan_memory_budget(requested_procs=1, per_worker_gb=2.0, main_reserve_gb=0.0,
+                           headroom_gb=args.headroom_gb, main_soft_cap=12.0)
+    install_memory_guard(soft_gb=b.main_soft_gb, label="leadlag")
+
+    start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
+    end_ms = int((pd.Timestamp(args.end, tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000 - 1)
+
+    if args.candidates_file:
+        cands = [l.strip().lower() for l in open(args.candidates_file)
+                 if l.strip() and not l.startswith("#")][:args.max_wallets]
+    else:
+        cands = pick_candidates(args.max_wallets, start_ms, end_ms)
+    log.info(f"{len(cands)} candidate wallets; window {args.start}..{args.end}; "
+             f"trail={args.trail_min}m hold={args.hold_min}m top_frac={args.top_frac}")
+    run(cands, start_ms, end_ms, trail_min=args.trail_min, hold_min=args.hold_min,
+        latency_s=args.latency_s, adverse_bps=args.adverse_bps, top_frac=args.top_frac,
+        null_mult=args.null_mult, seed=args.seed, out_path=args.out)
+
+
+if __name__ == "__main__":
+    main()
