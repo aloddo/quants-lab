@@ -28,7 +28,10 @@ def edge(rts, lo, hi, lat, fee):
         if ent is None or ex is None or ent <= 0:
             continue
         nets.append(dir_ * (ex - ent) / ent - fee)
-    return (np.mean(nets) * 1e4, len(nets)) if nets else (None, 0)
+    if not nets:
+        return (None, 0, None)
+    a = np.array(nets)
+    return (a.mean() * 1e4, len(a), a.std(ddof=1) * 1e4 if len(a) > 1 else None)
 
 
 def main():
@@ -55,11 +58,14 @@ def main():
     rows = []
     for w, fl in wf.items():
         fl.sort(key=lambda x: x[0]); rts = roundtrips(fl)
-        trm, trn = edge(rts, start, split, lat, FEE_M)
-        tem, ten = edge(rts, split, end, lat, FEE_M)
-        tet, _ = edge(rts, split, end, lat, FEE_T)
+        trm, trn, trs = edge(rts, start, split, lat, FEE_M)
+        tem, ten, _ = edge(rts, split, end, lat, FEE_M)
+        tet, _, _ = edge(rts, split, end, lat, FEE_T)
+        trt, _, _ = edge(rts, start, split, lat, FEE_T)
         if trm is not None and tem is not None and trn >= args.min_rt and ten >= args.min_rt:
-            rows.append({"wallet": w, "train_maker": trm, "test_maker": tem, "test_taker": tet, "test_n": ten})
+            tstat = (trt / trs * np.sqrt(trn)) if (trs and trs > 0) else 0.0   # train TAKER t-stat
+            rows.append({"wallet": w, "train_maker": trm, "train_taker": trt, "train_tstat": tstat,
+                         "train_n": trn, "test_maker": tem, "test_taker": tet, "test_n": ten})
     df = pd.DataFrame(rows)
     print(f"\n=== OOS FAITHFUL COPY ({len(df)} wallets, >= {args.min_rt} round-trips both windows) ===")
     print(f"corr(train,test) maker edge: {df.train_maker.corr(df.test_maker):.3f}")
