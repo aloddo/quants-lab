@@ -346,7 +346,8 @@ class WalletEvents:
 
 # ----- copy lot accounting ------------------------------------------------------------------ #
 def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adverse_bps: float,
-              realistic_slip: bool = True, fee_rt: float = FEE_RT, exit_mode: str = "mirror"):
+              realistic_slip: bool = True, fee_rt: float = FEE_RT, exit_mode: str = "mirror",
+              maker: bool = False):
     """Copy ONLY opens whose ts is in (win_lo, win_hi]. Each open = one unit lot, entered at the
     mark `latency_ms` after the fill. Cross-spread slippage is applied on BOTH entry and exit. With
     realistic_slip=True (default), uses the per-coin measured half_spread+impact (l2_calib); else the
@@ -372,7 +373,8 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
             ent = mark_at(coin, f["ts"] + latency_ms)
             if ent is None or ent <= 0:
                 continue
-            s = slip_oneway(coin) if realistic_slip else adv      # cross the spread to enter
+            # maker = post liquidity, do NOT cross the spread (slip 0; optimistic = 100% fill assumed)
+            s = 0.0 if maker else (slip_oneway(coin) if realistic_slip else adv)
             ent_adj = ent * (1 + s) if is_long else ent * (1 - s)
             open_lots.setdefault((coin, is_long), []).append(
                 {"coin": coin, "is_long": is_long, "entry_ts": f["ts"] + latency_ms, "entry_px": ent_adj})
@@ -391,7 +393,7 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
                 if ex is None or ex <= 0:
                     lots.insert(0, lot)   # cannot price exit now; keep, force-close later
                     continue
-                _finalize(lot, ex_ts, ex, done, realistic_slip, fee_rt)
+                _finalize(lot, ex_ts, ex, done, realistic_slip, fee_rt, maker)
     # close survivors: oracle = best ex-post mark in (entry, win_hi]; mirror = win_hi mark.
     for key, lots in open_lots.items():
         for lot in lots:
@@ -407,16 +409,17 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
                 ex = mark_at(lot["coin"], win_hi)
             if ex is None or ex <= 0:
                 continue
-            _finalize(lot, ex_ts, ex, done, realistic_slip, fee_rt)
+            _finalize(lot, ex_ts, ex, done, realistic_slip, fee_rt, maker)
     if not done:
         return None, []
     net_mean = float(np.mean([l["net"] for l in done]))
     return net_mean, done
 
 
-def _finalize(lot, exit_ts, exit_px, done, realistic_slip=True, fee_rt=FEE_RT):
+def _finalize(lot, exit_ts, exit_px, done, realistic_slip=True, fee_rt=FEE_RT, maker=False):
     # cross the spread to EXIT too: sell a long into the bid, buy back a short at the ask.
-    s = slip_oneway(lot["coin"]) if realistic_slip else 0.0
+    # maker = post the exit, do NOT cross (slip 0).
+    s = 0.0 if maker else (slip_oneway(lot["coin"]) if realistic_slip else 0.0)
     exit_fill = exit_px * (1 - s) if lot["is_long"] else exit_px * (1 + s)
     if lot["is_long"]:
         gross = (exit_fill - lot["entry_px"]) / lot["entry_px"]
@@ -430,7 +433,7 @@ def _finalize(lot, exit_ts, exit_px, done, realistic_slip=True, fee_rt=FEE_RT):
 
 def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
                        realistic_slip: bool = True, fee_rt: float = FEE_RT,
-                       exit_mode: str = "mirror") -> float | None:
+                       exit_mode: str = "mirror", maker: bool = False) -> float | None:
     """DECISION-ANCHORED beta (codex #3): for each top lot's (coin, side), the market return of just
     BEING in that coin/side over the WHOLE forward window [t0, t1] -- entries NOT at the wallet's
     chosen timestamp. top_fwd - beta isolates the wallet's entry-TIMING + exit-SELECTION skill above
@@ -453,8 +456,8 @@ def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
             x = mark_at(l["coin"], t1)
         if e is None or x is None or e <= 0:
             continue
-        s = slip_oneway(l["coin"]) if realistic_slip else 0.0
-        e_fill = e * (1 + s) if l["is_long"] else e * (1 - s)     # enter crossing spread
+        s = 0.0 if maker else (slip_oneway(l["coin"]) if realistic_slip else 0.0)
+        e_fill = e * (1 + s) if l["is_long"] else e * (1 - s)     # enter crossing spread (maker: no cross)
         x_fill = x * (1 - s) if l["is_long"] else x * (1 + s)     # exit crossing spread
         g = (x_fill - e_fill) / e_fill if l["is_long"] else (e_fill - x_fill) / e_fill
         rets.append(g - fee_rt)
@@ -464,7 +467,7 @@ def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
 # ----- main sim ----------------------------------------------------------------------------- #
 def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, hold_min: int, exit_mode: str = "mirror",
         latency_s: int, adverse_bps: float, top_frac: float, null_mult: int, seed: int,
-        out_path: str, source: str = "m02", step_hours: int = 1) -> str:
+        out_path: str, source: str = "m02", step_hours: int = 1, maker: bool = False) -> str:
     trail_ms, hold_ms, lat_ms = trail_min * 60_000, hold_min * 60_000, latency_s * 1000
     rng = np.random.default_rng(seed)
     load_lo, load_hi = start_ms - trail_ms, end_ms + hold_ms
@@ -496,6 +499,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
     if len(wallets) < 20:
         raise SystemExit(f"too few wallets with events ({len(wallets)}); widen candidates/window")
     step_ms = step_hours * HOUR_MS
+    fee = fee_rt(maker=maker)   # canonical fee (maker 2.88bps if maker else taker 8.64bps)
 
     aw = ShardedParquetWriter(out_path, flush_rows=200_000)
     by_wallet_path = out_path.replace(".parquet", "_bywallet.parquet")
@@ -527,11 +531,11 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             top_lots = []
             top_wallet_rows = []
             for w in top:
-                _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps, exit_mode=exit_mode)
+                _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps, fee_rt=fee, exit_mode=exit_mode, maker=maker)
                 top_lots += lots
                 if lots:
                     we = float(np.mean([l["net"] for l in lots]))
-                    wb = beta_edge_for_lots(lots, t, t + hold_ms, exit_mode=exit_mode)
+                    wb = beta_edge_for_lots(lots, t, t + hold_ms, fee_rt=fee, exit_mode=exit_mode, maker=maker)
                     top_wallet_rows.append({
                         "decision_ts": t, "wallet": w, "n_lots": len(lots),
                         "fwd_edge_bps": we * 1e4,
@@ -540,7 +544,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             if top_wallet_rows:
                 bw.add_many(top_wallet_rows)
             top_edge = float(np.mean([l["net"] for l in top_lots])) if top_lots else None
-            beta = beta_edge_for_lots(top_lots, t, t + hold_ms, exit_mode=exit_mode) if top_lots else None
+            beta = beta_edge_for_lots(top_lots, t, t + hold_ms, fee_rt=fee, exit_mode=exit_mode, maker=maker) if top_lots else None
             # 3) matched null: rank-eligible NON-top wallets, matched on causal trailing-activity bucket
             null_lots = []
             top_bucket_counts = {}
@@ -557,7 +561,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
                     continue
                 pick = rng.choice(pool, size=min(len(pool), cnt * null_mult), replace=False)
                 for w in pick:
-                    _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps, exit_mode=exit_mode)
+                    _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps, fee_rt=fee, exit_mode=exit_mode, maker=maker)
                     null_lots += lots
             null_edge = float(np.mean([l["net"] for l in null_lots])) if null_lots else None
             # diagnostics: symbol/side overlap between top and null forward baskets (codex #5)
@@ -637,6 +641,7 @@ def main():
                     help="mirror=follow wallet exits; oracle=best ex-post exit (#2 ceiling, not tradeable); "
                          "trail=realizable trailing-stop (#9).")
     ap.add_argument("--trail-frac", type=float, default=0.01, help="trailing-stop retracement for --exit-mode trail.")
+    ap.add_argument("--maker", action="store_true", help="MAKER execution: 2.88bps RT fee, no spread-crossing (V11 maker_ws proved +25.8bps vs taker -5.7). Optimistic: assumes 100%% fill.")
     ap.add_argument("--out", default="app/data/v15/leadlag_clean_rank.parquet")
     args = ap.parse_args()
 
@@ -671,7 +676,7 @@ def main():
     run(cands, start_ms, end_ms, trail_min=args.trail_min, hold_min=args.hold_min, exit_mode=args.exit_mode,
         latency_s=args.latency_s, adverse_bps=args.adverse_bps, top_frac=args.top_frac,
         null_mult=args.null_mult, seed=args.seed, out_path=args.out,
-        source=args.source, step_hours=args.decision_step_hours)
+        source=args.source, step_hours=args.decision_step_hours, maker=args.maker)
 
 
 if __name__ == "__main__":
