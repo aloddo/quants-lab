@@ -77,6 +77,7 @@ from execution_model import (  # noqa: E402
     calibrated_share, reset_hits, LATENCY_MS,
 )
 FEE_RT = fee_rt()            # canonical HL round-trip taker (from hl_fee_schedule.json)
+TRAIL_FRAC = 0.01            # exit_mode="trail" retracement (hyp #9); set via --trail-frac
 
 # ----- marks: page-cached per-coin asof index (no per-row DB round-trip) ---------------------- #
 _marks: dict[str, tuple] = {}   # coin -> (ts_array, px_array)
@@ -106,6 +107,39 @@ def mark_at(coin: str, ts_ms: int):
     if i < 0:
         return None
     return float(px[i])
+
+
+def trail_exit(coin: str, entry_ts: int, hi_ts: int, is_long: bool, trail: float):
+    """REALIZABLE trailing-stop exit (hyp #9): walk marks forward from entry; ride the favorable move,
+    exit when price retraces `trail` (fraction) from the running peak/trough. Timeout at hi_ts.
+    Returns (exit_ts, exit_mark). Causal (only uses marks after entry)."""
+    m = _load_marks(coin)
+    if m is None:
+        return None
+    ts, px = m
+    lo = bisect_right(ts, entry_ts)
+    hi = bisect_right(ts, hi_ts)
+    if hi <= lo:
+        return None
+    seg_px = px[lo:hi]
+    seg_ts = ts[lo:hi]
+    if is_long:
+        peak = seg_px[0]
+        for j in range(len(seg_px)):
+            p = seg_px[j]
+            if p > peak:
+                peak = p
+            if p <= peak * (1 - trail):
+                return int(seg_ts[j]), float(p)
+    else:
+        trough = seg_px[0]
+        for j in range(len(seg_px)):
+            p = seg_px[j]
+            if p < trough:
+                trough = p
+            if p >= trough * (1 + trail):
+                return int(seg_ts[j]), float(p)
+    return int(seg_ts[-1]), float(seg_px[-1])     # timeout
 
 
 def best_mark(coin: str, lo_ts: int, hi_ts: int, is_long: bool):
@@ -344,13 +378,19 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
     # close survivors: oracle = best ex-post mark in (entry, win_hi]; mirror = win_hi mark.
     for key, lots in open_lots.items():
         for lot in lots:
+            ex_ts = win_hi
             if exit_mode == "oracle":
                 ex = best_mark(lot["coin"], lot["entry_ts"], win_hi, lot["is_long"])
+            elif exit_mode == "trail":
+                r = trail_exit(lot["coin"], lot["entry_ts"], win_hi, lot["is_long"], TRAIL_FRAC)
+                ex = None if r is None else r[1]
+                if r is not None:
+                    ex_ts = r[0]
             else:
                 ex = mark_at(lot["coin"], win_hi)
             if ex is None or ex <= 0:
                 continue
-            _finalize(lot, win_hi, ex, done, realistic_slip, fee_rt)
+            _finalize(lot, ex_ts, ex, done, realistic_slip, fee_rt)
     if not done:
         return None, []
     net_mean = float(np.mean([l["net"] for l in done]))
@@ -386,8 +426,14 @@ def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
     rets = []
     for l in lots:
         e = mark_at(l["coin"], t0)
-        # oracle beta: passive entry at t0, BEST ex-post exit in (t0, t1] (same privilege as oracle top).
-        x = best_mark(l["coin"], t0, t1, l["is_long"]) if exit_mode == "oracle" else mark_at(l["coin"], t1)
+        # benchmark exit matches the strategy's exit mode (same privilege/policy), passive entry at t0.
+        if exit_mode == "oracle":
+            x = best_mark(l["coin"], t0, t1, l["is_long"])
+        elif exit_mode == "trail":
+            r = trail_exit(l["coin"], t0, t1, l["is_long"], TRAIL_FRAC)
+            x = None if r is None else r[1]
+        else:
+            x = mark_at(l["coin"], t1)
         if e is None or x is None or e <= 0:
             continue
         s = slip_oneway(l["coin"]) if realistic_slip else 0.0
@@ -562,9 +608,10 @@ def main():
     ap.add_argument("--per-worker-gb", type=float, default=3.0,
                     help="main-process peak-RSS estimate. m02 full-universe load is ~2-3GB (events for "
                          "~18k wallets + 0.73GB marks-cache ceiling). The memory guard aborts loud above it.")
-    ap.add_argument("--exit-mode", choices=["mirror", "oracle"], default="mirror",
-                    help="mirror = follow wallet exits (force-close at horizon); oracle = best ex-post "
-                         "exit in (entry, horizon] (hyp #2 upper bound; NOT tradeable).")
+    ap.add_argument("--exit-mode", choices=["mirror", "oracle", "trail"], default="mirror",
+                    help="mirror=follow wallet exits; oracle=best ex-post exit (#2 ceiling, not tradeable); "
+                         "trail=realizable trailing-stop (#9).")
+    ap.add_argument("--trail-frac", type=float, default=0.01, help="trailing-stop retracement for --exit-mode trail.")
     ap.add_argument("--out", default="app/data/v15/leadlag_clean_rank.parquet")
     args = ap.parse_args()
 
@@ -572,6 +619,8 @@ def main():
     set_slip_default_bps(args.slip_default_bps)
     set_latency_ms(args.latency_s * 1000)
     reset_hits()
+    global TRAIL_FRAC
+    TRAIL_FRAC = args.trail_frac
 
     # memory budget: serial (one process); aborts before work if the box cannot fit it.
     b = plan_memory_budget(requested_procs=1, per_worker_gb=args.per_worker_gb, main_reserve_gb=0.0,
