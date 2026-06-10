@@ -108,6 +108,22 @@ def mark_at(coin: str, ts_ms: int):
     return float(px[i])
 
 
+def best_mark(coin: str, lo_ts: int, hi_ts: int, is_long: bool):
+    """ORACLE exit (hyp #2): the most favorable mark in (lo_ts, hi_ts] -- max for a long, min for a
+    short. This is the EX-POST upper bound on exit timing (not tradeable; it bounds whether copied
+    entry timing has enough gross edge to ever cover execution)."""
+    m = _load_marks(coin)
+    if m is None:
+        return None
+    ts, px = m
+    lo = bisect_right(ts, lo_ts)            # first idx with ts > lo_ts
+    hi = bisect_right(ts, hi_ts)            # first idx with ts > hi_ts  (exclusive)
+    if hi <= lo:
+        return None
+    seg = px[lo:hi]
+    return float(seg.max()) if is_long else float(seg.min())
+
+
 # ----- HL fills with authoritative Open/Close dir ------------------------------------------- #
 class FetchError(RuntimeError):
     pass
@@ -279,7 +295,7 @@ class WalletEvents:
 
 # ----- copy lot accounting ------------------------------------------------------------------ #
 def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adverse_bps: float,
-              realistic_slip: bool = True, fee_rt: float = FEE_RT):
+              realistic_slip: bool = True, fee_rt: float = FEE_RT, exit_mode: str = "mirror"):
     """Copy ONLY opens whose ts is in (win_lo, win_hi]. Each open = one unit lot, entered at the
     mark `latency_ms` after the fill. Cross-spread slippage is applied on BOTH entry and exit. With
     realistic_slip=True (default), uses the per-coin measured half_spread+impact (l2_calib); else the
@@ -309,9 +325,10 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
             ent_adj = ent * (1 + s) if is_long else ent * (1 - s)
             open_lots.setdefault((coin, is_long), []).append(
                 {"coin": coin, "is_long": is_long, "entry_ts": f["ts"] + latency_ms, "entry_px": ent_adj})
-        else:
+        elif exit_mode == "mirror":
             # wallet closes (ts <= win_hi only, guaranteed by the break above) -> FIFO-close our
-            # oldest copied lot of the SAME coin+direction.
+            # oldest copied lot of the SAME coin+direction. (oracle mode ignores wallet closes:
+            # every lot exits at its best ex-post mark below.)
             key = (coin, is_long)
             lots = open_lots.get(key)
             if lots:
@@ -324,10 +341,13 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
                     lots.insert(0, lot)   # cannot price exit now; keep, force-close later
                     continue
                 _finalize(lot, ex_ts, ex, done, realistic_slip, fee_rt)
-    # force-close survivors at win_hi
+    # close survivors: oracle = best ex-post mark in (entry, win_hi]; mirror = win_hi mark.
     for key, lots in open_lots.items():
         for lot in lots:
-            ex = mark_at(lot["coin"], win_hi)
+            if exit_mode == "oracle":
+                ex = best_mark(lot["coin"], lot["entry_ts"], win_hi, lot["is_long"])
+            else:
+                ex = mark_at(lot["coin"], win_hi)
             if ex is None or ex <= 0:
                 continue
             _finalize(lot, win_hi, ex, done, realistic_slip, fee_rt)
@@ -352,7 +372,8 @@ def _finalize(lot, exit_ts, exit_px, done, realistic_slip=True, fee_rt=FEE_RT):
 
 
 def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
-                       realistic_slip: bool = True, fee_rt: float = FEE_RT) -> float | None:
+                       realistic_slip: bool = True, fee_rt: float = FEE_RT,
+                       exit_mode: str = "mirror") -> float | None:
     """DECISION-ANCHORED beta (codex #3): for each top lot's (coin, side), the market return of just
     BEING in that coin/side over the WHOLE forward window [t0, t1] -- entries NOT at the wallet's
     chosen timestamp. top_fwd - beta isolates the wallet's entry-TIMING + exit-SELECTION skill above
@@ -365,7 +386,8 @@ def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
     rets = []
     for l in lots:
         e = mark_at(l["coin"], t0)
-        x = mark_at(l["coin"], t1)
+        # oracle beta: passive entry at t0, BEST ex-post exit in (t0, t1] (same privilege as oracle top).
+        x = best_mark(l["coin"], t0, t1, l["is_long"]) if exit_mode == "oracle" else mark_at(l["coin"], t1)
         if e is None or x is None or e <= 0:
             continue
         s = slip_oneway(l["coin"]) if realistic_slip else 0.0
@@ -377,7 +399,7 @@ def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
 
 
 # ----- main sim ----------------------------------------------------------------------------- #
-def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, hold_min: int,
+def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, hold_min: int, exit_mode: str = "mirror",
         latency_s: int, adverse_bps: float, top_frac: float, null_mult: int, seed: int,
         out_path: str, source: str = "m02", step_hours: int = 1) -> str:
     trail_ms, hold_ms, lat_ms = trail_min * 60_000, hold_min * 60_000, latency_s * 1000
@@ -442,11 +464,11 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             top_lots = []
             top_wallet_rows = []
             for w in top:
-                _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps)
+                _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps, exit_mode=exit_mode)
                 top_lots += lots
                 if lots:
                     we = float(np.mean([l["net"] for l in lots]))
-                    wb = beta_edge_for_lots(lots, t, t + hold_ms)
+                    wb = beta_edge_for_lots(lots, t, t + hold_ms, exit_mode=exit_mode)
                     top_wallet_rows.append({
                         "decision_ts": t, "wallet": w, "n_lots": len(lots),
                         "fwd_edge_bps": we * 1e4,
@@ -455,7 +477,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             if top_wallet_rows:
                 bw.add_many(top_wallet_rows)
             top_edge = float(np.mean([l["net"] for l in top_lots])) if top_lots else None
-            beta = beta_edge_for_lots(top_lots, t, t + hold_ms) if top_lots else None
+            beta = beta_edge_for_lots(top_lots, t, t + hold_ms, exit_mode=exit_mode) if top_lots else None
             # 3) matched null: rank-eligible NON-top wallets, matched on causal trailing-activity bucket
             null_lots = []
             top_bucket_counts = {}
@@ -472,7 +494,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
                     continue
                 pick = rng.choice(pool, size=min(len(pool), cnt * null_mult), replace=False)
                 for w in pick:
-                    _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps)
+                    _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps, exit_mode=exit_mode)
                     null_lots += lots
             null_edge = float(np.mean([l["net"] for l in null_lots])) if null_lots else None
             # diagnostics: symbol/side overlap between top and null forward baskets (codex #5)
@@ -540,6 +562,9 @@ def main():
     ap.add_argument("--per-worker-gb", type=float, default=3.0,
                     help="main-process peak-RSS estimate. m02 full-universe load is ~2-3GB (events for "
                          "~18k wallets + 0.73GB marks-cache ceiling). The memory guard aborts loud above it.")
+    ap.add_argument("--exit-mode", choices=["mirror", "oracle"], default="mirror",
+                    help="mirror = follow wallet exits (force-close at horizon); oracle = best ex-post "
+                         "exit in (entry, horizon] (hyp #2 upper bound; NOT tradeable).")
     ap.add_argument("--out", default="app/data/v15/leadlag_clean_rank.parquet")
     args = ap.parse_args()
 
@@ -569,7 +594,7 @@ def main():
     log.info(f"source={args.source} {len(cands)} candidate wallets; window {args.start}..{args.end}; "
              f"trail={args.trail_min}m hold={args.hold_min}m step={args.decision_step_hours}h "
              f"top_frac={args.top_frac}")
-    run(cands, start_ms, end_ms, trail_min=args.trail_min, hold_min=args.hold_min,
+    run(cands, start_ms, end_ms, trail_min=args.trail_min, hold_min=args.hold_min, exit_mode=args.exit_mode,
         latency_s=args.latency_s, adverse_bps=args.adverse_bps, top_frac=args.top_frac,
         null_mult=args.null_mult, seed=args.seed, out_path=args.out,
         source=args.source, step_hours=args.decision_step_hours)
