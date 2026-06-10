@@ -8,6 +8,14 @@ PATCH_SCRIPT="/Users/hermes/quants-lab/scripts/patch_hb_docker.sh"
 export DOCKER_HOST="unix:///Users/hermes/.colima/docker.sock"
 export PATH="/opt/homebrew/bin:$PATH"
 
+# 2026-06-10 (Alberto): the HB-native Docker stack (api + postgres + emqx broker) is unused and eats
+# ~0.7GB. Skip auto-starting it while this flag exists. gbrain-postgres is a SEPARATE container and is
+# unaffected. To re-enable the HB stack: rm /Users/hermes/quants-lab/.HB_STACK_DISABLED
+if [ -f "/Users/hermes/quants-lab/.HB_STACK_DISABLED" ]; then
+  echo "$(date): .HB_STACK_DISABLED present -> skipping HB stack startup (unused, frees ~0.7GB)"
+  exit 0
+fi
+
 echo "$(date): Waiting for Docker daemon..."
 for i in $(seq 1 60); do
     if docker info >/dev/null 2>&1; then

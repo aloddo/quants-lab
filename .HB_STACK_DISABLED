@@ -1,0 +1,3 @@
+Disabled 2026-06-10 by quant-engineer per Alberto: HB-native Docker stack (hummingbot-api,
+hummingbot-postgres, hummingbot-broker/emqx) is unused and eats ~0.7GB. gbrain-postgres unaffected.
+Re-enable: rm /Users/hermes/quants-lab/.HB_STACK_DISABLED  (then reboot or run tools/start_docker_stack.sh)
