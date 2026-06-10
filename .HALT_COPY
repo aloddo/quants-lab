@@ -1,0 +1,4 @@
+HALTED 2026-06-10 11:02 CEST by quant-engineer.
+Reason: reboot-OOM incident -> launchd auto-re-armed unapproved 11-leader basket on machine-wake; flattened.
+Standing order: copy bot stays FLAT+HALTED until Alberto explicitly says re-arm.
+To resume: rm -f /tmp/v12_pause .HALT_COPY  (then launchd KeepAlive will restart it)
