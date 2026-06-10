@@ -16,6 +16,18 @@ from pymongo import MongoClient
 
 from core.tasks import BaseTask, TaskContext
 
+# MEMORY-LEAK FIX (2026-06-10): runs EVERY MINUTE in-process; _init_executor did MongoClient(uri)[db]
+# per run with no close() -> pymongo monitor threads keep each alive -> unbounded leak (same class as
+# risk_state/watchdog). Reuse one module-level client for the process lifetime.
+_MONGO_CLIENT = None
+
+
+def _shared_db(uri: str, db_name: str):
+    global _MONGO_CLIENT
+    if _MONGO_CLIENT is None:
+        _MONGO_CLIENT = MongoClient(uri)
+    return _MONGO_CLIENT[db_name]
+
 from app.services.bybit_exchange_client import BybitExchangeClient
 from app.services.market_data_shim import MarketDataShim
 from app.services.thin_executor import ThinExecutor, StrategySlot
@@ -77,7 +89,7 @@ class ThinExecutorTask(BaseTask):
         """Initialize the ThinExecutor with configured strategies."""
         mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/quants_lab")
         mongo_db = os.getenv("MONGO_DATABASE", "quants_lab")
-        db = MongoClient(mongo_uri)[mongo_db]
+        db = _shared_db(mongo_uri, mongo_db)  # reuse one client (no per-run leak)
 
         exchange = BybitExchangeClient()
         shim = MarketDataShim()
