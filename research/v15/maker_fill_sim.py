@@ -19,6 +19,7 @@ from execution_model import fee_rt, set_latency_ms
 
 _DATA = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15"
 _HALF = {}
+POST_OFFSET_MULT = 1.0   # 1.0 = post at bid/ask (passive, adverse); 0.0 = post at mark (reactive/leader)
 def half_spread(coin):
     if not _HALF:
         try:
@@ -26,7 +27,7 @@ def half_spread(coin):
                 _HALF[c] = float(v.get("half_spread_bps") or 0.0) / 1e4
         except Exception:
             pass
-    return _HALF.get(coin, 4.7 / 1e4)   # midcap-ish default half-spread
+    return _HALF.get(coin, 4.7 / 1e4) * POST_OFFSET_MULT   # scaled by posting aggression
 
 
 def _seg(coin, lo_ts, hi_ts):
@@ -87,10 +88,14 @@ def main():
     ap.add_argument("--hold-min", type=int, default=60)
     ap.add_argument("--latency-s", type=int, default=2)
     ap.add_argument("--fill-timeout-min", type=int, default=15)
+    ap.add_argument("--post-offset-mult", type=float, default=1.0,
+                    help="1.0=post at bid/ask (passive, adverse); 0.0=post at mark (reactive/join-leader).")
     ap.add_argument("--min-fills", type=int, default=20)
     ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt")
     args = ap.parse_args()
     set_latency_ms(args.latency_s * 1000)
+    global POST_OFFSET_MULT
+    POST_OFFSET_MULT = args.post_offset_mult
     ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
     start, split, end = ms(args.start), ms(args.split), ms(args.end)
     hold_ms, lat_ms = args.hold_min * 60_000, args.latency_s * 1000
