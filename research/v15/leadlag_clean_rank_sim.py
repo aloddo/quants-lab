@@ -142,6 +142,23 @@ def trail_exit(coin: str, entry_ts: int, hi_ts: int, is_long: bool, trail: float
     return int(seg_ts[-1]), float(seg_px[-1])     # timeout
 
 
+def realized_vol_bps(coin: str, lo_ts: int, hi_ts: int):
+    """Realized vol (bps) of the coin's marks over (lo_ts, hi_ts] = std of consecutive pct returns x1e4.
+    Confound check for #2: if top-lot coins have higher realized vol than null-lot coins, the oracle
+    peak edge (+26bps top-null) is volatility selection, not directional skill."""
+    m = _load_marks(coin)
+    if m is None:
+        return None
+    ts, px = m
+    lo = bisect_right(ts, lo_ts)
+    hi = bisect_right(ts, hi_ts)
+    if hi - lo < 3:
+        return None
+    seg = px[lo:hi].astype(float)
+    rets = np.diff(seg) / seg[:-1]
+    return float(np.std(rets) * 1e4)
+
+
 def best_mark(coin: str, lo_ts: int, hi_ts: int, is_long: bool):
     """ORACLE exit (hyp #2): the most favorable mark in (lo_ts, hi_ts] -- max for a long, min for a
     short. This is the EX-POST upper bound on exit timing (not tradeable; it bounds whether copied
@@ -547,10 +564,18 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             top_keys = {(l["coin"], l["is_long"]) for l in top_lots}
             null_keys = {(l["coin"], l["is_long"]) for l in null_lots}
             overlap = len(top_keys & null_keys) / max(1, len(top_keys))
+            # CONFOUND CHECK (#2): realized vol of the coins top vs null entered. If top >> null, the
+            # oracle +26 is volatility selection, not directional skill.
+            tv = [realized_vol_bps(l["coin"], t, t + hold_ms) for l in top_lots]
+            nv = [realized_vol_bps(l["coin"], t, t + hold_ms) for l in null_lots]
+            tv = [v for v in tv if v is not None]
+            nv = [v for v in nv if v is not None]
             aw.add_many([{
                 "decision_ts": t, "n_eligible": len(trailing), "n_top": len(top),
                 "n_top_lots": len(top_lots), "n_null_lots": len(null_lots),
                 "top_null_symside_overlap": overlap,
+                "top_coin_vol_bps": (float(np.mean(tv)) if tv else None),
+                "null_coin_vol_bps": (float(np.mean(nv)) if nv else None),
                 "top_fwd_edge_bps": (top_edge * 1e4) if top_edge is not None else None,
                 "null_fwd_edge_bps": (null_edge * 1e4) if null_edge is not None else None,
                 "beta_edge_bps": (beta * 1e4) if beta is not None else None,
