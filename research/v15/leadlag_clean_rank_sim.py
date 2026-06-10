@@ -65,9 +65,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [leadlag] %(levelnam
 log = logging.getLogger("leadlag")
 
 HL_API = "https://api.hyperliquid.xyz/info"
-ASSETCTX_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "assetctx_marks"
-FEE_RT = 0.000864            # HL round-trip taker (CLAUDE.md)
+_DATA = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15"
+ASSETCTX_DIR = _DATA / "assetctx_marks"
 HOUR_MS = 3_600_000
+
+# CANONICAL execution model is the SINGLE source of truth for slippage / fees / latency (Alberto
+# 2026-06-10: no sim may hardcode its own). See research/v15/execution_model.py + the spec in brain
+# projects/quant/v15/execution-model. FEE_RT kept as a module alias so default args resolve.
+from execution_model import (  # noqa: E402
+    slip_oneway, fee_rt, set_slip_default_bps, set_latency_ms,
+    calibrated_share, reset_hits, LATENCY_MS,
+)
+FEE_RT = fee_rt()            # canonical HL round-trip taker (from hl_fee_schedule.json)
 
 # ----- marks: page-cached per-coin asof index (no per-row DB round-trip) ---------------------- #
 _marks: dict[str, tuple] = {}   # coin -> (ts_array, px_array)
@@ -269,12 +278,14 @@ class WalletEvents:
 
 
 # ----- copy lot accounting ------------------------------------------------------------------ #
-def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adverse_bps: float):
+def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adverse_bps: float,
+              realistic_slip: bool = True, fee_rt: float = FEE_RT):
     """Copy ONLY opens whose ts is in (win_lo, win_hi]. Each open = one unit lot, entered at the
-    mark `latency_ms` after the fill, with `adverse_bps` adverse slippage on entry. Close our oldest
-    matching lot (FIFO, per coin+direction) when the wallet emits a matching Close; force-close any
-    survivor at win_hi mark. Net of RT fee. Returns (net_sum_per_lot_mean, lots) where each lot is
-    {coin, is_long, entry_ts, entry_px, exit_ts, exit_px, net}. Equal-weight per lot (size-normalized)."""
+    mark `latency_ms` after the fill. Cross-spread slippage is applied on BOTH entry and exit. With
+    realistic_slip=True (default), uses the per-coin measured half_spread+impact (l2_calib); else the
+    flat `adverse_bps` on entry only (legacy A/B). Close our oldest matching lot (FIFO, per
+    coin+direction) when the wallet emits a matching Close; force-close survivors at win_hi. Net of
+    `fee_rt`. Returns (net_per_lot_mean, lots): {coin, is_long, entry_ts, entry_px, exit_ts, exit_px, net}."""
     open_lots: dict[tuple, list] = {}     # (coin,is_long) -> [lot,...] FIFO
     done = []
     adv = adverse_bps / 10_000.0
@@ -294,7 +305,8 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
             ent = mark_at(coin, f["ts"] + latency_ms)
             if ent is None or ent <= 0:
                 continue
-            ent_adj = ent * (1 + adv) if is_long else ent * (1 - adv)   # adverse entry
+            s = slip_oneway(coin) if realistic_slip else adv      # cross the spread to enter
+            ent_adj = ent * (1 + s) if is_long else ent * (1 - s)
             open_lots.setdefault((coin, is_long), []).append(
                 {"coin": coin, "is_long": is_long, "entry_ts": f["ts"] + latency_ms, "entry_px": ent_adj})
         else:
@@ -311,53 +323,56 @@ def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adve
                 if ex is None or ex <= 0:
                     lots.insert(0, lot)   # cannot price exit now; keep, force-close later
                     continue
-                _finalize(lot, ex_ts, ex, done)
+                _finalize(lot, ex_ts, ex, done, realistic_slip, fee_rt)
     # force-close survivors at win_hi
     for key, lots in open_lots.items():
         for lot in lots:
             ex = mark_at(lot["coin"], win_hi)
             if ex is None or ex <= 0:
                 continue
-            _finalize(lot, win_hi, ex, done)
+            _finalize(lot, win_hi, ex, done, realistic_slip, fee_rt)
     if not done:
         return None, []
     net_mean = float(np.mean([l["net"] for l in done]))
     return net_mean, done
 
 
-def _finalize(lot, exit_ts, exit_px, done):
+def _finalize(lot, exit_ts, exit_px, done, realistic_slip=True, fee_rt=FEE_RT):
+    # cross the spread to EXIT too: sell a long into the bid, buy back a short at the ask.
+    s = slip_oneway(lot["coin"]) if realistic_slip else 0.0
+    exit_fill = exit_px * (1 - s) if lot["is_long"] else exit_px * (1 + s)
     if lot["is_long"]:
-        gross = (exit_px - lot["entry_px"]) / lot["entry_px"]
+        gross = (exit_fill - lot["entry_px"]) / lot["entry_px"]
     else:
-        gross = (lot["entry_px"] - exit_px) / lot["entry_px"]
+        gross = (lot["entry_px"] - exit_fill) / lot["entry_px"]
     lot["exit_ts"] = exit_ts
-    lot["exit_px"] = exit_px
-    lot["net"] = gross - FEE_RT
+    lot["exit_px"] = exit_fill
+    lot["net"] = gross - fee_rt
     done.append(lot)
 
 
-def beta_edge_for_lots(lots: list[dict], t0: int, t1: int) -> float | None:
+def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
+                       realistic_slip: bool = True, fee_rt: float = FEE_RT) -> float | None:
     """DECISION-ANCHORED beta (codex #3): for each top lot's (coin, side), the market return of just
     BEING in that coin/side over the WHOLE forward window [t0, t1] -- entries NOT at the wallet's
-    chosen timestamp (which would just measure slippage). This is the trend available to anyone who
-    decided at t0 to hold those coins/sides. top_fwd - beta isolates the wallet's entry-TIMING and
-    exit-SELECTION skill above simply holding the basket the top decile traded.
+    chosen timestamp. top_fwd - beta isolates the wallet's entry-TIMING + exit-SELECTION skill above
+    simply holding the basket the top decile traded.
 
-    One beta observation per (coin, side) the top lots touched (deduped), so a wallet opening the same
-    coin many times does not over-weight the basket. No adverse slippage (it is a reference, not a
-    tradetable copy); fees still subtracted so top_minus_beta cancels fees consistently."""
-    seen, rets = set(), []
+    Beta pays the SAME execution (per-coin cross-spread slippage on entry+exit + fee) as the copied
+    lots. codex fix: ONE beta obs PER TOP LOT (NOT deduped) so the execution frequency/weighting
+    matches top exactly -> top_minus_beta cancels execution and churn, leaving a clean SKILL estimate.
+    (A wallet that opens BTC 3x gets 3 identical t0->t1 BTC beta obs, matching its 3 copied lots.)"""
+    rets = []
     for l in lots:
-        key = (l["coin"], l["is_long"])
-        if key in seen:
-            continue
-        seen.add(key)
         e = mark_at(l["coin"], t0)
         x = mark_at(l["coin"], t1)
         if e is None or x is None or e <= 0:
             continue
-        g = (x - e) / e if l["is_long"] else (e - x) / e
-        rets.append(g - FEE_RT)
+        s = slip_oneway(l["coin"]) if realistic_slip else 0.0
+        e_fill = e * (1 + s) if l["is_long"] else e * (1 - s)     # enter crossing spread
+        x_fill = x * (1 - s) if l["is_long"] else x * (1 + s)     # exit crossing spread
+        g = (x_fill - e_fill) / e_fill if l["is_long"] else (e_fill - x_fill) / e_fill
+        rets.append(g - fee_rt)
     return float(np.mean(rets)) if rets else None
 
 
@@ -482,7 +497,9 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
         t += step_ms
     n = aw.close()
     nb = bw.close()
+    share, n_calib, n_def = calibrated_share()
     log.info(f"streamed {n} decision rows -> {out_path}; {nb} per-wallet rows -> {by_wallet_path}")
+    log.info(f"[exec] calibrated-coin slip share: {share:.1f}% ({n_calib} calib / {n_def} default)")
     return out_path
 
 
@@ -517,12 +534,19 @@ def main():
     ap.add_argument("--top-frac", type=float, default=0.10)
     ap.add_argument("--null-mult", type=int, default=3, help="null wallets sampled per top wallet/bucket.")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--slip-default-bps", type=float, default=4.7,
+                    help="one-way slippage for coins not in l2_calib (sensitivity knob; ~midcap=4.7).")
     ap.add_argument("--headroom-gb", type=float, default=6.0)
     ap.add_argument("--per-worker-gb", type=float, default=3.0,
                     help="main-process peak-RSS estimate. m02 full-universe load is ~2-3GB (events for "
                          "~18k wallets + 0.73GB marks-cache ceiling). The memory guard aborts loud above it.")
     ap.add_argument("--out", default="app/data/v15/leadlag_clean_rank.parquet")
     args = ap.parse_args()
+
+    # configure the CANONICAL execution model (single source of truth)
+    set_slip_default_bps(args.slip_default_bps)
+    set_latency_ms(args.latency_s * 1000)
+    reset_hits()
 
     # memory budget: serial (one process); aborts before work if the box cannot fit it.
     b = plan_memory_budget(requested_procs=1, per_worker_gb=args.per_worker_gb, main_reserve_gb=0.0,
