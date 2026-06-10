@@ -23,6 +23,19 @@ from pymongo import MongoClient
 
 from core.tasks import BaseTask, TaskContext
 
+# MEMORY-LEAK FIX (2026-06-10): this task runs EVERY MINUTE via the in-process orchestrator. It used
+# to do `MongoClient(uri)[db]` per run and never close() -> pymongo's monitor threads keep each client
+# alive, so ~120 clients/connection-pools/buffers leaked in 2h (5.4GB compressed in pid run-tasks).
+# Reuse ONE module-level client for the process lifetime instead.
+_MONGO_CLIENT: "MongoClient | None" = None
+
+
+def _shared_db(uri: str, db_name: str):
+    global _MONGO_CLIENT
+    if _MONGO_CLIENT is None:
+        _MONGO_CLIENT = MongoClient(uri)
+    return _MONGO_CLIENT[db_name]
+
 from app.services.bybit_exchange_client import BybitExchangeClient
 from app.services.portfolio_risk_manager import (
     compute_risk_state,
@@ -46,7 +59,7 @@ class RiskStateTask(BaseTask):
 
         mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/quants_lab")
         mongo_db_name = os.getenv("MONGO_DATABASE", "quants_lab")
-        db = MongoClient(mongo_uri)[mongo_db_name]
+        db = _shared_db(mongo_uri, mongo_db_name)  # reuse one client (no per-minute leak)
 
         exchange = BybitExchangeClient()
         risk_config = _load_risk_config(db)

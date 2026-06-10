@@ -25,6 +25,18 @@ from pymongo import MongoClient
 
 from core.tasks import BaseTask, TaskContext, TaskResult, TaskStatus
 
+# MEMORY-LEAK FIX (2026-06-10): runs every 5 min in-process; the old per-run MongoClient was closed
+# only on the success path (close() outside try/finally) -> any error before it leaked a client.
+# Reuse one module-level client for the process lifetime (same fix as risk_state_task).
+_MONGO_CLIENT = None
+
+
+def _shared_client(uri: str) -> MongoClient:
+    global _MONGO_CLIENT
+    if _MONGO_CLIENT is None:
+        _MONGO_CLIENT = MongoClient(uri)
+    return _MONGO_CLIENT
+
 logger = logging.getLogger(__name__)
 
 # A task lock held longer than this is considered stale
@@ -77,7 +89,7 @@ class WatchdogTask(BaseTask):
         if not mongo_uri:
             return {"status": "completed", "message": "No MONGO_URI"}
 
-        client = MongoClient(mongo_uri)
+        client = _shared_client(mongo_uri)  # reused process-wide (no per-run leak)
         db = client[mongo_db]
         issues = []
         healed = []
@@ -188,7 +200,7 @@ class WatchdogTask(BaseTask):
             logger.info("Watchdog: all checks passed")
             self._clear_issue_state(db)  # reset escalation timer
 
-        client.close()
+        # NOTE: do NOT close() -- client is the process-wide shared singleton (_shared_client).
 
         n_issues = len(issues)
         n_reaped = len(reaped) if reaped else 0
