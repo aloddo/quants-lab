@@ -158,6 +158,47 @@ def load_wallet_opens_closes(w: str, start_ms: int, end_ms: int) -> list[dict]:
     return out
 
 
+M02_ACTIONS = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "m02_actions.parquet"
+
+
+def load_events_from_m02(wallet_set: set[str], start_ms: int, end_ms: int,
+                         exclude_liq: bool = True) -> dict[str, list]:
+    """Full-universe open/close events from the m02 journey-trace output (NO API). Reads only the
+    needed columns, row-group by row-group (bounded RAM), filters to `wallet_set` and [start,end].
+    Returns {wallet: [{ts, coin, is_open, is_long}, ...]} sorted by ts.
+
+    action_type ENTRY=open, EXIT=close. Direction for FIFO matching is the POSITION's side:
+      ENTRY -> is_long = signed_size > 0 ; EXIT -> is_long = signed_size < 0 (selling closes a long).
+    Liquidations excluded by default (not copyable signal)."""
+    import pyarrow.parquet as pq
+    cols = ["wallet", "coin", "ts", "action_type", "signed_size", "is_liquidation"]
+    pf = pq.ParquetFile(str(M02_ACTIONS))
+    out: dict[str, list] = {}
+    for batch in pf.iter_batches(batch_size=1_000_000, columns=cols):
+        d = batch.to_pydict()
+        ws, cs, ts, at, sz, liq = (d["wallet"], d["coin"], d["ts"], d["action_type"],
+                                   d["signed_size"], d["is_liquidation"])
+        for i in range(len(ws)):
+            w = ws[i]
+            if w not in wallet_set:
+                continue
+            tt = ts[i]
+            if tt < start_ms or tt > end_ms:
+                continue
+            if exclude_liq and liq[i]:
+                continue
+            is_open = (at[i] == "ENTRY")
+            s = sz[i]
+            if s is None or s == 0:
+                continue
+            is_long = (s > 0) if is_open else (s < 0)
+            out.setdefault(w, []).append({"ts": int(tt), "coin": cs[i],
+                                          "is_open": is_open, "is_long": is_long})
+    for w in out:
+        out[w].sort(key=lambda x: x["ts"])
+    return out
+
+
 # ----- copy lot accounting ------------------------------------------------------------------ #
 def copy_edge(fills: list[dict], win_lo: int, win_hi: int, latency_ms: int, adverse_bps: float):
     """Copy ONLY opens whose ts is in (win_lo, win_hi]. Each open = one unit lot, entered at the
@@ -254,31 +295,37 @@ def beta_edge_for_lots(lots: list[dict], t0: int, t1: int) -> float | None:
 # ----- main sim ----------------------------------------------------------------------------- #
 def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, hold_min: int,
         latency_s: int, adverse_bps: float, top_frac: float, null_mult: int, seed: int,
-        out_path: str) -> str:
+        out_path: str, source: str = "m02", step_hours: int = 1) -> str:
     trail_ms, hold_ms, lat_ms = trail_min * 60_000, hold_min * 60_000, latency_s * 1000
     rng = np.random.default_rng(seed)
+    load_lo, load_hi = start_ms - trail_ms, end_ms + hold_ms
 
-    # bulk-load each candidate's fills ONCE for the whole window (bounded by len(candidates)).
-    # codex #7: a fetch failure marks the wallet INCOMPLETE and DROPS it (never silently truncated).
-    log.info(f"loading fills for {len(candidates)} candidate wallets ...")
-    wf: dict[str, list] = {}
-    n_incomplete = 0
-    for i, w in enumerate(candidates, 1):
-        try:
-            f = load_wallet_opens_closes(w, start_ms - trail_ms, end_ms + hold_ms)
-        except FetchError as e:
-            n_incomplete += 1
-            log.warning(f"  DROP incomplete wallet {w[:10]}: {e}")
-            f = None
-        if f:
-            wf[w] = f
-        if i % 50 == 0:
-            log.info(f"  fills {i}/{len(candidates)} ({len(wf)} ok, {n_incomplete} dropped-incomplete)")
-    log.info(f"{len(wf)} wallets with complete fills ({n_incomplete} dropped incomplete)")
+    if source == "m02":
+        # FULL-UNIVERSE open/close from the m02 journey-trace parquet (no API). One streamed pass.
+        log.info(f"loading m02 events for {len(candidates)} wallets from {M02_ACTIONS.name} ...")
+        wf = load_events_from_m02(set(candidates), load_lo, load_hi)
+        log.info(f"{len(wf)} wallets with events (of {len(candidates)} candidates)")
+    else:
+        # legacy API path (per-wallet; slow, rate-limited). codex #7: failures DROP the wallet.
+        log.info(f"loading fills via HL API for {len(candidates)} wallets ...")
+        wf, n_incomplete = {}, 0
+        for i, w in enumerate(candidates, 1):
+            try:
+                f = load_wallet_opens_closes(w, load_lo, load_hi)
+            except FetchError as e:
+                n_incomplete += 1
+                log.warning(f"  DROP incomplete wallet {w[:10]}: {e}")
+                f = None
+            if f:
+                wf[w] = f
+            if i % 50 == 0:
+                log.info(f"  fills {i}/{len(candidates)} ({len(wf)} ok, {n_incomplete} dropped)")
+        log.info(f"{len(wf)} wallets with complete fills ({n_incomplete} dropped incomplete)")
 
     wallets = list(wf.keys())
     if len(wallets) < 20:
-        raise SystemExit(f"too few wallets with fills ({len(wallets)}); widen candidates/window")
+        raise SystemExit(f"too few wallets with events ({len(wallets)}); widen candidates/window")
+    step_ms = step_hours * HOUR_MS
 
     aw = ShardedParquetWriter(out_path, flush_rows=200_000)
     by_wallet_path = out_path.replace(".parquet", "_bywallet.parquet")
@@ -362,7 +409,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             n_dec += 1
             if n_dec % 50 == 0:
                 log.info(f"  decisions {n_dec} (t={pd.to_datetime(t, unit='ms')})")
-        t += HOUR_MS
+        t += step_ms
     n = aw.close()
     nb = bw.close()
     log.info(f"streamed {n} decision rows -> {out_path}; {nb} per-wallet rows -> {by_wallet_path}")
@@ -381,23 +428,34 @@ def pick_candidates(max_wallets: int, start_ms: int, end_ms: int) -> list[str]:
 
 def main():
     ap = argparse.ArgumentParser(description="Lead-lag clean-rank salvage sim (memory-safe)")
-    ap.add_argument("--start", default="2026-04-01")
+    ap.add_argument("--source", choices=["m02", "api"], default="m02",
+                    help="m02 = full-universe open/close from m02_actions.parquet (no API, default); "
+                         "api = legacy per-wallet HL API (slow, small scope only).")
+    ap.add_argument("--start", default="2025-12-01", help="default Dec 1 (full m02 history).")
     ap.add_argument("--end", default="2026-05-23")
-    ap.add_argument("--max-wallets", type=int, default=300, help="candidate cap (bounds RAM + API).")
-    ap.add_argument("--candidates-file", default=None, help="optional: one wallet/line; else m03 top-N.")
+    ap.add_argument("--max-wallets", type=int, default=0,
+                    help="candidate cap (0 = ALL wallets in the universe file; >0 caps, mainly for api).")
+    ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt",
+                    help="full-universe wallet list for --source m02 (one address/line).")
+    ap.add_argument("--candidates-file", default=None, help="override universe; one wallet/line.")
     ap.add_argument("--trail-min", type=int, default=60)
     ap.add_argument("--hold-min", type=int, default=60)
+    ap.add_argument("--decision-step-hours", type=int, default=1,
+                    help="hours between decision points (raise to coarsen the grid for tractability).")
     ap.add_argument("--latency-s", type=int, default=2)
     ap.add_argument("--adverse-bps", type=float, default=7.0)
     ap.add_argument("--top-frac", type=float, default=0.10)
     ap.add_argument("--null-mult", type=int, default=3, help="null wallets sampled per top wallet/bucket.")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--headroom-gb", type=float, default=6.0)
+    ap.add_argument("--per-worker-gb", type=float, default=3.0,
+                    help="main-process peak-RSS estimate. m02 full-universe load is ~2-3GB (events for "
+                         "~18k wallets + 0.73GB marks-cache ceiling). The memory guard aborts loud above it.")
     ap.add_argument("--out", default="app/data/v15/leadlag_clean_rank.parquet")
     args = ap.parse_args()
 
     # memory budget: serial (one process); aborts before work if the box cannot fit it.
-    b = plan_memory_budget(requested_procs=1, per_worker_gb=2.0, main_reserve_gb=0.0,
+    b = plan_memory_budget(requested_procs=1, per_worker_gb=args.per_worker_gb, main_reserve_gb=0.0,
                            headroom_gb=args.headroom_gb, main_soft_cap=12.0)
     install_memory_guard(soft_gb=b.main_soft_gb, label="leadlag")
 
@@ -406,14 +464,21 @@ def main():
 
     if args.candidates_file:
         cands = [l.strip().lower() for l in open(args.candidates_file)
-                 if l.strip() and not l.startswith("#")][:args.max_wallets]
+                 if l.strip() and not l.startswith("#")]
+    elif args.source == "m02":
+        cands = [l.strip().lower() for l in open(args.universe_file)
+                 if l.strip() and not l.startswith("#")]
     else:
-        cands = pick_candidates(args.max_wallets, start_ms, end_ms)
-    log.info(f"{len(cands)} candidate wallets; window {args.start}..{args.end}; "
-             f"trail={args.trail_min}m hold={args.hold_min}m top_frac={args.top_frac}")
+        cands = pick_candidates(args.max_wallets or 300, start_ms, end_ms)
+    if args.max_wallets and args.max_wallets > 0:
+        cands = cands[:args.max_wallets]
+    log.info(f"source={args.source} {len(cands)} candidate wallets; window {args.start}..{args.end}; "
+             f"trail={args.trail_min}m hold={args.hold_min}m step={args.decision_step_hours}h "
+             f"top_frac={args.top_frac}")
     run(cands, start_ms, end_ms, trail_min=args.trail_min, hold_min=args.hold_min,
         latency_s=args.latency_s, adverse_bps=args.adverse_bps, top_frac=args.top_frac,
-        null_mult=args.null_mult, seed=args.seed, out_path=args.out)
+        null_mult=args.null_mult, seed=args.seed, out_path=args.out,
+        source=args.source, step_hours=args.decision_step_hours)
 
 
 if __name__ == "__main__":
