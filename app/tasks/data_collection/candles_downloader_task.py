@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -148,7 +149,20 @@ class CandlesDownloaderTask(NotifyingTaskMixin, BaseTask):
             # Save all cached data to parquet files
             logging.info("Saving candles cache to parquet files...")
             self.clob.dump_candles_cache()
-            
+
+            # MEMORY FIX (2026-06-10): the candle cache (self.clob._candles_cache) holds full history
+            # for every pair x interval and PERSISTS on the long-lived task instance across hourly runs
+            # -> the orchestrator RSS grew unbounded (multi-GB, compressor-bound on a swap=0 box). Drop
+            # it after dumping; next run rebuilds it from parquet (load_candles_cache). Trades a slower
+            # reload for bounded memory -- correct on a 16GB/swap-0 box. Parquet on disk is the truth.
+            try:
+                n_cached = len(self.clob._candles_cache)
+                self.clob._candles_cache.clear()
+                gc.collect()
+                logging.info(f"Cleared in-memory candle cache ({n_cached} sets) + gc to bound RSS")
+            except Exception as _e:
+                logging.warning(f"candle cache clear skipped: {_e}")
+
             # Prepare result
             duration = datetime.now(timezone.utc) - start_execution
             result = {
