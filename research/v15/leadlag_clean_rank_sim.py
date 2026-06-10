@@ -173,7 +173,9 @@ def load_events_from_m02(wallet_set: set[str], start_ms: int, end_ms: int,
     import pyarrow.parquet as pq
     cols = ["wallet", "coin", "ts", "action_type", "signed_size", "is_liquidation"]
     pf = pq.ParquetFile(str(M02_ACTIONS))
-    out: dict[str, list] = {}
+    # accumulate compact tuples per wallet (ts, coin_id, is_open, is_long) -> ~72B/event transient,
+    # converted to numpy WalletEvents at the end (~12B/event). Avoids 30M dicts.
+    acc: dict[str, list] = {}
     for batch in pf.iter_batches(batch_size=1_000_000, columns=cols):
         d = batch.to_pydict()
         ws, cs, ts, at, sz, liq = (d["wallet"], d["coin"], d["ts"], d["action_type"],
@@ -192,11 +194,66 @@ def load_events_from_m02(wallet_set: set[str], start_ms: int, end_ms: int,
             if s is None or s == 0:
                 continue
             is_long = (s > 0) if is_open else (s < 0)
-            out.setdefault(w, []).append({"ts": int(tt), "coin": cs[i],
-                                          "is_open": is_open, "is_long": is_long})
-    for w in out:
-        out[w].sort(key=lambda x: x["ts"])
+            acc.setdefault(w, []).append((int(tt), _coin_id(cs[i]), is_open, is_long))
+    out: dict[str, WalletEvents] = {}
+    for w, tuples in acc.items():
+        tuples.sort(key=lambda x: x[0])
+        out[w] = WalletEvents.from_tuples(tuples)
     return out
+
+
+# ----- compact per-wallet event store (memory + speed for the full 18k universe) ------------- #
+# Storing ~30M events as list-of-dicts needs ~30GB. Compact numpy arrays per wallet need ~12B/event
+# (~0.4GB total). Each decision then bisect-slices the [win_lo, win_hi] range (O(log n)) and
+# materializes ONLY that small slice as dicts for the (unchanged, codex-approved) copy_edge. This
+# avoids the old O(events-up-to-t) from-zero scan that made the full universe infeasible.
+_COINS: list[str] = []          # id -> coin string
+_COIN_ID: dict[str, int] = {}   # coin string -> id
+
+
+def _coin_id(coin: str) -> int:
+    i = _COIN_ID.get(coin)
+    if i is None:
+        i = len(_COINS)
+        _COINS.append(coin)
+        _COIN_ID[coin] = i
+    return i
+
+
+class WalletEvents:
+    """Per-wallet open/close events as compact, ts-sorted parallel numpy arrays."""
+    __slots__ = ("ts", "coin_id", "is_open", "is_long")
+
+    def __init__(self, ts, coin_id, is_open, is_long):
+        self.ts = ts            # int64[]
+        self.coin_id = coin_id  # int16[]
+        self.is_open = is_open  # bool[]
+        self.is_long = is_long  # bool[]
+
+    @classmethod
+    def from_tuples(cls, tuples: list):
+        """tuples: list of (ts, coin_id, is_open, is_long), sorted by ts ascending."""
+        n = len(tuples)
+        ts = np.empty(n, dtype=np.int64)
+        cid = np.empty(n, dtype=np.int16)
+        op = np.empty(n, dtype=np.bool_)
+        lg = np.empty(n, dtype=np.bool_)
+        for i, (t, c, o, l) in enumerate(tuples):
+            ts[i] = t; cid[i] = c; op[i] = o; lg[i] = l
+        return cls(ts, cid, op, lg)
+
+    def slice_dicts(self, win_lo: int, win_hi: int) -> list[dict]:
+        """Materialize ONLY events with ts in (win_lo, win_hi] as dicts for copy_edge. bisect-bounded;
+        identical to what copy_edge would have iterated (it skips ts<=win_lo opens and breaks at
+        ts>win_hi)."""
+        from bisect import bisect_right
+        lo = bisect_right(self.ts, win_lo)          # first idx with ts > win_lo
+        hi = bisect_right(self.ts, win_hi)          # first idx with ts > win_hi
+        out = []
+        for i in range(lo, hi):
+            out.append({"ts": int(self.ts[i]), "coin": _COINS[self.coin_id[i]],
+                        "is_open": bool(self.is_open[i]), "is_long": bool(self.is_long[i])})
+        return out
 
 
 # ----- copy lot accounting ------------------------------------------------------------------ #
@@ -317,7 +374,8 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
                 log.warning(f"  DROP incomplete wallet {w[:10]}: {e}")
                 f = None
             if f:
-                wf[w] = f
+                wf[w] = WalletEvents.from_tuples(
+                    [(d["ts"], _coin_id(d["coin"]), d["is_open"], d["is_long"]) for d in f])
             if i % 50 == 0:
                 log.info(f"  fills {i}/{len(candidates)} ({len(wf)} ok, {n_incomplete} dropped)")
         log.info(f"{len(wf)} wallets with complete fills ({n_incomplete} dropped incomplete)")
@@ -337,7 +395,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
         #    count per wallet for a CAUSAL activity-matched null (codex #4/#5).
         trailing, trail_n = {}, {}
         for w in wallets:
-            edge, lots = copy_edge(wf[w], t - trail_ms, t, lat_ms, adverse_bps)
+            edge, lots = copy_edge(wf[w].slice_dicts(t - trail_ms, t), t - trail_ms, t, lat_ms, adverse_bps)
             if edge is not None and lots:
                 trailing[w] = edge
                 trail_n[w] = len(lots)
@@ -357,7 +415,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
             top_lots = []
             top_wallet_rows = []
             for w in top:
-                _, lots = copy_edge(wf[w], t, t + hold_ms, lat_ms, adverse_bps)
+                _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps)
                 top_lots += lots
                 if lots:
                     we = float(np.mean([l["net"] for l in lots]))
@@ -387,7 +445,7 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
                     continue
                 pick = rng.choice(pool, size=min(len(pool), cnt * null_mult), replace=False)
                 for w in pick:
-                    _, lots = copy_edge(wf[w], t, t + hold_ms, lat_ms, adverse_bps)
+                    _, lots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms, adverse_bps)
                     null_lots += lots
             null_edge = float(np.mean([l["net"] for l in null_lots])) if null_lots else None
             # diagnostics: symbol/side overlap between top and null forward baskets (codex #5)
