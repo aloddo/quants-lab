@@ -66,15 +66,24 @@ def faithful_net(coin, dir_, ets, xts, lat):
     return g * 1e4 - FEE_T * 1e4
 
 
-def overlay_net(coin, dir_, ets, xts, lat):
-    """Shipped overlay replay (copy of overlay_oos.overlay_trade with SHIPPED params)."""
+def overlay_net(coin, dir_, ets, xts, lat, ride_hold_ms=None):
+    """Shipped overlay replay (copy of overlay_oos.overlay_trade with SHIPPED params).
+
+    ride_hold_ms (V17.1 ride): when set, IGNORE the leader close (xts) and hold to
+    ets+lat+ride_hold_ms (still 7d-capped), with the SAME trailing stop. None = shipped
+    behavior, byte-identical. Returns (net_bps, reason, exit_ts_ms)."""
     mark0 = S.mark_at(coin, ets + lat)
     if mark0 is None or mark0 <= 0:
         return None
     entry_px = apply_entry(coin, mark0, dir_ > 0)
-    deadline = min(xts + lat, ets + lat + MAX_HOLD_S * 1000)
-    reason = "leader_close" if deadline == xts + lat else "max_hold"
+    if ride_hold_ms is not None:
+        deadline = min(ets + lat + ride_hold_ms, ets + lat + MAX_HOLD_S * 1000)
+        reason = "ride_cap" if deadline == ets + lat + ride_hold_ms else "max_hold"
+    else:
+        deadline = min(xts + lat, ets + lat + MAX_HOLD_S * 1000)
+        reason = "leader_close" if deadline == xts + lat else "max_hold"
     exit_mark = None
+    exit_t = deadline
     peak = 0.0
     t = ets + lat + MARK_STEP_MS
     while t < deadline:
@@ -83,10 +92,10 @@ def overlay_net(coin, dir_, ets, xts, lat):
             pnl = dir_ * (m - entry_px) / entry_px * 1e4
             peak = max(peak, pnl)
             if pnl <= SL_BPS:
-                exit_mark, reason = m, "sl"
+                exit_mark, reason, exit_t = m, "sl", t
                 break
             if peak >= TRAIL_ACTIVATE_BPS and (peak - pnl) >= TRAIL_BPS:
-                exit_mark, reason = m, "trail"
+                exit_mark, reason, exit_t = m, "trail", t
                 break
         t += MARK_STEP_MS
     if exit_mark is None:
@@ -95,9 +104,9 @@ def overlay_net(coin, dir_, ets, xts, lat):
             return None
     exit_px = apply_exit(coin, exit_mark, dir_ > 0)
     gross = dir_ * (exit_px - entry_px) / entry_px
-    if reason in ("leader_close", "max_hold"):
+    if reason in ("leader_close", "max_hold", "ride_cap"):
         gross = max(-CAP, min(CAP, gross))
-    return (gross * 1e4 - FEE_T * 1e4, reason)
+    return (gross * 1e4 - FEE_T * 1e4, reason, exit_t)
 
 
 def run_fold(writer, fname, f_start, f_split, f_end, uni):

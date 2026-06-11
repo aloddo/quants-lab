@@ -39,6 +39,8 @@ from _streaming_io import ShardedParquetWriter, install_memory_guard
 from select_cohort import edge, LIQUID, CAP
 from sprint_decompose import faithful_net, overlay_net, LAT, LAT_VARIANTS
 
+RIDE_HOLD_MS = 72 * 3_600_000     # V17.1 ride: hold high-knet entries to 72h (matches engine default)
+
 FEE_T = fee_rt(maker=False)
 FILLS_DIR = _REPO / "app" / "data" / "hl_s3_fills_v2"
 CFG = json.load(open(_REPO / "config" / "copy_trader_wallets_v16.json"))
@@ -101,7 +103,7 @@ def validate():
     return (ok["diff"].abs() < 5.0).mean() > 0.9
 
 
-def forward(end_str: str, m02_slice: str | None = None):
+def forward(end_str: str, m02_slice: str | None = None, ride_knet: int | None = None):
     ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
     split = ms("2026-05-23")
     end = ms(end_str) + 86_399_000          # inclusive end-of-day
@@ -154,12 +156,16 @@ def forward(end_str: str, m02_slice: str | None = None):
             k_opp[i] = int(np.sum(live & (D != D[j])))
             k30[i] = int(np.sum(live & (D == D[j]) & (R <= 30)))
 
-    out = _REPO / "app" / "data" / "v16" / "forward_trades.parquet"
+    out = _REPO / "app" / "data" / "v16" / (
+        "forward_trades.parquet" if ride_knet is None
+        else f"forward_trades_ride_knet{ride_knet}.parquet")
     writer = ShardedParquetWriter(out, flush_rows=50_000)
-    n_out, n_skip = 0, 0
+    n_out, n_skip, n_ride = 0, 0, 0
     for i, (w, c, dir_, ets, xts) in enumerate(trades):
+        knet = int(k_same[i]) - int(k_opp[i])
+        is_ride = ride_knet is not None and knet >= ride_knet
         fl2 = faithful_net(c, dir_, ets, xts, LAT)
-        ov = overlay_net(c, dir_, ets, xts, LAT)
+        ov = overlay_net(c, dir_, ets, xts, LAT, ride_hold_ms=(RIDE_HOLD_MS if is_ride else None))
         if fl2 is None or ov is None:
             n_skip += 1
             continue
@@ -175,11 +181,18 @@ def forward(end_str: str, m02_slice: str | None = None):
         for lv in LAT_VARIANTS:
             v = faithful_net(c, dir_, ets, xts, lv)
             row[f"fl_{lv}"] = v if v is not None else np.nan
+        if ride_knet is not None:   # ride columns ONLY in ride mode -> default output byte-identical
+            row["knet"] = knet
+            row["ride"] = bool(is_ride)
+            row["ride_exit_ts"] = int(ov[2])
+            row["actual_hold_h"] = (int(ov[2]) - ets) / 3_600_000.0
+            n_ride += int(is_ride)
         writer.add_many([row])
         n_out += 1
     n = writer.close()
     cs, nc, nd = calibrated_share()
-    print(f"  {n_out} priced ({n_skip} skipped, no mark) -> {out}")
+    _rmsg = "" if ride_knet is None else f" | ride knet>={ride_knet}: {n_ride} rode of {n_out}"
+    print(f"  {n_out} priced ({n_skip} skipped, no mark) -> {out}{_rmsg}")
     print(f"  calibrated slip share: {cs:.0f}%")
     days = (end - split) / 86_400_000
     print(f"\nANALYZE: python research/v16/sprint_analysis.py --in {out} --days {days:.1f}")
@@ -198,13 +211,15 @@ def main():
     ap.add_argument("--forward", action="store_true")
     ap.add_argument("--end", default="2026-06-10")
     ap.add_argument("--m02-slice", default=None, help="cohort-only m02 actions parquet (validated path)")
+    ap.add_argument("--ride-knet", type=int, default=None,
+                    help="V17.1 ride: entries with knet>=N ignore the leader close and hold to 72h cap")
     args = ap.parse_args()
     if args.validate:
         ok = validate()
         print("VALIDATE:", "PASS" if ok else "FAIL")
         sys.exit(0 if ok else 1)
     if args.forward:
-        forward(args.end, args.m02_slice)
+        forward(args.end, args.m02_slice, args.ride_knet)
 
 
 if __name__ == "__main__":
