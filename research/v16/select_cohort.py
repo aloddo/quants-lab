@@ -93,10 +93,15 @@ V16_DEFAULTS = {
     "max_coin_concentration": 1.0,     # effectively off (book-level controls govern)
     "max_coin_notional_pct": 10.0,     # effectively off (fixed-mode cap disabled by construction)
     "exit_type": "FIRST_CLOSE",        # leader's first close -> we close (faithful exit)
-    "sl_bps": -400,                    # protective floor, beyond validated cap; overlay-tested
-    "trail_activate_bps": 150,         # rule #7 trailing TP: activate at +150bps...
-    "trail_bps": 75,                   # ...give back max 75bps from peak. Overlay-tested.
-    "max_hold_s": 172800,              # 48h safety valve (validated holds are multi-hour)
+    # SWEEP-SELECTED OVERLAY (overlay_sweep v2, 2026-06-11): sl1500_tr600_300_7d BEATS faithful in BOTH
+    # folds (fold1 +24.0 vs +19.6; fold2 +25.1 vs +22.4). SL -1500 fired 0% (pure disaster floor); the
+    # wide trail catches post-peak reversals without truncating the long-hold right tail. The engine
+    # defaults we nearly shipped (sl-400/tr150-75/48h) cost -21.5/-14.5bps. Fallback if codex objects
+    # to picking the beats-faithful cell: sl2500_notrail_7d (== faithful exactly).
+    "sl_bps": -1500,
+    "trail_activate_bps": 600,
+    "trail_bps": 300,
+    "max_hold_s": 604800,              # 7d. 48h cap alone cost -13.5bps fold1 (15% of trades hit it)
     "exit_twap_min_notional": 50,
 }
 

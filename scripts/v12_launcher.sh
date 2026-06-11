@@ -21,8 +21,13 @@ PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
 # 2026-06-09 (Alberto go-live): live-tiny PROBE copying 0x3ea004bb (passed shadow gate +3-5% net, 2% DD).
 # Proportional copy via the codex-SHIP'd hl_prop_copy engine. Tight gates: -8% account stop, $700 gross cap,
 # 5x max lev, per-position 12% trail, per-leader -35% breaker, per-coin 35%. Kill: touch /tmp/v12_pause.
-SCRIPT="strategies/live/hl_prop_copy.py"
-ARGS="--config config/copy_live_basket.json"
+# 2026-06-11 (Alberto V16 go-live, Fable build): repointed to V16 -- top-decile faithful copy on liquid
+# majors (codex SHIP-validated strategy; 100-wallet cohort, $50 fixed/trade, 10x cap, book-level risk).
+# Engine = hl_copy_trader_v16.py (V15 engine subclass + liquid whitelist hard guard + fail-fast asserts).
+# GATED: do NOT remove halt flags until the V16 codex gate passes AND Alberto gives the launch word.
+# To revert: SCRIPT="strategies/live/hl_prop_copy.py"; ARGS="--config config/copy_live_basket.json".
+SCRIPT="strategies/live/hl_copy_trader_v16.py"
+ARGS="--config config/copy_trader_wallets_v16.json"
 
 cd "$WORKDIR"
 
