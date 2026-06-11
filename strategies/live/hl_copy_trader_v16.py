@@ -96,6 +96,8 @@ class V16CopyTrader(base.CopyTrader):
              "exit_min_trim_pct must be >= 0.80 (full-close exit semantics, codex finding #2)")
         _req(float(d.get("exit_twap_min_notional", 0)) >= 1e8,
              "exit_twap_min_notional must be huge (disable $-threshold trims, codex finding #2)")
+        _req(abs(float(g.get("full_exit_trim_pct", 0.90)) - float(g["exit_min_trim_pct"])) < 1e-9,
+             "full_exit_trim_pct must equal exit_min_trim_pct (no partial-trim band; codex r2 #2)")
         n_wallets = len(self.wallet_configs)
         _req(n_wallets >= 30, f"cohort {n_wallets} < 30 minimum (re-run selection)")
         _req(n_wallets <= 100, f"cohort {n_wallets} > 100 cap")
@@ -110,6 +112,19 @@ class V16CopyTrader(base.CopyTrader):
 
         self._v16_blocked_signals = 0
         self._v16_add_fills = 0
+        self._v16_suppressed_reverse = 0
+
+        # ── codex r2 blocker #1: UNCONDITIONAL leader-position tracker. The base engine updates its
+        # _target_positions only when an entry actually proceeds, so a guard-rejected open makes the
+        # leader's next add look like a fresh open (and a later close look like an open of the other
+        # side). V16 classifies every fill against THIS tracker, which is updated for every target
+        # fill on a whitelisted coin regardless of whether we copied it. Seeded from the startup REST
+        # snapshot (base _init_target_positions ran in super().__init__).
+        self._v16_leader_pos = {}
+        for addr, posmap in self._target_positions.items():
+            for cn, sz in posmap.items():
+                if cn in self.coin_whitelist and abs(sz) > 1e-12:
+                    self._v16_leader_pos[(addr, cn)] = float(sz)
 
         # ── 4. label + PnL epoch (Alberto msg 9222: "pnl report with updated labels and epoch start").
         # Epoch = first LIVE start, persisted once in Mongo v16_meta; all PnL/report numbers count from
@@ -161,21 +176,28 @@ class V16CopyTrader(base.CopyTrader):
                 wallet = self.leader_to_vault.get(w, w)
                 px = float(trade.get("px", 0) or 0)
                 sz = float(trade.get("sz", 0) or 0)
-                prev = self._target_positions.get(wallet, {}).get(coin, 0.0)
-                mid = self.mid_prices.get(coin, px) or px
-                is_add = (abs(prev) * mid >= 1.0) and ((prev > 0) == is_buy) and px > 0 and sz > 0
+                if px <= 0 or sz <= 0:
+                    return
+                key = (wallet, coin)
+                prev = self._v16_leader_pos.get(key, 0.0)          # UNCONDITIONAL tracker (codex r2 #1)
+                signed = sz if is_buy else -sz
+                prev_notional = abs(prev) * px
+                is_open = prev_notional < 1.0
+                is_add = (not is_open) and ((prev > 0) == is_buy)
+                we_hold = any(p['coin'] == coin and p.get('wallet') == wallet and p.get('filled')
+                              for p in self.positions)
+
                 if is_add:
+                    # ADD: track, never copy -- even when the original open was guard-rejected
                     tid = trade.get("tid", "")
                     if tid:
                         if tid in self._seen_tids:
                             return
                         self._seen_tids[tid] = base.time.time()
-                    self._target_positions.setdefault(wallet, {})[coin] = prev + (sz if is_buy else -sz)
-                    we_hold = any(p['coin'] == coin and p.get('wallet') == wallet and p.get('filled')
-                                  for p in self.positions)
+                    self._v16_leader_pos[key] = prev + signed
+                    self._target_positions.setdefault(wallet, {})[coin] = self._v16_leader_pos[key]
                     if we_hold:
-                        acc = (wallet, coin)
-                        self._position_accumulated[acc] = self._position_accumulated.get(acc, 0.0) + sz * px
+                        self._position_accumulated[key] = self._position_accumulated.get(key, 0.0) + sz * px
                     self._v16_add_fills += 1
                     try:
                         self.db[base.DB_FILLS_COLLECTION].insert_one({
@@ -188,7 +210,30 @@ class V16CopyTrader(base.CopyTrader):
                         })
                     except Exception:
                         pass
-                    return   # adds are tracked, never copied (entry purity)
+                    return
+
+                if (not is_open) and (not is_add) and not we_hold:
+                    # REVERSE on a position we never copied (e.g. the open was guard-rejected): track
+                    # only, NEVER pass to the base handler -- its own (stale) view would classify this
+                    # as an opening trade and copy the leader's CLOSE as our OPEN (codex r2 #1).
+                    tid = trade.get("tid", "")
+                    if tid:
+                        if tid in self._seen_tids:
+                            return
+                        self._seen_tids[tid] = base.time.time()
+                    self._v16_leader_pos[key] = prev + signed
+                    self._target_positions.setdefault(wallet, {})[coin] = self._v16_leader_pos[key]
+                    self._v16_suppressed_reverse += 1
+                    return
+
+                # OPEN (leader ~flat) or REVERSE-while-we-hold: update tracker, hand to the base
+                # engine (entry guards / exit-TWAP machinery). Base may also update its own
+                # _target_positions on a copied open; ours is authoritative for classification.
+                # Dedup: CHECK (without consuming) -- the base handler inserts the tid itself.
+                tid = trade.get("tid", "")
+                if tid and tid in self._seen_tids:
+                    return
+                self._v16_leader_pos[key] = prev + signed
         return super()._on_hl_trade(trade)
 
     # ── choke point 2: order path -- nothing outside the whitelist can ever reach the exchange ──────

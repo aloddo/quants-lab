@@ -11,6 +11,7 @@
     "cooldown_s": 30,
     "exit_poll_s": 10,
     "exit_min_trim_pct": 0.85,
+    "full_exit_trim_pct": 0.85,
     "exit_min_trim_usd": 1000000000.0,
     "max_chase_bps": 15,
     "max_spread_bps": 20,

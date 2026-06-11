@@ -1639,7 +1639,9 @@ class CopyTrader:
 
                 if should_trim:
                     trim_pct_display = trim_pct * 100
-                    is_full_exit = trim_pct >= 0.90
+                    # V16 (codex r2 blocker #2): full-exit threshold is config-driven so a strategy can
+                    # collapse the partial-trim band (runtime == replay proof). Default 0.90 unchanged.
+                    is_full_exit = trim_pct >= float(self.global_config.get("full_exit_trim_pct", 0.90))
                     if not pos.get('_exit_logged') or pos.get('_last_trim_pct', 0) != round(trim_pct, 2):
                         action_str = "FULL EXIT" if is_full_exit else f"TRIM {trim_pct_display:.0f}%"
                         logger.info(

@@ -69,6 +69,8 @@ V16_GLOBAL = {
     # codex finding #2 (FULL-CLOSE semantics): act only when the leader has closed >= 85% of tracked
     # notional (engine full-exits at >= 90%, 85-90% trims to dust then full-exits). NOT the 5% trim.
     "exit_min_trim_pct": 0.85,
+    "full_exit_trim_pct": 0.85,        # codex r2 #2: == exit_min_trim_pct -> NO partial-trim band;
+                                       # any trigger is a FULL exit (exactly the replay-proven behavior)
     "exit_min_trim_usd": 1e9,
     "max_chase_bps": 15,
     "max_spread_bps": 20,
