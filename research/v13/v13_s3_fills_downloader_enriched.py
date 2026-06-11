@@ -159,7 +159,13 @@ def main():
     wallets_lc = set(df['wallet'].str.lower().unique())
     logger.info(f'Loaded {len(wallets_lc):,} wallets to filter')
 
-    s3 = boto3.client('s3', region_name='us-east-1')
+    # 2026-06-11: explicit timeouts + adaptive retries. Without these, concurrent requester-pays
+    # GETs (5 procs x 8 threads) wedged on dead sockets with 0 TCP conns open for 30+ min.
+    from botocore.config import Config as _BotoConfig
+    s3 = boto3.client('s3', region_name='us-east-1', config=_BotoConfig(
+        connect_timeout=10, read_timeout=30,
+        retries={'max_attempts': 6, 'mode': 'adaptive'},
+        max_pool_connections=max(10, args.n_workers + 2)))
 
     start_d = datetime.strptime(args.start, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     end_d = datetime.strptime(args.end, '%Y-%m-%d').replace(tzinfo=timezone.utc)
@@ -178,12 +184,16 @@ def main():
 
     for day_idx, day in enumerate(days, 1):
         day_fills = []
+        n_done = 0
         with ThreadPoolExecutor(max_workers=args.n_workers) as ex:
             futures = {ex.submit(_fetch_and_parse_hour, s3, day, h, wallets_lc): h for h in range(24)}
-            for fut in as_completed(futures):
+            for fut in as_completed(futures, timeout=1800):
                 fills, dl_bytes = fut.result()
                 day_fills.extend(fills)
                 bytes_dl += dl_bytes
+                n_done += 1
+                if n_done % 6 == 0:
+                    logger.info(f'  {day}: {n_done}/24 hours, cum {bytes_dl/1e9:.2f}GB')
         n_written = flush_day(day_fills, day)
         n_total += n_written
         elapsed = time.time() - t_start

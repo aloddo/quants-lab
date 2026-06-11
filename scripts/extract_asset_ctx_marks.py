@@ -75,11 +75,28 @@ def download(start: str, end: str):
 def consolidate():
     """Per-coin (minute_ms, mark) .npy from day-shards. Bounded: streams shards, one pyarrow column
     read per shard; groups in a dict then writes per coin. Peak ~ full dataset arrays (~900MB-1.3GB),
-    under the 12GB guard. (If ever larger: switch to per-coin pass with pyarrow dataset filters.)"""
+    under the 12GB guard. (If ever larger: switch to per-coin pass with pyarrow dataset filters.)
+
+    GUARD (2026-06-11 incident): consolidate REPLACES every npy with exactly the shard set. When the
+    shard dir holds only a recent slice (e.g. after an incremental download into a cleaned dir, with
+    asset_ctxs publishing ~10d behind), this DESTROYS npy history. Refuse when an existing npy starts
+    earlier than the shard set; require the missing day-shards to be re-downloaded first."""
     OUT.mkdir(parents=True, exist_ok=True)
     shards = sorted(glob.glob(str(DAILY / "*.parquet")))
     if not shards:
         log.warning("no day-shards to consolidate"); return
+    shard_min_day = Path(shards[0]).stem            # YYYYMMDD
+    probe = sorted(OUT.glob("*.npy"))
+    if probe:
+        a = np.load(probe[0], allow_pickle=False)
+        if a.shape[1] > 0:
+            npy_min_day = dt.datetime.utcfromtimestamp(float(a[0, 0]) / 1000).strftime("%Y%m%d")
+            if npy_min_day < shard_min_day:
+                log.error(
+                    f"REFUSING consolidate: existing npys start {npy_min_day} but shards start "
+                    f"{shard_min_day}; consolidating would destroy history. Re-download the missing "
+                    f"days into {DAILY} first.")
+                sys.exit(2)
     acc: dict[str, list] = {}  # coin -> [df, df, ...] (chronological)
     for sh in shards:
         df = pd.read_parquet(sh, columns=["ts_ms", "coin", "mark"])
@@ -104,7 +121,7 @@ def main():
     ap.add_argument("--start"); ap.add_argument("--end")
     ap.add_argument("--consolidate", action="store_true")
     args = ap.parse_args()
-    install_memory_guard("assetctx")
+    install_memory_guard(soft_gb=12.0, label="assetctx")
     if args.start and args.end:
         download(args.start, args.end)
     if args.consolidate or not (args.start and args.end):
