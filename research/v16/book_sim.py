@@ -33,16 +33,20 @@ from execution_model import fee_rt, apply_entry, apply_exit, set_latency_ms
 from _streaming_io import install_memory_guard
 from select_cohort import load_wallet_fills, LIQUID, CAP
 
+import json as _json
+_CFG = _json.load(open(_REPO / "config" / "copy_trader_wallets_v16.json"))
 FEE_T = fee_rt(maker=False)
 LAT = 2_000
-MAX_HOLD_MS = 172_800_000
+# codex gate finding #1: params from the SHIPPED config, never hardcoded
+MAX_HOLD_MS = int(_CFG["defaults"]["max_hold_s"]) * 1000
 EQUITY0 = 486.0
 SIZES = [50.0, 75.0, 100.0]
-UTIL_CAP = 0.60          # engine max_margin_util
-LEV = 10.0               # margin = gross / LEV
-STOP_PCT = 0.08          # latched global stop
-BACKSTOP_X = 6.0         # gross backstop
+UTIL_CAP = float(_CFG["global"]["max_margin_util"])
+LEV = float(_CFG["global"]["max_leverage_cap"])
+STOP_PCT = float(_CFG["global"]["global_stop_pct"])
+BACKSTOP_X = float(_CFG["global"]["gross_backstop_x"])
 HOUR = 3_600_000
+# NOTE: superseded by engine_replay.py (the codex-required end-to-end proof). Kept for sizing scans.
 
 
 def main():

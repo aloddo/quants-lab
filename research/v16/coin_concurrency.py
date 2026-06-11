@@ -23,7 +23,9 @@ from fidelity_replay import roundtrips
 from _streaming_io import install_memory_guard
 from select_cohort import load_wallet_fills, LIQUID
 
-MAX_HOLD_MS = 172_800_000   # live 48h max-hold caps our position lifetime
+import json as _json
+MAX_HOLD_MS = int(_json.load(open(_REPO / "config" / "copy_trader_wallets_v16.json"))
+                  ["defaults"]["max_hold_s"]) * 1000   # from SHIPPED config (codex finding #1)
 
 
 def main():
