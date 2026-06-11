@@ -41,8 +41,11 @@ from execution_model import fee_rt, apply_entry, apply_exit, set_latency_ms
 from _streaming_io import install_memory_guard
 from select_cohort import load_wallet_fills, edge, LIQUID, CAP, MIN_COHORT, MAX_COHORT
 
-CFG = json.load(open(_REPO / "config" / "copy_trader_wallets_v16.json"))
+import os
+_CFG_PATH = os.environ.get("V16_REPLAY_CONFIG", str(_REPO / "config" / "copy_trader_wallets_v16.json"))
+CFG = json.load(open(_CFG_PATH))
 G, D = CFG["global"], CFG["defaults"]
+print(f"[replay] config: {_CFG_PATH}")
 
 # ---- ALL knobs from the shipped config (codex finding #1) ----
 ORDER = float(G["order_size_usd"])

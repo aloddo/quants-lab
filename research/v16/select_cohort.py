@@ -52,18 +52,17 @@ CONFIG_OUT = _REPO / "config" / "copy_trader_wallets_v16.json"
 V16_GLOBAL = {
     "strategy": "v16_top_decile_faithful_copy",
     "sizing_mode": "fixed",            # fixed per-trade $ = matches the validated equal-weighted-trade edge
-    "order_size_usd": 50.0,            # BOOK-SIM SIZED (2026-06-11): cohort herds -> natural book at
-                                       # $50/trade = p50 $1.9k / p90 $3k gross; caps block only 4% of
-                                       # flow (vs 31% at $100, a non-random distortion during max
-                                       # herding). Bigger $/trade just hits the same ~$2.9k gross
-                                       # envelope while distorting WHICH trades execute.
+    "order_size_usd": 25.0,            # ENGINE-REPLAY SIZED (2026-06-11, variant A): the book is ONE
+                                       # correlated trend bet (herding IS the strategy), so survivable
+                                       # gross <= ~stop%/5% correlated-move budget = ~3x. At $25 the
+                                       # full flow saturates at ~$1.45k (3x); the $50 book hit 6x and
+                                       # DIED by stop cascade in fold1 (-$62, latched dead 2 months);
+                                       # the $25 book made +$165 through the SAME period. fold2 +$32.
     "min_entry_notional": 10.0,
-    "max_margin_util": 0.60,           # at 10x lev => gross envelope ~0.6*10*equity ~ $2.9k
+    "max_margin_util": 0.30,           # at 10x lev => gross envelope ~3x equity (~$1.45k)
     "max_daily_loss": -25.0,           # NOTE: inert in engine (validated at init only); real latches below
-    "global_stop_pct": 0.12,           # latched flatten-all at -12% (-$58). Book sim: in-sample max DD
-                                       # 6.8-7.8% nearly kissed -8%; OOS edge ~4x smaller, similar vol
-                                       # -> -8% would trip on normal variance and kill the live test.
-                                       # -12% ~ 3.4 daily sigma at $50/trade. Alberto + codex to bless.
+    "global_stop_pct": 0.15,           # latched flatten-all at -15% (-$73). fold1 trough was -10.3%
+                                       # (eq_min $436): -12% had only $8 spare; -15% has $23.
     "max_leverage_cap": 10,            # Alberto: up to 10x on liquid majors
     "cooldown_s": 30,
     "exit_poll_s": 10,
@@ -78,7 +77,7 @@ V16_GLOBAL = {
     "mark_max_age_s": 30,
     "margin_reserve_max_lev": 10,
     "trim_over_frac": 0.2,
-    "gross_backstop_x": 6.0,           # flatten-all if gross notional > 6x account equity (blow-up guard)
+    "gross_backstop_x": 4.0,           # flatten-all if gross notional > 4x account equity (blow-up guard)
     # V16-specific (consumed by hl_copy_trader_v16.py, ignored by the base engine):
     "coin_whitelist": sorted(LIQUID),  # MUST equal the validated LIQUID set -- selector enforces this
 }

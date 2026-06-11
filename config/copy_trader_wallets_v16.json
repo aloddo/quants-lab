@@ -2,11 +2,11 @@
   "global": {
     "strategy": "v16_top_decile_faithful_copy",
     "sizing_mode": "fixed",
-    "order_size_usd": 50.0,
+    "order_size_usd": 25.0,
     "min_entry_notional": 10.0,
-    "max_margin_util": 0.6,
+    "max_margin_util": 0.3,
     "max_daily_loss": -25.0,
-    "global_stop_pct": 0.12,
+    "global_stop_pct": 0.15,
     "max_leverage_cap": 10,
     "cooldown_s": 30,
     "exit_poll_s": 10,
@@ -19,7 +19,7 @@
     "mark_max_age_s": 30,
     "margin_reserve_max_lev": 10,
     "trim_over_frac": 0.2,
-    "gross_backstop_x": 6.0,
+    "gross_backstop_x": 4.0,
     "coin_whitelist": [
       "ADA",
       "AVAX",
