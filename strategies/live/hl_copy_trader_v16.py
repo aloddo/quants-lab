@@ -48,6 +48,19 @@ class V16CopyTrader(base.CopyTrader):
     """V15 engine + liquid whitelist guard + faithful-copy config asserts."""
 
     def __init__(self, config_path: str, order_size_override: float = None, shadow: bool = False):
+        # ── PnL epoch BEFORE super().__init__: the base engine runs its blocking fill sync INSIDE
+        # __init__, and that sync reads self.pnl_epoch_ms. Setting it afterwards let the first sync
+        # fall back to the legacy V9 epoch and pollute v16_exchange_fills with pre-V16 history
+        # (caught 2026-06-11 launch day: stale chart/account_net). Persisted epoch wins; first live
+        # start persists after super(); shadow uses a provisional 'now' without persisting.
+        from pymongo import MongoClient as _MC
+        _now_ms = int(base.time.time() * 1000)
+        try:
+            _doc = _MC("mongodb://localhost:27017", serverSelectionTimeoutMS=3000) \
+                .quants_lab.v16_meta.find_one({"_id": "epoch"})
+            self.pnl_epoch_ms = int(_doc["epoch_ms"]) if _doc else _now_ms
+        except Exception:
+            self.pnl_epoch_ms = _now_ms
         super().__init__(config_path, order_size_override=order_size_override, shadow=shadow)
 
         g, d = self.global_config, self.default_config
@@ -130,12 +143,10 @@ class V16CopyTrader(base.CopyTrader):
         # Epoch = first LIVE start, persisted once in Mongo v16_meta; all PnL/report numbers count from
         # there (base fill-sync reads self.pnl_epoch_ms). Shadow runs use 'now' without persisting.
         self.label = "V16"
-        now_ms = int(base.time.time() * 1000)
-        if self.shadow_mode:
-            self.pnl_epoch_ms = now_ms
-        else:
+        if not self.shadow_mode:
+            # First LIVE start persists the (pre-super) epoch; later starts re-read the persisted one.
             self.db.v16_meta.update_one(
-                {"_id": "epoch"}, {"$setOnInsert": {"epoch_ms": now_ms,
+                {"_id": "epoch"}, {"$setOnInsert": {"epoch_ms": self.pnl_epoch_ms,
                                                     "created_at": base.datetime.now(base.timezone.utc)}},
                 upsert=True)
             self.pnl_epoch_ms = int(self.db.v16_meta.find_one({"_id": "epoch"})["epoch_ms"])

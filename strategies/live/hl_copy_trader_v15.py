@@ -3047,7 +3047,11 @@ class CopyTrader:
             v11_fees = 0.0
             v11_closes = 0
 
-            for doc in self.db[DB_EXCHANGE_FILLS].find({}, {"closedPnl": 1, "fee": 1, "oid": 1}):
+            # V16: step-2 compute honors the same pnl epoch as step-1 ingest, so pre-epoch rows that
+            # ever landed in the collection (e.g. a sync that ran before the epoch attr was set) can
+            # never leak into account_net. Legacy default: epoch 0 -> no filter change.
+            _q = {"time": {"$gte": epoch_ms}} if getattr(self, "pnl_epoch_ms", 0) else {}
+            for doc in self.db[DB_EXCHANGE_FILLS].find(_q, {"closedPnl": 1, "fee": 1, "oid": 1}):
                 pnl = float(doc.get("closedPnl", 0))
                 fee = float(doc.get("fee", 0))
                 oid = doc.get("oid")

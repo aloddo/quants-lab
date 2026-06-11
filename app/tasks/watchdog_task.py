@@ -67,7 +67,7 @@ V11_LOG_PATH = "/private/tmp/ql-v12-copy-trader-launchd.log"
 # V15 (hl_prop_copy) is SILENT when idle (no per-minute STATS), so log-staleness is a weak signal:
 # 30min, and even then it only fires if the in-process watchdog (90s force-restart) ALSO failed.
 V11_STATS_STALE_MINUTES = 30
-V11_PROCESS_NAME = "hl_prop_copy.py"   # V15 live copy trader (replaced hl_copy_trader_v11.py 2026-06-04)
+V11_PROCESS_NAME = "hl_copy_trader_v16.py"   # V16 live copy trader (replaced hl_prop_copy.py 2026-06-11 go-live)
 
 # Self-healing limits
 HB_MAX_RESTARTS_PER_6H = 2
@@ -484,7 +484,7 @@ class WatchdogTask(BaseTask):
                 capture_output=True, text=True, timeout=5
             )
             if ps_out.returncode != 0 or not ps_out.stdout.strip():
-                issues.append(f"V15 PROCESS DOWN: {V11_PROCESS_NAME} not running")
+                issues.append(f"V16 PROCESS DOWN: {V11_PROCESS_NAME} not running")
                 return issues
 
             # Check 2: V11 log fresh

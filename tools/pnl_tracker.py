@@ -704,9 +704,10 @@ def main():
         stats = tracker.compute_pnl(since_ms)
         report = tracker.format_daily_report(stats)
 
-        # Generate equity curve
-        chart_path = args.chart or "/tmp/v12_equity_curve.png"
-        tracker.generate_equity_curve(since_ms, chart_path)
+        # Generate equity curve. CRITICAL: use the RETURN value -- when there are no fills yet the
+        # generator returns "" and writes nothing; attaching the preset path would send a STALE chart
+        # from a previous strategy (2026-06-11 launch-day incident: months-old V15 chart went to TG).
+        chart_path = tracker.generate_equity_curve(since_ms, args.chart or "/tmp/v16_equity_curve.png")
 
         # Options report (separate)
         opts_report = tracker.format_options_report()
