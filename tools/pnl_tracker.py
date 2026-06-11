@@ -34,8 +34,10 @@ logger = logging.getLogger("pnl_tracker")
 HL_API = "https://api.hyperliquid.xyz"
 PARENT_ADDRESS = "0x11ca20aeb7cd014cf8406560ae405b12601994b4"
 DB_NAME = "quants_lab"
-FILLS_COLLECTION = "v11_exchange_fills"
-OID_COLLECTION = "v11_order_ids"
+# V16 (2026-06-11, Alberto msg 9222/9226: updated labels + epoch start): track V16 collections.
+FILLS_COLLECTION = "v16_exchange_fills"
+OID_COLLECTION = "v16_order_ids"
+STRATEGY_LABEL = "V16"
 TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003576397888")
 
@@ -354,7 +356,7 @@ class PnLTracker:
         net = stats["total_pnl"] - stats["total_fees"]
 
         lines = []
-        lines.append("V15 PnL Report")
+        lines.append(f"{STRATEGY_LABEL} PnL Report")
         lines.append("")
 
         # Strategy totals
@@ -602,7 +604,7 @@ class PnLTracker:
             )
 
         ax.set_title(
-            f"Copy Trader V15 -- {closed_count} closed, {open_count} open",
+            f"Copy Trader {STRATEGY_LABEL} -- {closed_count} closed, {open_count} open",
             fontsize=13, fontweight="bold",
         )
         ax.set_ylabel("Cumulative PnL ($)")
@@ -638,7 +640,7 @@ class PnLTracker:
                     else:
                         requests.post(
                             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
-                            data={"chat_id": TG_CHAT_ID, "caption": "V15 Equity Curve"},
+                            data={"chat_id": TG_CHAT_ID, "caption": f"{STRATEGY_LABEL} Equity Curve"},
                             files={"photo": photo},
                             timeout=15,
                         )
@@ -682,7 +684,12 @@ def main():
             dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             since_ms = int(dt.timestamp() * 1000)
         elif args.epoch:
-            since_ms = 1780374300000  # V15 launch 2026-06-02 04:25 UTC (V15 prop-copy go-live)
+            # V16 epoch: persisted by hl_copy_trader_v16.py at FIRST LIVE START (mongo v16_meta).
+            # Before launch (doc absent) fall back to 'now' so pre-launch reports show zero, never
+            # legacy history (Alberto msg 9222: fresh epoch for V16).
+            _epoch_doc = tracker.db.v16_meta.find_one({"_id": "epoch"})
+            since_ms = int(_epoch_doc["epoch_ms"]) if _epoch_doc else int(
+                datetime.now(timezone.utc).timestamp() * 1000)
         elif args.daily:
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             since_ms = int(today.timestamp() * 1000)
