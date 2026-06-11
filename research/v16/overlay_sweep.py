@@ -58,6 +58,12 @@ CONFIGS = [
     ("sl1500_tr1000_500_7d", H7D, -1500.0, 1000.0, 500.0),
     ("sl1500_notrail_7d", H7D, -1500.0, None, None),
     ("sl2500_notrail_7d", H7D, -2500.0, None, None),
+    # sprint v3 (2026-06-11): hold-cap sweep between 48h (kills edge) and 7d (shipped).
+    # Motivated by sprint_decompose: >3d-hold trades are NEGATIVE both folds (fold2 wmed -34.6),
+    # while 1-3d trades are strongly positive -- 72h/96h caps may trim the toxic tail only.
+    ("sl1500_tr600_300_72h", 259_200, -1500.0, 600.0, 300.0),
+    ("sl1500_tr600_300_96h", 345_600, -1500.0, 600.0, 300.0),
+    ("sl1500_tr600_300_5d", 432_000, -1500.0, 600.0, 300.0),
 ]
 
 

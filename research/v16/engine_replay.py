@@ -65,11 +65,54 @@ LAT = 2_000
 FEE_T = fee_rt(maker=False)
 EQUITY0 = 486.0
 MINUTE = 60_000
+_kg = os.environ.get("V16_REPLAY_KNET_MIN")
+KNET_MIN = int(_kg) if _kg not in (None, "") else None   # sprint: net-consensus entry gate
+_nx = os.environ.get("V16_REPLAY_NETX_CAP")
+NETX_CAP = float(_nx) if _nx not in (None, "") else None  # sprint: |net book exposure| cap (x equity)
+_cs = os.environ.get("V16_REPLAY_COINSIDE_CAP")
+COINSIDE_CAP = float(_cs) if _cs not in (None, "") else None  # sprint: per coin-side gross cap (x equity)
+# sprint H51: regime-conditional exits. Entries taken at knet >= this threshold IGNORE the
+# leader-close signal and ride to max_hold (72h via config) / trail / SL. None = off.
+_rx = os.environ.get("V16_REPLAY_RIDE_KNET")
+RIDE_KNET = int(_rx) if _rx not in (None, "") else None
+RIDE_HOLD_MS = int(os.environ.get("V16_REPLAY_RIDE_HOLD_H", "72")) * 3_600_000
+# sprint 2026-06-11: FUNDING ACCRUAL (hole flagged by codex + the V18 scout: 30-70h holds span
+# many hourly funding intervals). Loads hyperliquid_funding_rates once; accrues hourly in
+# risk_pass: long pays positive funding, short earns it. V16_REPLAY_FUNDING=1 to enable.
+FUNDING_ON = os.environ.get("V16_REPLAY_FUNDING", "") == "1"
+_FUNDING = {}   # coin -> (ts_sec_array, rate_array)
+
+def _load_funding(coins):
+    if not FUNDING_ON or _FUNDING:
+        return
+    from pymongo import MongoClient
+    import numpy as _np
+    db = MongoClient("mongodb://localhost:27017")["quants_lab"]
+    for c in coins:
+        rows = list(db["hyperliquid_funding_rates"].find(
+            {"coin": c}, {"timestamp_utc": 1, "funding_rate": 1, "_id": 0}).sort("timestamp_utc", 1))
+        if rows:
+            ts = _np.array([r["timestamp_utc"] for r in rows], dtype="float64") / 1000.0
+            rt = _np.array([r["funding_rate"] for r in rows], dtype="float64")
+            _FUNDING[c] = (ts, rt)
+    print(f"[replay] funding loaded for {len(_FUNDING)} coins")
+
+def _funding_rate(coin, ts_ms):
+    f = _FUNDING.get(coin)
+    if f is None:
+        return 0.0
+    import bisect
+    i = bisect.bisect_right(f[0], ts_ms / 1000.0) - 1
+    return float(f[1][i]) if i >= 0 else 0.0
 
 FOLDS = [
     ("fold1", "2025-12-01", "2026-03-15", "2026-05-17"),
     ("fold2", "2025-12-15", "2026-04-15", "2026-05-23"),
 ]
+# sprint 2026-06-11: custom fold override, e.g. "forward,2025-12-01,2026-05-23,2026-06-10"
+_fo = os.environ.get("V16_REPLAY_FOLDS")
+if _fo:
+    FOLDS = [tuple(part.split(",")) for part in _fo.split(";")]
 
 
 class Book:
@@ -126,6 +169,7 @@ def run_fold(fname, f_start, f_split, f_end, uni):
     ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
     start, split, end = ms(f_start), ms(f_split), ms(f_end)
     print(f"\n=== {fname}: train {f_start}->{f_split} | TEST replay {f_split}->{f_end} ===")
+    _load_funding(list(LIQUID))
     wf = load_wallet_fills(uni, start, end)
 
     # TRAIN selection (validated procedure)
@@ -138,8 +182,12 @@ def run_fold(fname, f_start, f_split, f_end, uni):
         if tr is not None and trn >= 15 and ten >= 15:
             rows.append({"wallet": w, "train_taker": tr})
     df = pd.DataFrame(rows).sort_values("train_taker", ascending=False).reset_index(drop=True)
-    cohort = list(df.head(min(max(MIN_COHORT, len(df) // 10), MAX_COHORT)).wallet)
-    print(f"  cohort {len(cohort)} of {len(df)} rankable")
+    _topn = int(os.environ.get("V16_REPLAY_TOPN", "0"))   # sprint 2026-06-11: cohort-depth variant
+    if _topn > 0:
+        cohort = list(df.head(_topn).wallet)
+    else:
+        cohort = list(df.head(min(max(MIN_COHORT, len(df) // 10), MAX_COHORT)).wallet)
+    print(f"  cohort {len(cohort)} of {len(df)} rankable (topn_override={_topn or 'off'})")
 
     # merged TEST fill stream for the cohort (ts, wallet, coin, signed_size, price)
     stream = []
@@ -155,10 +203,24 @@ def run_fold(fname, f_start, f_split, f_end, uni):
     eq_min = EQUITY0
     eq_path_day = {}
     next_risk_ts = stream[0][0] if stream else split
+    # codex round-2 telemetry: gross distribution + cluster maxima (sampled per risk minute)
+    tele = {"gross": [], "max_coin_side": 0.0, "max_all_long": 0.0, "max_all_short": 0.0}
+
+    last_funding_hour = [0]
 
     def risk_pass(now):
         """Per-minute risk checks + equity/stop/backstop bookkeeping."""
         nonlocal eq_min
+        # hourly funding accrual on open positions (long pays positive rate, short earns)
+        if FUNDING_ON:
+            hour = now // 3_600_000
+            if hour > last_funding_hour[0]:
+                last_funding_hour[0] = hour
+                for key2, p2 in book.pos.items():
+                    fr = _funding_rate(p2["coin"], now)
+                    if fr:
+                        book.realized -= p2["side"] * fr * ORDER
+                        book.funding_paid = getattr(book, "funding_paid", 0.0) + p2["side"] * fr * ORDER
         # SL / trail / max_hold
         for key in list(book.pos.keys()):
             p = book.pos[key]
@@ -172,8 +234,24 @@ def run_fold(fname, f_start, f_split, f_end, uni):
                 if p["peak_bps"] >= TR_ACT and (p["peak_bps"] - pnl) >= TR_GIVE:
                     close_pos(book, key, now, "trail", clip=False)
                     continue
-            if now - p["entry_ts"] >= MAX_HOLD_MS:
+            _cap = RIDE_HOLD_MS if p.get("ride") else MAX_HOLD_MS
+            if now - p["entry_ts"] >= _cap:
                 close_pos(book, key, now, "max_hold", clip=True)
+        # codex telemetry: gross + clusters at this minute
+        g_now = book.gross()
+        tele["gross"].append(g_now)
+        cs = defaultdict(float)
+        n_long = n_short = 0
+        for (w2, c2), p2 in book.pos.items():
+            cs[(c2, p2["side"])] += ORDER
+            if p2["side"] > 0:
+                n_long += 1
+            else:
+                n_short += 1
+        if cs:
+            tele["max_coin_side"] = max(tele["max_coin_side"], max(cs.values()))
+        tele["max_all_long"] = max(tele["max_all_long"], n_long * ORDER)
+        tele["max_all_short"] = max(tele["max_all_short"], n_short * ORDER)
         # equity incl unrealized -> latched stop
         u = unrealized(book, now)
         eq = book.equity(u)
@@ -214,7 +292,11 @@ def run_fold(fname, f_start, f_split, f_end, uni):
             if key in book.pos:
                 book.rev[key] += min(abs(ssz), abs(prev)) * px
                 if book.acc[key] > 0 and book.rev[key] / book.acc[key] >= TRIM_PCT:
-                    close_pos(book, key, ts, "leader_close", clip=True)
+                    if book.pos[key].get("ride"):
+                        book.exits["ride_ignored_leader_close"] = book.exits.get(
+                            "ride_ignored_leader_close", 0) + 1
+                    else:
+                        close_pos(book, key, ts, "leader_close", clip=True)
             continue
 
         # OPEN (leader ~flat -> nonzero). Flip residuals land here only if prev was ~dust.
@@ -222,6 +304,33 @@ def run_fold(fname, f_start, f_split, f_end, uni):
         if book.stopped:
             book.rejects["stop_latched"] += 1
             continue
+        k = None
+        if KNET_MIN is not None or RIDE_KNET is not None:
+            # sprint 2026-06-11: net-consensus gate. knet = (# cohort wallets net-long this coin
+            # minus net-short), sign-aligned with OUR side, EXCLUDING this leader. Live equivalent:
+            # the engine's unconditional leader tracker (+ userState seed at boot).
+            k = 0
+            for (w2, c2), sz2 in book.leader.items():
+                if c2 != c or w2 == w or abs(sz2) * px < 1.0:
+                    continue
+                k += 1 if (sz2 > 0) == is_buy else -1
+            if KNET_MIN is not None and k < KNET_MIN:
+                book.rejects["knet_gate"] += 1
+                continue
+        if NETX_CAP is not None:
+            # sprint: net-exposure cap. The knet gate removes counter-herd entries that previously
+            # HEDGED the aligned book (v17b fold1 death); bound the one-directional swing instead.
+            net_now = sum(p2["side"] * ORDER for p2 in book.pos.values())
+            side_ = 1 if is_buy else -1
+            if abs(net_now + side_ * ORDER) > NETX_CAP * EQUITY0 and abs(net_now + side_ * ORDER) > abs(net_now):
+                book.rejects["netx_cap"] += 1
+                continue
+        if COINSIDE_CAP is not None:
+            cs_now = sum(ORDER for (w3, c3), p3 in book.pos.items()
+                         if c3 == c and p3["side"] == (1 if is_buy else -1))
+            if cs_now + ORDER > COINSIDE_CAP * EQUITY0:
+                book.rejects["coin_side_cap"] += 1
+                continue
         if key in book.pos:
             book.rejects["already_holding"] += 1
             continue
@@ -250,7 +359,8 @@ def run_fold(fname, f_start, f_split, f_end, uni):
             continue
         side = 1 if is_buy else -1
         book.pos[key] = {"coin": c, "side": side, "entry_px": apply_entry(c, ment, is_buy),
-                         "entry_ts": ts, "peak_bps": 0.0}
+                         "entry_ts": ts, "peak_bps": 0.0,
+                         "ride": bool(RIDE_KNET is not None and k is not None and k >= RIDE_KNET)}
         book.acc[key] = abs(ssz) * px
         book.rev[key] = 0.0
         book.last_entry[key] = ts
@@ -268,6 +378,7 @@ def run_fold(fname, f_start, f_split, f_end, uni):
     days = sorted(eq_path_day)
     eqs = np.array([eq_path_day[d] for d in days])
     dd = float(np.max(np.maximum.accumulate(eqs) - eqs)) if len(eqs) else 0.0
+    ga = np.array(tele["gross"]) if tele["gross"] else np.array([0.0])
     res = {
         "fold": fname, "entries": len(book.trades), "book_pnl": book.realized,
         "trade_med_bps": float(np.median(tr)) if len(tr) else 0.0,
@@ -275,6 +386,12 @@ def run_fold(fname, f_start, f_split, f_end, uni):
         "max_dd": dd, "eq_min": eq_min, "stopped": book.stopped,
         "rejects": dict(book.rejects), "exits": dict(book.exits),
         "max_coin_gross": dict(sorted(book.max_coin_gross.items(), key=lambda kv: -kv[1])[:4]),
+        "gross_max_x": float(ga.max() / EQUITY0), "gross_p99_x": float(np.percentile(ga, 99) / EQUITY0),
+        "gross_mean_x": float(ga.mean() / EQUITY0),
+        "max_coin_side_x": tele["max_coin_side"] / EQUITY0,
+        "max_all_long_x": tele["max_all_long"] / EQUITY0,
+        "max_all_short_x": tele["max_all_short"] / EQUITY0,
+        "funding_paid": float(getattr(book, "funding_paid", 0.0)),
     }
     print(f"  ENTRIES {res['entries']} | book PnL ${res['book_pnl']:+.0f} | per-trade med {res['trade_med_bps']:+.1f} "
           f"mean {res['trade_mean_bps']:+.1f} bps | maxDD ${dd:.0f} ({dd/EQUITY0*100:.1f}%) | eq_min ${eq_min:.0f} "
@@ -282,12 +399,24 @@ def run_fold(fname, f_start, f_split, f_end, uni):
     print(f"  exits: {res['exits']}")
     print(f"  rejects: {res['rejects']}")
     print(f"  herd stress (max one-coin gross): {res['max_coin_gross']}")
+    print(f"  gross: max {res['gross_max_x']:.2f}x | p99 {res['gross_p99_x']:.2f}x | mean {res['gross_mean_x']:.2f}x "
+          f"| max coin-side {res['max_coin_side_x']:.2f}x | all-long {res['max_all_long_x']:.2f}x "
+          f"| all-short {res['max_all_short_x']:.2f}x")
     return res
 
 
 def main():
     install_memory_guard(soft_gb=12.0, label="v16_engine_replay")
     set_latency_ms(LAT)
+    _md = os.environ.get("V16_SPRINT_MARKS_DIR")
+    if _md:
+        S.ASSETCTX_DIR = Path(_md)
+        print(f"[replay] marks dir override: {_md}")
+    _m02 = os.environ.get("V16_REPLAY_M02")
+    if _m02:
+        import select_cohort as SC
+        SC.M02 = Path(_m02)
+        print(f"[replay] m02 override: {_m02}")
     print(f"SHIPPED CONFIG: order ${ORDER} | util {UTIL_CAP} lev {LEV} | stop {STOP_PCT} | backstop {BACKSTOP_X}x "
           f"| sl {SL} trail {TR_ACT}/{TR_GIVE} hold {MAX_HOLD_MS//3600000}h | trim_pct {TRIM_PCT} | chase {CHASE_BPS}bps")
     uni = set(l.strip().lower() for l in open(S._DATA / "m01_nonerroring_wallets.txt")
