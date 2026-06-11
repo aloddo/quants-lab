@@ -55,6 +55,8 @@ def main():
     ap.add_argument("--end", default="2026-05-17")
     ap.add_argument("--latency-s", type=int, default=2)
     ap.add_argument("--min-rt", type=int, default=20)
+    ap.add_argument("--liquid-only", action="store_true", help="restrict to l2_calib liquid coins (kills microcap mark artifacts).")
+    ap.add_argument("--cap-bps", type=float, default=500.0, help="clip per-trade net to +/- this (kills reconstruction outliers).")
     ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt")
     args = ap.parse_args()
     set_latency_ms(args.latency_s * 1000)
@@ -73,35 +75,40 @@ def main():
             w = d["wallet"][i]; t = d["ts"][i]
             if w in uni and start <= t <= end:
                 wf[w].append((t, d["coin"][i], d["signed_size"][i], d["price"][i]))
-    print(f"{len(wf)} wallets with fills; reconstructing round-trips + fidelity replay ...")
+    # liquid coins (l2_calib) to kill microcap mark-reconstruction artifacts
+    import json
+    liquid = set(json.load(open(S._DATA / "l2_calib_10coin.json")).keys()) if args.liquid_only else None
+    cap = args.cap_bps / 1e4
+    print(f"{len(wf)} wallets with fills; reconstructing round-trips (liquid_only={args.liquid_only}, "
+          f"cap={args.cap_bps}bps) ...")
     rows = []
     for w, fl in wf.items():
         fl.sort(key=lambda x: x[0])
         rts = roundtrips(fl)
-        if len(rts) < args.min_rt:
-            continue
         their, ours_t, ours_m = [], [], []
         for c, dir_, ets, xts, evw, xvw, g in rts:
-            their.append(g)
+            if liquid is not None and c not in liquid:
+                continue
             ent = S.mark_at(c, ets + lat); ex = S.mark_at(c, xts + lat)
             if ent is None or ex is None or ent <= 0:
                 continue
-            og = dir_ * (ex - ent) / ent
+            og = max(-cap, min(cap, dir_ * (ex - ent) / ent))   # cap kills reconstruction outliers
+            their.append(max(-cap, min(cap, g)))
             ours_t.append(og - FEE_TAKER); ours_m.append(og - FEE_MAKER)
-        if not ours_t:
+        if len(ours_t) < args.min_rt:
             continue
-        rows.append({"wallet": w, "n_rt": len(rts),
+        rows.append({"wallet": w, "n_rt": len(ours_t),
                      "their_gross_bps": np.mean(their) * 1e4,
                      "our_taker_bps": np.mean(ours_t) * 1e4,
                      "our_maker_bps": np.mean(ours_m) * 1e4})
     df = pd.DataFrame(rows)
-    print(f"\n=== HIGH-FIDELITY REPLAY ({len(df)} wallets, >= {args.min_rt} round-trips) ===")
-    print(f"ALL wallets: their_gross {df.their_gross_bps.mean():.1f} | our_taker {df.our_taker_bps.mean():.1f} | "
-          f"our_maker {df.our_maker_bps.mean():.1f} bps/trade")
+    md = lambda s: f"mean {s.mean():.1f} / MEDIAN {s.median():.1f}"
+    print(f"\n=== HIGH-FIDELITY REPLAY ({len(df)} wallets, >= {args.min_rt} rt; liquid_only={args.liquid_only}) ===")
+    print(f"ALL: their_gross [{md(df.their_gross_bps)}] | our_taker [{md(df.our_taker_bps)}] | our_maker [{md(df.our_maker_bps)}]")
+    print(f"corr(their_gross, our_taker): {df.their_gross_bps.corr(df.our_taker_bps):.3f}  (should be high if faithful)")
     prof = df[df.their_gross_bps > 0]
-    print(f"\nPROFITABLE wallets only ({len(prof)} = {len(prof)/len(df)*100:.0f}% of universe, their_gross>0):")
-    print(f"  their_gross {prof.their_gross_bps.mean():.1f} | our_taker {prof.our_taker_bps.mean():.1f} | "
-          f"our_maker {prof.our_maker_bps.mean():.1f} bps/trade")
+    print(f"\nPROFITABLE wallets ({len(prof)} = {len(prof)/len(df)*100:.0f}%, their_gross>0):")
+    print(f"  their_gross [{md(prof.their_gross_bps)}] | our_taker [{md(prof.our_taker_bps)}] | our_maker [{md(prof.our_maker_bps)}]")
     print(f"  of profitable wallets, our_maker stays >0 for: {(prof.our_maker_bps>0).mean()*100:.0f}% | "
           f"our_taker >0 for: {(prof.our_taker_bps>0).mean()*100:.0f}%")
     print(f"  fidelity (our_maker / their_gross): {prof.our_maker_bps.mean()/prof.their_gross_bps.mean():.2f}")
