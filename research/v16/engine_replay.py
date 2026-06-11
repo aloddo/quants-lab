@@ -81,6 +81,49 @@ RIDE_HOLD_MS = int(os.environ.get("V16_REPLAY_RIDE_HOLD_H", "72")) * 3_600_000
 # risk_pass: long pays positive funding, short earns it. V16_REPLAY_FUNDING=1 to enable.
 FUNDING_ON = os.environ.get("V16_REPLAY_FUNDING", "") == "1"
 _FUNDING = {}   # coin -> (ts_sec_array, rate_array)
+# H-NB-FILTER card (agent G, 2026-06-11): per-trade log + raw-cohort net-book regime filter.
+# ALL default-off; with these envs unset behavior is byte-identical to the shipped replay.
+TRADE_LOG = os.environ.get("V16_REPLAY_TRADE_LOG")   # parquet path: one row per closed trade
+_TRADE_ROWS: list = []
+NB_FILTER = os.environ.get("V16_REPLAY_NB_FILTER")   # block_opposed | block_opposed_neutral
+NB_SERIES = os.environ.get("V16_REPLAY_NB_SERIES",
+                           str(_REPO / "app" / "data" / "v18" / "nb_pct_series.parquet"))
+OUT_PQ = os.environ.get("V16_REPLAY_OUT")            # optional result-parquet redirect
+if NB_FILTER not in (None, "", "block_opposed", "block_opposed_neutral"):
+    raise SystemExit(f"bad V16_REPLAY_NB_FILTER={NB_FILTER!r}")
+_NB = {}   # (fold, coin) -> (hour_ts_i64, pct_f64), hour-grid causal NB percentile
+
+
+def _load_nb():
+    if not NB_FILTER or _NB:
+        return
+    df = pd.read_parquet(NB_SERIES)
+    for (f, c), g in df.groupby(["fold", "coin"]):
+        g = g.sort_values("hour_ts")
+        _NB[(f, c)] = (g["hour_ts"].values.astype(np.int64),
+                       g["pct"].values.astype(np.float64))
+    print(f"[replay] NB filter '{NB_FILTER}': {NB_SERIES} ({len(df)} rows, {len(_NB)} fold-coin keys)")
+
+
+def _nb_bucket(fold, coin, ts, is_buy):
+    """Bucket vs the last COMPLETED-hour NB percentile STRICTLY before ts (causal asof).
+    ALIGNED: pct>=0.6 long / pct<=0.4 short; OPPOSED: pct<=0.4 long / pct>=0.6 short;
+    NEUTRAL between. no_coverage when the asof hour is absent, stale (>1h), or NaN."""
+    s = _NB.get((fold, coin))
+    if s is None:
+        return "no_coverage", float("nan")
+    import bisect
+    i = bisect.bisect_left(s[0], ts) - 1          # largest hour_ts < ts (ts==hour excluded)
+    if i < 0 or ts - int(s[0][i]) > 3_600_000:
+        return "no_coverage", float("nan")
+    p = float(s[1][i])
+    if not np.isfinite(p):
+        return "no_coverage", float("nan")
+    if is_buy:
+        b = "ALIGNED" if p >= 0.6 else ("OPPOSED" if p <= 0.4 else "NEUTRAL")
+    else:
+        b = "ALIGNED" if p <= 0.4 else ("OPPOSED" if p >= 0.6 else "NEUTRAL")
+    return b, p
 
 def _load_funding(coins):
     if not FUNDING_ON or _FUNDING:
@@ -161,6 +204,10 @@ def close_pos(book, key, ts, reason, clip=True):
     net = g - FEE_T
     book.realized += net * ORDER
     book.trades.append(net)
+    if TRADE_LOG:   # H-NB-FILTER step 1: observational, default-off
+        _TRADE_ROWS.append(dict(fold=book.fold, coin=p["coin"], dir=p["side"],
+                                entry_ts_ms=int(p["entry_ts"]), exit_ts_ms=int(ts),
+                                net_bps=net * 1e4, exit_reason=reason))
     book.exits[reason] += 1
     book.post_exit[key] = ts
 
@@ -200,6 +247,8 @@ def run_fold(fname, f_start, f_split, f_end, uni):
     print(f"  {len(stream)} cohort TEST fills on liquid majors")
 
     book = Book()
+    book.fold = fname                 # H-NB-FILTER: fold label for trade log / NB asof
+    book.nb_counts = defaultdict(int)  # H-NB-FILTER: gate-eval bucket composition
     eq_min = EQUITY0
     eq_path_day = {}
     next_risk_ts = stream[0][0] if stream else split
@@ -317,6 +366,15 @@ def run_fold(fname, f_start, f_split, f_end, uni):
             if KNET_MIN is not None and k < KNET_MIN:
                 book.rejects["knet_gate"] += 1
                 continue
+        if NB_FILTER:
+            # H-NB-FILTER step 4: regime filter on V17's gated entries. Causal asof
+            # (last completed hour strictly before ts). no_coverage = NEUTRAL pass-through
+            # (no signal -> never block), counted for disclosure.
+            nb_b, _nbp = _nb_bucket(fname, c, ts, is_buy)
+            book.nb_counts[nb_b] += 1
+            if (nb_b == "OPPOSED") or (NB_FILTER == "block_opposed_neutral" and nb_b == "NEUTRAL"):
+                book.rejects["nb_filter"] += 1
+                continue
         if NETX_CAP is not None:
             # sprint: net-exposure cap. The knet gate removes counter-herd entries that previously
             # HEDGED the aligned book (v17b fold1 death); bound the one-directional swing instead.
@@ -393,6 +451,9 @@ def run_fold(fname, f_start, f_split, f_end, uni):
         "max_all_short_x": tele["max_all_short"] / EQUITY0,
         "funding_paid": float(getattr(book, "funding_paid", 0.0)),
     }
+    if NB_FILTER:   # H-NB-FILTER: extra key only when the (default-off) filter is on
+        res["nb_counts"] = dict(book.nb_counts)
+        print(f"  nb_counts: {res['nb_counts']}")
     print(f"  ENTRIES {res['entries']} | book PnL ${res['book_pnl']:+.0f} | per-trade med {res['trade_med_bps']:+.1f} "
           f"mean {res['trade_mean_bps']:+.1f} bps | maxDD ${dd:.0f} ({dd/EQUITY0*100:.1f}%) | eq_min ${eq_min:.0f} "
           f"| STOPPED: {book.stopped}")
@@ -419,10 +480,15 @@ def main():
         print(f"[replay] m02 override: {_m02}")
     print(f"SHIPPED CONFIG: order ${ORDER} | util {UTIL_CAP} lev {LEV} | stop {STOP_PCT} | backstop {BACKSTOP_X}x "
           f"| sl {SL} trail {TR_ACT}/{TR_GIVE} hold {MAX_HOLD_MS//3600000}h | trim_pct {TRIM_PCT} | chase {CHASE_BPS}bps")
+    _load_nb()   # H-NB-FILTER: no-op unless V16_REPLAY_NB_FILTER is set
     uni = set(l.strip().lower() for l in open(S._DATA / "m01_nonerroring_wallets.txt")
               if l.strip() and not l.startswith("#"))
     out = [run_fold(*f, uni) for f in FOLDS]
-    pd.DataFrame(out).to_parquet(_REPO / "app" / "data" / "v16" / "engine_replay.parquet")
+    if TRADE_LOG:   # H-NB-FILTER step 1: observational dump, default-off
+        pd.DataFrame(_TRADE_ROWS).to_parquet(TRADE_LOG, index=False)
+        print(f"[replay] trade log: {len(_TRADE_ROWS)} rows -> {TRADE_LOG}")
+    _out_path = Path(OUT_PQ) if OUT_PQ else (_REPO / "app" / "data" / "v16" / "engine_replay.parquet")
+    pd.DataFrame(out).to_parquet(_out_path)
     ok = all(o["book_pnl"] > 0 and not o["stopped"] for o in out)
     print(f"\n=== VERDICT: {'PASS' if ok else 'FAIL'} (book PnL>0 + no stop trip, both folds) ===")
     sys.exit(0 if ok else 1)
