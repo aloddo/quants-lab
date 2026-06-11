@@ -26,8 +26,16 @@ PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
 # Engine = hl_copy_trader_v16.py (V15 engine subclass + liquid whitelist hard guard + fail-fast asserts).
 # GATED: do NOT remove halt flags until the V16 codex gate passes AND Alberto gives the launch word.
 # To revert: SCRIPT="strategies/live/hl_prop_copy.py"; ARGS="--config config/copy_live_basket.json".
-SCRIPT="strategies/live/hl_copy_trader_v16.py"
-ARGS="--config config/copy_trader_wallets_v16.json"
+# 2026-06-11 ~12:40 (Alberto V17 go-live msg 9254, Fable sprint): repointed to V17 -- GATED HERD
+# COPY. V16 + knet>=0 net-consensus entry gate + $50 + stop -25% latched + util 0.40 + backstop 5x
+# + netx 2.5x + coin-side 2.0x caps + seed audit (>=98/100 configured, top-30 hard block) +
+# stale-tracker kill. Codex chain: strategy SHIP-WITH-CHANGES (rounds 1-4) + CODE review GO
+# (rounds 1-2; 4 P1s fixed + verified). Replay (real marks) +$260/+$60 vs V16 +$165/+$32; forward
+# gate spread +140bps. Rollback gates: 18d forward fail -> revert V16; live DD 18% pre-forward ->
+# revert V16. To revert to V16: SCRIPT="strategies/live/hl_copy_trader_v16.py";
+# ARGS="--config config/copy_trader_wallets_v16.json".
+SCRIPT="strategies/live/hl_copy_trader_v17.py"
+ARGS="--config config/copy_trader_wallets_v17.json"
 
 cd "$WORKDIR"
 

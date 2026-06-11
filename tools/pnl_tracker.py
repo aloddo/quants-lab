@@ -34,10 +34,11 @@ logger = logging.getLogger("pnl_tracker")
 HL_API = "https://api.hyperliquid.xyz"
 PARENT_ADDRESS = "0x11ca20aeb7cd014cf8406560ae405b12601994b4"
 DB_NAME = "quants_lab"
-# V16 (2026-06-11, Alberto msg 9222/9226: updated labels + epoch start): track V16 collections.
-FILLS_COLLECTION = "v16_exchange_fills"
-OID_COLLECTION = "v16_order_ids"
-STRATEGY_LABEL = "V16"
+# V17 (2026-06-11 cutover 12:26 CEST, decisions/2026-06-11-v17-go-live): track V17 collections.
+# (V16 history remains in v16_* collections; --since covers it if ever needed.)
+FILLS_COLLECTION = "v17_exchange_fills"
+OID_COLLECTION = "v17_order_ids"
+STRATEGY_LABEL = "V17"
 TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003576397888")
 
@@ -684,10 +685,10 @@ def main():
             dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             since_ms = int(dt.timestamp() * 1000)
         elif args.epoch:
-            # V16 epoch: persisted by hl_copy_trader_v16.py at FIRST LIVE START (mongo v16_meta).
+            # V17 epoch: persisted by hl_copy_trader_v17.py at FIRST LIVE START (mongo v17_meta).
             # Before launch (doc absent) fall back to 'now' so pre-launch reports show zero, never
-            # legacy history (Alberto msg 9222: fresh epoch for V16).
-            _epoch_doc = tracker.db.v16_meta.find_one({"_id": "epoch"})
+            # legacy history (same convention as V16; cutover 2026-06-11 12:26 CEST).
+            _epoch_doc = tracker.db.v17_meta.find_one({"_id": "epoch"})
             since_ms = int(_epoch_doc["epoch_ms"]) if _epoch_doc else int(
                 datetime.now(timezone.utc).timestamp() * 1000)
         elif args.daily:

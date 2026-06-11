@@ -1,0 +1,661 @@
+{
+ "global": {
+  "strategy": "v16_top_decile_faithful_copy",
+  "sizing_mode": "fixed",
+  "order_size_usd": 50.0,
+  "min_entry_notional": 10.0,
+  "max_margin_util": 0.4,
+  "max_daily_loss": -25.0,
+  "global_stop_pct": 0.25,
+  "max_leverage_cap": 10,
+  "cooldown_s": 30,
+  "exit_poll_s": 10,
+  "exit_min_trim_pct": 0.85,
+  "full_exit_trim_pct": 0.85,
+  "exit_min_trim_usd": 1000000000.0,
+  "max_chase_bps": 15,
+  "max_spread_bps": 20,
+  "min_book_depth_usd": 3000,
+  "target_equity_max_age_s": 120,
+  "mark_max_age_s": 30,
+  "margin_reserve_max_lev": 10,
+  "trim_over_frac": 0.2,
+  "gross_backstop_x": 5.0,
+  "coin_whitelist": [
+   "ADA",
+   "AVAX",
+   "BNB",
+   "BTC",
+   "CRV",
+   "DOGE",
+   "ETH",
+   "HYPE",
+   "LINK",
+   "SOL"
+  ],
+  "cohort_asof": "2026-05-23T23:59:59.018000+00:00",
+  "cohort_window_days": 75,
+  "knet_min": 0,
+  "netx_cap_x": 2.5,
+  "coin_side_cap_x": 2.0,
+  "seed_min_wallets": 98,
+  "v17_authorization": "decisions/2026-06-11-v17-ship-with-changes + Alberto GO msg 9254"
+ },
+ "defaults": {
+  "group": "v16_top_decile",
+  "entry_mode": "instant",
+  "twap_window_s": 0,
+  "min_twap_notional": 0,
+  "max_addon_multiplier": 1,
+  "max_coin_concentration": 1.0,
+  "max_coin_notional_pct": 10.0,
+  "exit_type": "FIRST_CLOSE",
+  "sl_bps": -1500,
+  "trail_activate_bps": 600,
+  "trail_bps": 300,
+  "max_hold_s": 604800,
+  "exit_twap_min_notional": 1000000000.0
+ },
+ "wallets": {
+  "0x82eedad4fdd0c0a0ab12880974d24ef1198d54d6": {
+   "group": "v16_top_decile",
+   "rank": 1,
+   "trail_taker_bps": 317.23,
+   "trail_n_rt": 21
+  },
+  "0x6d43ae52c309b37d9cc7a8419c776a92fa6691dd": {
+   "group": "v16_top_decile",
+   "rank": 2,
+   "trail_taker_bps": 270.38,
+   "trail_n_rt": 18
+  },
+  "0xcb57377435ae16e2902ba96905d750c648acd466": {
+   "group": "v16_top_decile",
+   "rank": 3,
+   "trail_taker_bps": 252.66,
+   "trail_n_rt": 16
+  },
+  "0xf15e2997287a910f01421c10173b63e65e660651": {
+   "group": "v16_top_decile",
+   "rank": 4,
+   "trail_taker_bps": 216.77,
+   "trail_n_rt": 17
+  },
+  "0x28a950881cabca89900e59d354189b4860ca1b0e": {
+   "group": "v16_top_decile",
+   "rank": 5,
+   "trail_taker_bps": 211.71,
+   "trail_n_rt": 20
+  },
+  "0xdd5cd906db39545d5c11c3c1a3e087dd031deb7b": {
+   "group": "v16_top_decile",
+   "rank": 6,
+   "trail_taker_bps": 201.41,
+   "trail_n_rt": 20
+  },
+  "0x615da5bb122164d657d69d6201d28ef969d1dd38": {
+   "group": "v16_top_decile",
+   "rank": 7,
+   "trail_taker_bps": 185.79,
+   "trail_n_rt": 23
+  },
+  "0xcb2b3f8b7395abe3ac387477ebd638e9475ade44": {
+   "group": "v16_top_decile",
+   "rank": 8,
+   "trail_taker_bps": 184.57,
+   "trail_n_rt": 21
+  },
+  "0x0442f45807cf2fe3a3daed99762cdd9ceff853b8": {
+   "group": "v16_top_decile",
+   "rank": 9,
+   "trail_taker_bps": 179.34,
+   "trail_n_rt": 20
+  },
+  "0x2e2e76c5e1d91a78ec41672da4640620d88a1c50": {
+   "group": "v16_top_decile",
+   "rank": 10,
+   "trail_taker_bps": 177.48,
+   "trail_n_rt": 17
+  },
+  "0x1aec48167b063c580a9c4e989640df2836b91787": {
+   "group": "v16_top_decile",
+   "rank": 11,
+   "trail_taker_bps": 170.7,
+   "trail_n_rt": 30
+  },
+  "0xcce206e1dde85ded9e167f3ea65e88116d923d25": {
+   "group": "v16_top_decile",
+   "rank": 12,
+   "trail_taker_bps": 169.48,
+   "trail_n_rt": 15
+  },
+  "0x5e7a21e885f06a678572b3df33d6c0852269d26d": {
+   "group": "v16_top_decile",
+   "rank": 13,
+   "trail_taker_bps": 163.82,
+   "trail_n_rt": 16
+  },
+  "0xffdb2d4eb40e3bc00fda2c6bc3d3a79ab4de5137": {
+   "group": "v16_top_decile",
+   "rank": 14,
+   "trail_taker_bps": 163.25,
+   "trail_n_rt": 19
+  },
+  "0xf92b294f79e44f12279db546ed87557c6bd1bc02": {
+   "group": "v16_top_decile",
+   "rank": 15,
+   "trail_taker_bps": 163.21,
+   "trail_n_rt": 18
+  },
+  "0xa5f58e092c3cb6479eebce341394003eef1c68e8": {
+   "group": "v16_top_decile",
+   "rank": 16,
+   "trail_taker_bps": 161.86,
+   "trail_n_rt": 16
+  },
+  "0x5dabf1ff05a1cfb4d8d97b662d1f4443850eee14": {
+   "group": "v16_top_decile",
+   "rank": 17,
+   "trail_taker_bps": 160.34,
+   "trail_n_rt": 19
+  },
+  "0xdf81063cbf242a23196e3a68723f97f779bfe156": {
+   "group": "v16_top_decile",
+   "rank": 18,
+   "trail_taker_bps": 151.95,
+   "trail_n_rt": 27
+  },
+  "0x5c42b895c1a7f42fe0f72ed2ba1fe442376fb61d": {
+   "group": "v16_top_decile",
+   "rank": 19,
+   "trail_taker_bps": 149.32,
+   "trail_n_rt": 23
+  },
+  "0xfc8b2ac3c0cb313ad1a4bd984cb57c5b3de822b3": {
+   "group": "v16_top_decile",
+   "rank": 20,
+   "trail_taker_bps": 149.15,
+   "trail_n_rt": 16
+  },
+  "0x78153a9e6237fc27d5db1eed25cbbda643d4172d": {
+   "group": "v16_top_decile",
+   "rank": 21,
+   "trail_taker_bps": 148.53,
+   "trail_n_rt": 39
+  },
+  "0x1eb39d46c9814c8f16ea657d9dc1029575f4d651": {
+   "group": "v16_top_decile",
+   "rank": 22,
+   "trail_taker_bps": 148.32,
+   "trail_n_rt": 32
+  },
+  "0xf007760ae1c441b87751450b7bd2f5f83c325fd1": {
+   "group": "v16_top_decile",
+   "rank": 23,
+   "trail_taker_bps": 147.34,
+   "trail_n_rt": 17
+  },
+  "0xd350958b84c64d25652b3a2a92c9509a6c0125a0": {
+   "group": "v16_top_decile",
+   "rank": 24,
+   "trail_taker_bps": 147.05,
+   "trail_n_rt": 23
+  },
+  "0x565b1c32936bdaa526947178acc95c5b08cfacc4": {
+   "group": "v16_top_decile",
+   "rank": 25,
+   "trail_taker_bps": 146.94,
+   "trail_n_rt": 21
+  },
+  "0x59d6d3e57e7fed44bbe38774e3ca0ee5c9630c41": {
+   "group": "v16_top_decile",
+   "rank": 26,
+   "trail_taker_bps": 144.15,
+   "trail_n_rt": 17
+  },
+  "0xd997e887d93276ef9cef5b642affcc0b20c03880": {
+   "group": "v16_top_decile",
+   "rank": 27,
+   "trail_taker_bps": 140.18,
+   "trail_n_rt": 26
+  },
+  "0x85b3f50e9d3e902123fa6d3469511029be7c51f2": {
+   "group": "v16_top_decile",
+   "rank": 28,
+   "trail_taker_bps": 139.13,
+   "trail_n_rt": 20
+  },
+  "0xb580fd00adbc1580f97b7238aa91e4dd5ace5ba6": {
+   "group": "v16_top_decile",
+   "rank": 29,
+   "trail_taker_bps": 138.66,
+   "trail_n_rt": 25
+  },
+  "0x081942c75ff82341ab9f71d5df8b1309f6ddbc3e": {
+   "group": "v16_top_decile",
+   "rank": 30,
+   "trail_taker_bps": 138.61,
+   "trail_n_rt": 23
+  },
+  "0x677fa53cd2acb8e87f65ed1d0353683b82618d02": {
+   "group": "v16_top_decile",
+   "rank": 31,
+   "trail_taker_bps": 138.4,
+   "trail_n_rt": 31
+  },
+  "0x1404109f8cd4a79a0447365edbb7a13acd0b2f27": {
+   "group": "v16_top_decile",
+   "rank": 32,
+   "trail_taker_bps": 136.5,
+   "trail_n_rt": 24
+  },
+  "0x10d11287eba086fd52ae41821fdb8d7e612eafdc": {
+   "group": "v16_top_decile",
+   "rank": 33,
+   "trail_taker_bps": 135.26,
+   "trail_n_rt": 18
+  },
+  "0x9bda7f3510ff9cd5df02e0e9ec5393a85ee3c55b": {
+   "group": "v16_top_decile",
+   "rank": 34,
+   "trail_taker_bps": 135.07,
+   "trail_n_rt": 37
+  },
+  "0xf2a4c99526c77d3c311abdfdb571d855ab0a442d": {
+   "group": "v16_top_decile",
+   "rank": 35,
+   "trail_taker_bps": 134.49,
+   "trail_n_rt": 21
+  },
+  "0x6358b96b390ba2bb84eaf8facb609537b8c529a0": {
+   "group": "v16_top_decile",
+   "rank": 36,
+   "trail_taker_bps": 131.34,
+   "trail_n_rt": 25
+  },
+  "0x77495a643ef895ab79f48971a13e3a3a1b987049": {
+   "group": "v16_top_decile",
+   "rank": 37,
+   "trail_taker_bps": 130.54,
+   "trail_n_rt": 29
+  },
+  "0x8e9ce07ab1955a82a555c13eacd0243069d2476c": {
+   "group": "v16_top_decile",
+   "rank": 38,
+   "trail_taker_bps": 130.49,
+   "trail_n_rt": 18
+  },
+  "0xecf453e118c05baac43aa5b01d60ac821360a57e": {
+   "group": "v16_top_decile",
+   "rank": 39,
+   "trail_taker_bps": 130.39,
+   "trail_n_rt": 78
+  },
+  "0x13c1f4964452453b63d77ef44bf68ea8d761c0ba": {
+   "group": "v16_top_decile",
+   "rank": 40,
+   "trail_taker_bps": 129.3,
+   "trail_n_rt": 27
+  },
+  "0x1d1380c9df13a16189c39413433be01d43f7e7e6": {
+   "group": "v16_top_decile",
+   "rank": 41,
+   "trail_taker_bps": 129.06,
+   "trail_n_rt": 48
+  },
+  "0xfafbf5af1024b52b2c5d4be7ea292409f2d3a8c9": {
+   "group": "v16_top_decile",
+   "rank": 42,
+   "trail_taker_bps": 128.82,
+   "trail_n_rt": 20
+  },
+  "0x91f0780b4b7a6087a5f839b2e8d0622035507d35": {
+   "group": "v16_top_decile",
+   "rank": 43,
+   "trail_taker_bps": 128.74,
+   "trail_n_rt": 33
+  },
+  "0x735f4919ad66a401c5ed6da6e0a6d8c6271f765b": {
+   "group": "v16_top_decile",
+   "rank": 44,
+   "trail_taker_bps": 127.49,
+   "trail_n_rt": 19
+  },
+  "0x4f22d0f16e770c7f03726295c86aaeb7d3260baa": {
+   "group": "v16_top_decile",
+   "rank": 45,
+   "trail_taker_bps": 125.87,
+   "trail_n_rt": 29
+  },
+  "0xb918bbf81d250a7f1b081b23f76256c71b2a11bc": {
+   "group": "v16_top_decile",
+   "rank": 46,
+   "trail_taker_bps": 125.86,
+   "trail_n_rt": 19
+  },
+  "0xdd334f7e8977c80e3ce0e5675d496b75a2de153e": {
+   "group": "v16_top_decile",
+   "rank": 47,
+   "trail_taker_bps": 125.49,
+   "trail_n_rt": 18
+  },
+  "0x73069bb22c0c0dd469634ac60b5fcb12066107e1": {
+   "group": "v16_top_decile",
+   "rank": 48,
+   "trail_taker_bps": 124.67,
+   "trail_n_rt": 39
+  },
+  "0x350b9705c5f66ae2c0164a3e7e48b70d40c56716": {
+   "group": "v16_top_decile",
+   "rank": 49,
+   "trail_taker_bps": 124.38,
+   "trail_n_rt": 16
+  },
+  "0x8beef9d4859508142ff2eb936837a7873e11eab7": {
+   "group": "v16_top_decile",
+   "rank": 50,
+   "trail_taker_bps": 121.5,
+   "trail_n_rt": 20
+  },
+  "0xd79656d9e6ec643c6df635b21fe78ba7c02cbdc5": {
+   "group": "v16_top_decile",
+   "rank": 51,
+   "trail_taker_bps": 120.93,
+   "trail_n_rt": 20
+  },
+  "0x0c349d9b92fbd172bbb5a17a9db0a673a6a10ad3": {
+   "group": "v16_top_decile",
+   "rank": 52,
+   "trail_taker_bps": 120.82,
+   "trail_n_rt": 22
+  },
+  "0x3d6a70546bd7d97d0d47c9f57d7ead2cc202672a": {
+   "group": "v16_top_decile",
+   "rank": 53,
+   "trail_taker_bps": 120.36,
+   "trail_n_rt": 22
+  },
+  "0xfed98d26d5215dbd111959c344257149ebdbab09": {
+   "group": "v16_top_decile",
+   "rank": 54,
+   "trail_taker_bps": 120.35,
+   "trail_n_rt": 17
+  },
+  "0x2352bb8d8cf7b94075062047628465094c81eea4": {
+   "group": "v16_top_decile",
+   "rank": 55,
+   "trail_taker_bps": 119.79,
+   "trail_n_rt": 17
+  },
+  "0xd20928516631b043d72d9a97153bd83489da137d": {
+   "group": "v16_top_decile",
+   "rank": 56,
+   "trail_taker_bps": 118.58,
+   "trail_n_rt": 51
+  },
+  "0xa8ad3b7407031091f27af3bfedf170edc77cf761": {
+   "group": "v16_top_decile",
+   "rank": 57,
+   "trail_taker_bps": 118.47,
+   "trail_n_rt": 15
+  },
+  "0x68191e792269d8d835ed033b55f09bb3762a73ec": {
+   "group": "v16_top_decile",
+   "rank": 58,
+   "trail_taker_bps": 116.99,
+   "trail_n_rt": 19
+  },
+  "0x425c7726d40e59dc7ba6d8f1b65fa08e4253cb11": {
+   "group": "v16_top_decile",
+   "rank": 59,
+   "trail_taker_bps": 116.89,
+   "trail_n_rt": 19
+  },
+  "0x9f720b1a07b224c1a768adf0b0e19bc6a4eb88e1": {
+   "group": "v16_top_decile",
+   "rank": 60,
+   "trail_taker_bps": 116.86,
+   "trail_n_rt": 23
+  },
+  "0x3bbe8e02f72b10c9698a6e4375b5a19e53fc5b40": {
+   "group": "v16_top_decile",
+   "rank": 61,
+   "trail_taker_bps": 116.1,
+   "trail_n_rt": 40
+  },
+  "0xcc3d9e3e7f52d3094cfe8b0bbe8a47d1a015756c": {
+   "group": "v16_top_decile",
+   "rank": 62,
+   "trail_taker_bps": 115.38,
+   "trail_n_rt": 24
+  },
+  "0x2f8afdd2130362895f1536a31dd36aa16e4a932f": {
+   "group": "v16_top_decile",
+   "rank": 63,
+   "trail_taker_bps": 115.06,
+   "trail_n_rt": 30
+  },
+  "0x04a97ae7f350a22cd0cdb6b1875e8905b76495aa": {
+   "group": "v16_top_decile",
+   "rank": 64,
+   "trail_taker_bps": 114.35,
+   "trail_n_rt": 16
+  },
+  "0x3a6747c8e913085e243a2c22d188dafa8c6a612a": {
+   "group": "v16_top_decile",
+   "rank": 65,
+   "trail_taker_bps": 113.6,
+   "trail_n_rt": 18
+  },
+  "0x6a3ea4ac7626423a70ef602a91aab51f8a38398d": {
+   "group": "v16_top_decile",
+   "rank": 66,
+   "trail_taker_bps": 113.4,
+   "trail_n_rt": 17
+  },
+  "0x8afacaa08de7189d84db9d87b9c21c2f1ac28113": {
+   "group": "v16_top_decile",
+   "rank": 67,
+   "trail_taker_bps": 113.05,
+   "trail_n_rt": 20
+  },
+  "0x6ef4d5bd612ec78d9a6f002e5a3f3061a12d03d0": {
+   "group": "v16_top_decile",
+   "rank": 68,
+   "trail_taker_bps": 111.89,
+   "trail_n_rt": 50
+  },
+  "0x412289c2a6ea40f078f5f1a8cf39269da135e0c0": {
+   "group": "v16_top_decile",
+   "rank": 69,
+   "trail_taker_bps": 111.36,
+   "trail_n_rt": 27
+  },
+  "0x3682268a81f93ed00f7fe8cec15a99468836a342": {
+   "group": "v16_top_decile",
+   "rank": 70,
+   "trail_taker_bps": 111.36,
+   "trail_n_rt": 43
+  },
+  "0x97be9c7904f9c772a3efbf9e10286b91ba8a773e": {
+   "group": "v16_top_decile",
+   "rank": 71,
+   "trail_taker_bps": 110.9,
+   "trail_n_rt": 49
+  },
+  "0x5bb838fcefcc659b1eddc12f1541d69321cd6cc7": {
+   "group": "v16_top_decile",
+   "rank": 72,
+   "trail_taker_bps": 110.62,
+   "trail_n_rt": 17
+  },
+  "0x6a2cec2bda4749f113676bd9a5f3e64277260efd": {
+   "group": "v16_top_decile",
+   "rank": 73,
+   "trail_taker_bps": 110.56,
+   "trail_n_rt": 21
+  },
+  "0x64696c400fb0f2c65d7082e20dba596cc6dc0069": {
+   "group": "v16_top_decile",
+   "rank": 74,
+   "trail_taker_bps": 109.95,
+   "trail_n_rt": 15
+  },
+  "0x4aa63e8115c5b29a3e0e062a77c11592931453dc": {
+   "group": "v16_top_decile",
+   "rank": 75,
+   "trail_taker_bps": 109.53,
+   "trail_n_rt": 19
+  },
+  "0x259b9c4cfeadaef8a5b842710a777364988415b3": {
+   "group": "v16_top_decile",
+   "rank": 76,
+   "trail_taker_bps": 109.16,
+   "trail_n_rt": 26
+  },
+  "0xac6226173171d53539fc7799a4c55a7f3d9a99fc": {
+   "group": "v16_top_decile",
+   "rank": 77,
+   "trail_taker_bps": 108.8,
+   "trail_n_rt": 18
+  },
+  "0xaaa3c93538ac273bfd2770673d77ae560148fd50": {
+   "group": "v16_top_decile",
+   "rank": 78,
+   "trail_taker_bps": 108.62,
+   "trail_n_rt": 20
+  },
+  "0x344e1d17d7d453be95123bc0a892328fe7116398": {
+   "group": "v16_top_decile",
+   "rank": 79,
+   "trail_taker_bps": 108.57,
+   "trail_n_rt": 30
+  },
+  "0xee06d080a7fbd50a92403240df9873dddd736876": {
+   "group": "v16_top_decile",
+   "rank": 80,
+   "trail_taker_bps": 108.44,
+   "trail_n_rt": 36
+  },
+  "0x3adcd58134109c4d4d586984c286dd090bf1d568": {
+   "group": "v16_top_decile",
+   "rank": 81,
+   "trail_taker_bps": 108.22,
+   "trail_n_rt": 44
+  },
+  "0x2006ff3a3a4eafdb14a38aa127dce8bea37a5f19": {
+   "group": "v16_top_decile",
+   "rank": 82,
+   "trail_taker_bps": 108.18,
+   "trail_n_rt": 15
+  },
+  "0xf43a34220cc930b573554d5e1454d5c8d7ca8872": {
+   "group": "v16_top_decile",
+   "rank": 83,
+   "trail_taker_bps": 107.88,
+   "trail_n_rt": 28
+  },
+  "0xf8bb001a9e55d81fd6a5834f8e64865ef4e231c9": {
+   "group": "v16_top_decile",
+   "rank": 84,
+   "trail_taker_bps": 107.33,
+   "trail_n_rt": 17
+  },
+  "0x92c72d49870317f18bcbd762f4f37ec8dfcffb67": {
+   "group": "v16_top_decile",
+   "rank": 85,
+   "trail_taker_bps": 107.1,
+   "trail_n_rt": 17
+  },
+  "0x15f7729e220d29f846f2e0ac08bf45c11e6d2462": {
+   "group": "v16_top_decile",
+   "rank": 86,
+   "trail_taker_bps": 106.79,
+   "trail_n_rt": 43
+  },
+  "0x1f4ab7e9acebb8b591e74b81e34bebe8be9bc934": {
+   "group": "v16_top_decile",
+   "rank": 87,
+   "trail_taker_bps": 106.72,
+   "trail_n_rt": 55
+  },
+  "0x6d532964eaed1d6c24070c098d8655bd9383da6a": {
+   "group": "v16_top_decile",
+   "rank": 88,
+   "trail_taker_bps": 106.61,
+   "trail_n_rt": 23
+  },
+  "0x504ec17f392b0aea095a1774146316bbeb464683": {
+   "group": "v16_top_decile",
+   "rank": 89,
+   "trail_taker_bps": 106.55,
+   "trail_n_rt": 55
+  },
+  "0xf4a9c1fb2623f813d5975f1d73c31215c08eaa32": {
+   "group": "v16_top_decile",
+   "rank": 90,
+   "trail_taker_bps": 106.35,
+   "trail_n_rt": 55
+  },
+  "0x561edc21a1ec1dd67c3166219dde4f1c3f6993f0": {
+   "group": "v16_top_decile",
+   "rank": 91,
+   "trail_taker_bps": 106.09,
+   "trail_n_rt": 19
+  },
+  "0xea7fb0caa7b16f1c657f478455e4e51cfaf5faa0": {
+   "group": "v16_top_decile",
+   "rank": 92,
+   "trail_taker_bps": 105.79,
+   "trail_n_rt": 33
+  },
+  "0xe97e4d510652593b276883836470c5ac9a4f2379": {
+   "group": "v16_top_decile",
+   "rank": 93,
+   "trail_taker_bps": 105.75,
+   "trail_n_rt": 16
+  },
+  "0x7bc5239180bea2255f4dd243d79481d39adee41e": {
+   "group": "v16_top_decile",
+   "rank": 94,
+   "trail_taker_bps": 105.56,
+   "trail_n_rt": 55
+  },
+  "0x493f4ee400c8ae660017769072b6f69724878ef1": {
+   "group": "v16_top_decile",
+   "rank": 95,
+   "trail_taker_bps": 105.31,
+   "trail_n_rt": 38
+  },
+  "0x21846f35a006438d6474b8f534c6b56afe87cf91": {
+   "group": "v16_top_decile",
+   "rank": 96,
+   "trail_taker_bps": 104.72,
+   "trail_n_rt": 35
+  },
+  "0x8a0e881251dd5e3e07b0d559cb777c1781c09185": {
+   "group": "v16_top_decile",
+   "rank": 97,
+   "trail_taker_bps": 104.6,
+   "trail_n_rt": 15
+  },
+  "0x93ab5a80125a3dab04dced7b96058bfe63730384": {
+   "group": "v16_top_decile",
+   "rank": 98,
+   "trail_taker_bps": 103.76,
+   "trail_n_rt": 20
+  },
+  "0x9c17986f2608cb66659a3234e890892eb2533527": {
+   "group": "v16_top_decile",
+   "rank": 99,
+   "trail_taker_bps": 103.41,
+   "trail_n_rt": 36
+  },
+  "0x59418b287bbd45959b87ecc993a166ffa18c929f": {
+   "group": "v16_top_decile",
+   "rank": 100,
+   "trail_taker_bps": 103.34,
+   "trail_n_rt": 26
+  }
+ }
+}
