@@ -52,12 +52,14 @@ CONFIG_OUT = _REPO / "config" / "copy_trader_wallets_v16.json"
 V16_GLOBAL = {
     "strategy": "v16_top_decile_faithful_copy",
     "sizing_mode": "fixed",            # fixed per-trade $ = matches the validated equal-weighted-trade edge
-    "order_size_usd": 12.0,            # > HL $10 min; ~25 concurrent = $300 gross on ~$486 equity
+    "order_size_usd": 100.0,           # Alberto 2026-06-11 (msg 9212): full $490 account, up to 10x on
+                                       # liquid coins, "don't be shy". ~7 avg concurrent = ~$700 gross
+                                       # (~1.4x); 25-concurrent burst = $2500 (~5x, 51% util at 10x).
     "min_entry_notional": 10.0,
-    "max_margin_util": 0.50,           # conservative go-live (engine default era used 0.95)
-    "max_daily_loss": -8.0,            # $ latch; ~5% of the $150 strategy slice
-    "global_stop_pct": 0.04,           # flatten-all + latch at -4% account equity from session baseline
-    "max_leverage_cap": 3,
+    "max_margin_util": 0.60,
+    "max_daily_loss": -25.0,           # NOTE: inert in engine (validated at init only); real latches below
+    "global_stop_pct": 0.08,           # flatten-all + latch at -8% account (-$39; ~6 sigma daily at $100/trade)
+    "max_leverage_cap": 10,            # Alberto: up to 10x on liquid majors
     "cooldown_s": 30,
     "exit_poll_s": 10,
     "exit_min_trim_pct": 0.05,
@@ -67,9 +69,9 @@ V16_GLOBAL = {
     "min_book_depth_usd": 3000,
     "target_equity_max_age_s": 120,
     "mark_max_age_s": 30,
-    "margin_reserve_max_lev": 3,
+    "margin_reserve_max_lev": 10,
     "trim_over_frac": 0.2,
-    "gross_backstop_x": 1.0,           # flatten-all if gross notional > 1x account equity (blow-up guard)
+    "gross_backstop_x": 6.0,           # flatten-all if gross notional > 6x account equity (blow-up guard)
     # V16-specific (consumed by hl_copy_trader_v16.py, ignored by the base engine):
     "coin_whitelist": sorted(LIQUID),  # MUST equal the validated LIQUID set -- selector enforces this
 }
@@ -78,9 +80,9 @@ V16_DEFAULTS = {
     "entry_mode": "instant",           # leader opens -> we enter immediately (taker path)
     "twap_window_s": 0,
     "min_twap_notional": 0,
-    "max_addon_multiplier": 1,         # copy the round-trip OPEN only; no add-on stacking at $12 size
-    "max_coin_concentration": 0.10,    # per-coin margin <= 10% of equity
-    "max_coin_notional_pct": 0.08,     # per-coin notional <= 8% of equity (~$39) ~ 3 stacked signals
+    "max_addon_multiplier": 1,         # copy the round-trip OPEN only; no add-on stacking
+    "max_coin_concentration": 0.25,    # per-coin margin <= 25% of equity
+    "max_coin_notional_pct": 0.50,     # per-coin notional <= 50% of equity (~$245) ~ 2 stacked signals
     "exit_type": "FIRST_CLOSE",        # leader's first close -> we close (faithful exit)
     "sl_bps": -400,                    # protective floor, beyond validated cap; overlay-tested
     "trail_activate_bps": 150,         # rule #7 trailing TP: activate at +150bps...
