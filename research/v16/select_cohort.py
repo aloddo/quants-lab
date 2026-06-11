@@ -52,13 +52,18 @@ CONFIG_OUT = _REPO / "config" / "copy_trader_wallets_v16.json"
 V16_GLOBAL = {
     "strategy": "v16_top_decile_faithful_copy",
     "sizing_mode": "fixed",            # fixed per-trade $ = matches the validated equal-weighted-trade edge
-    "order_size_usd": 100.0,           # Alberto 2026-06-11 (msg 9212): full $490 account, up to 10x on
-                                       # liquid coins, "don't be shy". ~7 avg concurrent = ~$700 gross
-                                       # (~1.4x); 25-concurrent burst = $2500 (~5x, 51% util at 10x).
+    "order_size_usd": 50.0,            # BOOK-SIM SIZED (2026-06-11): cohort herds -> natural book at
+                                       # $50/trade = p50 $1.9k / p90 $3k gross; caps block only 4% of
+                                       # flow (vs 31% at $100, a non-random distortion during max
+                                       # herding). Bigger $/trade just hits the same ~$2.9k gross
+                                       # envelope while distorting WHICH trades execute.
     "min_entry_notional": 10.0,
-    "max_margin_util": 0.60,
+    "max_margin_util": 0.60,           # at 10x lev => gross envelope ~0.6*10*equity ~ $2.9k
     "max_daily_loss": -25.0,           # NOTE: inert in engine (validated at init only); real latches below
-    "global_stop_pct": 0.08,           # flatten-all + latch at -8% account (-$39; ~6 sigma daily at $100/trade)
+    "global_stop_pct": 0.12,           # latched flatten-all at -12% (-$58). Book sim: in-sample max DD
+                                       # 6.8-7.8% nearly kissed -8%; OOS edge ~4x smaller, similar vol
+                                       # -> -8% would trip on normal variance and kill the live test.
+                                       # -12% ~ 3.4 daily sigma at $50/trade. Alberto + codex to bless.
     "max_leverage_cap": 10,            # Alberto: up to 10x on liquid majors
     "cooldown_s": 30,
     "exit_poll_s": 10,
@@ -81,8 +86,12 @@ V16_DEFAULTS = {
     "twap_window_s": 0,
     "min_twap_notional": 0,
     "max_addon_multiplier": 1,         # copy the round-trip OPEN only; no add-on stacking
-    "max_coin_concentration": 0.25,    # per-coin margin <= 25% of equity
-    "max_coin_notional_pct": 0.50,     # per-coin notional <= 50% of equity (~$245) ~ 2 stacked signals
+    # PER-COIN CAPS OFF (Alberto msg 9214 + coin_concurrency.py): cohort herds -- median 8 same-coin
+    # positions open at typical entry, 84% of flow on HYPE/ETH/SOL/BTC. Any per-coin cap blocks 50-88%
+    # of the validated flow non-randomly. Risk is carried at BOOK level: margin util 0.60, gross
+    # backstop 6x, latched global stop, per-position SL.
+    "max_coin_concentration": 1.0,     # effectively off (book-level controls govern)
+    "max_coin_notional_pct": 10.0,     # effectively off (fixed-mode cap disabled by construction)
     "exit_type": "FIRST_CLOSE",        # leader's first close -> we close (faithful exit)
     "sl_bps": -400,                    # protective floor, beyond validated cap; overlay-tested
     "trail_activate_bps": 150,         # rule #7 trailing TP: activate at +150bps...

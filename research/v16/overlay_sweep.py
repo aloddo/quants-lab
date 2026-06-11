@@ -32,7 +32,7 @@ from select_cohort import load_wallet_fills, edge, LIQUID, CAP, MIN_COHORT, MAX_
 
 FEE_T = fee_rt(maker=False)
 MARK_STEP_MS = 60_000
-MAX_HOLD_S = 172_800
+WALK_HOLD_S = 604_800            # walk paths to 7d; per-config hold caps truncate
 LAT = 2_000
 MIN_RT = 15
 
@@ -41,58 +41,71 @@ FOLDS = [
     ("fold2", "2025-12-15", "2026-04-15", "2026-05-23"),
 ]
 
-# (name, sl_bps, trail_activate_bps, trail_bps); None = layer disabled
+H48, H7D = 172_800, 604_800
+# (name, hold_s, sl_bps, trail_activate_bps, trail_bps); None = layer disabled.
+# v2 (post-bug): hold cap is now a SWEPT dimension -- v1 baked 48h into every config including
+# "faithful", which silently cost ~19bps median in fold1 (15% of trades hit 48h; the edge has a long-
+# hold tail). faithful_7d FIRST so the in-loop cost column is correct.
 CONFIGS = [
-    ("engine_default", -400.0, 150.0, 75.0),
-    ("sl400_tr300_150", -400.0, 300.0, 150.0),
-    ("sl400_tr600_300", -400.0, 600.0, 300.0),
-    ("sl800_tr300_150", -800.0, 300.0, 150.0),
-    ("sl800_tr600_300", -800.0, 600.0, 300.0),
-    ("sl800_tr1000_500", -800.0, 1000.0, 500.0),
-    ("sl800_notrail", -800.0, None, None),
-    ("sl1500_tr600_300", -1500.0, 600.0, 300.0),
-    ("sl1500_tr1000_500", -1500.0, 1000.0, 500.0),
-    ("sl1500_notrail", -1500.0, None, None),
-    ("faithful_nooverlay", None, None, None),
+    ("faithful_7d", H7D, None, None, None),
+    ("faithful_48h", H48, None, None, None),
+    ("engine_default_48h", H48, -400.0, 150.0, 75.0),
+    ("sl800_tr300_150_48h", H48, -800.0, 300.0, 150.0),
+    ("sl800_tr300_150_7d", H7D, -800.0, 300.0, 150.0),
+    ("sl800_tr600_300_7d", H7D, -800.0, 600.0, 300.0),
+    ("sl800_notrail_7d", H7D, -800.0, None, None),
+    ("sl1500_tr600_300_7d", H7D, -1500.0, 600.0, 300.0),
+    ("sl1500_tr1000_500_7d", H7D, -1500.0, 1000.0, 500.0),
+    ("sl1500_notrail_7d", H7D, -1500.0, None, None),
+    ("sl2500_notrail_7d", H7D, -2500.0, None, None),
 ]
 
 
 def trade_path(coin, dir_, ets, xts):
-    """Walk 1-min marks once. Returns (entry_px, [(pnl_bps, mark), ...] per step, final_mark, reason_end)."""
+    """Walk 1-min marks ONCE to min(leader exit, 7d). Returns (entry_px, [(t, pnl_bps, mark)...],
+    leader_deadline_ms)."""
     m0 = S.mark_at(coin, ets + LAT)
     if m0 is None or m0 <= 0:
         return None
     entry_px = apply_entry(coin, m0, dir_ > 0)
-    deadline = min(xts + LAT, ets + LAT + MAX_HOLD_S * 1000)
-    end_reason = "leader_close" if deadline == xts + LAT else "max_hold"
+    deadline = min(xts + LAT, ets + LAT + WALK_HOLD_S * 1000)
     path = []
     t = ets + LAT + MARK_STEP_MS
     while t < deadline:
         m = S.mark_at(coin, t)
         if m is not None and m > 0:
-            path.append((dir_ * (m - entry_px) / entry_px * 1e4, m))
+            path.append((t, dir_ * (m - entry_px) / entry_px * 1e4, m))
         t += MARK_STEP_MS
     m_end = S.mark_at(coin, deadline)
     if m_end is None or m_end <= 0:
         return None
-    return entry_px, path, m_end, end_reason
+    return entry_px, path, deadline, m_end
 
 
-def eval_config(entry_px, path, m_end, end_reason, coin, dir_, sl, act, tr):
-    """Net bps for one overlay config on a precomputed path."""
+def eval_config(entry_px, path, leader_deadline, m_end, coin, dir_, ets, hold_s, sl, act, tr):
+    """Net bps for one (hold, sl, trail) config on a precomputed path."""
+    hold_deadline = ets + LAT + hold_s * 1000
     exit_mark, hit = None, None
-    if sl is not None or act is not None:
-        peak = 0.0
-        for pnl, m in path:
-            peak = max(peak, pnl)
-            if sl is not None and pnl <= sl:
-                exit_mark, hit = m, "sl"
-                break
-            if act is not None and peak >= act and (peak - pnl) >= tr:
-                exit_mark, hit = m, "trail"
-                break
+    peak = 0.0
+    last_m_before_hold = None
+    for t, pnl, m in path:
+        if t >= hold_deadline:
+            break
+        last_m_before_hold = m
+        peak = max(peak, pnl)
+        if sl is not None and pnl <= sl:
+            exit_mark, hit = m, "sl"
+            break
+        if act is not None and peak >= act and (peak - pnl) >= tr:
+            exit_mark, hit = m, "trail"
+            break
     if exit_mark is None:
-        exit_mark, hit = m_end, end_reason
+        if leader_deadline <= hold_deadline:
+            exit_mark, hit = m_end, "leader_close"
+        else:
+            exit_mark, hit = last_m_before_hold, "max_hold"
+            if exit_mark is None:
+                exit_mark, hit = m_end, "leader_close"   # no path point before cap; degenerate, use end
     exit_px = apply_exit(coin, exit_mark, dir_ > 0)
     g = dir_ * (exit_px - entry_px) / entry_px
     if hit in ("leader_close", "max_hold"):
@@ -134,20 +147,21 @@ def main():
                 tp = trade_path(c, dir_, ets, xts)
                 if tp is None:
                     continue
-                entry_px, path, m_end, end_reason = tp
-                for name, sl, act, tr in CONFIGS:
-                    net, hit = eval_config(entry_px, path, m_end, end_reason, c, dir_, sl, act, tr)
+                entry_px, path, leader_deadline, m_end = tp
+                for name, hold_s, sl, act, tr in CONFIGS:
+                    net, hit = eval_config(entry_px, path, leader_deadline, m_end, c, dir_, ets,
+                                           hold_s, sl, act, tr)
                     per_cfg[name].setdefault(w, []).append(net)
                     reasons[name][hit] = reasons[name].get(hit, 0) + 1
         base_med = None
-        print(f"  {'config':>20} | {'median':>8} {'mean':>8} | {'cost':>7} | %>0 | exits(sl/trail/hold)")
-        for name, sl, act, tr in CONFIGS:
+        print(f"  {'config':>22} | {'median':>8} {'mean':>8} | {'cost':>7} | %>0 | exits(sl/trail/hold)")
+        for name, hold_s, sl, act, tr in CONFIGS:
             pw = pd.Series({w: np.mean(v) for w, v in per_cfg[name].items() if len(v) >= MIN_RT})
             med, mean = pw.median(), pw.mean()
-            if name == "faithful_nooverlay":
+            if name == "faithful_7d":
                 base_med = med
             r = reasons[name]; tot = sum(r.values()) or 1
-            print(f"  {name:>20} | {med:>+8.2f} {mean:>+8.2f} | "
+            print(f"  {name:>22} | {med:>+8.2f} {mean:>+8.2f} | "
                   f"{(med - (base_med if base_med is not None else med)):>+7.2f} | "
                   f"{(pw > 0).mean()*100:>3.0f} | "
                   f"{r.get('sl',0)/tot*100:.0f}%/{r.get('trail',0)/tot*100:.0f}%/{r.get('max_hold',0)/tot*100:.0f}%")
@@ -158,7 +172,7 @@ def main():
     sdf.to_parquet(_REPO / "app" / "data" / "v16" / "overlay_sweep.parquet")
     print("\n=== CROSS-FOLD (median bps by config) ===")
     piv = sdf.pivot(index="config", columns="fold", values="median")
-    base = piv.loc["faithful_nooverlay"]
+    base = piv.loc["faithful_7d"]
     piv["cost_f1"] = piv["fold1"] - base["fold1"]
     piv["cost_f2"] = piv["fold2"] - base["fold2"]
     print(piv.round(2).to_string())
