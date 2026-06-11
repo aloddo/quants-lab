@@ -17,17 +17,21 @@ import leadlag_clean_rank_sim as S
 from fidelity_replay import roundtrips
 from execution_model import fee_rt, set_latency_ms
 FEE_M = fee_rt(maker=True); FEE_T = fee_rt(maker=False)
+import json as _json
+LIQUID = set(_json.load(open(S._DATA / "l2_calib_10coin.json")).keys())   # liquid coins (no microcap artifacts)
+CAP = 500.0 / 1e4
 
 
 def edge(rts, lo, hi, lat, fee):
     nets = []
     for c, dir_, ets, xts, evw, xvw, g in rts:
-        if not (lo <= ets < hi):
+        if not (lo <= ets < hi) or c not in LIQUID:   # liquid-only (kills microcap mark artifacts)
             continue
         ent = S.mark_at(c, ets + lat); ex = S.mark_at(c, xts + lat)
         if ent is None or ex is None or ent <= 0:
             continue
-        nets.append(dir_ * (ex - ent) / ent - fee)
+        og = max(-CAP, min(CAP, dir_ * (ex - ent) / ent))   # cap per-trade
+        nets.append(og - fee)
     if not nets:
         return (None, 0, None)
     a = np.array(nets)
