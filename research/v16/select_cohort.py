@@ -67,8 +67,10 @@ V16_GLOBAL = {
     "max_leverage_cap": 10,            # Alberto: up to 10x on liquid majors
     "cooldown_s": 30,
     "exit_poll_s": 10,
-    "exit_min_trim_pct": 0.05,
-    "exit_min_trim_usd": 3.0,
+    # codex finding #2 (FULL-CLOSE semantics): act only when the leader has closed >= 85% of tracked
+    # notional (engine full-exits at >= 90%, 85-90% trims to dust then full-exits). NOT the 5% trim.
+    "exit_min_trim_pct": 0.85,
+    "exit_min_trim_usd": 1e9,
     "max_chase_bps": 15,
     "max_spread_bps": 20,
     "min_book_depth_usd": 3000,
@@ -102,7 +104,7 @@ V16_DEFAULTS = {
     "trail_activate_bps": 600,
     "trail_bps": 300,
     "max_hold_s": 604800,              # 7d. 48h cap alone cost -13.5bps fold1 (15% of trades hit it)
-    "exit_twap_min_notional": 50,
+    "exit_twap_min_notional": 1e9,     # codex #2: no $-threshold trims; close-fraction governs exits
 }
 
 

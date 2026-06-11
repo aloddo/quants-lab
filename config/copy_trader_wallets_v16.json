@@ -10,8 +10,8 @@
     "max_leverage_cap": 10,
     "cooldown_s": 30,
     "exit_poll_s": 10,
-    "exit_min_trim_pct": 0.05,
-    "exit_min_trim_usd": 3.0,
+    "exit_min_trim_pct": 0.85,
+    "exit_min_trim_usd": 1000000000.0,
     "max_chase_bps": 15,
     "max_spread_bps": 20,
     "min_book_depth_usd": 3000,
@@ -48,7 +48,7 @@
     "trail_activate_bps": 600,
     "trail_bps": 300,
     "max_hold_s": 604800,
-    "exit_twap_min_notional": 50
+    "exit_twap_min_notional": 1000000000.0
   },
   "wallets": {
     "0x82eedad4fdd0c0a0ab12880974d24ef1198d54d6": {

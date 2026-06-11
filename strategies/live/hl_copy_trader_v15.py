@@ -2991,8 +2991,11 @@ class CopyTrader:
         try:
             # Step 1: Ingest new fills from exchange
             fills = self.info.user_fills(self.parent_address)
+            # PnL epoch: subclasses may set self.pnl_epoch_ms (V16: go-live ts from v16_meta, Alberto
+            # msg 9222 "updated labels and epoch start"). Default unchanged: V9 epoch 2026-05-09.
             v9_epoch_ms = int(datetime(2026, 5, 9, 23, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
-            recent = [f for f in fills if int(f['time']) >= v9_epoch_ms]
+            epoch_ms = int(getattr(self, "pnl_epoch_ms", 0) or v9_epoch_ms)
+            recent = [f for f in fills if int(f['time']) >= epoch_ms]
 
             # Load V11's known oids for attribution
             v11_oids = set()
@@ -3424,7 +3427,7 @@ class CopyTrader:
                            textcoords="offset points", xytext=(10, -12),
                            fontsize=8, color='gray')
 
-            ax.set_title(f'Copy Trader V11 -- {len(closed_trades)} closed, {n_open} open', fontsize=12)
+            ax.set_title(f'Copy Trader {getattr(self, "label", "V11")} -- {len(closed_trades)} closed, {n_open} open', fontsize=12)
             ax.set_ylabel('Cumulative PnL ($)', fontsize=10)
 
             span_hours = (timestamps[-1] - timestamps[0]).total_seconds() / 3600
@@ -3506,7 +3509,7 @@ class CopyTrader:
                     if not hasattr(self, '_ws_ever_connected'):
                         self._ws_ever_connected = True
                         _tg(
-                            f"V11 STARTED: {len(self.target_set)} wallets, "
+                            f"{getattr(self, 'label', 'V11')} STARTED: {len(self.target_set)} wallets, "
                             f"{len(self.all_perp_coins)}+{len(self.all_builder_coins)} coins "
                             f"(perp+builder), size=${self.order_size}"
                             f"{' [SHADOW]' if self.shadow_mode else ''}"
