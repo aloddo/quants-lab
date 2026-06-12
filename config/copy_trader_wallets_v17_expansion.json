@@ -2,7 +2,7 @@
   "global": {
     "strategy": "v16_top_decile_faithful_copy",
     "sizing_mode": "fixed",
-    "order_size_usd": 50.0,
+    "order_size_usd": 75.0,
     "min_entry_notional": 10.0,
     "max_margin_util": 0.4,
     "max_daily_loss": -25.0,
