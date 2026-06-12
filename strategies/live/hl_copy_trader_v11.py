@@ -696,11 +696,128 @@ class CopyTrader:
 
     # ── Margin-based risk management ─────────────────────────────────────────
 
+    @staticmethod
+    def _parse_clearinghouse(data: dict):
+        """Parse (margin_used, positions, upnl) from a clearinghouseState dict.
+        Same shape whether it came from REST clearinghouseState OR a webData2 push.
+        positions: {coin: {marginUsed, positionValue, unrealizedPnl, szi}}."""
+        margin_used = float(data.get("marginSummary", {}).get("totalMarginUsed", 0))
+        positions = {}
+        upnl = 0.0
+        for p in data.get("assetPositions", []):
+            pos = p.get("position", {})
+            coin = pos.get("coin", "")
+            szi = float(pos.get("szi", 0))
+            if abs(szi) > 1e-10:
+                u = float(pos.get("unrealizedPnl", 0))
+                positions[coin] = {
+                    "marginUsed": float(pos.get("marginUsed", 0)),
+                    "positionValue": float(pos.get("positionValue", 0)),
+                    "unrealizedPnl": u, "szi": szi,
+                }
+                upnl += u
+        return margin_used, positions, upnl
+
+    @staticmethod
+    def _parse_spot_usdc(spot_json):
+        """Spot USDC total (= HL equity per HARD RULE 16). None on transient null."""
+        if not isinstance(spot_json, dict):
+            return None
+        return sum(
+            float(b.get("total", 0))
+            for b in spot_json.get("balances", [])
+            if b.get("coin") == "USDC"
+        )
+
+    def _ingest_webdata2(self, wd: dict):
+        """Update the WS-pushed main-dex account snapshot from a webData2 payload.
+        Main dex + spot only; builder dexes (xyz/flx) are NOT in webData2 and stay
+        on the (guarded) REST path. Sets _ws_state_ts so _refresh_exchange_state
+        can prefer this over REST polling."""
+        try:
+            chs = wd.get("clearinghouseState", {})
+            if isinstance(chs, dict) and chs and "assetPositions" in chs:
+                m, pos, up = self._parse_clearinghouse(chs)
+                self._ws_main_margin = m
+                self._ws_main_positions = pos
+                self._ws_main_upnl = up
+                # Only stamp freshness when main state actually updated -- a spot-only
+                # or malformed payload must NOT let the fast path serve stale positions.
+                self._ws_state_ts = time.time()
+            spot = self._parse_spot_usdc(wd.get("spotState", {}))
+            if spot is not None:
+                self._ws_spot_equity = spot  # diagnostics only (free USDC; not equity)
+        except Exception as e:
+            logger.debug(f"webData2 ingest failed: {e}")
+
+    def _fetch_builder_dex_state(self):
+        """REST-poll builder dexes (xyz/flx) -- not covered by webData2.
+        Returns (margin_add, positions, upnl_add). Per-dex transient nulls skipped."""
+        margin_add = 0.0
+        positions = {}
+        upnl_add = 0.0
+        for dex_name in BUILDER_DEXES:
+            try:
+                rd = requests.post(
+                    HL_API + "/info",
+                    json={"type": "clearinghouseState", "user": self.parent_address, "dex": dex_name},
+                    timeout=5,
+                )
+                dd = rd.json()
+                if not isinstance(dd, dict):
+                    continue
+                m, pos, up = self._parse_clearinghouse(dd)
+                margin_add += m
+                positions.update(pos)
+                upnl_add += up
+            except Exception as e:
+                logger.debug(f"Builder dex {dex_name} state fetch failed: {e}")
+        return margin_add, positions, upnl_add
+
     def _refresh_exchange_state(self) -> bool:
-        """Fetch full account state from exchange. Cached for 30s."""
+        """Refresh account state. Prefers the fresh webData2 WS push for main-dex
+        margin/positions/spot-equity (eliminates the REST clearinghouse+spot polls
+        and the 'NoneType' transient-null crash); REST-polls only builder dexes.
+        Full-REST fallback when the WS snapshot is stale. Cached 30s."""
         now = time.time()
         if self._equity_cache is not None and now - self._equity_cache_ts < 30:
             return True
+
+        # ---- Preferred path: fresh WS (webData2) main margin/positions/upnl ----
+        # webData2 is EXACT-parity for main-dex margin, positions, upnl (verified
+        # 2026-06-12 parity test). It is NOT used for spot equity: webData2 reports
+        # FREE USDC (hold zeroed) while the engine's equity = GROSS spot USDC per
+        # HARD RULE 16 (the $35 hold is real). Spot stays on REST below.
+        ws_ts = getattr(self, "_ws_state_ts", 0)
+        if ws_ts and now - ws_ts < 15 and getattr(self, "_ws_main_positions", None) is not None:
+            try:
+                margin_used = getattr(self, "_ws_main_margin", 0.0)
+                positions = dict(self._ws_main_positions)
+                upnl = getattr(self, "_ws_main_upnl", 0.0)
+                m2, pos2, up2 = self._fetch_builder_dex_state()
+                margin_used += m2
+                positions.update(pos2)
+                upnl += up2
+                # Spot equity: REST (gross USDC), null-guarded.
+                r2 = requests.post(
+                    HL_API + "/info",
+                    json={"type": "spotClearinghouseState", "user": self.parent_address},
+                    timeout=5,
+                )
+                spot = self._parse_spot_usdc(r2.json())
+                if spot is None:
+                    logger.debug("spot null on WS path; keeping cache")
+                    return self._equity_cache is not None
+                self._exch_margin_used = margin_used
+                self._exch_positions = positions
+                self._exch_unrealized_pnl = upnl
+                self._equity_cache = spot
+                self._equity_cache_ts = now
+                return True
+            except Exception as e:
+                logger.debug(f"WS-state path failed, REST fallback: {e}")
+
+        # ---- Fallback: full REST poll (main + builder + spot), all null-guarded ----
         try:
             r1 = requests.post(
                 HL_API + "/info",
@@ -708,66 +825,33 @@ class CopyTrader:
                 timeout=5,
             )
             data = r1.json()
-            margin = data.get("marginSummary", {})
-            self._exch_margin_used = float(margin.get("totalMarginUsed", 0))
+            if not isinstance(data, dict) or "assetPositions" not in data:
+                # non-dict OR empty {} transient -> don't zero main state, keep cache.
+                logger.debug("clearinghouseState missing/empty; keeping cache")
+                return self._equity_cache is not None
+            margin_used, positions, total_upnl = self._parse_clearinghouse(data)
 
-            self._exch_positions = {}
-            total_upnl = 0.0
-            # Parse positions from default dex
-            for p in data.get("assetPositions", []):
-                pos = p.get("position", {})
-                coin = pos.get("coin", "")
-                szi = float(pos.get("szi", 0))
-                if abs(szi) > 1e-10:
-                    mu = float(pos.get("marginUsed", 0))
-                    upnl = float(pos.get("unrealizedPnl", 0))
-                    pv = float(pos.get("positionValue", 0))
-                    self._exch_positions[coin] = {
-                        "marginUsed": mu, "positionValue": pv,
-                        "unrealizedPnl": upnl, "szi": szi,
-                    }
-                    total_upnl += upnl
+            m2, pos2, up2 = self._fetch_builder_dex_state()
+            margin_used += m2
+            positions.update(pos2)
+            total_upnl += up2
 
-            # Also fetch positions from builder dexes (xyz, flx, etc.)
-            for dex_name in BUILDER_DEXES:
-                try:
-                    rd = requests.post(
-                        HL_API + "/info",
-                        json={"type": "clearinghouseState", "user": self.parent_address, "dex": dex_name},
-                        timeout=5,
-                    )
-                    dex_data = rd.json()
-                    dex_margin = dex_data.get("marginSummary", {})
-                    self._exch_margin_used += float(dex_margin.get("totalMarginUsed", 0))
-                    for p in dex_data.get("assetPositions", []):
-                        pos = p.get("position", {})
-                        coin = pos.get("coin", "")
-                        szi = float(pos.get("szi", 0))
-                        if abs(szi) > 1e-10:
-                            mu = float(pos.get("marginUsed", 0))
-                            upnl = float(pos.get("unrealizedPnl", 0))
-                            pv = float(pos.get("positionValue", 0))
-                            self._exch_positions[coin] = {
-                                "marginUsed": mu, "positionValue": pv,
-                                "unrealizedPnl": upnl, "szi": szi,
-                            }
-                            total_upnl += upnl
-                except Exception as e:
-                    logger.debug(f"Builder dex {dex_name} state fetch failed: {e}")
-
-            self._exch_unrealized_pnl = total_upnl
-
+            # Fetch spot BEFORE committing any _exch_* -- a transient null on spot
+            # must keep the ENTIRE prior snapshot, not leave margin/positions updated
+            # against a stale equity (codex finding #1).
             r2 = requests.post(
                 HL_API + "/info",
                 json={"type": "spotClearinghouseState", "user": self.parent_address},
                 timeout=5,
             )
-            spot = sum(
-                float(b.get("total", 0))
-                for b in r2.json().get("balances", [])
-                if b.get("coin") == "USDC"
-            )
+            spot = self._parse_spot_usdc(r2.json())
+            if spot is None:
+                logger.debug("spotClearinghouseState returned non-dict; keeping cache")
+                return self._equity_cache is not None
 
+            self._exch_margin_used = margin_used
+            self._exch_positions = positions
+            self._exch_unrealized_pnl = total_upnl
             self._equity_cache = spot
             self._equity_cache_ts = now
             return True
@@ -3252,6 +3336,14 @@ class CopyTrader:
                         "subscription": {"type": "orderUpdates", "user": self.parent_address}
                     }))
 
+                    # Subscribe to webData2: push-based main-dex account state
+                    # (margin/positions/spot equity) -> serves _refresh_exchange_state
+                    # without REST polling. Builder dexes stay on REST.
+                    await ws.send(json.dumps({
+                        "method": "subscribe",
+                        "subscription": {"type": "webData2", "user": self.parent_address}
+                    }))
+
                     logger.info("WS subscribed")
                     if not hasattr(self, '_ws_ever_connected'):
                         self._ws_ever_connected = True
@@ -3289,6 +3381,9 @@ class CopyTrader:
 
                             elif channel == "orderUpdates":
                                 self._on_order_update(data.get("data", []))
+
+                            elif channel == "webData2":
+                                self._ingest_webdata2(data.get("data", {}))
 
                         except asyncio.TimeoutError:
                             pass
