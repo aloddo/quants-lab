@@ -36,7 +36,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("hl_copy_v17")   # live tag (was "hl_copy_v11"; renamed 2026-06-12)
+logger = logging.getLogger("hl_copy_v17")   # live tag (was "hl_copy_v17"; renamed 2026-06-12)
 
 HL_API = "https://api.hyperliquid.xyz"
 HL_WS = "wss://api.hyperliquid.xyz/ws"
@@ -62,9 +62,9 @@ EXIT_POSITION_PCT = 0.30     # GRADUAL: exit trigger when reverse flow > 30% of 
 DB_COLLECTION = "unified_copy_trades"
 DB_SHADOW_COLLECTION = "unified_shadow_signals"
 DB_FILLS_COLLECTION = "hl_copy_target_fills"
-DB_OPEN_POSITIONS = "v11_open_positions"  # persistent position state (per-wallet)
-DB_EXCHANGE_FILLS = "v11_exchange_fills"  # exchange fills (source of truth for PnL)
-DB_ORDER_IDS = "v11_order_ids"  # every oid V11 generates (for fill attribution)
+DB_OPEN_POSITIONS = "v17_open_positions"  # persistent position state (per-wallet)
+DB_EXCHANGE_FILLS = "v17_exchange_fills"  # exchange fills (source of truth for PnL)
+DB_ORDER_IDS = "v17_order_ids"  # every oid V17 generates (for fill attribution)
 
 
 def _tg(msg: str):
@@ -136,10 +136,10 @@ class CopyTrader:
         self.shadow_mode = shadow
         self._deploy_time = datetime.now(timezone.utc)
 
-        # ── V15 PROPORTIONAL SIZING (vs V11 fixed order_size) ────────────────
+        # ── V15 PROPORTIONAL SIZING (vs V17 fixed order_size) ────────────────
         # V15 mirrors each leader's EXPOSURE-% (their position notional / their account equity) onto OUR
         # equity, instead of a fixed $/order. order_size becomes only a FLOOR/lot helper. Leader equity
-        # comes from the same clearinghouseState V11 already fetches (marginSummary.accountValue summed
+        # comes from the same clearinghouseState V17 already fetches (marginSummary.accountValue summed
         # over dexes). Gross exposure across all copied positions is capped at gross_cap x our equity.
         self.sizing_mode = self.global_config.get("sizing_mode", "proportional")  # proportional | fixed
         # Alberto 2026-06-01: NO cap on gross leverage (mirror leaders' true exposure faithfully); risk is
@@ -170,7 +170,7 @@ class CopyTrader:
         # Resolve vault leaders: vaults trade under their leader address on WS
         self._resolve_vault_leaders()
 
-        logger.info(f"V11: loaded {len(self.target_set)} wallets ({len(self.leader_to_vault)} vaults) from {config_path}")
+        logger.info(f"V17: loaded {len(self.target_set)} wallets ({len(self.leader_to_vault)} vaults) from {config_path}")
         for addr in sorted(self.wallet_configs.keys()):
             wc = self._wallet_config(addr)
             logger.info(
@@ -230,12 +230,12 @@ class CopyTrader:
                     self.sz_decimals[name] = u.get("szDecimals", 2)
                     self.max_leverage[name] = min(u.get("maxLeverage", 3), max_lev_cap)
                     self.all_builder_coins.append(name)
-                logger.info(f"V11: loaded {dex_name} dex: {len([c for c in self.all_builder_coins if c.startswith(dex_name + ':')])} coins")
+                logger.info(f"V17: loaded {dex_name} dex: {len([c for c in self.all_builder_coins if c.startswith(dex_name + ':')])} coins")
             except Exception as e:
-                logger.warning(f"V11: failed to load {dex_name} dex meta: {e}")
+                logger.warning(f"V17: failed to load {dex_name} dex meta: {e}")
 
         logger.info(
-            f"V11: {len(self.all_perp_coins)} perp + {len(self.all_builder_coins)} builder coins available"
+            f"V17: {len(self.all_perp_coins)} perp + {len(self.all_builder_coins)} builder coins available"
         )
 
         # MongoDB
@@ -279,11 +279,11 @@ class CopyTrader:
         self._kill_reasons = {}  # {"stale": True, "loss": True} -- separate tracking
 
         # Exchange PnL cache (READ-ONLY, refreshed by _sync_exchange_fills)
-        # V11 NEVER computes PnL internally. This cache is the ONLY source.
+        # V17 NEVER computes PnL internally. This cache is the ONLY source.
         self._exch_pnl = {
             "account_net": 0.0,    # all fills: closedPnl - fees
-            "v11_net": 0.0,        # V11-attributed fills only
-            "v11_closes": 0,       # V11 closing fill count
+            "v17_net": 0.0,        # V17-attributed fills only
+            "v17_closes": 0,       # V17 closing fill count
             "account_closes": 0,   # all closing fills
             "fees": 0.0,           # total fees
             "last_sync": 0.0,      # timestamp of last successful sync
@@ -296,7 +296,7 @@ class CopyTrader:
             logger.info(
                 f"LOADED from EXCHANGE: {self._exch_pnl['account_closes']} closes, "
                 f"account_net=${self._exch_pnl['account_net']:+.4f} "
-                f"v11_net=${self._exch_pnl['v11_net']:+.4f} "
+                f"v17_net=${self._exch_pnl['v17_net']:+.4f} "
                 f"fees=${self._exch_pnl['fees']:.4f}"
             )
         except Exception as e:
@@ -492,7 +492,7 @@ class CopyTrader:
             logger.warning(f"Failed to persist position {pos['coin']}: {e}")
 
     def _record_oid(self, oid, coin: str, side: str, action: str, wallet: str = ""):
-        """Record every order ID V11 generates for fill attribution."""
+        """Record every order ID V17 generates for fill attribution."""
         if self.shadow_mode or not oid:
             return
         try:
@@ -858,10 +858,10 @@ class CopyTrader:
                         f"(k_opp<={self._tilt_e1_kopp_max}) clamp[{self._tilt_floor},{self._tilt_cap}]")
             # codex: a prior auto-disable must survive restart (don't silently re-enable).
             try:
-                st = self.db["v11_tilt_state"].find_one({"_id": "tilt"})
+                st = self.db["v17_tilt_state"].find_one({"_id": "tilt"})
                 if st and st.get("disabled"):
                     logger.warning("H17 tilt: previously AUTO-DISABLED (persisted); staying OFF. "
-                                   "Clear v11_tilt_state to re-enable.")
+                                   "Clear v17_tilt_state to re-enable.")
                     self._tilt_enabled = False
                     self._tilt_disabled_alerted = True
             except Exception:
@@ -948,7 +948,7 @@ class CopyTrader:
                 logger.warning(msg)
                 # Persist so a restart does NOT silently re-enable the killed tilt (codex).
                 try:
-                    self.db["v11_tilt_state"].update_one(
+                    self.db["v17_tilt_state"].update_one(
                         {"_id": "tilt"},
                         {"$set": {"disabled": True, "adv": float(adv),
                                   "ts": datetime.now(timezone.utc), "n": len(win)}},
@@ -1204,7 +1204,7 @@ class CopyTrader:
             return False
 
         coin_notional = coin_data.get("positionValue", 0) + additional_notional
-        # V15: the next two caps are V11 FIXED-SIZE guardrails (addon x order_size, and a 35%-of-equity
+        # V15: the next two caps are V17 FIXED-SIZE guardrails (addon x order_size, and a 35%-of-equity
         # single-coin notional cap). They contradict proportional copy with NO gross cap (Alberto
         # 2026-06-01: mirror leaders' true exposure; risk capped by margin-util 0.95 + coin-concentration
         # + the global -15% stop, NOT an artificial per-coin notional clamp). So they apply in FIXED mode
@@ -1472,9 +1472,9 @@ class CopyTrader:
         self._mid_price_ts[coin] = time.time()
 
         # ── V15 PROPORTIONAL ENTRY NOTIONAL (converge OUR position to the leader's exposure level) ──
-        # V11 added a fixed $order_size per detected trade; V15 sizes the order as the DELTA needed to
+        # V17 added a fixed $order_size per detected trade; V15 sizes the order as the DELTA needed to
         # bring our position up to (leader_exposure% x our_equity). On staleness/missing leader equity we
-        # SKIP (never size off stale data). sizing_mode='fixed' falls back to V11 behavior.
+        # SKIP (never size off stale data). sizing_mode='fixed' falls back to V17 behavior.
         if self.sizing_mode == "proportional":
             tgt_notional = self._proportional_target_notional(twap_wallet, coin, mid)
             if tgt_notional is None:
@@ -1720,7 +1720,7 @@ class CopyTrader:
         self._evaluate_global_stop_fast()
 
         # codex r3 #1/#2/#3: GLOBAL STOP / backstop -> use the DEDICATED exchange-truth emergency flatten
-        # (market_close every real position; no V11 exit-machinery give-up / partial-IOC / book deps).
+        # (market_close every real position; no V17 exit-machinery give-up / partial-IOC / book deps).
         # Reconcile then syncs the tracker to the flat exchange. Entries stay off (kill latched).
         if self._flatten_requested:
             n_remaining = await self._emergency_flatten()
@@ -1785,8 +1785,8 @@ class CopyTrader:
             _risk_exit_attempted = False
 
             # NOTE (codex r2 #2/#3): a V15 proportional DOWN-convergence layer was removed here. It ran
-            # before the hard SL (could delay it) and read V11's leader-position cache, which only updates
-            # on opens (not on leader reductions) -> it could not reliably catch reductions anyway. V11's
+            # before the hard SL (could delay it) and read V17's leader-position cache, which only updates
+            # on opens (not on leader reductions) -> it could not reliably catch reductions anyway. V17's
             # existing reverse-flow exit path already mirrors leader closes/reductions. A proper
             # down-convergence reconciler (fresh per-leader clearinghouseState query, IOC trim, AFTER the
             # risk-exit layers) is deferred to v2.
@@ -2119,7 +2119,7 @@ class CopyTrader:
                     pos['_dust_logged'] = True
                 self._post_exit_cooldown[(wallet, coin)] = time.time()
                 return True  # remove from tracker, true dust
-            # Positions V11 entered are NEVER dust regardless of notional
+            # Positions V17 entered are NEVER dust regardless of notional
             # They must be properly exited or held until target closes
 
             ws_book = self._book_depth.get(coin)
@@ -2505,16 +2505,16 @@ class CopyTrader:
                 existing = pos
                 break
         if existing and max_addon_mult <= 1:
-            logger.debug(f"V11: skip {coin} -- already have position, no add-ons")
+            logger.debug(f"V17: skip {coin} -- already have position, no add-ons")
             return
 
         cooldown_key = (wallet, coin)
         if now - self.last_entry.get(cooldown_key, 0) < cooldown_s:
-            logger.debug(f"V11: cooldown active for {coin}")
+            logger.debug(f"V17: cooldown active for {coin}")
             return
 
         if not self._is_opening_trade(wallet, coin, is_buy):
-            logger.debug(f"V11: not an opening trade for {coin}")
+            logger.debug(f"V17: not an opening trade for {coin}")
             return
 
         if not self.shadow_mode and not self._check_margin_budget(coin, self.order_size, wallet=wallet):
@@ -2529,12 +2529,12 @@ class CopyTrader:
             self.mid_prices[coin] = px
             self._mid_price_ts[coin] = time.time()
             if coin not in self._l2_subscribed:
-                logger.info(f"V11: dynamic l2Book subscribe for {coin} (first target fill)")
+                logger.info(f"V17: dynamic l2Book subscribe for {coin} (first target fill)")
                 # Will be subscribed on next _sync_l2_subscriptions cycle
                 self._l2_subscribed.add(coin)  # Mark for subscription
         chase_bps = abs(mid - px) / px * 10000
         if chase_bps > max_chase_bps:
-            logger.info(f"V11 SKIP {coin}: chase {chase_bps:.0f}bps > {max_chase_bps}bps")
+            logger.info(f"V17 SKIP {coin}: chase {chase_bps:.0f}bps > {max_chase_bps}bps")
             return
 
         # Entry guard: spread
@@ -2543,14 +2543,14 @@ class CopyTrader:
         ask = book.get("best_ask", 0)
         spread_bps = (ask - bid) / mid * 10000 if mid > 0 and bid > 0 and ask > 0 else 999
         if spread_bps > max_spread_bps:
-            logger.info(f"V11 SKIP {coin}: spread {spread_bps:.0f}bps > {max_spread_bps}bps")
+            logger.info(f"V17 SKIP {coin}: spread {spread_bps:.0f}bps > {max_spread_bps}bps")
             return
 
         # Entry guard: book depth
         depth = self._get_book_depth(coin)
         entry_depth = depth["ask_usd"] if is_buy else depth["bid_usd"]
         if entry_depth < min_book_depth:
-            logger.info(f"V11 SKIP {coin}: depth ${entry_depth:.0f} < ${min_book_depth}")
+            logger.info(f"V17 SKIP {coin}: depth ${entry_depth:.0f} < ${min_book_depth}")
             return
 
         # ALL GUARDS PASS -- enter immediately
@@ -2562,7 +2562,7 @@ class CopyTrader:
         self.last_entry[cooldown_key] = now
 
         logger.info(
-            f"V11 ENTRY: {wallet[:10]} {coin} {'BUY' if is_buy else 'SELL'} "
+            f"V17 ENTRY: {wallet[:10]} {coin} {'BUY' if is_buy else 'SELL'} "
             f"${notional:,.0f} -- chase={chase_bps:.0f}bps spread={spread_bps:.0f}bps "
             f"depth=${entry_depth:,.0f} [{wallet_group}]"
         )
@@ -3179,9 +3179,9 @@ class CopyTrader:
                     if coin not in self._orphan_reported:
                         logger.warning(
                             f"ORPHAN DETECTED: {coin} sz={exch_sz} (${notional:.0f} notional) "
-                            f"exists on exchange but NOT tracked by V11"
+                            f"exists on exchange but NOT tracked by V17"
                         )
-                        _tg(f"ORPHAN: {coin} sz={exch_sz} on exchange, not tracked by V11. Manual close needed.")
+                        _tg(f"ORPHAN: {coin} sz={exch_sz} on exchange, not tracked by V17. Manual close needed.")
                         self._orphan_reported.add(coin)
 
             # Size reconciliation: compare SUM of tracked sizes per coin vs exchange
@@ -3242,7 +3242,7 @@ class CopyTrader:
 
     def _sync_exchange_fills(self):
         """Pull exchange fills and compute TRUE PnL from exchange (source of truth).
-        Runs every 60 seconds. Filters to V11-owned oids for accurate attribution."""
+        Runs every 60 seconds. Filters to V17-owned oids for accurate attribution."""
         now = time.time()
         if now - self._last_fill_sync < 60:
             return
@@ -3262,11 +3262,11 @@ class CopyTrader:
             epoch_ms = int(getattr(self, "pnl_epoch_ms", 0) or v9_epoch_ms)
             recent = [f for f in fills if int(f['time']) >= epoch_ms]
 
-            # Load V11's known oids for attribution
-            v11_oids = set()
+            # Load V17's known oids for attribution
+            v17_oids = set()
             try:
                 for doc in self.db[DB_ORDER_IDS].find({}, {"oid": 1}):
-                    v11_oids.add(doc["oid"])
+                    v17_oids.add(doc["oid"])
             except Exception:
                 pass
 
@@ -3306,9 +3306,9 @@ class CopyTrader:
             total_pnl = 0.0
             total_fees = 0.0
             total_closes = 0
-            v11_pnl = 0.0
-            v11_fees = 0.0
-            v11_closes = 0
+            v17_pnl = 0.0
+            v17_fees = 0.0
+            v17_closes = 0
 
             # V16: step-2 compute honors the same pnl epoch as step-1 ingest, so pre-epoch rows that
             # ever landed in the collection (e.g. a sync that ran before the epoch attr was set) can
@@ -3322,22 +3322,22 @@ class CopyTrader:
                 total_fees += fee
                 if abs(pnl) > 0.0001:
                     total_closes += 1
-                if oid in v11_oids:
-                    v11_pnl += pnl
-                    v11_fees += fee
+                if oid in v17_oids:
+                    v17_pnl += pnl
+                    v17_fees += fee
                     if abs(pnl) > 0.0001:
-                        v11_closes += 1
+                        v17_closes += 1
 
             total_net = total_pnl - total_fees
-            v11_net = v11_pnl - v11_fees
-            unattributed_pnl = total_pnl - v11_pnl
+            v17_net = v17_pnl - v17_fees
+            unattributed_pnl = total_pnl - v17_pnl
 
             # Update exchange PnL cache (the ONLY source of PnL truth)
             old_net = self._exch_pnl["account_net"]
             self._exch_pnl = {
                 "account_net": total_net,
-                "v11_net": v11_net,
-                "v11_closes": v11_closes,
+                "v17_net": v17_net,
+                "v17_closes": v17_closes,
                 "account_closes": total_closes,
                 "fees": total_fees,
                 "last_sync": time.time(),
@@ -3347,13 +3347,13 @@ class CopyTrader:
             if abs(old_net - total_net) > 0.01:
                 logger.info(
                     f"PNL SYNC: account=${total_net:+.4f} (closes={total_closes} fees=${total_fees:.4f}) "
-                    f"| V11=${v11_net:+.4f} (closes={v11_closes} fees=${v11_fees:.4f}) "
+                    f"| V17=${v17_net:+.4f} (closes={v17_closes} fees=${v17_fees:.4f}) "
                     f"| unattributed=${unattributed_pnl:+.4f}"
                 )
 
             total_stored = self.db[DB_EXCHANGE_FILLS].count_documents({})
             if new_fills > 0:
-                logger.debug(f"FILL SYNC: {total_stored} fills stored ({len(v11_oids)} V11 oids)")
+                logger.debug(f"FILL SYNC: {total_stored} fills stored ({len(v17_oids)} V17 oids)")
 
         except Exception as e:
             logger.warning(f"Exchange fill sync failed: {e}")
@@ -3385,7 +3385,7 @@ class CopyTrader:
         # equity. Trigger when net_pnl <= -global_stop_pct x baseline. No auto-lift (a hit stop stays
         # latched; manual re-arm only -- you do not want a 15% stop oscillating back into the trade).
         total_upnl = self._compute_unrealized_pnl()
-        # codex r2 #4: account_net is cumulative since the V11/v9 epoch, NOT this session. Snapshot a
+        # codex r2 #4: account_net is cumulative since the V17/v9 epoch, NOT this session. Snapshot a
         # SESSION realized baseline once, so the -15% stop measures THIS session's loss only (prior P&L
         # cannot mask current losses or trip the stop on startup).
         if not hasattr(self, "_session_realized_base") or self._session_realized_base is None:
@@ -3439,13 +3439,13 @@ class CopyTrader:
             tilt_str = f" tilt={'ON' if self._tilt_enabled else 'OFF'}(n={n}{adv})"
         logger.info(
             f"STATS: acct=${ep['account_net']:+.4f}({ep['account_closes']}) "
-            f"v11=${ep['v11_net']:+.4f}({ep['v11_closes']}) "
+            f"v17=${ep['v17_net']:+.4f}({ep['v17_closes']}) "
             f"fees=${ep['fees']:.2f} uPnL=${total_upnl:+.4f} "
             f"open={len(open_pos)}[{open_coins}] margin={margin_pct:.0f}% eq=${equity or 0:.2f} "
             f"sync={sync_age}s{tilt_str}"
         )
 
-        # V11 internal TG report DISABLED -- replaced by exchange-truth pnl_tracker.py
+        # V17 internal TG report DISABLED -- replaced by exchange-truth pnl_tracker.py
         # The old _send_performance_report used internal collections (not exchange truth)
         # and produced numbers that conflicted with the pnl_tracker. All TG reporting
         # now goes through scripts/pnl_tracker.py (15-min loop in tmux pnl-tracker).
@@ -3576,7 +3576,7 @@ class CopyTrader:
             # Build report
             net_pnl = total_usd + total_upnl
             emoji = "+" if net_pnl >= 0 else "-"
-            lines = [f"COPY TRADER V11 -- {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
+            lines = [f"COPY TRADER V17 -- {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
             lines.append(f"Equity: ${acct_val:.2f} | Wallets: {len(self.target_set)} tracked, {len(active_targets)} active")
             lines.append("")
             lines.append(f"Today: {n_today}t ${today_usd:+.3f} ({today_wr:.0f}%WR)")
@@ -3705,7 +3705,7 @@ class CopyTrader:
                            textcoords="offset points", xytext=(10, -12),
                            fontsize=8, color='gray')
 
-            ax.set_title(f'Copy Trader {getattr(self, "label", "V11")} -- {len(closed_trades)} closed, {n_open} open', fontsize=12)
+            ax.set_title(f'Copy Trader {getattr(self, "label", "V17")} -- {len(closed_trades)} closed, {n_open} open', fontsize=12)
             ax.set_ylabel('Cumulative PnL ($)', fontsize=10)
 
             span_hours = (timestamps[-1] - timestamps[0]).total_seconds() / 3600
@@ -3719,7 +3719,7 @@ class CopyTrader:
             fig.autofmt_xdate()
             plt.tight_layout()
 
-            path = '/tmp/copy_equity_curve_v11.png'
+            path = '/tmp/copy_equity_curve_v17.png'
             fig.savefig(path, dpi=120)
             plt.close(fig)
             return path
@@ -3734,7 +3734,7 @@ class CopyTrader:
 
     async def run(self):
         logger.info(
-            f"Copy trader V11 starting: {len(self.target_set)} wallets, "
+            f"Copy trader V17 starting: {len(self.target_set)} wallets, "
             f"size=${self.order_size}, shadow={self.shadow_mode}"
         )
 
@@ -3795,7 +3795,7 @@ class CopyTrader:
                     if not hasattr(self, '_ws_ever_connected'):
                         self._ws_ever_connected = True
                         _tg(
-                            f"{getattr(self, 'label', 'V11')} STARTED: {len(self.target_set)} wallets, "
+                            f"{getattr(self, 'label', 'V17')} STARTED: {len(self.target_set)} wallets, "
                             f"{len(self.all_perp_coins)}+{len(self.all_builder_coins)} coins "
                             f"(perp+builder), size=${self.order_size}"
                             f"{' [SHADOW]' if self.shadow_mode else ''}"
@@ -3863,7 +3863,7 @@ class CopyTrader:
                 except Exception:
                     pass
         ep = self._exch_pnl
-        logger.info(f"FINAL: acct=${ep['account_net']:+.4f}({ep['account_closes']}) v11=${ep['v11_net']:+.4f}({ep['v11_closes']})")
+        logger.info(f"FINAL: acct=${ep['account_net']:+.4f}({ep['account_closes']}) v17=${ep['v17_net']:+.4f}({ep['v17_closes']})")
 
 
 
