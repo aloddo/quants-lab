@@ -93,6 +93,86 @@ if NB_FILTER not in (None, "", "block_opposed", "block_opposed_neutral"):
     raise SystemExit(f"bad V16_REPLAY_NB_FILTER={NB_FILTER!r}")
 _NB = {}   # (fold, coin) -> (hour_ts_i64, pct_f64), hour-grid causal NB percentile
 
+# ---- AGENT N (2026-06-12): H17 cohort filter + E1 anti-crowd entry filter ----
+# Backtest the 2 OOS-validated copy filters as cohort/entry conditioning. ALL default-off;
+# with every env below unset the run is byte-identical to the shipped replay (regression-proven).
+#
+# E1 (anti-crowd, agent M / L21, OOS +52bps): ENTRY filter. At OPEN, count cohort wallets
+# currently net-OPPOSITE our side on this coin (excl self + dust) -- the live-faithful k_opp.
+# Reject (or down-weight) the entry when k_opp > E1_KOPP_MAX. Agent M favored bucket = k_opp<=3.
+#   V16_REPLAY_E1_KOPP_MAX = int (e.g. "3"); default off.
+#   V16_REPLAY_E1_MODE     = "drop" (skip entry) | "tilt" (allow but ORDER*tilt sizing); default drop.
+#   V16_REPLAY_E1_TILT     = float weight for tilt mode on non-favored entries (default 0.5).
+_e1 = os.environ.get("V16_REPLAY_E1_KOPP_MAX")
+E1_KOPP_MAX = int(_e1) if _e1 not in (None, "") else None
+E1_MODE = os.environ.get("V16_REPLAY_E1_MODE", "drop")
+E1_TILT = float(os.environ.get("V16_REPLAY_E1_TILT", "0.5"))
+if E1_MODE not in ("drop", "tilt"):
+    raise SystemExit(f"bad V16_REPLAY_E1_MODE={E1_MODE!r}")
+#
+# H17 (keep-T1, agent A/D, PASS both folds): COHORT filter. Tercile the SELECTED replay cohort
+# by crossed_share computed from each fold's TRAIN-window leader fills (agent D method, exact),
+# then keep / down-weight by tercile. Rank-tilt preferred over hard-drop to preserve cohort size.
+#   V16_REPLAY_H17 = "keep_t1" | "drop_t3" | "tilt"; default off.
+#     keep_t1  -> cohort = T1 only (lowest crossed_share); hard.
+#     drop_t3  -> cohort = T1+T2 (drop highest-crossed tercile); hard.
+#     tilt     -> keep full cohort; size ORDER by tercile weight (T1=1.0, T2=H17_T2, T3=H17_T3).
+#   V16_REPLAY_H17_T2 / _T3 = tilt weights (defaults 0.66 / 0.33).
+H17 = os.environ.get("V16_REPLAY_H17")
+H17_T2 = float(os.environ.get("V16_REPLAY_H17_T2", "0.66"))
+H17_T3 = float(os.environ.get("V16_REPLAY_H17_T3", "0.33"))
+if H17 not in (None, "", "keep_t1", "drop_t3", "tilt"):
+    raise SystemExit(f"bad V16_REPLAY_H17={H17!r}")
+H17_FILLS_DIR = _REPO / "app" / "data" / "hl_s3_fills_v2"
+# fold -> (train_d0, train_d1) inclusive day strings; mirrors agent D WINDOWS (TRAIN only).
+_H17_TRAIN_DAYS = {
+    "fold1": ("20251201", "20260314"),
+    "fold2": ("20251215", "20260414"),
+    # forward (OOS) fold: 90d pre-forward train window (agent N deployable-H17, no look-ahead).
+    "forward": ("20260222", "20260522"),
+}
+_H17_TERCILE: dict = {}   # (fold, wallet) -> "T1"|"T2"|"T3"
+
+
+def _h17_terciles(fname, cohort):
+    """Per-fold crossed_share terciles for the SELECTED replay cohort, computed from that
+    fold's TRAIN-window leader fills ONLY (agent D method: n_crossed/n_fills, rank+qcut(3))."""
+    from collections import Counter
+    d0, d1 = _H17_TRAIN_DAYS[fname]
+    cset = set(cohort)
+    n_fills, n_crossed = Counter(), Counter()
+    days = sorted(f for f in os.listdir(H17_FILLS_DIR)
+                  if f.endswith(".parquet") and d0 <= f[:8] <= d1)
+    for fn in days:
+        df = pd.read_parquet(H17_FILLS_DIR / fn, columns=["wallet", "crossed"],
+                             filters=[("wallet", "in", list(cset))])
+        if len(df):
+            n_fills.update(df["wallet"].value_counts().to_dict())
+            n_crossed.update(df.loc[df["crossed"].astype(bool), "wallet"].value_counts().to_dict())
+    share = {w: n_crossed.get(w, 0) / n_fills[w] for w in n_fills if n_fills[w] > 0}
+    feat = pd.Series(share)
+    r = feat.rank(method="average")
+    codes = pd.qcut(r, 3, labels=False, duplicates="drop")
+    terc = {w: f"T{int(c) + 1}" for w, c in codes.items()}
+    for w in cohort:                       # wallets w/o TRAIN fills -> treat as T3 (most aggressive prior)
+        _H17_TERCILE[(fname, w)] = terc.get(w, "T3")
+    from collections import Counter as _C
+    comp = _C(terc.get(w, "T3") for w in cohort)
+    print(f"  [H17 {fname}] cohort terciles: {dict(comp)} (mode={H17}, "
+          f"with TRAIN fills: {len(share)}/{len(cohort)})")
+
+
+def _entry_size(fname, w, k_opp):
+    """Per-entry order size. Default = ORDER (baseline). H17 tilt scales by crossed-share
+    tercile; E1 tilt scales non-favored (high-k_opp) entries. Multiplicative."""
+    sz = ORDER
+    if H17 == "tilt":
+        t = _H17_TERCILE.get((fname, w), "T3")
+        sz *= 1.0 if t == "T1" else (H17_T2 if t == "T2" else H17_T3)
+    if E1_KOPP_MAX is not None and E1_MODE == "tilt" and k_opp is not None and k_opp > E1_KOPP_MAX:
+        sz *= E1_TILT
+    return sz
+
 
 def _load_nb():
     if not NB_FILTER or _NB:
@@ -174,7 +254,7 @@ class Book:
         self.max_coin_gross = defaultdict(float)
 
     def gross(self):
-        return len(self.pos) * ORDER
+        return sum(p.get("size", ORDER) for p in self.pos.values())
 
     def equity(self, unreal):
         return EQUITY0 + self.realized + unreal
@@ -186,7 +266,7 @@ def unrealized(book, ts):
         m = S.mark_at(p["coin"], ts)
         if m and m > 0:
             d = 1 if p["side"] > 0 else -1
-            u += d * (m - p["entry_px"]) / p["entry_px"] * ORDER
+            u += d * (m - p["entry_px"]) / p["entry_px"] * p.get("size", ORDER)
     return u
 
 
@@ -202,7 +282,7 @@ def close_pos(book, key, ts, reason, clip=True):
     if clip:
         g = max(-CAP, min(CAP, g))
     net = g - FEE_T
-    book.realized += net * ORDER
+    book.realized += net * p.get("size", ORDER)
     book.trades.append(net)
     if TRADE_LOG:   # H-NB-FILTER step 1: observational, default-off
         _TRADE_ROWS.append(dict(fold=book.fold, coin=p["coin"], dir=p["side"],
@@ -236,6 +316,16 @@ def run_fold(fname, f_start, f_split, f_end, uni):
         cohort = list(df.head(min(max(MIN_COHORT, len(df) // 10), MAX_COHORT)).wallet)
     print(f"  cohort {len(cohort)} of {len(df)} rankable (topn_override={_topn or 'off'})")
 
+    # AGENT N H17 cohort filter: tercile selected cohort by TRAIN crossed_share (agent D method).
+    if H17:
+        _h17_terciles(fname, cohort)
+        if H17 == "keep_t1":
+            cohort = [w for w in cohort if _H17_TERCILE[(fname, w)] == "T1"]
+        elif H17 == "drop_t3":
+            cohort = [w for w in cohort if _H17_TERCILE[(fname, w)] in ("T1", "T2")]
+        # "tilt" keeps the full cohort; sizing applied per-entry via _h17_weight.
+        print(f"  [H17 {fname}] cohort after '{H17}': {len(cohort)} wallets")
+
     # merged TEST fill stream for the cohort (ts, wallet, coin, signed_size, price)
     stream = []
     for w in cohort:
@@ -268,8 +358,9 @@ def run_fold(fname, f_start, f_split, f_end, uni):
                 for key2, p2 in book.pos.items():
                     fr = _funding_rate(p2["coin"], now)
                     if fr:
-                        book.realized -= p2["side"] * fr * ORDER
-                        book.funding_paid = getattr(book, "funding_paid", 0.0) + p2["side"] * fr * ORDER
+                        _sz2 = p2.get("size", ORDER)
+                        book.realized -= p2["side"] * fr * _sz2
+                        book.funding_paid = getattr(book, "funding_paid", 0.0) + p2["side"] * fr * _sz2
         # SL / trail / max_hold
         for key in list(book.pos.keys()):
             p = book.pos[key]
@@ -366,6 +457,20 @@ def run_fold(fname, f_start, f_split, f_end, uni):
             if KNET_MIN is not None and k < KNET_MIN:
                 book.rejects["knet_gate"] += 1
                 continue
+        # AGENT N E1 anti-crowd filter: k_opp = # cohort wallets currently net-OPPOSITE our
+        # side on this coin (excl self + dust) -- live-faithful analog of forward_test's k_opp
+        # (D != D[j] count). Agent M OOS-confirmed favored bucket = k_opp <= 3 (+52bps).
+        k_opp = None
+        if E1_KOPP_MAX is not None:
+            k_opp = 0
+            for (w2, c2), sz2 in book.leader.items():
+                if c2 != c or w2 == w or abs(sz2) * px < 1.0:
+                    continue
+                if (sz2 > 0) != is_buy:
+                    k_opp += 1
+            if E1_MODE == "drop" and k_opp > E1_KOPP_MAX:
+                book.rejects["e1_kopp"] += 1
+                continue
         if NB_FILTER:
             # H-NB-FILTER step 4: regime filter on V17's gated entries. Causal asof
             # (last completed hour strictly before ts). no_coverage = NEUTRAL pass-through
@@ -405,10 +510,11 @@ def run_fold(fname, f_start, f_split, f_end, uni):
         if abs(m - px) / px * 1e4 > CHASE_BPS:
             book.rejects["chase_guard"] += 1
             continue
-        if (book.gross() + ORDER) / LEV > UTIL_CAP * book.equity(0):
+        _sz = _entry_size(fname, w, k_opp)   # AGENT N: ORDER unless H17/E1 tilt active
+        if (book.gross() + _sz) / LEV > UTIL_CAP * book.equity(0):
             book.rejects["margin_util"] += 1
             continue
-        if (book.gross() + ORDER) > BACKSTOP_X * EQUITY0:
+        if (book.gross() + _sz) > BACKSTOP_X * EQUITY0:
             book.rejects["gross_backstop"] += 1
             continue
         ment = S.mark_at(c, ts + LAT)
@@ -417,7 +523,7 @@ def run_fold(fname, f_start, f_split, f_end, uni):
             continue
         side = 1 if is_buy else -1
         book.pos[key] = {"coin": c, "side": side, "entry_px": apply_entry(c, ment, is_buy),
-                         "entry_ts": ts, "peak_bps": 0.0,
+                         "entry_ts": ts, "peak_bps": 0.0, "size": _sz,
                          "ride": bool(RIDE_KNET is not None and k is not None and k >= RIDE_KNET)}
         book.acc[key] = abs(ssz) * px
         book.rev[key] = 0.0

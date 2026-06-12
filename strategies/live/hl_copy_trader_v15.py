@@ -243,6 +243,23 @@ class CopyTrader:
         self._exch_positions = {}
         self._pending_margin = 0.0
 
+        # ── H17 x E1 BOTH-SIZE-TILT (agent N; Alberto "A more trades" + both-tilt; codex GO) ──
+        # Boost favored NEW entries (low-crossed-share cohort T1 x E1 anti-crowd low-k_opp), cut
+        # unfavored (T3 / crowded). Multiplicative, clamped. codex-required counterfactual auto-disable.
+        self._tilt_enabled = bool(self.global_config.get("tilt_enabled", False))
+        self._tilt_h17_t1 = float(self.global_config.get("tilt_h17_t1", 1.5))    # T1 cohort BOOST
+        self._tilt_h17_t3 = float(self.global_config.get("tilt_h17_t3", 0.66))   # T3 cohort CUT
+        self._tilt_e1_fav = float(self.global_config.get("tilt_e1_fav", 1.3))    # E1 favored BOOST
+        self._tilt_e1_unfav = float(self.global_config.get("tilt_e1_unfav", 0.66))  # E1 crowded CUT
+        self._tilt_e1_kopp_max = int(self.global_config.get("tilt_e1_kopp_max", 3))
+        self._tilt_cap = float(self.global_config.get("tilt_cap", 2.0))          # mult ceiling
+        self._tilt_floor = float(self.global_config.get("tilt_floor", 0.33))     # mult floor
+        self._tilt_log = []          # (close_ts, pnl_bps, mult, notional) -- counterfactual window
+        self._tilt_disabled_alerted = False
+        self._h17_tercile = {}       # wallet(lower) -> 1|2|3 (1=T1 lowest crossed_share = favored)
+        if self._tilt_enabled:
+            self._load_h17_terciles()
+
         # State
         self.positions = []
         self.last_entry = {}
@@ -460,6 +477,7 @@ class CopyTrader:
             "entry_time": pos.get("entry_time", time.time()),
             "fill_time": pos.get("fill_time", time.time()),
             "target_coin": pos.get("target_coin", pos["coin"]),
+            "_tilt_mult": pos.get("_tilt_mult", 1.0),
             "updated_at": datetime.now(timezone.utc),
         }
         try:
@@ -514,6 +532,7 @@ class CopyTrader:
                     "filled": True,
                     "wallet": doc.get("wallet", ""),
                     "target_coin": doc.get("target_coin", doc["coin"]),
+                    "_tilt_mult": doc.get("_tilt_mult", 1.0),
                     "_recovered": True,
                 }
                 # 2026-05-23: propagate _force_exit flag for orphan management.
@@ -809,11 +828,254 @@ class CopyTrader:
 
     # ── Margin-based risk management ─────────────────────────────────────────
 
+    # ── H17 x E1 size-tilt ───────────────────────────────────────────────────
+    def _load_h17_terciles(self):
+        """Load per-cohort-wallet crossed_share terciles (H17). T1=lowest=favored.
+        Reads the persisted v17_cohort_crossed_share parquet; wallets absent -> T3."""
+        try:
+            import pandas as pd
+            p = "/Users/hermes/quants-lab/app/data/v16/v17_cohort_crossed_share.parquet"
+            df = pd.read_parquet(p)
+            df["wallet"] = df["wallet"].str.lower()
+            df = df[df.wallet.isin({w.lower() for w in self.target_set})]
+            if len(df) < 6:
+                logger.warning(f"H17 tilt: only {len(df)} ranked wallets (<6); tilt DISABLED")
+                self._tilt_enabled = False
+                return
+            r = df.set_index("wallet")["crossed_share"].rank(method="average")
+            codes = pd.qcut(r, 3, labels=False, duplicates="drop")
+            self._h17_tercile = {w: int(c) + 1 for w, c in codes.items()}
+            t1 = sum(1 for v in self._h17_tercile.values() if v == 1)
+            logger.info(f"H17 tilt loaded: {len(self._h17_tercile)} wallets ranked, "
+                        f"{t1} in T1; h17 t1={self._tilt_h17_t1}/t3={self._tilt_h17_t3} "
+                        f"e1 fav={self._tilt_e1_fav}/unfav={self._tilt_e1_unfav} "
+                        f"(k_opp<={self._tilt_e1_kopp_max}) clamp[{self._tilt_floor},{self._tilt_cap}]")
+            # codex: a prior auto-disable must survive restart (don't silently re-enable).
+            try:
+                st = self.db["v11_tilt_state"].find_one({"_id": "tilt"})
+                if st and st.get("disabled"):
+                    logger.warning("H17 tilt: previously AUTO-DISABLED (persisted); staying OFF. "
+                                   "Clear v11_tilt_state to re-enable.")
+                    self._tilt_enabled = False
+                    self._tilt_disabled_alerted = True
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"H17 tilt load failed ({e}); tilt DISABLED")
+            self._tilt_enabled = False
+
+    def _count_opposite_leaders(self, coin: str, is_buy: bool) -> int:
+        """E1 k_opp: number of OTHER tracked leaders currently holding a position
+        OPPOSITE to this (coin, direction). Live analog of the backtest k_opp.
+        Low = uncrowded = favored entry. Source: _target_positions (already tracked)."""
+        k = 0
+        for coins in self._target_positions.values():
+            sz = coins.get(coin, 0.0)
+            if abs(sz) < 1e-10:
+                continue
+            if (sz > 0) != is_buy:   # leader opposite to our entry direction
+                k += 1
+        return k
+
+    def _tilt_mult(self, wallet: str, coin: str, is_buy: bool):
+        """BOTH-tilt multiplier for a NEW entry (Alberto: up favored AND down unfavored).
+        H17: T1 wallet -> x h17_t1 (boost), T3 -> x h17_t3 (cut), T2 -> 1.0.
+        E1: k_opp<=max -> x e1_fav (boost), else x e1_unfav (cut). Multiplicative, clamped
+        to [tilt_floor, tilt_cap]. Returns (mult, k_opp). (1.0, None) when disabled."""
+        if not self._tilt_enabled:
+            return 1.0, None
+        m = 1.0
+        t = self._h17_tercile.get(wallet.lower(), 3)
+        if t == 1:
+            m *= self._tilt_h17_t1
+        elif t == 3:
+            m *= self._tilt_h17_t3
+        k_opp = self._count_opposite_leaders(coin, is_buy)
+        m *= self._tilt_e1_fav if k_opp <= self._tilt_e1_kopp_max else self._tilt_e1_unfav
+        return min(max(m, self._tilt_floor), self._tilt_cap), k_opp
+
+    def _log_tilt_outcome(self, pnl_bps: float, mult: float, notional: float):
+        """Record a closed (or partially-closed) exit slice for the counterfactual monitor.
+        notional = this slice's actual $ exposure (filled_sz*exit_px). NOTIONAL-weighted so
+        partial fills / trims are counted by their real size (one slice each, never
+        double-counted in $ terms). Bounded window."""
+        try:
+            mult = float(mult) if mult and mult > 0 else 1.0
+            self._tilt_log.append((time.time(), float(pnl_bps), mult, float(notional)))
+            if len(self._tilt_log) > 300:
+                self._tilt_log = self._tilt_log[-300:]
+        except Exception:
+            pass
+
+    def _tilt_advantage(self, win):
+        """capital-wt tilted return minus baseline counterfactual return, in bps.
+        tilted: deploys notional_i, earns pnl_i*notional_i.
+        baseline: same trades at notional_i/mult_i. >0 => tilt is adding value per $."""
+        import numpy as np
+        bps = np.array([b for _, b, _, _ in win])
+        mult = np.array([m for _, _, m, _ in win])
+        notl = np.array([n for _, _, _, n in win])
+        base_notl = notl / mult
+        if notl.sum() <= 0 or base_notl.sum() <= 0:
+            return None
+        tilted = float((bps * notl).sum() / notl.sum())
+        baseline = float((bps * base_notl).sum() / base_notl.sum())
+        return tilted - baseline
+
+    def _eval_tilt_counterfactual(self):
+        """codex-REQUIRED guard: auto-disable the tilt if its realized edge over baseline
+        goes negative. Disable if notional-weighted (tilted - baseline) <= -10 bps over the
+        rolling >=100-slice window. Realized pnl_bps already includes fills/fees/slippage.
+        Disabling only reverts NEW entries to baseline size (open positions keep their size)."""
+        if not self._tilt_enabled or len(self._tilt_log) < 100:
+            return
+        win = self._tilt_log[-100:]
+        adv = self._tilt_advantage(win)
+        if adv is None:
+            return
+        if adv <= -10.0:
+            self._tilt_enabled = False
+            if not self._tilt_disabled_alerted:
+                self._tilt_disabled_alerted = True
+                msg = (f"TILT AUTO-DISABLED: counterfactual adv={adv:+.1f}bps <= -10 over "
+                       f"n={len(win)} slices. Reverting NEW entries to baseline size.")
+                logger.warning(msg)
+                # Persist so a restart does NOT silently re-enable the killed tilt (codex).
+                try:
+                    self.db["v11_tilt_state"].update_one(
+                        {"_id": "tilt"},
+                        {"$set": {"disabled": True, "adv": float(adv),
+                                  "ts": datetime.now(timezone.utc), "n": len(win)}},
+                        upsert=True)
+                except Exception:
+                    pass
+                try:
+                    _tg(f"V17 {msg}")
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _parse_clearinghouse(data: dict):
+        """Parse (margin_used, positions, upnl) from a clearinghouseState dict.
+        Same shape whether it came from REST clearinghouseState OR a webData2 push.
+        positions: {coin: {marginUsed, positionValue, unrealizedPnl, szi}}."""
+        margin_used = float(data.get("marginSummary", {}).get("totalMarginUsed", 0))
+        positions = {}
+        upnl = 0.0
+        for p in data.get("assetPositions", []):
+            pos = p.get("position", {})
+            coin = pos.get("coin", "")
+            szi = float(pos.get("szi", 0))
+            if abs(szi) > 1e-10:
+                u = float(pos.get("unrealizedPnl", 0))
+                positions[coin] = {
+                    "marginUsed": float(pos.get("marginUsed", 0)),
+                    "positionValue": float(pos.get("positionValue", 0)),
+                    "unrealizedPnl": u, "szi": szi,
+                }
+                upnl += u
+        return margin_used, positions, upnl
+
+    @staticmethod
+    def _parse_spot_usdc(spot_json):
+        """Spot USDC total (= HL equity per HARD RULE 16). None on transient null."""
+        if not isinstance(spot_json, dict):
+            return None
+        return sum(
+            float(b.get("total", 0))
+            for b in spot_json.get("balances", [])
+            if b.get("coin") == "USDC"
+        )
+
+    def _ingest_webdata2(self, wd: dict):
+        """Update the WS-pushed main-dex account snapshot from a webData2 payload.
+        Main dex + spot only; builder dexes (xyz/flx) are NOT in webData2 and stay
+        on the (guarded) REST path. Sets _ws_state_ts so _refresh_exchange_state
+        can prefer this over REST polling."""
+        try:
+            chs = wd.get("clearinghouseState", {})
+            if isinstance(chs, dict) and chs and "assetPositions" in chs:
+                m, pos, up = self._parse_clearinghouse(chs)
+                self._ws_main_margin = m
+                self._ws_main_positions = pos
+                self._ws_main_upnl = up
+                # Only stamp freshness when main state actually updated -- a spot-only
+                # or malformed payload must NOT let the fast path serve stale positions.
+                self._ws_state_ts = time.time()
+            spot = self._parse_spot_usdc(wd.get("spotState", {}))
+            if spot is not None:
+                self._ws_spot_equity = spot  # diagnostics only (free USDC; not equity)
+        except Exception as e:
+            logger.debug(f"webData2 ingest failed: {e}")
+
+    def _fetch_builder_dex_state(self):
+        """REST-poll builder dexes (xyz/flx) -- not covered by webData2.
+        Returns (margin_add, positions, upnl_add). Per-dex transient nulls skipped."""
+        margin_add = 0.0
+        positions = {}
+        upnl_add = 0.0
+        for dex_name in BUILDER_DEXES:
+            try:
+                rd = requests.post(
+                    HL_API + "/info",
+                    json={"type": "clearinghouseState", "user": self.parent_address, "dex": dex_name},
+                    timeout=5,
+                )
+                dd = rd.json()
+                if not isinstance(dd, dict):
+                    continue
+                m, pos, up = self._parse_clearinghouse(dd)
+                margin_add += m
+                positions.update(pos)
+                upnl_add += up
+            except Exception as e:
+                logger.debug(f"Builder dex {dex_name} state fetch failed: {e}")
+        return margin_add, positions, upnl_add
+
     def _refresh_exchange_state(self) -> bool:
-        """Fetch full account state from exchange. Cached for 30s."""
+        """Refresh account state. Prefers the fresh webData2 WS push for main-dex
+        margin/positions/spot-equity (eliminates the REST clearinghouse+spot polls
+        and the 'NoneType' transient-null crash); REST-polls only builder dexes.
+        Full-REST fallback when the WS snapshot is stale. Cached 30s."""
         now = time.time()
         if self._equity_cache is not None and now - self._equity_cache_ts < 30:
             return True
+
+        # ---- Preferred path: fresh WS (webData2) main margin/positions/upnl ----
+        # webData2 is EXACT-parity for main-dex margin, positions, upnl (verified
+        # 2026-06-12 parity test). It is NOT used for spot equity: webData2 reports
+        # FREE USDC (hold zeroed) while the engine's equity = GROSS spot USDC per
+        # HARD RULE 16 (the $35 hold is real). Spot stays on REST below.
+        ws_ts = getattr(self, "_ws_state_ts", 0)
+        if ws_ts and now - ws_ts < 15 and getattr(self, "_ws_main_positions", None) is not None:
+            try:
+                margin_used = getattr(self, "_ws_main_margin", 0.0)
+                positions = dict(self._ws_main_positions)
+                upnl = getattr(self, "_ws_main_upnl", 0.0)
+                m2, pos2, up2 = self._fetch_builder_dex_state()
+                margin_used += m2
+                positions.update(pos2)
+                upnl += up2
+                # Spot equity: REST (gross USDC), null-guarded.
+                r2 = requests.post(
+                    HL_API + "/info",
+                    json={"type": "spotClearinghouseState", "user": self.parent_address},
+                    timeout=5,
+                )
+                spot = self._parse_spot_usdc(r2.json())
+                if spot is None:
+                    logger.debug("spot null on WS path; keeping cache")
+                    return self._equity_cache is not None
+                self._exch_margin_used = margin_used
+                self._exch_positions = positions
+                self._exch_unrealized_pnl = upnl
+                self._equity_cache = spot
+                self._equity_cache_ts = now
+                return True
+            except Exception as e:
+                logger.debug(f"WS-state path failed, REST fallback: {e}")
+
+        # ---- Fallback: full REST poll (main + builder + spot), all null-guarded ----
         try:
             r1 = requests.post(
                 HL_API + "/info",
@@ -821,66 +1083,33 @@ class CopyTrader:
                 timeout=5,
             )
             data = r1.json()
-            margin = data.get("marginSummary", {})
-            self._exch_margin_used = float(margin.get("totalMarginUsed", 0))
+            if not isinstance(data, dict) or "assetPositions" not in data:
+                # non-dict OR empty {} transient -> don't zero main state, keep cache.
+                logger.debug("clearinghouseState missing/empty; keeping cache")
+                return self._equity_cache is not None
+            margin_used, positions, total_upnl = self._parse_clearinghouse(data)
 
-            self._exch_positions = {}
-            total_upnl = 0.0
-            # Parse positions from default dex
-            for p in data.get("assetPositions", []):
-                pos = p.get("position", {})
-                coin = pos.get("coin", "")
-                szi = float(pos.get("szi", 0))
-                if abs(szi) > 1e-10:
-                    mu = float(pos.get("marginUsed", 0))
-                    upnl = float(pos.get("unrealizedPnl", 0))
-                    pv = float(pos.get("positionValue", 0))
-                    self._exch_positions[coin] = {
-                        "marginUsed": mu, "positionValue": pv,
-                        "unrealizedPnl": upnl, "szi": szi,
-                    }
-                    total_upnl += upnl
+            m2, pos2, up2 = self._fetch_builder_dex_state()
+            margin_used += m2
+            positions.update(pos2)
+            total_upnl += up2
 
-            # Also fetch positions from builder dexes (xyz, flx, etc.)
-            for dex_name in BUILDER_DEXES:
-                try:
-                    rd = requests.post(
-                        HL_API + "/info",
-                        json={"type": "clearinghouseState", "user": self.parent_address, "dex": dex_name},
-                        timeout=5,
-                    )
-                    dex_data = rd.json()
-                    dex_margin = dex_data.get("marginSummary", {})
-                    self._exch_margin_used += float(dex_margin.get("totalMarginUsed", 0))
-                    for p in dex_data.get("assetPositions", []):
-                        pos = p.get("position", {})
-                        coin = pos.get("coin", "")
-                        szi = float(pos.get("szi", 0))
-                        if abs(szi) > 1e-10:
-                            mu = float(pos.get("marginUsed", 0))
-                            upnl = float(pos.get("unrealizedPnl", 0))
-                            pv = float(pos.get("positionValue", 0))
-                            self._exch_positions[coin] = {
-                                "marginUsed": mu, "positionValue": pv,
-                                "unrealizedPnl": upnl, "szi": szi,
-                            }
-                            total_upnl += upnl
-                except Exception as e:
-                    logger.debug(f"Builder dex {dex_name} state fetch failed: {e}")
-
-            self._exch_unrealized_pnl = total_upnl
-
+            # Fetch spot BEFORE committing any _exch_* -- a transient null on spot
+            # must keep the ENTIRE prior snapshot, not leave margin/positions updated
+            # against a stale equity (codex finding #1).
             r2 = requests.post(
                 HL_API + "/info",
                 json={"type": "spotClearinghouseState", "user": self.parent_address},
                 timeout=5,
             )
-            spot = sum(
-                float(b.get("total", 0))
-                for b in r2.json().get("balances", [])
-                if b.get("coin") == "USDC"
-            )
+            spot = self._parse_spot_usdc(r2.json())
+            if spot is None:
+                logger.debug("spotClearinghouseState returned non-dict; keeping cache")
+                return self._equity_cache is not None
 
+            self._exch_margin_used = margin_used
+            self._exch_positions = positions
+            self._exch_unrealized_pnl = total_upnl
             self._equity_cache = spot
             self._equity_cache_ts = now
             return True
@@ -1248,6 +1477,15 @@ class CopyTrader:
         else:
             entry_notional = self.order_size
 
+        # H17 x E1 BOTH-tilt: scale NEW entries (not add-ons) by the favored/unfavored multiplier.
+        # Applied to entry_notional so the margin check, round_size, and pending-margin all see the
+        # ACTUAL tilted notional (codex: tilt is the safe direction; sz<=0 + min_entry_notional guard dust).
+        if existing is None:
+            tilt_mult, _tilt_kopp = self._tilt_mult(twap_wallet, coin, is_buy)
+        else:
+            tilt_mult, _tilt_kopp = 1.0, None
+        entry_notional *= tilt_mult
+
         # Margin budget check (on the ACTUAL proportional notional)
         if self.shadow_mode:
             shadow_margin = sum(
@@ -1293,7 +1531,7 @@ class CopyTrader:
                     "entry_px": fill_px, "entry_time": now, "fill_time": now,
                     "size": fill_sz, "oid": 0, "filled": True,
                     "wallet": twap_wallet, "target_coin": coin,
-                    "_shadow": True,
+                    "_shadow": True, "_tilt_mult": tilt_mult,
                 })
             self.last_entry[cooldown_key] = now
             wallet_group = self.wallet_groups.get(twap_wallet, "unknown")
@@ -1347,6 +1585,13 @@ class CopyTrader:
                     avg_entry = (old_notional + new_notional) / total_sz if total_sz > 0 else fill_px
                     existing["size"] = total_sz
                     existing["entry_px"] = avg_entry
+                    # Blend tilt mult by notional (add-on adds baseline 1.0 size). effective mult =
+                    # total actual notional / total baseline notional (codex-correct). Keeps the
+                    # counterfactual attribution honest for the blended position.
+                    _old_mult = existing.get("_tilt_mult", 1.0) or 1.0
+                    _base_notl = old_notional / _old_mult + new_notional
+                    if _base_notl > 0:
+                        existing["_tilt_mult"] = (old_notional + new_notional) / _base_notl
                     # Codex R9 fix #6: reset peak PnL on add-on
                     existing.pop("_peak_pnl_bps", None)
                     self._persist_position(existing)  # Update persistent state
@@ -1363,6 +1608,7 @@ class CopyTrader:
                         "entry_px": fill_px, "entry_time": now, "fill_time": now,
                         "size": fill_sz, "oid": 0, "filled": True,
                         "wallet": twap_wallet, "target_coin": coin,
+                        "_tilt_mult": tilt_mult,
                     }
                     self.positions.append(new_pos)
                     self._persist_position(new_pos)  # Persist to DB
@@ -1925,6 +2171,7 @@ class CopyTrader:
                         "timestamp": datetime.now(timezone.utc),
                     })
                     self._track_market_pnl(mt, pnl_usd)
+                    self._log_tilt_outcome(pnl_bps, pos.get('_tilt_mult', 1.0), filled_sz * exit_px)
                     self._post_exit_cooldown[(wallet, coin)] = time.time()
                     return True
                 else:
@@ -1975,6 +2222,7 @@ class CopyTrader:
                                 "timestamp": datetime.now(timezone.utc),
                             })
                             self._track_market_pnl(mt, pnl_usd)
+                            self._log_tilt_outcome(pnl_bps, pos.get('_tilt_mult', 1.0), filled_sz * exit_px)
                             self._equity_cache_ts = 0
                             pos.pop('exit_oid', None)
                             pos['_maker_exit_tried'] = False
@@ -2092,6 +2340,7 @@ class CopyTrader:
                     "timestamp": datetime.now(timezone.utc),
                 })
                 self._track_market_pnl(mt, pnl_usd)
+                self._log_tilt_outcome(pnl_bps, pos.get('_tilt_mult', 1.0), filled_sz * exit_px)
 
                 if is_partial:
                     pos['_maker_exit_tried'] = False
@@ -2518,6 +2767,7 @@ class CopyTrader:
                             "timestamp": datetime.now(timezone.utc),
                         })
                         self._track_market_pnl(mt, pnl_usd)
+                        self._log_tilt_outcome(pnl_bps, pos.get('_tilt_mult', 1.0), filled_sz * exit_px)
                         acc_key = (wallet, pos['coin'])
 
                         if pos.get('_trim_mode'):
@@ -3165,12 +3415,21 @@ class CopyTrader:
         margin_pct = (margin_used / equity * 100) if equity > 0 else 0
         ep = self._exch_pnl
         sync_age = int(now - ep["last_sync"]) if ep["last_sync"] > 0 else 999
+        tilt_str = ""
+        if getattr(self, "_tilt_enabled", False) or getattr(self, "_tilt_log", None):
+            n = len(self._tilt_log)
+            adv = ""
+            if n >= 1:
+                a = self._tilt_advantage(self._tilt_log[-100:])
+                if a is not None:
+                    adv = f" adv={a:+.0f}bp"
+            tilt_str = f" tilt={'ON' if self._tilt_enabled else 'OFF'}(n={n}{adv})"
         logger.info(
             f"STATS: acct=${ep['account_net']:+.4f}({ep['account_closes']}) "
             f"v11=${ep['v11_net']:+.4f}({ep['v11_closes']}) "
             f"fees=${ep['fees']:.2f} uPnL=${total_upnl:+.4f} "
             f"open={len(open_pos)}[{open_coins}] margin={margin_pct:.0f}% eq=${equity or 0:.2f} "
-            f"sync={sync_age}s"
+            f"sync={sync_age}s{tilt_str}"
         )
 
         # V11 internal TG report DISABLED -- replaced by exchange-truth pnl_tracker.py
@@ -3511,6 +3770,14 @@ class CopyTrader:
                         "subscription": {"type": "orderUpdates", "user": self.parent_address}
                     }))
 
+                    # Subscribe to webData2: push-based main-dex account state
+                    # (margin/positions) -> serves _refresh_exchange_state without the main
+                    # clearinghouse REST poll. Builder dexes + spot stay on (guarded) REST.
+                    await ws.send(json.dumps({
+                        "method": "subscribe",
+                        "subscription": {"type": "webData2", "user": self.parent_address}
+                    }))
+
                     logger.info("WS subscribed")
                     if not hasattr(self, '_ws_ever_connected'):
                         self._ws_ever_connected = True
@@ -3549,6 +3816,9 @@ class CopyTrader:
                             elif channel == "orderUpdates":
                                 self._on_order_update(data.get("data", []))
 
+                            elif channel == "webData2":
+                                self._ingest_webdata2(data.get("data", {}))
+
                         except asyncio.TimeoutError:
                             pass
 
@@ -3558,6 +3828,7 @@ class CopyTrader:
                             self._last_check = now_check
                             await self._check_twap_windows()
                             await self._check_exits()
+                            self._eval_tilt_counterfactual()   # codex guard: auto-disable bad tilt
                             self._log_stats()
 
                         # Sync l2Book subscriptions every 30s
