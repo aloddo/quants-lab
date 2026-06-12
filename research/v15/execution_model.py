@@ -53,6 +53,8 @@ LATENCY_MS = 1000               # leader-fill -> our-fill; TODO replace with mea
 
 # ---- internal caches ----------------------------------------------------------------------- #
 _SLIP_ONEWAY: dict[str, float] = {}        # coin -> one-way slippage (fraction)
+_BASE_CALIB_COINS: set[str] = set()        # coins loaded from the committed l2_calib (the base 10);
+                                           # register_slip_oneway must NOT silently overwrite these
 _FEES: dict[str, float] | None = None
 _HITS = {"calib": 0, "default": 0}
 
@@ -66,6 +68,7 @@ def _load_slip():
             hs = float(v.get("half_spread_bps") or 0.0)
             imp = float(v.get("impact_10k_bps") or v.get("impact_50k_bps") or 0.0)
             _SLIP_ONEWAY[c] = (hs + imp) / 10_000.0
+            _BASE_CALIB_COINS.add(c)
         logger.info(f"[exec] loaded L2 slippage for {len(_SLIP_ONEWAY)} coins from {L2_CALIB.name}")
     except Exception as e:
         logger.warning(f"[exec] l2_calib load failed ({e}); flat default {DEFAULT_SLIP_BPS}bps one-way")
@@ -91,6 +94,45 @@ def set_slip_default_bps(bps: float):
     """Override the uncalibrated-coin one-way slippage (sensitivity analysis)."""
     global DEFAULT_SLIP_BPS
     DEFAULT_SLIP_BPS = bps
+
+
+def register_slip_oneway(coin: str, oneway_frac: float, allow_override: bool = False):
+    """ADDITIVE (agent H, 2026-06-12, V17 universe-expansion backtest): merge a per-coin one-way
+    slippage (fraction of price) into _SLIP_ONEWAY WITHOUT changing any existing coin's value or the
+    10-coin l2_calib load path. Used to admit expansion coins (crypto + xyz perps) into the canonical
+    execution model so the expanded backtest pays a MEASURED per-coin cost rather than the flat default.
+
+    `oneway_frac` is the TOTAL one-way cost as a fraction (e.g. agentC impact_1k_bps/1e4, which already
+    includes the half-spread -- do NOT double-add it here). No-op-safe: ensures the base calib is loaded
+    first so this merges on top rather than being clobbered by a later lazy _load_slip().
+
+    CALIB-OVERRIDE GUARD (agent J, 2026-06-12, codex V17 go-live req #1): a coin that is part of the
+    committed base 10-coin l2_calib must NOT be silently overwritten by a registration call. With
+    allow_override=False (default) such a call is REJECTED (the committed value stands) and a warning is
+    logged -- a fat-fingered expansion mapping cannot quietly redefine BTC/ETH/etc. slippage and void the
+    cancellation against the skill benchmark. Pass allow_override=True to intentionally replace a base
+    value (logged loudly). Registering a brand-new (expansion) coin, or re-registering a previously
+    registered EXTRA coin, is unaffected."""
+    _load_slip()                       # ensure base 10-coin calib present so we merge, not get clobbered
+    if coin in _BASE_CALIB_COINS and not allow_override:
+        cur = _SLIP_ONEWAY.get(coin)
+        logger.warning(
+            f"[exec] register_slip_oneway IGNORED for base-calib coin {coin}: refusing to overwrite the "
+            f"committed l2_calib value ({(cur or 0)*1e4:.2f}bps one-way) with {oneway_frac*1e4:.2f}bps "
+            f"(pass allow_override=True to force). Base 10-coin slippage is immutable by default.")
+        return
+    if coin in _BASE_CALIB_COINS and allow_override:
+        logger.warning(
+            f"[exec] register_slip_oneway OVERRIDE base-calib coin {coin}: "
+            f"{(_SLIP_ONEWAY.get(coin) or 0)*1e4:.2f} -> {oneway_frac*1e4:.2f}bps one-way (allow_override=True)")
+    _SLIP_ONEWAY[coin] = float(oneway_frac)
+
+
+def load_extra_calib(mapping: dict[str, float], allow_override: bool = False):
+    """Bulk register_slip_oneway: {coin: oneway_frac}. ADDITIVE, same semantics + base-calib override
+    guard as register_slip_oneway (agent J, codex req #1)."""
+    for c, ow in mapping.items():
+        register_slip_oneway(c, ow, allow_override=allow_override)
 
 
 def set_latency_ms(ms: int):

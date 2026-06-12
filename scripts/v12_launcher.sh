@@ -34,8 +34,14 @@ PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
 # gate spread +140bps. Rollback gates: 18d forward fail -> revert V16; live DD 18% pre-forward ->
 # revert V16. To revert to V16: SCRIPT="strategies/live/hl_copy_trader_v16.py";
 # ARGS="--config config/copy_trader_wallets_v16.json".
+# 2026-06-12 (quant): UNIVERSE EXPANSION deploy. Same V17 engine + cohort; config adds the
+# global.expansion block (29 net-positive new coins: 7 crypto-main + 22 xyz builder-dex) + the
+# codex-required guards (per-coin kill -$25/n20-fee-net-mean<0, expansion-wide kill -$50, builder
+# seed retry, restart kill-state reload, NEW/OLD reject tagging). Alberto GO (msg 9351 "only
+# positive full set") + codex GO (session 019e2d30, re-review). Guards inert if the expansion block
+# is absent. To revert to the baseline 10-coin V17: ARGS="--config config/copy_trader_wallets_v17.json".
 SCRIPT="strategies/live/hl_copy_trader_v17.py"
-ARGS="--config config/copy_trader_wallets_v17.json"
+ARGS="--config config/copy_trader_wallets_v17_expansion.json"
 
 cd "$WORKDIR"
 

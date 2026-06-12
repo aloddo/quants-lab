@@ -157,20 +157,40 @@ class V17CopyTrader(v16.V16CopyTrader):
             time.sleep(5)
             still_failed = set()
             for addr in sorted(failed_now):
+                # codex P1.1: query ALL dexes ([""]+BUILDER_DEXES) exactly like the base
+                # _init_target_positions, NOT just the main perp dex. The base seed covers every dex,
+                # but this retry (which re-queries rate-limited wallets and re-seeds _v16_leader_pos)
+                # previously hit only the main dex -- so a wallet that failed its initial seed and
+                # holds an xyz:* (builder) expansion coin would never get that leader position
+                # reseeded, and _v17_init_expansion (which runs AFTER this loop) would seed an empty
+                # _v16_leader_pos -> the leader's later add/close on that coin misclassifies as a fresh
+                # OPEN with the wrong knet seed. Querying all dexes here closes that gap BEFORE the
+                # expansion seeding. A NULL on the main dex marks the wallet still-failed (agent-key
+                # case); builder-dex NULLs are skipped per-dex (the wallet may simply hold nothing
+                # there) -- identical to the base loop's per-dex semantics.
                 try:
-                    payload = {"type": "clearinghouseState", "user": addr}
-                    r = base.requests.post(f"{base.HL_API}/info", json=payload, timeout=8)
-                    data = r.json()
-                    if data is None:
-                        still_failed.add(addr)
-                        continue
+                    main_ok = False
                     self._target_positions.setdefault(addr, {})
-                    for p in data.get("assetPositions", []):
-                        pos = p["position"]
-                        self._target_positions[addr][pos["coin"]] = float(pos["szi"])
-                        if pos["coin"] in self.coin_whitelist and abs(float(pos["szi"])) > 1e-12:
-                            self._v16_leader_pos[(addr, pos["coin"])] = float(pos["szi"])
-                    time.sleep(0.5)
+                    for dex_name in [""] + base.BUILDER_DEXES:
+                        payload = {"type": "clearinghouseState", "user": addr}
+                        if dex_name:
+                            payload["dex"] = dex_name
+                        r = base.requests.post(f"{base.HL_API}/info", json=payload, timeout=8)
+                        data = r.json()
+                        if data is None:
+                            if dex_name == "":
+                                still_failed.add(addr)   # main-dex NULL = still failed (base semantics)
+                            continue
+                        if dex_name == "":
+                            main_ok = True
+                        for p in data.get("assetPositions", []):
+                            pos = p["position"]
+                            self._target_positions[addr][pos["coin"]] = float(pos["szi"])
+                            if pos["coin"] in self.coin_whitelist and abs(float(pos["szi"])) > 1e-12:
+                                self._v16_leader_pos[(addr, pos["coin"])] = float(pos["szi"])
+                        time.sleep(0.2)
+                    if not main_ok:
+                        still_failed.add(addr)
                 except Exception:
                     still_failed.add(addr)
             self._target_init_failed = still_failed
@@ -209,6 +229,22 @@ class V17CopyTrader(v16.V16CopyTrader):
         self._v17_pending_net = 0.0
         self._v17_pending_coin_side = {}   # (coin, side) -> reserved $
 
+        # ══════════════════════════════════════════════════════════════════════════════════════════
+        # V17 UNIVERSE-EXPANSION GUARDS (agent J, 2026-06-12; codex go-live requirement, 4 guards).
+        # ADDITIVE + FLAG-GATED: with NO `global.expansion` block in the config (the current live
+        # config/copy_trader_wallets_v17.json), _v17_init_expansion() leaves every guard structure
+        # EMPTY and NO expansion code path is ever entered -- the engine behaves byte-identically to
+        # the validated 10-coin V17. With an expansion block present it admits the new coins behind
+        # per-coin + expansion-wide kill switches. New-coin edge is in-sample-only; these guards
+        # quarantine that risk so a bad new coin disables ITSELF (and, in aggregate, ALL new coins)
+        # without ever touching the baseline 10. Existing positions on a disabled coin still EXIT
+        # normally; only NEW ENTRIES are blocked.  FAIL-CLOSED throughout: any uncertainty about a
+        # new coin's guard state skips the entry rather than trading it.
+        # Read from self.global_config (the authoritative loaded config the engine runs on); the
+        # stop-shim used during super().__init__ shallow-copied global so the expansion key survives.
+        self._v17_init_expansion(self.global_config.get("expansion"))
+        # ══════════════════════════════════════════════════════════════════════════════════════════
+
         # V17 label + persist epoch (first live start)
         self.label = "V17"
         if not self.shadow_mode:
@@ -222,6 +258,453 @@ class V17CopyTrader(v16.V16CopyTrader):
         logger.info(f"V17 READY: knet_min={self._v17_knet_min}, netx<={self._v17_netx_cap_x}x, "
                     f"coin-side<={self._v17_coin_side_cap_x}x, stop={self._v17_stop_pct:.0%}, "
                     f"seed_ok={self._v17_trading_enabled}")
+
+    # ══════════════════════════════════════════════════════════════════════════════════════════════
+    # EXPANSION GUARDS (codex go-live req). All state lives behind self._v17_expansion_on; when the
+    # config has no `expansion` block this is False and every guard is a no-op (flag-off == validated
+    # 10-coin V17, byte-identically -- the regression gate).
+    # ══════════════════════════════════════════════════════════════════════════════════════════════
+    def _v17_init_expansion(self, exp_cfg):
+        # ── default OFF state (also the flag-absent state). Defined unconditionally so every guard
+        # site can reference these attrs without hasattr churn. With the flag off, _v17_new_coins is
+        # empty -> `coin in _v17_new_coins` is always False -> no guard branch is taken.
+        self._v17_expansion_on = False
+        self._v17_new_coins: set[str] = set()
+        self._v17_baseline_whitelist: set[str] = set(self.coin_whitelist)  # the validated 10
+        self._v17_disabled_coins: set[str] = set()       # per-coin kill: entries blocked
+        self._v17_expansion_killed = False               # expansion-wide kill: ALL new coins off
+        # codex re-review P1: precautionary fail-closed disable (state unknown at boot). Unlike a real
+        # latched kill, this is LIFTED by the first successful poll that re-establishes state -- so a
+        # transient boot-time Mongo blip does not permanently sideline all new coins for the session.
+        self._v17_precautionary_disabled = False
+        # codex re-review (2nd follow-up) P1: the set of PERSISTED-latched disabled coins loaded at
+        # boot. When we lift a precautionary blanket, we must restore from THIS snapshot (a latched
+        # kill is never auto-lifted) -- not from set(), which would let a coin whose later exits moved
+        # its cum/mean back above the threshold silently re-enter.
+        self._v17_latched_disabled: set[str] = set()
+        self._v17_coin_realized: dict[str, float] = {}   # new coin -> cumulative realized $ (heuristic)
+        self._v17_coin_bps: dict[str, list] = {}         # new coin -> [realized_bps, ...] THIS session
+        # codex re-review P1: persisted pre-restart bps aggregates (sum, n) per coin, restored on load.
+        # Effective n/mean for the kill = these + this-session _v17_coin_bps (so the n>=20 mean-kill
+        # state survives a restart instead of rebuilding from zero past the resumed cursor).
+        self._v17_coin_bps_base: dict[str, tuple] = {}   # coin -> (sum_bps, n) carried across restart
+        self._v17_expansion_realized = 0.0               # aggregate realized $ across all new coins
+        self._v17_close_cursor = None                    # ObjectId high-water for close-doc polling
+        self._v17_per_coin_kill_usd = -25.0
+        self._v17_per_coin_kill_n = 20
+        self._v17_expansion_kill_usd = -50.0
+        # codex P2.1: the close-doc pnl_bps is GROSS (pure (exit-entry)/entry*1e4 price move; verified
+        # in hl_copy_trader_v15.py -- fees tracked separately in the exchange-fill sync, NOT in the
+        # per-trade close doc). The per-coin n-rule mean must be FEE-NET, so we subtract the HL taker
+        # round-trip from the gross mean before the <0 test. The documented HL constant (8.64bps RT) is
+        # the default; when expansion is actually ON we resolve it from the canonical execution model
+        # (below, AFTER the flag-off early returns) so flag-off boots do ZERO extra imports / sys.path
+        # mutation (codex re-review P1: keep the flag-off path's footprint minimal).
+        self._v17_fee_rt_bps = 8.64
+        # new/old reject tagging (codex req #4): are NEW coins driving cap pressure?
+        self._v17_rej_new = {"netx": 0, "coinside": 0, "margin_util": 0, "gross_backstop": 0}
+        self._v17_rej_old = {"netx": 0, "coinside": 0, "margin_util": 0, "gross_backstop": 0}
+
+        if not exp_cfg:
+            logger.info("V17 EXPANSION: no `global.expansion` block -- guards INERT, "
+                        "running the validated 10-coin universe unchanged.")
+            return
+
+        coins = exp_cfg.get("coins") or []
+        if not isinstance(coins, list) or not coins:
+            logger.info("V17 EXPANSION: block present but `coins` empty -- guards INERT.")
+            return
+
+        # ── fee_rt from the canonical execution model (ONLY when expansion is on; codex re-review P1
+        # keeps the flag-off path free of this import + sys.path mutation). Fallback to the 8.64bps
+        # constant set above if the module/data is unavailable.
+        try:
+            sys.path.insert(0, str(_REPO / "research" / "v15"))
+            import execution_model as _xm
+            self._v17_fee_rt_bps = float(_xm.fee_rt(maker=False)) * 1e4
+        except Exception as e:
+            logger.warning(f"V17 EXPANSION: execution_model.fee_rt() unavailable ({e}); "
+                           f"using documented HL taker RT fallback {self._v17_fee_rt_bps:.2f}bps.")
+
+        # ── kill params (validated bounds; fail-closed clamp on garbage) ──
+        self._v17_per_coin_kill_usd = float(exp_cfg.get("per_coin_kill_usd", -25.0))
+        self._v17_per_coin_kill_n = int(exp_cfg.get("per_coin_kill_n", 20))
+        self._v17_expansion_kill_usd = float(exp_cfg.get("expansion_kill_usd", -50.0))
+        if not (self._v17_per_coin_kill_usd < 0 and self._v17_expansion_kill_usd < 0
+                and self._v17_per_coin_kill_n >= 1):
+            raise ValueError(f"V17 EXPANSION: kill params must be (per_coin_kill_usd<0, "
+                             f"expansion_kill_usd<0, per_coin_kill_n>=1); got "
+                             f"{self._v17_per_coin_kill_usd}/{self._v17_expansion_kill_usd}/"
+                             f"{self._v17_per_coin_kill_n}")
+
+        # ── validate each new coin exists in the HL/builder universe AND is not already a baseline
+        # coin. all_perp_coins/all_builder_coins were filtered by V16 to the baseline whitelist, so we
+        # validate against the FULL universe captured in self.max_leverage / self.sz_decimals (the base
+        # engine populated those for EVERY perp + builder coin at init, before V16 filtered the feed
+        # lists). FAIL-CLOSED: a coin we cannot verify is dropped (never traded), with a loud log.
+        known_universe = set(self.max_leverage.keys())   # full perp + builder set from base init
+        admitted, dropped = [], []
+        for c in coins:
+            if c in self._v17_baseline_whitelist:
+                dropped.append((c, "already a baseline coin"))
+                continue
+            if c not in known_universe:
+                dropped.append((c, "not in HL/builder universe"))
+                continue
+            admitted.append(c)
+        if dropped:
+            logger.warning(f"V17 EXPANSION: dropped {len(dropped)} coin(s) (FAIL-CLOSED, not traded): "
+                           f"{dropped}")
+        if not admitted:
+            logger.warning("V17 EXPANSION: no admissible new coins after validation -- guards INERT.")
+            return
+
+        self._v17_new_coins = set(admitted)
+        self._v17_expansion_on = True
+
+        # ── extend the whitelist + WS feed lists to INCLUDE the new coins. V16 set
+        # coin_whitelist to exactly the validated 10 and pruned all_perp_coins / emptied
+        # all_builder_coins; we re-admit the new coins to BOTH the guard set (so the V16 choke
+        # points pass them) AND the WS subscription lists (so their leader fills + books arrive).
+        self.coin_whitelist = set(self.coin_whitelist) | self._v17_new_coins
+        new_perp = sorted(c for c in self._v17_new_coins if ":" not in c)
+        new_builder = sorted(c for c in self._v17_new_coins if ":" in c)
+        for c in new_perp:
+            if c not in self.all_perp_coins:
+                self.all_perp_coins.append(c)
+        for c in new_builder:
+            if c not in self.all_builder_coins:
+                self.all_builder_coins.append(c)
+
+        # ── seed the unconditional leader tracker (_v16_leader_pos) for the new coins. The base
+        # _init_target_positions already RESTed EVERY leader's clearinghouseState across ALL dexes
+        # at startup (incl. builder), populating self._target_positions[addr][coin] for new coins
+        # too. V16 only seeded _v16_leader_pos for baseline-whitelist coins; we add the new ones so
+        # knet + open/add/reverse classification work for them from minute zero.
+        seeded = 0
+        for addr, posmap in self._target_positions.items():
+            for cn, sz in posmap.items():
+                if cn in self._v17_new_coins and abs(sz) > 1e-12:
+                    self._v16_leader_pos[(addr, cn)] = float(sz)
+                    seeded += 1
+
+        logger.info(
+            f"V17 EXPANSION ON: +{len(self._v17_new_coins)} new coins "
+            f"(perp={new_perp}, builder={new_builder}); whitelist now {len(self.coin_whitelist)}; "
+            f"seeded {seeded} new-coin leader positions; per-coin kill: realized<=${self._v17_per_coin_kill_usd:.0f} "
+            f"OR (n>={self._v17_per_coin_kill_n} AND mean_bps<0); expansion-wide kill: "
+            f"aggregate realized<=${self._v17_expansion_kill_usd:.0f}.")
+        base._tg(f"V17 EXPANSION ON: +{len(self._v17_new_coins)} new coins behind per-coin "
+                 f"(${self._v17_per_coin_kill_usd:.0f}/n{self._v17_per_coin_kill_n}) + "
+                 f"expansion-wide (${self._v17_expansion_kill_usd:.0f}) kills.")
+
+        # ── RESTART KILL-STATE LOAD (codex P1.2 + P2.2) ──────────────────────────────────────────────
+        # _v17_persist_expansion_state writes disabled coins + the killed flag + the close cursor to
+        # v17_meta.expansion_state. On a restart we MUST rebuild that state BEFORE any WS subscription
+        # can trigger an entry, or a previously-killed coin could re-enter until the first 30s poll.
+        # Here (still inside __init__, before run()/WS), we:
+        #   (1) LOAD the persisted disabled set + killed flag + realized accounting + close cursor;
+        #   (2) synchronously poll the close collection ONCE so counters + kill state are fully rebuilt
+        #       from the durable record before entries are reachable.
+        # FAIL-CLOSED (codex re-review P1): only ADD to the disabled set from persistence (never clear
+        # it). If the state READ fails, or the synchronous pre-WS poll fails, we CANNOT prove which
+        # coins were killed -> disable ALL expansion coins until the first SUCCESSFUL 30s poll
+        # re-establishes state from the durable close record. Never resume entry-eligible with unknown
+        # kill state. Restricted to coins still in the CURRENT expansion set (a coin dropped from the
+        # new config is not tradeable anyway). Skipped in shadow (no persistence there).
+        self._v17_restart_loaded = False
+        if not self.shadow_mode:
+            state_known = True
+            try:
+                st = self.db.v17_meta.find_one({"_id": "expansion_state"})
+            except Exception as e:
+                st = None
+                state_known = False
+                logger.error(f"V17 EXPANSION: kill-state READ failed ({e}); FAIL-CLOSED -- disabling "
+                             f"ALL new coins until a successful poll re-establishes state.")
+            if st:
+                persisted_disabled = {c for c in (st.get("disabled_coins") or [])
+                                      if c in self._v17_new_coins}
+                self._v17_disabled_coins |= persisted_disabled        # ADD only (fail-closed)
+                self._v17_latched_disabled |= persisted_disabled      # latched snapshot (never lifted)
+                self._v17_expansion_killed = bool(st.get("expansion_killed", False)) \
+                    or self._v17_expansion_killed
+                if self._v17_expansion_killed:
+                    self._v17_disabled_coins |= set(self._v17_new_coins)
+                # restore realized accounting so the synchronous poll resumes from the persisted total
+                # rather than from zero (the cursor below ensures we only ADD un-accounted closes).
+                self._v17_expansion_realized = float(st.get("expansion_realized", 0.0) or 0.0)
+                for c, v in (st.get("coin_realized") or {}).items():
+                    if c in self._v17_new_coins:
+                        self._v17_coin_realized[c] = float(v)
+                # restore per-coin bps aggregate (sum, n) so the n>=20 mean-kill spans the FULL history
+                # across restarts (the cursor skips already-counted closes -> we can't re-derive these).
+                _bsum = st.get("coin_bps_sum") or {}
+                _bn = st.get("coin_bps_n") or {}
+                for c in self._v17_new_coins:
+                    if c in _bn:
+                        self._v17_coin_bps_base[c] = (float(_bsum.get(c, 0.0) or 0.0), int(_bn[c]))
+                # P2.2: resume the close cursor from the persisted high-water oid (exactly-once).
+                oid = st.get("last_close_oid")
+                if oid:
+                    try:
+                        from bson import ObjectId as _OID
+                        self._v17_close_cursor = _OID(oid)
+                    except Exception as e:
+                        logger.warning(f"V17 EXPANSION: bad persisted last_close_oid {oid!r} ({e}); "
+                                       f"the poll will fall back to the V17-epoch lower bound.")
+                self._v17_restart_loaded = True
+                logger.info(f"V17 EXPANSION RESTART-LOAD: disabled={sorted(self._v17_disabled_coins) or 'none'} "
+                            f"killed={self._v17_expansion_killed} "
+                            f"agg_realized=${self._v17_expansion_realized:.2f} "
+                            f"bps_base={ {c: self._v17_coin_bps_base[c] for c in self._v17_coin_bps_base} or 'none'} "
+                            f"cursor={'resumed' if self._v17_close_cursor else 'epoch'}.")
+            # (2) synchronous pre-WS poll: rebuild counters/kills from the durable close record BEFORE
+            # WS entries are reachable. DRAIN fully (loop while a full 2000-doc batch comes back) so a
+            # large restart backlog is entirely accounted before any entry (codex re-review P2). Each
+            # batch is bounded (memory-safe). A batch FAILURE (None) trips fail-closed.
+            self._v17_last_exp_poll = base.time.time()
+            for _ in range(50):    # hard cap: 50 * 2000 = 100k closes (far beyond any real backlog)
+                got = self._v17_poll_new_coin_closes()
+                if got is None:
+                    state_known = False
+                    logger.error("V17 EXPANSION: pre-WS close-poll FAILED; FAIL-CLOSED -- disabling ALL "
+                                 "new coins until a successful poll re-establishes state.")
+                    break
+                if got < 2000:
+                    break          # drained
+            if not state_known:
+                self._v17_disabled_coins |= set(self._v17_new_coins)
+                self._v17_precautionary_disabled = True   # lift on the next successful poll
+            logger.info(f"V17 EXPANSION SYNC-POLL (pre-WS): state_known={state_known} "
+                        f"disabled={sorted(self._v17_disabled_coins) or 'none'} "
+                        f"killed={self._v17_expansion_killed} agg_realized=${self._v17_expansion_realized:.2f}.")
+            if self._v17_disabled_coins:
+                base._tg(f"V17 EXPANSION RESTART: {len(self._v17_disabled_coins)} coin(s) disabled "
+                         f"before any entry{' (FAIL-CLOSED: state unknown)' if not state_known else ''}: "
+                         f"{sorted(self._v17_disabled_coins)}.")
+
+    def _v17_is_new(self, coin: str) -> bool:
+        """A coin is a NEW (expansion) coin iff it is in the configured expansion set."""
+        return coin in self._v17_new_coins
+
+    def _v17_record_new_coin_close(self, coin: str, pnl_usd: float, pnl_bps: float):
+        """Update per-coin + aggregate realized PnL for a NEW coin close, then evaluate kills.
+        Pure function of its inputs + accumulated state -- unit-testable (see __main__ self-test).
+        Called once per recorded close of a new coin (deduped by the close-doc cursor in
+        _v17_poll_new_coin_closes). No-op for baseline coins / flag-off."""
+        if not self._v17_expansion_on or coin not in self._v17_new_coins:
+            return
+        self._v17_coin_realized[coin] = self._v17_coin_realized.get(coin, 0.0) + float(pnl_usd)
+        self._v17_coin_bps.setdefault(coin, []).append(float(pnl_bps))
+        self._v17_expansion_realized += float(pnl_usd)
+        self._v17_eval_kills(coin)
+
+    def _v17_eval_kills(self, coin: str):
+        """Per-coin kill (codex req #2) + expansion-wide kill (codex req #3). Idempotent: a coin
+        already disabled stays disabled; re-evaluation only adds disables, never lifts them (a hit
+        kill is latched -- you do not re-enable an in-sample-only coin automatically)."""
+        # ── per-coin kill ──
+        # codex re-review (round 3) P1: gate on the LATCHED set, NOT the runtime _v17_disabled_coins.
+        # During a precautionary fail-closed blanket every new coin sits in _v17_disabled_coins, which
+        # would suppress latching a genuine threshold crossing observed mid-replay; gating on
+        # _v17_latched_disabled lets a real kill latch even while the blanket is up (and a
+        # truly-already-latched coin is still skipped, preserving idempotency).
+        if coin in self._v17_new_coins and coin not in self._v17_latched_disabled:
+            cum = self._v17_coin_realized.get(coin, 0.0)
+            bps = self._v17_coin_bps.get(coin, [])
+            # codex re-review P1: combine the persisted pre-restart aggregate (sum, n) with this
+            # session's closes so n + mean span the coin's FULL realized history across restarts.
+            base_sum, base_n = self._v17_coin_bps_base.get(coin, (0.0, 0))
+            n = len(bps) + base_n
+            mean_gross_bps = ((sum(bps) + base_sum) / n) if n else 0.0
+            # codex P2.1: the close-doc pnl_bps is GROSS, so the n-rule must use a FEE-NET mean --
+            # subtract the HL taker round-trip (8.64bps) so a coin whose gross mean is slightly
+            # positive but net-negative (e.g. +5bps gross, 5 - 8.64 < 0 net) is correctly killed.
+            mean_net_bps = mean_gross_bps - self._v17_fee_rt_bps
+            reason = None
+            if cum <= self._v17_per_coin_kill_usd:
+                reason = f"cum_realized=${cum:.2f}<=${self._v17_per_coin_kill_usd:.0f}"
+            elif n >= self._v17_per_coin_kill_n and mean_net_bps < 0:
+                reason = (f"n={n}>={self._v17_per_coin_kill_n} AND mean_NET_bps={mean_net_bps:.1f}<0 "
+                          f"(gross {mean_gross_bps:.1f} - fee_rt {self._v17_fee_rt_bps:.2f})")
+            if reason:
+                self._v17_disabled_coins.add(coin)
+                self._v17_latched_disabled.add(coin)   # latched: preserved across a precautionary lift
+                logger.error(f"EXPANSION KILL coin={coin} reason={reason} "
+                             f"(cum=${cum:.2f}, n={n}, mean_gross_bps={mean_gross_bps:.1f}, "
+                             f"mean_net_bps={mean_net_bps:.1f}). New ENTRIES for "
+                             f"{coin} disabled; existing position exits normally.")
+                base._tg(f"EXPANSION KILL coin={coin}: {reason}. New entries off (exits normal).")
+                self._v17_persist_expansion_state()
+
+        # ── expansion-wide kill: aggregate realized across ALL new coins <= -$50 ──
+        if not self._v17_expansion_killed and self._v17_expansion_realized <= self._v17_expansion_kill_usd:
+            self._v17_expansion_killed = True
+            still_active = sorted(self._v17_new_coins - self._v17_disabled_coins)
+            self._v17_disabled_coins |= set(self._v17_new_coins)   # disable ALL new coins
+            self._v17_latched_disabled |= set(self._v17_new_coins) # latched (never lifted)
+            logger.error(f"EXPANSION-WIDE KILL: aggregate new-coin realized "
+                         f"${self._v17_expansion_realized:.2f} <= ${self._v17_expansion_kill_usd:.0f}. "
+                         f"ALL {len(self._v17_new_coins)} new coins disabled (reverting to the {len(self._v17_baseline_whitelist)} "
+                         f"baseline). Newly-disabled: {still_active}. Existing new-coin positions exit normally.")
+            base._tg(f"EXPANSION-WIDE KILL: agg ${self._v17_expansion_realized:.2f} <= "
+                     f"${self._v17_expansion_kill_usd:.0f}. ALL new coins off; reverted to baseline 10.")
+            self._v17_persist_expansion_state()
+
+    def _v17_persist_expansion_state(self):
+        """Snapshot kill state + the close cursor to v17_meta (audit + survives a restart). On restart
+        _v17_init_expansion LOADS this (codex P1.2: disabled set + killed flag rebuilt before any entry
+        is possible) and resumes the close cursor from last_close_oid (codex P2.2: deterministic
+        exactly-once across restarts). Never raises into the hot path."""
+        if self.shadow_mode:
+            return
+        try:
+            doc = {
+                # codex re-review (round 3) P2: persist the LATCHED set, NOT the runtime
+                # _v17_disabled_coins. The runtime set can transiently include the precautionary
+                # fail-closed blanket (all new coins) before a successful poll lifts it; persisting that
+                # would make a later restart treat precautionary coins as permanently latched. The
+                # durable "disabled" record is exactly the real latched kills (+ the expansion_killed
+                # flag, which independently disables all on load).
+                "disabled_coins": sorted(self._v17_latched_disabled),
+                "expansion_killed": self._v17_expansion_killed,
+                "coin_realized": {k: round(v, 4) for k, v in self._v17_coin_realized.items()},
+                "expansion_realized": round(self._v17_expansion_realized, 4),
+                # codex re-review P1 (+ follow-up): the n>=20 mean-kill needs the per-coin bps SERIES to
+                # survive a restart. The cursor resumes PAST already-counted closes, so we can't
+                # re-derive n/mean by re-polling them -- persist the COMBINED running (sum, count) per
+                # coin = the pre-restart base (_v17_coin_bps_base) PLUS this session's closes. Persisting
+                # only the session list would, after a no-kill post-restart close, overwrite n=19+1 with
+                # n=1 and lose the base 19 on a SECOND restart (codex follow-up). Union the keys.
+                "coin_bps_sum": {k: round(self._v17_coin_bps_base.get(k, (0.0, 0))[0] + sum(self._v17_coin_bps.get(k, [])), 4)
+                                 for k in (set(self._v17_coin_bps) | set(self._v17_coin_bps_base))},
+                "coin_bps_n": {k: self._v17_coin_bps_base.get(k, (0.0, 0))[1] + len(self._v17_coin_bps.get(k, []))
+                               for k in (set(self._v17_coin_bps) | set(self._v17_coin_bps_base))},
+                "updated_at": base.datetime.now(base.timezone.utc)}
+            # codex P2.2: persist the close-doc high-water cursor so a restart resumes exactly-once.
+            if self._v17_close_cursor is not None:
+                doc["last_close_oid"] = str(self._v17_close_cursor)
+            self.db.v17_meta.update_one({"_id": "expansion_state"}, {"$set": doc}, upsert=True)
+        except Exception as e:
+            logger.warning(f"V17 expansion-state persist failed (non-fatal): {e}")
+
+    def _v17_poll_new_coin_closes(self):
+        """Pull any NEW closed-trade docs for NEW coins from the V17 close collection and feed them to
+        the per-coin/aggregate accounting EXACTLY ONCE (ObjectId high-water cursor; ObjectIds are
+        monotonic by insertion). Every close-recording site in the base/V16 engine writes a doc with
+        {coin, pnl_usd, pnl_bps} to DB_COLLECTION (== v17_copy_trades) -- this is the single, faithful,
+        in-engine record of realized closes, so we account off it rather than editing the 5 base
+        recording sites (zero base-engine surface; codex-reviewable in one place). Runs on the stats
+        cadence; kills gate FUTURE entries, so sub-second latency is unnecessary. Memory-safe: a
+        bounded cursor query, never a full-collection scan.
+
+        Returns the number of close docs consumed in THIS batch (0 = drained), or None on a query
+        error -- the pre-WS startup caller uses this to (a) drain a >2000-doc backlog fully before
+        WS entries are reachable (codex re-review P2) and (b) treat a failure as fail-closed."""
+        if not self._v17_expansion_on or self.shadow_mode:
+            return 0
+        try:
+            q = {"coin": {"$in": sorted(self._v17_new_coins)}, "pnl_usd": {"$exists": True}}
+            if self._v17_close_cursor is not None:
+                q["_id"] = {"$gt": self._v17_close_cursor}
+            else:
+                # first poll after (re)start: only count closes AT/AFTER the V17 epoch so we never
+                # double-count history from a prior session into the live kill counters.
+                from bson import ObjectId as _OID
+                q["_id"] = {"$gte": _OID.from_datetime(
+                    base.datetime.fromtimestamp(self.pnl_epoch_ms / 1000, base.timezone.utc))}
+            cur = self.db[base.DB_COLLECTION].find(q).sort("_id", 1).limit(2000)
+            n = 0
+            for doc in cur:
+                self._v17_close_cursor = doc["_id"]
+                self._v17_record_new_coin_close(
+                    doc.get("coin", ""), doc.get("pnl_usd", 0.0) or 0.0, doc.get("pnl_bps", 0.0) or 0.0)
+                n += 1
+            if n:
+                logger.info(f"V17 EXPANSION: accounted {n} new-coin close(s); "
+                            f"agg realized ${self._v17_expansion_realized:.2f}; "
+                            f"disabled {sorted(self._v17_disabled_coins) or 'none'}.")
+                # codex P2.2: persist the advanced cursor (+ realized state) every poll that consumed
+                # closes, NOT only when a kill fires -- otherwise a restart between a no-kill poll and
+                # the next kill would re-count the same closes. _v17_eval_kills already persisted on a
+                # kill; this makes the cursor durable for the no-kill case too. Idempotent upsert.
+                self._v17_persist_expansion_state()
+            return n
+        except Exception as e:
+            logger.warning(f"V17 expansion close-poll failed (non-fatal, retries next cycle): {e}")
+            return None
+
+    def _v17_lift_precautionary_if_known(self, got):
+        """codex re-review P1 (+ follow-ups): after a poll, if we are in a precautionary fail-closed
+        state (boot couldn't prove kill state) and the poll SUCCEEDED (got is not None), state is now
+        known -- lift ONLY the precautionary blanket. Restore the base disabled set from the LATCHED
+        snapshot (_v17_latched_disabled = persisted kills + any kill that fired this session, including
+        during the blanket because _v17_eval_kills gates on the latched set), NOT from set(): a latched
+        kill is never auto-lifted, even if the coin's later exits moved its cum/mean back above the
+        threshold. Then re-eval to catch any kill the poll newly trips. Extracted from _log_stats so it
+        is independently unit-testable without the base stats super() chain."""
+        if self._v17_precautionary_disabled and got is not None:
+            self._v17_precautionary_disabled = False
+            self._v17_disabled_coins = set(self._v17_new_coins) if self._v17_expansion_killed \
+                else set(self._v17_latched_disabled)
+            for c in self._v17_new_coins:
+                self._v17_eval_kills(c)    # re-applies $/n kills from restored state
+            logger.info(f"V17 EXPANSION: state re-established after fail-closed boot; "
+                        f"disabled now {sorted(self._v17_disabled_coins) or 'none'} "
+                        f"(latched {sorted(self._v17_latched_disabled) or 'none'}).")
+
+    # ── stats cadence hook: poll new-coin closes -> evaluate kills, then defer to the base stats ──
+    def _log_stats(self):
+        # the base _log_stats self-throttles to 60s; run the (cheap, bounded) close-poll on the SAME
+        # cadence by gating on the same clock the base uses, BEFORE super so a kill that disables a
+        # coin takes effect on this very cycle. No-op when the flag is off.
+        if self._v17_expansion_on:
+            now = base.time.time()
+            if now - getattr(self, "_v17_last_exp_poll", 0) >= 30:
+                self._v17_last_exp_poll = now
+                got = self._v17_poll_new_coin_closes()
+                self._v17_lift_precautionary_if_known(got)
+            # gross-backstop attribution (codex req #4): the base backstop is a global FLATTEN, not a
+            # per-entry reject, so we record (once, on the cycle it trips) which NEW vs OLD coins were
+            # open at the time -- the audit signal is "did new coins drive the gross that tripped it".
+            if self._kill_reasons.get("gross_backstop") and not getattr(self, "_v17_gb_attributed", False):
+                self._v17_gb_attributed = True
+                open_new = sorted({p["coin"] for p in self.positions
+                                   if p.get("filled") and self._v17_is_new(p["coin"])})
+                open_old = sorted({p["coin"] for p in self.positions
+                                   if p.get("filled") and not self._v17_is_new(p["coin"])})
+                self._v17_rej_new["gross_backstop"] += len(open_new)
+                self._v17_rej_old["gross_backstop"] += len(open_old)
+                logger.error(f"V17 GROSS-BACKSTOP attribution: open NEW coins={open_new} "
+                             f"open OLD coins={open_old} at trip time.")
+        return super()._log_stats()
+
+    # ── reject tagging helpers (codex req #4) ──────────────────────────────────────────────────────
+    def _v17_coin_tag(self, coin: str) -> str:
+        """'[NEW]' / '[OLD]' label for log lines (no-op-cheap; '[OLD]' when expansion flag off)."""
+        return "[NEW]" if self._v17_is_new(coin) else "[OLD]"
+
+    def _v17_tag_reject(self, kind: str, coin: str):
+        """Bump the NEW-coin or OLD-coin reject counter for `kind` in
+        {netx, coinside, margin_util, gross_backstop}. Pure counter update; safe when flag off
+        (everything tags as OLD then, and the counters are simply never surfaced/used)."""
+        (self._v17_rej_new if self._v17_is_new(coin) else self._v17_rej_old)[kind] += 1
+
+    # ── margin_util reject tagging (codex req #4): the base _check_margin_budget gates margin-util,
+    # per-coin concentration and the fixed-mode notional caps. It is the entry-time 'margin_util'
+    # rejection path the codex spec names. We wrap it: on a False (rejected) return, tag the reject
+    # NEW vs OLD. Behaviour is otherwise IDENTICAL (we return exactly what super returns) -- and with
+    # the expansion flag off this only ever bumps the OLD counter, which nothing reads. ──
+    def _check_margin_budget(self, coin: str, additional_notional: float, wallet: str = None) -> bool:
+        ok = super()._check_margin_budget(coin, additional_notional, wallet=wallet)
+        # tag ONLY when the expansion flag is on, so flag-off is byte-identical to base behaviour
+        # (this override then just forwards super's return value verbatim).
+        if not ok and self._v17_expansion_on:
+            self._v17_tag_reject("margin_util", coin)
+            if (sum(self._v17_rej_new.values()) + sum(self._v17_rej_old.values())) % 25 == 1:
+                logger.info(f"V17 REJECT TAGS so far: NEW={self._v17_rej_new} OLD={self._v17_rej_old}")
+        return ok
 
     # ── knet from the unconditional tracker (V16 maintains _v16_leader_pos for EVERY target fill) ──
     def _v17_knet(self, coin: str, is_buy: bool, exclude_wallet: str, px: float) -> int:
@@ -271,6 +754,16 @@ class V17CopyTrader(v16.V16CopyTrader):
         if not self._v17_trading_enabled:
             self._v17_stale_rejects += 1
             logger.warning(f"V17 ENTRY BLOCKED (trading_disabled/seed): {coin} {wallet}")
+            return
+        # EXPANSION KILL gate (codex req #2/#3): block NEW ENTRIES on a disabled new coin. A coin is
+        # disabled by its own per-coin kill or by the expansion-wide kill (which disables ALL new
+        # coins). Existing positions on the coin are NOT touched here -- the exit machinery in
+        # _check_exits/_exit_position runs independently and closes them normally. No-op when the
+        # expansion flag is off (_v17_disabled_coins is always empty then). FAIL-CLOSED: this gate is
+        # the first thing checked, so a disabled coin can never reach sizing/exposure logic.
+        if coin in self._v17_disabled_coins:
+            logger.warning(f"V17 EXPANSION KILL: ENTRY blocked for disabled new coin {coin} "
+                           f"(wallet={wallet}); existing position exits normally.")
             return
         # stale-tracker kill: knet is meaningless if we have not seen target flow recently
         age = time.time() - self._v17_last_target_fill_ts
@@ -326,13 +819,22 @@ class V17CopyTrader(v16.V16CopyTrader):
         if abs(net + side_new * self.order_size) > self._v17_netx_cap_x * eq \
                 and abs(net + side_new * self.order_size) > abs(net):
             self._v17_netx_rejects += 1
-            logger.info(f"V17 NETX CAP: rejected {coin} (net {net:+.0f} cap "
+            _tag = ""
+            if self._v17_expansion_on:                 # codex req #4: NEW vs OLD cap-pressure audit
+                self._v17_tag_reject("netx", coin)
+                _tag = self._v17_coin_tag(coin) + " "
+            logger.info(f"V17 NETX CAP: rejected {_tag}{coin} (net {net:+.0f} cap "
                         f"{self._v17_netx_cap_x}x${eq:.0f}; total {self._v17_netx_rejects})")
             return
         if coin_side + self.order_size > self._v17_coin_side_cap_x * eq:
             self._v17_coinside_rejects += 1
-            logger.info(f"V17 COIN-SIDE CAP: rejected {coin} ({coin_side:.0f}+{self.order_size:.0f} "
-                        f"> {self._v17_coin_side_cap_x}x${eq:.0f}; total {self._v17_coinside_rejects})")
+            _tag = ""
+            if self._v17_expansion_on:                 # codex req #4
+                self._v17_tag_reject("coinside", coin)
+                _tag = self._v17_coin_tag(coin) + " "
+            logger.info(f"V17 COIN-SIDE CAP: rejected {_tag}{coin} "
+                        f"({coin_side:.0f}+{self.order_size:.0f} > {self._v17_coin_side_cap_x}x${eq:.0f}; "
+                        f"total {self._v17_coinside_rejects})")
             return
 
         # record accepted-entry knet for attribution (week-1 KPI: knet-bucket PnL)

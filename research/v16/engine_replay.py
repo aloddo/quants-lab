@@ -478,6 +478,30 @@ def main():
         import select_cohort as SC
         SC.M02 = Path(_m02)
         print(f"[replay] m02 override: {_m02}")
+    # AGENT H (2026-06-12) universe-expansion backtest, ADDITIVE + default-off. When
+    # V16_REPLAY_EXPAND_COINS is set (JSON {coin: oneway_frac}), expand the LIQUID coin gate with
+    # those coins and register their measured per-coin slippage into the canonical execution model.
+    # The gate is select_cohort.LIQUID (used inside edge()) AND engine_replay's imported LIQUID alias
+    # (used in run_fold's `c in LIQUID` + funding load) -- BOTH must be mutated. With the env unset,
+    # LIQUID is untouched and the run is byte-identical to the shipped replay (regression-proven).
+    global LIQUID
+    _exp = os.environ.get("V16_REPLAY_EXPAND_COINS")
+    if _exp:
+        import select_cohort as SC
+        from execution_model import register_slip_oneway
+        emap = json.load(open(_exp)) if os.path.exists(_exp) else json.loads(_exp)
+        added = []
+        for coin, ow in emap.items():
+            ow = float(ow)
+            if ow <= 0:
+                continue
+            register_slip_oneway(coin, ow)            # additive: never touches the 10 majors
+            if coin not in LIQUID:
+                LIQUID.add(coin); SC.LIQUID.add(coin)
+                added.append(coin)
+        print(f"[replay] EXPANDED universe: +{len(added)} coins (gate now {len(LIQUID)}); "
+              f"slip registered for {len(emap)} expansion coins")
+        print(f"[replay] added: {sorted(added)}")
     print(f"SHIPPED CONFIG: order ${ORDER} | util {UTIL_CAP} lev {LEV} | stop {STOP_PCT} | backstop {BACKSTOP_X}x "
           f"| sl {SL} trail {TR_ACT}/{TR_GIVE} hold {MAX_HOLD_MS//3600000}h | trim_pct {TRIM_PCT} | chase {CHASE_BPS}bps")
     _load_nb()   # H-NB-FILTER: no-op unless V16_REPLAY_NB_FILTER is set
