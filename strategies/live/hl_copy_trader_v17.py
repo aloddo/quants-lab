@@ -207,7 +207,8 @@ class CopyTrader:
 
         # Get asset metadata (sz_decimals + per-coin max leverage) for ALL dexes
         self.sz_decimals = {}
-        self.max_leverage = {}
+        self.max_leverage = {}          # capped to config -- used in the engine's margin-reserve MATH
+        self._raw_max_leverage = {}     # the coin's actual HL max -- used to SET cross leverage on-exchange
         self.all_perp_coins = []       # regular perp coins (no prefix)
         self.all_builder_coins = []    # builder-deployed coins (xyz:X, flx:Y, etc.)
         max_lev_cap = self.global_config["max_leverage_cap"]
@@ -218,6 +219,7 @@ class CopyTrader:
             for u in meta[0]["universe"]:
                 name = u["name"]
                 self.sz_decimals[name] = u.get("szDecimals", 2)
+                self._raw_max_leverage[name] = int(u.get("maxLeverage", 3))
                 self.max_leverage[name] = min(u.get("maxLeverage", 3), max_lev_cap)
                 self.all_perp_coins.append(name)
 
@@ -228,6 +230,7 @@ class CopyTrader:
                 for u in dex_meta.get("universe", []):
                     name = u["name"]  # already prefixed, e.g. "xyz:TSLA"
                     self.sz_decimals[name] = u.get("szDecimals", 2)
+                    self._raw_max_leverage[name] = int(u.get("maxLeverage", 3))
                     self.max_leverage[name] = min(u.get("maxLeverage", 3), max_lev_cap)
                     self.all_builder_coins.append(name)
                 logger.info(f"V17: loaded {dex_name} dex: {len([c for c in self.all_builder_coins if c.startswith(dex_name + ':')])} coins")
@@ -318,6 +321,8 @@ class CopyTrader:
         self._seen_tids = {}
         self._seen_liq_tids = set()       # liquidation fill tids already recorded (dedup)
         self._liquidated_coins = {}       # coin -> ts of last confirmed liquidation (reconciler trigger)
+        self._leverage_set = set()        # coins whose leverage/margin-mode we've set on the exchange
+        self._leverage_set_fail = {}      # coin -> ts of last failed set (60s backoff before retry)
         self._post_exit_cooldown = {}  # (wallet, coin) -> timestamp of last exit
 
         # Dynamic l2Book subscriptions: coins we currently need book data for
@@ -330,6 +335,14 @@ class CopyTrader:
         # Position recovery
         if not self.shadow_mode:
             self._recover_positions()
+            # Protect already-OPEN positions immediately: force CROSS margin on every held coin
+            # (the at-risk isolated xyz positions get account-backed right away, not just on next trade).
+            held_coins = {p['coin'] for p in self.positions if p.get('filled')}
+            for _c in held_coins:
+                self._set_coin_leverage(_c)
+                time.sleep(0.15)   # gentle pacing to avoid a rate-limit burst
+            if held_coins:
+                logger.info(f"LEVERAGE: forced CROSS on {len(held_coins)} held coins at startup")
 
     def _resolve_vault_leaders(self):
         """Check if any target wallets are vaults. If so, add their leader address
@@ -1165,6 +1178,30 @@ class CopyTrader:
     def _get_coin_leverage(self, coin: str) -> int:
         return self.max_leverage.get(coin, 3)
 
+    def _set_coin_leverage(self, coin: str):
+        """Force CROSS margin on the exchange for this coin (Alberto 9430/9432).
+        The engine otherwise inherits HL DEFAULTS -- xyz builder coins land on ISOLATED margin and get
+        liquidated on normal moves (SNDK +4.8%, SPCX -11.3% on 2026-06-12). CROSS = the whole account
+        backs each position, so a single coin's move can't isolate-liquidate it. We do NOT lower leverage
+        (Alberto: the leverage number barely matters under cross with our fixed order size); we set it at
+        the coin's FULL max so cross is the only change. Idempotent (tracked in _leverage_set). HL accepts
+        cross on builder dexes (verified). Best-effort: failure is logged, never blocks trading."""
+        if self.shadow_mode or coin in self._leverage_set:
+            return
+        # codex: mark ONLY on success (a transient failure must NOT permanently mark the coin
+        # "protected" while it's still isolated). 60s failure-backoff so a persistent reject doesn't
+        # spam every trade.
+        if time.time() - self._leverage_set_fail.get(coin, 0) < 60:
+            return
+        lev = int(self._raw_max_leverage.get(coin, self.max_leverage.get(coin, 5)))   # FULL max, not lowered
+        try:
+            self.exchange.update_leverage(lev, coin, is_cross=True)
+            self._leverage_set.add(coin)   # success -> never retry
+            logger.info(f"LEVERAGE SET: {coin} -> {lev}x CROSS (margin-mode fix; leverage unchanged)")
+        except Exception as e:
+            self._leverage_set_fail[coin] = time.time()   # retry on a later entry
+            logger.warning(f"LEVERAGE SET failed for {coin} ({lev}x cross): {e}")
+
     def _check_margin_budget(self, coin: str, additional_notional: float, wallet: str = None) -> bool:
         """Check if we can afford this entry. Uses per-wallet config for concentration and addon caps."""
         if not self._refresh_exchange_state():
@@ -1367,6 +1404,10 @@ class CopyTrader:
         if getattr(self, '_kill_switch_active', False):
             logger.debug(f"Entry blocked (kill switch active): {coin}")
             return
+
+        # Force CROSS margin + capped leverage on this coin before trading it (once per coin).
+        # Stops the xyz isolated-margin liquidations (Alberto 9430).
+        self._set_coin_leverage(coin)
 
         now = time.time()
         twap_wallet = wallet if wallet else "unknown"
@@ -3010,6 +3051,8 @@ class CopyTrader:
             # Also capture markPx as a backup for stale mid prices.
             exchange_positions = {}
             exchange_mark_prices = {}
+            used_cache_fallback = False     # True if we fell back to the webData2 cache (not authoritative
+                                            # enough for the liquidation-reconcile -- may be pre-liquidation)
             queries_ok = {"main": False}
             for dex_name in BUILDER_DEXES:
                 queries_ok[dex_name] = False
@@ -3052,6 +3095,27 @@ class CopyTrader:
                                     pass
                 except Exception as exc:
                     logger.warning(f"Reconcile {dex_name} dex query failed: {exc}")
+
+            # NON-BLOCKING reliability fallback (replaces a blocking retry, codex): if a reconcile REST
+            # query failed but the webData2-maintained _exch_positions cache is FRESH (<60s), use it as
+            # the authoritative position set rather than treating everything as exchange=0 (which caused
+            # the spurious mass-drift false alarms). _exch_positions carries signed szi per coin (main via
+            # webData2 push + builders via the cached REST in _refresh_exchange_state).
+            if not all(queries_ok.values()):
+                cache_age = time.time() - getattr(self, "_equity_cache_ts", 0)
+                cache = getattr(self, "_exch_positions", {}) or {}
+                if cache_age < 60 and cache:
+                    for _c, _d in cache.items():
+                        if _c not in exchange_positions:           # don't overwrite a query that DID succeed
+                            try:
+                                exchange_positions[_c] = float(_d.get("szi", 0))
+                            except (TypeError, ValueError):
+                                pass
+                    for _k in list(queries_ok):
+                        queries_ok[_k] = True                       # cache is reliable -> treat as ok
+                    used_cache_fallback = True
+                    logger.info(f"Reconcile: REST query failed; used fresh webData2 cache "
+                                f"({cache_age:.0f}s old, {len(cache)} positions) instead of flagging mass-drift")
 
             # 2026-05-23 (codex review): gate the cancel-pending cleanup behind
             # successful queries too. Same class of bug — `exchange_positions.get(coin, 0)`
@@ -3170,7 +3234,7 @@ class CopyTrader:
             # exchange truth (Rule 8), clearing the liquidated phantom WITHOUT touching any live
             # re-entered position. Only ever REDUCES tracked magnitude; guarded by query success so a
             # transient query miss can never drop a real position.
-            if not self.shadow_mode and all_queries_ok and self._liquidated_coins:
+            if not self.shadow_mode and all_queries_ok and self._liquidated_coins and not used_cache_fallback:
                 _now = time.time()
                 for coin, liq_ts in list(self._liquidated_coins.items()):
                     if _now - liq_ts > 7200:                 # 2h window then forget
