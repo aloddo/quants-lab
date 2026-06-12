@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """
-HL Copy Trader V11 -- Unified engine merging V9 (DCA/TWAP) and V10 (momentum/instant).
+========================================================================================
+THIS IS THE LIVE V17 BASE ENGINE.  *** EDIT HERE for the live bot. ***
+The live process runs hl_copy_trader_v17.py, whose class chain is:
+    V17CopyTrader (hl_copy_trader_v17.py = thin entry: expansion + knet + seed/staleness)
+      -> V16CopyTrader (hl_copy_trader_v16.py = liquid-whitelist hard guard, thin)
+        -> CopyTrader   (THIS FILE, hl_copy_trader_v15.py = the actual engine: entry/exit/
+                          sizing/margin/WS/tilt/webData2/persistence).
+So almost all engine logic + edits land in THIS file. hl_copy_trader_v11.py is DEAD (deleted
+2026-06-12). Logs are tagged [hl_copy_v17] (renamed from the legacy "hl_copy_v11" that wrongly
+implied v11 was live and cost a full debugging detour, 2026-06-12).
+========================================================================================
+
+HL Copy Trader V15 base -- unified engine merging V9 (DCA/TWAP) and V10 (momentum/instant),
+proportional sizing, H17xE1 size-tilt, webData2 WS account state.
 
 Per-wallet configuration from JSON: entry mode, add-on behavior, exit params, entry guards.
-Dynamic coin subscription: trades for ALL perp coins, l2Book only for active coins.
 
-Usage:
-    python scripts/hl_copy_trader_v11.py [--config config/copy_trader_wallets.json] [--size 11] [--shadow]
+Usage (do NOT run directly; the launcher runs hl_copy_trader_v17.py):
+    python strategies/live/hl_copy_trader_v17.py --config config/copy_trader_wallets_v17_expansion.json
 """
 import argparse
 import asyncio
@@ -31,7 +43,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("hl_copy_v11")
+logger = logging.getLogger("hl_copy_v17")   # live tag (was "hl_copy_v11"; renamed 2026-06-12)
 
 HL_API = "https://api.hyperliquid.xyz"
 HL_WS = "wss://api.hyperliquid.xyz/ws"
@@ -1204,9 +1216,16 @@ class CopyTrader:
         # + the global -15% stop, NOT an artificial per-coin notional clamp). So they apply in FIXED mode
         # only. In proportional mode the binding constraints above (total util, coin concentration) stand.
         if self.sizing_mode != "proportional":
-            if coin_notional > max_addon_mult * self.order_size:
+            # Per-coin notional cap. The H17xE1 up-tilt intentionally sizes FAVORED entries above
+            # base, so a SINGLE tilted entry must not be blocked by its own notional (else the cap
+            # neuters exactly the favored entries we want). Cap at max(addon x base, this entry's
+            # notional); cumulative stacking beyond that is still blocked, and the 35%-equity hard cap
+            # below + margin-util remain the binding outer bounds.
+            coin_cap = max(max_addon_mult * self.order_size, additional_notional)
+            if coin_notional > coin_cap:
                 logger.info(
-                    f"Margin BLOCKED {coin}: notional ${coin_notional:.0f} > {max_addon_mult}x base ${self.order_size}"
+                    f"Margin BLOCKED {coin}: notional ${coin_notional:.0f} > cap ${coin_cap:.0f} "
+                    f"(addon {max_addon_mult}x base ${self.order_size}; tilted entry ${additional_notional:.0f})"
                 )
                 return False
             # Hard cap: no single coin > 35% of equity in notional terms
