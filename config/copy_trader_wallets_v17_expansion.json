@@ -13,7 +13,7 @@
     "exit_min_trim_pct": 0.85,
     "full_exit_trim_pct": 0.85,
     "exit_min_trim_usd": 1000000000.0,
-    "max_chase_bps": 15,
+    "max_chase_bps": 50,
     "max_spread_bps": 20,
     "min_book_depth_usd": 3000,
     "target_equity_max_age_s": 120,
