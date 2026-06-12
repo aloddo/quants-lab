@@ -282,10 +282,12 @@ class CopyTrader:
         # V17 NEVER computes PnL internally. This cache is the ONLY source.
         self._exch_pnl = {
             "account_net": 0.0,    # all fills: closedPnl - fees
-            "v17_net": 0.0,        # V17-attributed fills only
+            "v17_net": 0.0,        # V17-attributed fills only (incl. liquidations of our positions)
             "v17_closes": 0,       # V17 closing fill count
             "account_closes": 0,   # all closing fills
             "fees": 0.0,           # total fees
+            "liquidations": 0,     # count of our positions force-liquidated by HL
+            "liquidation_pnl": 0.0,
             "last_sync": 0.0,      # timestamp of last successful sync
         }
         self._last_successful_sync = 0
@@ -314,6 +316,8 @@ class CopyTrader:
         self._exit_twap_buffer = {}
         self._book_depth = {}
         self._seen_tids = {}
+        self._seen_liq_tids = set()       # liquidation fill tids already recorded (dedup)
+        self._liquidated_coins = {}       # coin -> ts of last confirmed liquidation (reconciler trigger)
         self._post_exit_cooldown = {}  # (wallet, coin) -> timestamp of last exit
 
         # Dynamic l2Book subscriptions: coins we currently need book data for
@@ -3159,6 +3163,59 @@ class CopyTrader:
                 phantom_coins = [k[1] for k in phantom_keys]
                 logger.info(f"RECONCILE: removed {len(phantom_keys)} phantom positions: {phantom_coins}")
                 _tg(f"Cleaned {len(phantom_keys)} phantom positions: {', '.join(phantom_coins)}")
+
+            # ── LIQUIDATION RECONCILE (Alberto 9420) ─────────────────────────────────────────
+            # A CONFIRMED liquidation (fill carried HL's liquidation marker) is positive proof the
+            # position was force-closed -- so we may safely reconcile the coin's tracked lots DOWN to
+            # exchange truth (Rule 8), clearing the liquidated phantom WITHOUT touching any live
+            # re-entered position. Only ever REDUCES tracked magnitude; guarded by query success so a
+            # transient query miss can never drop a real position.
+            if not self.shadow_mode and all_queries_ok and self._liquidated_coins:
+                _now = time.time()
+                for coin, liq_ts in list(self._liquidated_coins.items()):
+                    if _now - liq_ts > 7200:                 # 2h window then forget
+                        self._liquidated_coins.pop(coin, None); continue
+                    lots = [tp for tp in self.positions if tp.get('filled') and tp['coin'] == coin]
+                    if not lots:
+                        self._liquidated_coins.pop(coin, None); continue
+                    exch_net = float(exchange_positions.get(coin, 0.0))   # signed; absent==0 (queries_ok)
+                    tracked_net = sum((tp['size'] if tp['side'] == 'BUY' else -tp['size']) for tp in lots)
+                    # codex: only reduce magnitude when tracked and exchange are the SAME side (or
+                    # exchange is flat). A sign MISMATCH (tracked long vs exchange short, or vice versa)
+                    # is NOT a simple liquidation-shrink -- do not blind-reduce; warn + leave for the
+                    # next cycle / manual, and do NOT clear the trigger.
+                    if abs(exch_net) > 1e-9 and (tracked_net > 0) != (exch_net > 0):
+                        logger.warning(
+                            f"LIQUIDATION RECONCILE SKIP {coin}: sign mismatch tracked={tracked_net:.6f} "
+                            f"exchange={exch_net:.6f} -- not a simple shrink, leaving for manual/next.")
+                        continue
+                    excess = abs(tracked_net) - abs(exch_net)
+                    if excess <= 1e-9:                        # tracked already <= exchange
+                        self._liquidated_coins.pop(coin, None); continue
+                    removed = []
+                    for tp in sorted(lots, key=lambda t: t.get('entry_time', 0)):  # oldest (liquidated) first
+                        if excess <= 1e-9:
+                            break
+                        if tp['size'] <= excess + 1e-9:
+                            excess -= tp['size']; removed.append(tp)
+                        else:
+                            tp['size'] = round(tp['size'] - excess, 8); excess = 0.0
+                            self._persist_position(tp)
+                    for tp in removed:
+                        self._remove_persisted_position(tp.get('wallet', ''), coin)
+                        self._position_accumulated.pop((tp.get('wallet', ''), coin), None)
+                    if removed:
+                        _rm = {id(t) for t in removed}
+                        self.positions = [tp for tp in self.positions if id(tp) not in _rm]
+                    logger.warning(
+                        f"LIQUIDATION RECONCILE: {coin} tracked {tracked_net:.6f} -> exchange {exch_net:.6f} "
+                        f"(dropped {len(removed)} liquidated lot(s)); phantom cleared")
+                    try:
+                        _tg(f"Liquidation reconcile: {coin} tracking now matches exchange ({exch_net:.4f})")
+                    except Exception:
+                        pass
+                    self._liquidated_coins.pop(coin, None)
+
             # 2026-05-23 (codex review): only mark cycle complete if queries succeeded.
             # Otherwise allow retry on the next 5-min boundary (no premature backoff).
             if all_queries_ok:
@@ -3272,11 +3329,25 @@ class CopyTrader:
 
             # Store new fills (dedup by tid -- unique per fill on exchange)
             new_fills = 0
+            _wall_ms = int(time.time() * 1000)
             for f in recent:
                 tid = f.get('tid')
                 oid = int(f.get('oid', 0))
                 if not tid:
                     continue
+                # Record liquidations for the reconciler (positive confirmation a position was
+                # force-closed -> safe to reconcile tracked lots down to exchange truth, Rule 8).
+                # codex: use the FILL's own time (not wall-clock) + a recency gate, so an OLD
+                # liquidation re-returned by user_fills() after a restart can NOT retrigger a reconcile
+                # that drops current tracking.
+                _ftime = int(f.get('time', 0))
+                if f.get('liquidation') and tid not in self._seen_liq_tids and _ftime > _wall_ms - 7_200_000:
+                    self._seen_liq_tids.add(tid)
+                    self._liquidated_coins[f['coin']] = _ftime / 1000.0   # seconds (reconcile uses time.time())
+                    logger.warning(
+                        f"LIQUIDATION: {f['coin']} {f['side']} sz={f['sz']} @ {f['px']} "
+                        f"closedPnl={f.get('closedPnl')} (HL force-close; tracking will reconcile to exchange)"
+                    )
                 try:
                     self.db[DB_EXCHANGE_FILLS].update_one(
                         {"tid": tid},
@@ -3294,7 +3365,14 @@ class CopyTrader:
                             "dir": f.get('dir', ''),
                             "startPosition": f.get('startPosition', ''),
                             "feeToken": f.get('feeToken', 'USDC'),
-                        }},
+                         },
+                         # is_liquidation via $set (NOT $setOnInsert) so it BACKFILLS docs ingested
+                         # before this patch (codex). HL marks liquidation fills with a 'liquidation'
+                         # object; a liquidation of OUR position IS ours (HL places the close so its oid
+                         # is not in our recorded oids) -- we attribute + count it, not leave it
+                         # "unattributed" (Alberto 9420: liquidations are a first-class metric).
+                         "$set": {"is_liquidation": bool(f.get('liquidation'))},
+                        },
                         upsert=True,
                     )
                     new_fills += 1
@@ -3309,24 +3387,33 @@ class CopyTrader:
             v17_pnl = 0.0
             v17_fees = 0.0
             v17_closes = 0
+            liq_count = 0     # liquidations (our positions force-closed by HL)
+            liq_pnl = 0.0
 
             # V16: step-2 compute honors the same pnl epoch as step-1 ingest, so pre-epoch rows that
             # ever landed in the collection (e.g. a sync that ran before the epoch attr was set) can
             # never leak into account_net. Legacy default: epoch 0 -> no filter change.
             _q = {"time": {"$gte": epoch_ms}} if getattr(self, "pnl_epoch_ms", 0) else {}
-            for doc in self.db[DB_EXCHANGE_FILLS].find(_q, {"closedPnl": 1, "fee": 1, "oid": 1}):
+            for doc in self.db[DB_EXCHANGE_FILLS].find(_q, {"closedPnl": 1, "fee": 1, "oid": 1, "is_liquidation": 1}):
                 pnl = float(doc.get("closedPnl", 0))
                 fee = float(doc.get("fee", 0))
                 oid = doc.get("oid")
+                is_liq = bool(doc.get("is_liquidation"))
                 total_pnl += pnl
                 total_fees += fee
                 if abs(pnl) > 0.0001:
                     total_closes += 1
-                if oid in v17_oids:
+                # Attribute to V17 if it's our recorded order OR a liquidation of our position (HL
+                # places the liquidation order, so its oid is NOT in v17_oids -- but the position was
+                # ours, so the PnL is ours). This is what was previously leaking to "unattributed".
+                if oid in v17_oids or is_liq:
                     v17_pnl += pnl
                     v17_fees += fee
                     if abs(pnl) > 0.0001:
                         v17_closes += 1
+                if is_liq and abs(pnl) > 0.0001:
+                    liq_count += 1
+                    liq_pnl += pnl
 
             total_net = total_pnl - total_fees
             v17_net = v17_pnl - v17_fees
@@ -3340,6 +3427,8 @@ class CopyTrader:
                 "v17_closes": v17_closes,
                 "account_closes": total_closes,
                 "fees": total_fees,
+                "liquidations": liq_count,
+                "liquidation_pnl": liq_pnl,
                 "last_sync": time.time(),
             }
             self._last_successful_sync = time.time()
@@ -3348,6 +3437,7 @@ class CopyTrader:
                 logger.info(
                     f"PNL SYNC: account=${total_net:+.4f} (closes={total_closes} fees=${total_fees:.4f}) "
                     f"| V17=${v17_net:+.4f} (closes={v17_closes} fees=${v17_fees:.4f}) "
+                    f"| liquidations={liq_count} (${liq_pnl:+.4f}) "
                     f"| unattributed=${unattributed_pnl:+.4f}"
                 )
 
@@ -3441,6 +3531,7 @@ class CopyTrader:
             f"STATS: acct=${ep['account_net']:+.4f}({ep['account_closes']}) "
             f"v17=${ep['v17_net']:+.4f}({ep['v17_closes']}) "
             f"fees=${ep['fees']:.2f} uPnL=${total_upnl:+.4f} "
+            f"liq={ep.get('liquidations', 0)}(${ep.get('liquidation_pnl', 0.0):+.2f}) "
             f"open={len(open_pos)}[{open_coins}] margin={margin_pct:.0f}% eq=${equity or 0:.2f} "
             f"sync={sync_age}s{tilt_str}"
         )
