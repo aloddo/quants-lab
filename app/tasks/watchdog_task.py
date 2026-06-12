@@ -67,7 +67,7 @@ V11_LOG_PATH = "/private/tmp/ql-v12-copy-trader-launchd.log"
 # V15 (hl_prop_copy) is SILENT when idle (no per-minute STATS), so log-staleness is a weak signal:
 # 30min, and even then it only fires if the in-process watchdog (90s force-restart) ALSO failed.
 V11_STATS_STALE_MINUTES = 30
-V11_PROCESS_NAME = "hl_copy_trader_v16.py"   # V16 live copy trader (replaced hl_prop_copy.py 2026-06-11 go-live)
+V11_PROCESS_NAME = "hl_copy_trader_v17.py"   # live copy engine (single consolidated file, 2026-06-12)
 
 # Self-healing limits
 HB_MAX_RESTARTS_PER_6H = 2
