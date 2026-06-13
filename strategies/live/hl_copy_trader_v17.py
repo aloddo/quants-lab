@@ -32,6 +32,10 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from pymongo import MongoClient
 
+# Repo root for repo-relative artifact paths (parquet tilt artifacts, calib JSON, etc.).
+# strategies/live/hl_copy_trader_v17.py -> parent.parent.parent == repo root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -263,11 +267,19 @@ class CopyTrader:
         self._tilt_e1_kopp_max = int(self.global_config.get("tilt_e1_kopp_max", 3))
         self._tilt_cap = float(self.global_config.get("tilt_cap", 2.0))          # mult ceiling
         self._tilt_floor = float(self.global_config.get("tilt_floor", 0.33))     # mult floor
+        # MID-equity selection tilt (3rd factor; HOLD: $10k-100k leaders +26-77bps, indep of H17;
+        # brain plans/quant/2026-06-13-mid-equity-tilt-design). Over-weight MID, down-weight minnow,
+        # PRO/whale/unknown NEUTRAL (never penalize unknown). Self-validating via the counterfactual.
+        self._tilt_equity_enabled = bool(self.global_config.get("tilt_equity_enabled", True))
+        self._tilt_equity_mid = float(self.global_config.get("tilt_equity_mid", 1.4))      # $10k-100k BOOST
+        self._tilt_equity_minnow = float(self.global_config.get("tilt_equity_minnow", 0.66))  # <$10k CUT
         self._tilt_log = []          # (close_ts, pnl_bps, mult, notional) -- counterfactual window
         self._tilt_disabled_alerted = False
         self._h17_tercile = {}       # wallet(lower) -> 1|2|3 (1=T1 lowest crossed_share = favored)
+        self._equity_band = {}       # wallet(lower) -> band {minnow|mid|pro|whale|unknown}
         if self._tilt_enabled:
             self._load_h17_terciles()
+            self._load_equity_bands()
 
         # State
         self.positions = []
@@ -342,7 +354,12 @@ class CopyTrader:
                 self._set_coin_leverage(_c)
                 time.sleep(0.15)   # gentle pacing to avoid a rate-limit burst
             if held_coins:
-                logger.info(f"LEVERAGE: forced CROSS on {len(held_coins)} held coins at startup")
+                _n_builder = sum(1 for _c in held_coins if self._is_builder_dex(_c))
+                _n_cross = len(held_coins) - _n_builder
+                logger.info(
+                    f"LEVERAGE: configured {len(held_coins)} held coins at startup "
+                    f"(non-builder {_n_cross} CROSS @maxcap, builder-dex {_n_builder} ISOLATED 5x)"
+                )
 
     def _resolve_vault_leaders(self):
         """Check if any target wallets are vaults. If so, add their leader address
@@ -857,7 +874,7 @@ class CopyTrader:
         Reads the persisted v17_cohort_crossed_share parquet; wallets absent -> T3."""
         try:
             import pandas as pd
-            p = "/Users/hermes/quants-lab/app/data/v16/v17_cohort_crossed_share.parquet"
+            p = _REPO_ROOT / "app" / "data" / "v16" / "v17_cohort_crossed_share.parquet"
             df = pd.read_parquet(p)
             df["wallet"] = df["wallet"].str.lower()
             df = df[df.wallet.isin({w.lower() for w in self.target_set})]
@@ -872,7 +889,9 @@ class CopyTrader:
             logger.info(f"H17 tilt loaded: {len(self._h17_tercile)} wallets ranked, "
                         f"{t1} in T1; h17 t1={self._tilt_h17_t1}/t3={self._tilt_h17_t3} "
                         f"e1 fav={self._tilt_e1_fav}/unfav={self._tilt_e1_unfav} "
-                        f"(k_opp<={self._tilt_e1_kopp_max}) clamp[{self._tilt_floor},{self._tilt_cap}]")
+                        f"(k_opp<={self._tilt_e1_kopp_max}) "
+                        f"equity[en={self._tilt_equity_enabled} mid={self._tilt_equity_mid}/"
+                        f"minnow={self._tilt_equity_minnow}] clamp[{self._tilt_floor},{self._tilt_cap}]")
             # codex: a prior auto-disable must survive restart (don't silently re-enable).
             try:
                 st = self.db["v17_tilt_state"].find_one({"_id": "tilt"})
@@ -886,6 +905,48 @@ class CopyTrader:
         except Exception as e:
             logger.warning(f"H17 tilt load failed ({e}); tilt DISABLED")
             self._tilt_enabled = False
+
+    def _load_equity_bands(self):
+        """Load the per-cohort-wallet MID-equity band (3rd tilt factor).
+        Reads v17_cohort_equity_band.parquet [wallet, eq_med, band]. File-missing -> empty
+        dict (everyone neutral; H17xE1 tilt still works). band in
+        {minnow|mid|pro|whale|unknown}; only minnow/mid change the multiplier."""
+        _VALID_BANDS = {"minnow", "mid", "pro", "whale", "unknown"}
+        try:
+            import pandas as pd
+            p = _REPO_ROOT / "app" / "data" / "v16" / "v17_cohort_equity_band.parquet"
+            df = pd.read_parquet(p)
+            df["wallet"] = df["wallet"].astype(str).str.lower()
+            # FIX 7: band lookup is case/whitespace sensitive -- normalize, then validate the vocabulary.
+            df["band"] = df["band"].astype(str).str.strip().str.lower()
+            _unexpected = set(df["band"].unique()) - _VALID_BANDS
+            if _unexpected:
+                logger.warning(f"MID-equity tilt: unexpected band values {sorted(_unexpected)} "
+                               f"(expected {sorted(_VALID_BANDS)}); they will be treated as neutral")
+            self._equity_band = dict(zip(df["wallet"], df["band"]))
+            from collections import Counter
+            counts = dict(Counter(self._equity_band.values()))
+            logger.info(f"MID-equity tilt loaded: {len(self._equity_band)} wallets banded, "
+                        f"counts={counts}; mid x{self._tilt_equity_mid} "
+                        f"minnow x{self._tilt_equity_minnow} (pro/whale/unknown neutral)")
+        except FileNotFoundError:
+            # Graceful fallback (everyone neutral) -- but NOISY when the tilt was actually requested,
+            # so a missing artifact silently disabling the MID-equity tilt is visible in the log.
+            if getattr(self, "_tilt_equity_enabled", False):
+                logger.warning("ALERT: MID-equity tilt REQUESTED (tilt_equity_enabled=true) but band "
+                               f"parquet is MISSING at {p}; MID-equity tilt DISABLED, all wallets "
+                               "NEUTRAL (H17xE1 tilt unaffected). Build the artifact to enable it.")
+            else:
+                logger.warning("MID-equity tilt: band parquet missing; all wallets NEUTRAL "
+                               "(H17xE1 tilt unaffected)")
+            self._equity_band = {}
+        except Exception as e:
+            if getattr(self, "_tilt_equity_enabled", False):
+                logger.warning(f"ALERT: MID-equity tilt REQUESTED but band load FAILED ({e}); "
+                               "MID-equity tilt DISABLED, all wallets NEUTRAL.")
+            else:
+                logger.warning(f"MID-equity tilt load failed ({e}); all wallets NEUTRAL")
+            self._equity_band = {}
 
     def _count_opposite_leaders(self, coin: str, is_buy: bool) -> int:
         """E1 k_opp: number of OTHER tracked leaders currently holding a position
@@ -903,7 +964,9 @@ class CopyTrader:
     def _tilt_mult(self, wallet: str, coin: str, is_buy: bool):
         """BOTH-tilt multiplier for a NEW entry (Alberto: up favored AND down unfavored).
         H17: T1 wallet -> x h17_t1 (boost), T3 -> x h17_t3 (cut), T2 -> 1.0.
-        E1: k_opp<=max -> x e1_fav (boost), else x e1_unfav (cut). Multiplicative, clamped
+        E1: k_opp<=max -> x e1_fav (boost), else x e1_unfav (cut).
+        MID-equity: band==mid -> x tilt_equity_mid (boost), band==minnow -> x tilt_equity_minnow
+        (cut), pro/whale/unknown -> x1.0 (NEVER penalize unknown). Multiplicative, clamped
         to [tilt_floor, tilt_cap]. Returns (mult, k_opp). (1.0, None) when disabled."""
         if not self._tilt_enabled:
             return 1.0, None
@@ -915,6 +978,13 @@ class CopyTrader:
             m *= self._tilt_h17_t3
         k_opp = self._count_opposite_leaders(coin, is_buy)
         m *= self._tilt_e1_fav if k_opp <= self._tilt_e1_kopp_max else self._tilt_e1_unfav
+        if self._tilt_equity_enabled:
+            band = self._equity_band.get(wallet.lower(), "unknown")
+            if band == "mid":
+                m *= self._tilt_equity_mid
+            elif band == "minnow":
+                m *= self._tilt_equity_minnow
+            # pro / whale / unknown -> x1.0 (no change; never penalize unknown)
         return min(max(m, self._tilt_floor), self._tilt_cap), k_opp
 
     def _log_tilt_outcome(self, pnl_bps: float, mult: float, notional: float):
@@ -1175,17 +1245,38 @@ class CopyTrader:
         self._refresh_exchange_state()
         return self._equity_cache
 
+    @staticmethod
+    def _is_builder_dex(coin: str) -> bool:
+        # codex r2 FIX B: HIP-3 builder-dex coins (xyz:*, flx:*, ...) reject CROSS the same way and
+        # must run ISOLATED low-leverage. Single predicate so leverage + margin mode never drift.
+        return coin.startswith("xyz:") or coin.startswith("flx:")
+
     def _get_coin_leverage(self, coin: str) -> int:
+        # SINGLE SOURCE OF TRUTH for the leverage used in ALL margin budgeting / pending-margin /
+        # shadow-util reservations. Builder-dex coins (xyz:*, flx:*) run ISOLATED 5x on the exchange
+        # (see _set_coin_leverage), so they MUST reserve margin at 5x here too -- using the ~10x
+        # config/metadata cap would under-reserve margin and make the util gate optimistic.
+        if self._is_builder_dex(coin):
+            return 5
         return self.max_leverage.get(coin, 3)
 
     def _set_coin_leverage(self, coin: str):
-        """Force CROSS margin on the exchange for this coin (Alberto 9430/9432).
-        The engine otherwise inherits HL DEFAULTS -- xyz builder coins land on ISOLATED margin and get
-        liquidated on normal moves (SNDK +4.8%, SPCX -11.3% on 2026-06-12). CROSS = the whole account
-        backs each position, so a single coin's move can't isolate-liquidate it. We do NOT lower leverage
-        (Alberto: the leverage number barely matters under cross with our fixed order size); we set it at
-        the coin's FULL max so cross is the only change. Idempotent (tracked in _leverage_set). HL accepts
-        cross on builder dexes (verified). Best-effort: failure is logged, never blocks trading."""
+        """Set per-coin margin mode + leverage on the exchange (Alberto 9430/9432).
+        The engine otherwise inherits HL DEFAULTS -- coins land on ISOLATED margin and get liquidated on
+        normal moves (SNDK +4.8%, SPCX -11.3% on 2026-06-12).
+
+        Two regimes:
+        - Regular perps: force CROSS at the coin's FULL max. CROSS = the whole account backs each position,
+          so a single coin's move can't isolate-liquidate it. We do NOT lower the leverage number
+          (Alberto: it barely matters under cross with our fixed order size); cross is the only change.
+        - xyz: HIP-3 builder coins: CROSS is impossible (HL rejects it -> status 'err'), which previously
+          made us FALSE-LOG "CROSS" while the position stayed ISOLATED 20x. For these we instead set
+          ISOLATED leverage to 5 (low) so an isolated liquidation needs a ~20% adverse move, not ~5%.
+
+        Idempotent (tracked in _leverage_set). Best-effort: failure is logged, never blocks trading.
+
+        NOTE: exchange.update_leverage returns a VALUE dict {'status':'ok'|'err', ...}; it does NOT raise
+        on an API-level reject. We must inspect the returned status -- only mark the coin done on 'ok'."""
         if self.shadow_mode or coin in self._leverage_set:
             return
         # codex: mark ONLY on success (a transient failure must NOT permanently mark the coin
@@ -1193,14 +1284,38 @@ class CopyTrader:
         # spam every trade.
         if time.time() - self._leverage_set_fail.get(coin, 0) < 60:
             return
-        lev = int(self._raw_max_leverage.get(coin, self.max_leverage.get(coin, 5)))   # FULL max, not lowered
+
+        is_builder = self._is_builder_dex(coin)
+        if is_builder:
+            # ISOLATED 5x for HIP-3 builder-dex coins (xyz:*, flx:*). The 5 is the SAME value
+            # _get_coin_leverage returns for builder-dex (single source of truth) so exchange mode
+            # and margin reservation never drift. CROSS is rejected by HL for these dexes.
+            lev, is_cross = self._get_coin_leverage(coin), False
+        else:
+            lev = int(self._raw_max_leverage.get(coin, self.max_leverage.get(coin, 5)))   # FULL max
+            is_cross = True                                            # CROSS for regular perps
+        mode = "CROSS" if is_cross else "ISOLATED"
         try:
-            self.exchange.update_leverage(lev, coin, is_cross=True)
-            self._leverage_set.add(coin)   # success -> never retry
-            logger.info(f"LEVERAGE SET: {coin} -> {lev}x CROSS (margin-mode fix; leverage unchanged)")
+            # SDK CONTRACT (assumed): exchange.update_leverage returns a dict {'status': 'ok'|'err', ...}
+            # on an API-level outcome and does NOT raise on a reject. We treat status=='ok' as the ONLY
+            # success. Anything else (status=='err', None, or a non-dict the SDK might return) is treated
+            # as a transient failure: we record the fail ts so the 60s backoff retries on a later entry --
+            # we do NOT add the coin to _leverage_set, so it is NEVER permanently skipped. This is safe
+            # even if a future SDK returns None on SUCCESS: the coin just gets re-set on the next entry
+            # (idempotent on the exchange), rather than being falsely marked done while still isolated.
+            resp = self.exchange.update_leverage(lev, coin, is_cross=is_cross)
+            status = resp.get("status") if isinstance(resp, dict) else None
+            if status == "ok":
+                self._leverage_set.add(coin)   # success -> never retry
+                logger.info(f"LEVERAGE SET: {coin} -> {lev}x {mode}")
+            else:
+                # API-level reject or unexpected return (NOT an exception). Keep the 60s backoff; do NOT
+                # mark done; log the actual response and the mode we attempted (never false-log success).
+                self._leverage_set_fail[coin] = time.time()
+                logger.warning(f"LEVERAGE SET rejected for {coin} ({lev}x {mode}): {resp}")
         except Exception as e:
             self._leverage_set_fail[coin] = time.time()   # retry on a later entry
-            logger.warning(f"LEVERAGE SET failed for {coin} ({lev}x cross): {e}")
+            logger.warning(f"LEVERAGE SET failed for {coin} ({lev}x {mode}): {e}")
 
     def _check_margin_budget(self, coin: str, additional_notional: float, wallet: str = None) -> bool:
         """Check if we can afford this entry. Uses per-wallet config for concentration and addon caps."""
@@ -3590,7 +3705,8 @@ class CopyTrader:
                 a = self._tilt_advantage(self._tilt_log[-100:])
                 if a is not None:
                     adv = f" adv={a:+.0f}bp"
-            tilt_str = f" tilt={'ON' if self._tilt_enabled else 'OFF'}(n={n}{adv})"
+            eqf = "+eq" if getattr(self, "_tilt_equity_enabled", False) and self._equity_band else ""
+            tilt_str = f" tilt={'ON' if self._tilt_enabled else 'OFF'}{eqf}(n={n}{adv})"
         logger.info(
             f"STATS: acct=${ep['account_net']:+.4f}({ep['account_closes']}) "
             f"v17=${ep['v17_net']:+.4f}({ep['v17_closes']}) "
@@ -5012,9 +5128,10 @@ class V17CopyTrader(V16CopyTrader):
             return
         if k < self._v17_knet_min:
             self._v17_knet_rejects += 1
-            if self._v17_knet_rejects % 20 == 1:
-                logger.info(f"V17 KNET GATE: rejected {coin} {'BUY' if is_buy else 'SELL'} "
-                            f"knet={k} (total rejects {self._v17_knet_rejects})")
+            # Log EVERY knet reject at INFO (de-throttled; the %20 + restart-resetting counter hid most
+            # rejects from the human log even though they are all in mongo v17_gate_log).
+            logger.info(f"V17 KNET GATE: rejected {coin} {'BUY' if is_buy else 'SELL'} "
+                        f"knet={k} (total rejects {self._v17_knet_rejects})")
             try:
                 self.db.v17_gate_log.insert_one({
                     "coin": coin, "side": "BUY" if is_buy else "SELL", "knet": k,
@@ -5026,35 +5143,61 @@ class V17CopyTrader(V16CopyTrader):
 
         # exposure caps from OUR live filled positions PLUS in-flight reservations (codex P1.4:
         # concurrent entry tasks could all pass the cap before any IOC fill lands in positions).
+        # FIX 2: the base entry sends order_size * tilt_mult (up to _tilt_cap). The caps must NOT
+        # undercount the max tilted exposure, so:
+        #  - the NEW order reserves a CONSERVATIVE notional = order_size * _tilt_cap (over-reserve);
+        #  - EXISTING filled positions count their ACTUAL notional abs(size * entry_px), which already
+        #    bakes in whatever tilt they were opened with (more accurate than the old order_size proxy).
         eq = max(float(getattr(self, "_equity_cache", 0.0) or 0.0), 1.0)
         side_new = 1 if is_buy else -1
+        resv = self.order_size * self._tilt_cap   # conservative reserved notional for the new entry
         net = float(self._v17_pending_net)
         coin_side = float(self._v17_pending_coin_side.get((coin, side_new), 0.0))
         for p in self.positions:
             if not p.get("filled"):
                 continue
             s = 1 if p.get("side") == "BUY" else -1
-            net += s * self.order_size
+            p_coin = p.get("coin")
+            p_size = abs(float(p.get("size", 0.0)))
+            p_px = float(p.get("entry_px", 0.0) or 0.0)
+            # codex r2 FIX A: a 0 entry_px (DB-load default, unvalidated exchange recovery, add-on
+            # reconstruction) would count 0 notional and make a REAL position invisible to the
+            # net/coin-side caps. Never count 0 for a nonzero-size position: fall back to
+            # (1) live mid * size, (2) exchange positionValue, (3) conservative order_size*tilt_cap.
+            if p_px > 0:
+                p_notional = p_size * p_px
+            else:
+                _mid = float(self.mid_prices.get(p_coin, 0.0) or 0.0)
+                _exch_pv = float(self._exch_positions.get(p_coin, {}).get("positionValue", 0.0) or 0.0)
+                if p_size > 0 and _mid > 0:
+                    p_notional = p_size * _mid
+                elif _exch_pv > 0:
+                    p_notional = _exch_pv
+                elif p_size > 0:
+                    p_notional = self.order_size * self._tilt_cap   # conservative proxy
+                else:
+                    p_notional = 0.0   # truly zero-size position: nothing to count
+            net += s * p_notional
             if p.get("coin") == coin and s == side_new:
-                coin_side += self.order_size
-        if abs(net + side_new * self.order_size) > self._v17_netx_cap_x * eq \
-                and abs(net + side_new * self.order_size) > abs(net):
+                coin_side += p_notional
+        if abs(net + side_new * resv) > self._v17_netx_cap_x * eq \
+                and abs(net + side_new * resv) > abs(net):
             self._v17_netx_rejects += 1
             _tag = ""
             if self._v17_expansion_on:                 # codex req #4: NEW vs OLD cap-pressure audit
                 self._v17_tag_reject("netx", coin)
                 _tag = self._v17_coin_tag(coin) + " "
-            logger.info(f"V17 NETX CAP: rejected {_tag}{coin} (net {net:+.0f} cap "
+            logger.info(f"V17 NETX CAP: rejected {_tag}{coin} (net {net:+.0f} +resv {resv:.0f} cap "
                         f"{self._v17_netx_cap_x}x${eq:.0f}; total {self._v17_netx_rejects})")
             return
-        if coin_side + self.order_size > self._v17_coin_side_cap_x * eq:
+        if coin_side + resv > self._v17_coin_side_cap_x * eq:
             self._v17_coinside_rejects += 1
             _tag = ""
             if self._v17_expansion_on:                 # codex req #4
                 self._v17_tag_reject("coinside", coin)
                 _tag = self._v17_coin_tag(coin) + " "
             logger.info(f"V17 COIN-SIDE CAP: rejected {_tag}{coin} "
-                        f"({coin_side:.0f}+{self.order_size:.0f} > {self._v17_coin_side_cap_x}x${eq:.0f}; "
+                        f"({coin_side:.0f}+{resv:.0f} > {self._v17_coin_side_cap_x}x${eq:.0f}; "
                         f"total {self._v17_coinside_rejects})")
             return
 
@@ -5066,16 +5209,18 @@ class V17CopyTrader(V16CopyTrader):
                 "ts": datetime.now(timezone.utc)})
         except Exception:
             pass
-        # reserve in-flight exposure for the duration of the entry attempt (codex P1.4)
-        self._v17_pending_net += side_new * self.order_size
+        # reserve in-flight exposure for the duration of the entry attempt (codex P1.4).
+        # FIX 2: reserve the SAME conservative notional (order_size * _tilt_cap) the cap check used,
+        # so concurrent in-flight entries can't collectively exceed the cap via tilted sizing.
+        self._v17_pending_net += side_new * resv
         self._v17_pending_coin_side[(coin, side_new)] = \
-            self._v17_pending_coin_side.get((coin, side_new), 0.0) + self.order_size
+            self._v17_pending_coin_side.get((coin, side_new), 0.0) + resv
         try:
             return await super()._enter_position(coin, is_buy, twap_dedup_key=twap_dedup_key,
                                                  wallet=wallet, skip_cooldown=skip_cooldown)
         finally:
-            self._v17_pending_net -= side_new * self.order_size
-            _rem = self._v17_pending_coin_side.get((coin, side_new), 0.0) - self.order_size
+            self._v17_pending_net -= side_new * resv
+            _rem = self._v17_pending_coin_side.get((coin, side_new), 0.0) - resv
             if abs(_rem) < 1e-9:
                 self._v17_pending_coin_side.pop((coin, side_new), None)   # codex r2 P2: no clutter
             else:
