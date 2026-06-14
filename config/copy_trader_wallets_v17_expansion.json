@@ -89,7 +89,8 @@
       "per_coin_kill_n": 20,
       "expansion_kill_usd": -50.0
     },
-    "_expansion_note": "V17 universe-expansion config (agent K, 2026-06-12). expansion.coins = the 29 NET-POSITIVE deploy coins (7 crypto-main perps + 22 xyz builder coins) from the expansion research. coin_whitelist stays the validated BASELINE 10 (V16 asserts it == l2_calib_10coin keys EXACTLY); the engine MERGES baseline coin_whitelist + expansion.coins into the live whitelist AFTER super().__init__() (hl_copy_trader_v17._v17_init_expansion), so all 29 are admitted at both choke points and WS-subscribed (crypto via main dex, xyz via builder dex) without breaking the V16 exact-match assert. Guards: per-coin kill (realized<=-$25 OR n>=20 AND fee-net mean<0), expansion-wide kill (aggregate realized<=-$50). Each new coin disables itself (and, in aggregate, all new coins) without touching the baseline 10. Engine: absent 'expansion' block => guards inert, byte-identical to the live 10-coin config. Cross-wallet stacking is an ACCEPTED decision (Alberto: 'stacking is totally fine'); the caps + the -$50 expansion kill bound it -- no coin-level cap (codex P1.3)."
+    "_expansion_note": "V17 universe-expansion config (agent K, 2026-06-12). expansion.coins = the 29 NET-POSITIVE deploy coins (7 crypto-main perps + 22 xyz builder coins) from the expansion research. coin_whitelist stays the validated BASELINE 10 (V16 asserts it == l2_calib_10coin keys EXACTLY); the engine MERGES baseline coin_whitelist + expansion.coins into the live whitelist AFTER super().__init__() (hl_copy_trader_v17._v17_init_expansion), so all 29 are admitted at both choke points and WS-subscribed (crypto via main dex, xyz via builder dex) without breaking the V16 exact-match assert. Guards: per-coin kill (realized<=-$25 OR n>=20 AND fee-net mean<0), expansion-wide kill (aggregate realized<=-$50). Each new coin disables itself (and, in aggregate, all new coins) without touching the baseline 10. Engine: absent 'expansion' block => guards inert, byte-identical to the live 10-coin config. Cross-wallet stacking is an ACCEPTED decision (Alberto: 'stacking is totally fine'); the caps + the -$50 expansion kill bound it -- no coin-level cap (codex P1.3).",
+    "_bundle2_note": "2026-06-14 SHIP: concentration cap 0.35->0.50 ONLY (data: +10-25% return flat Calmar, 0.35 clipped high-edge entries; codex-verified safe fraction; brain research/2026-06-14-concentration-marginutil-cap-optimality). HELD: addon (inert via config -- engine never copies leader adds, needs a code change; codex 2026-06-14) + margin-util (Alberto leverage call)."
   },
   "defaults": {
     "group": "v16_top_decile",
@@ -98,7 +99,7 @@
     "min_twap_notional": 0,
     "max_addon_multiplier": 1,
     "max_coin_concentration": 1.0,
-    "max_coin_notional_pct": 0.35,
+    "max_coin_notional_pct": 0.5,
     "exit_type": "FIRST_CLOSE",
     "sl_bps": -1500,
     "trail_activate_bps": 600,
