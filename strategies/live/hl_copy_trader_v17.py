@@ -2690,8 +2690,10 @@ class CopyTrader:
             self._mid_price_ts[coin] = time.time()
             if coin not in self._l2_subscribed:
                 logger.info(f"V17: dynamic l2Book subscribe for {coin} (first target fill)")
-                # Will be subscribed on next _sync_l2_subscriptions cycle
-                self._l2_subscribed.add(coin)  # Mark for subscription
+                # codex 2026-06-14 P1 fix: do NOT pre-add to _l2_subscribed here -- that defeated
+                # _sync_l2_subscriptions (needed - _l2_subscribed excluded it) so the coin NEVER got a
+                # real l2Book and traded forever on the synthetic 5bps/$10k fallback. Leaving it absent
+                # lets the 30s sync send the real subscribe within one cycle.
         chase_bps = abs(mid - px) / px * 10000
         if chase_bps > max_chase_bps:
             logger.info(f"V17 SKIP {coin}: chase {chase_bps:.0f}bps > {max_chase_bps}bps")
@@ -2779,7 +2781,8 @@ class CopyTrader:
             self._mid_price_ts[coin] = now
             if coin not in self._l2_subscribed:
                 logger.info(f"TWAP: dynamic l2Book subscribe for {coin} (first target fill)")
-                self._l2_subscribed.add(coin)
+                # codex 2026-06-14 P1 fix: do NOT pre-add to _l2_subscribed (see _on_hl_trade) -- the 30s
+                # _sync_l2_subscriptions cycle sends the real subscribe; pre-adding here stranded it on fallback.
         else:
             # Update mid from latest fill price if our data is stale (>30s)
             if now - self._mid_price_ts.get(coin, 0) > 30:
