@@ -165,7 +165,9 @@ class CopyTrader:
         # cap -- a blow-up guard against margin mis-estimate). inf = pure uncapped (pending Alberto).
         self.gross_backstop_x = float(self.global_config.get("gross_backstop_x", float("inf")))
         self._baseline_equity = None      # session-start equity for the % global stop
-        self._flatten_requested = False   # set by the % stop / backstop -> _check_exits flattens all
+        self._flatten_requested = False   # set by the % loss stops -> _check_exits flattens all
+        self._trim_requested = False      # set by the gross backstop -> _check_exits TRIMS to target (self-heal)
+        self._trim_target_notional = 0.0
         # #5 equal-split denominator = the CONFIGURED copy wallets (NOT target_set, which also holds
         # vault-resolved leader addresses). Fixed at init -> a dead/skipped wallet just leaves its slice
         # idle (safe under-allocation), it never enlarges the others' slices (which would oversize).
@@ -1540,6 +1542,11 @@ class CopyTrader:
         if getattr(self, '_kill_switch_active', False):
             logger.debug(f"Entry blocked (kill switch active): {coin}")
             return
+        # codex 2026-06-15 #2: explicitly block NEW entries while the gross-backstop TRIM is in progress
+        # (do not rely on the possibly-stale gross-gate cache; no trim+open loop).
+        if getattr(self, '_trim_requested', False):
+            logger.info(f"Entry blocked (gross-backstop TRIM in progress): {coin}")
+            return
 
         # Force CROSS margin + capped leverage on this coin before trading it (once per coin).
         # Stops the xyz isolated-margin liquidations (Alberto 9430).
@@ -1874,6 +1881,56 @@ class CopyTrader:
                 logger.error(f"EMERGENCY FLATTEN clearinghouse query failed (dex={dex_name}): {e}")
         return n
 
+    async def _emergency_trim(self, target_notional: float) -> bool:
+        """Gross-backstop TRIM (Alberto 2026-06-15): close WORST-uPnL positions first (market_close,
+        reduce-only, exchange-truth) until total gross notional <= target_notional. Sheds the risk that
+        spiked us over the backstop while KEEPING winners. Returns True if already at/under target (done).
+        Idempotent: called every poll until done. Tracker reconciled by caller."""
+        positions = []  # (coin, notional, upnl)
+        reads_ok = 0   # codex 2026-06-15 #1: only declare DONE if reads actually succeeded (a failed/empty
+        n_dex = 0      # read must NOT zero cur_gross and falsely self-heal while still over the backstop)
+        for dex_name in [""] + BUILDER_DEXES:
+            n_dex += 1
+            try:
+                payload = {"type": "clearinghouseState", "user": self.parent_address}
+                if dex_name:
+                    payload["dex"] = dex_name
+                data = await asyncio.to_thread(
+                    lambda p=payload: requests.post(f"{HL_API}/info", json=p, timeout=5).json())
+                if not data:
+                    continue
+                reads_ok += 1
+                for ap in data.get("assetPositions", []):
+                    pos = ap.get("position", {})
+                    coin = pos.get("coin")
+                    if not coin or abs(float(pos.get("szi", 0) or 0)) < 1e-12:
+                        continue
+                    positions.append((coin, abs(float(pos.get("positionValue", 0) or 0)),
+                                      float(pos.get("unrealizedPnl", 0) or 0)))
+            except Exception as e:
+                logger.error(f"TRIM clearinghouse query failed (dex={dex_name}): {e}")
+        if reads_ok < n_dex:
+            logger.error(f"GROSS TRIM: only {reads_ok}/{n_dex} clearinghouse reads succeeded -- NOT clearing the "
+                         f"trim latch (could be a partial read over the backstop); retry next poll.")
+            return False
+        cur_gross = sum(p[1] for p in positions)
+        if cur_gross <= target_notional:
+            logger.info(f"GROSS TRIM done: gross ${cur_gross:.0f} <= target ${target_notional:.0f} -- resume.")
+            return True
+        # close WORST uPnL first (losers shed risk; winners kept)
+        positions.sort(key=lambda p: p[2])
+        for coin, notional, upnl in positions:
+            if cur_gross <= target_notional:
+                break
+            try:
+                await asyncio.to_thread(self.exchange.market_close, coin)
+                cur_gross -= notional
+                logger.error(f"GROSS TRIM: market_close {coin} (notional ${notional:.0f} uPnL ${upnl:.2f}); "
+                             f"gross -> ~${cur_gross:.0f} / target ${target_notional:.0f}")
+            except Exception as e:
+                logger.error(f"GROSS TRIM failed {coin}: {e}")
+        return False
+
     def _evaluate_global_stop_fast(self):
         """codex r3 #5: evaluate the -15% stop on the FAST exit-poll cadence (not only the 60s _log_stats),
         so the flatten latch fires within ~exit_poll_s, not up to 60s late. Sets _flatten_requested."""
@@ -1911,6 +1968,16 @@ class CopyTrader:
             self._reconcile_positions()
             if n_remaining == 0:
                 logger.info("GLOBAL STOP: exchange flat. Halted (manual re-arm to resume).")
+            return
+
+        # Gross-backstop TRIM (Alberto 2026-06-15): self-healing -- close worst-first to the target, then
+        # CLEAR the flag and resume normal trading (NOT a permanent kill, unlike the loss stops above).
+        if self._trim_requested:
+            done = await self._emergency_trim(self._trim_target_notional)
+            self._reconcile_positions()
+            if done:
+                self._trim_requested = False   # self-healed -> entries resume (gated by the gross gate)
+                logger.info("GROSS TRIM complete -> resuming normal trading.")
             return
 
         for pos in self.positions:
@@ -3701,18 +3768,23 @@ class CopyTrader:
             self._kill_reasons["global_stop"] = True
             self._flatten_requested = True   # _check_exits flattens all open positions
 
-        # #4 runaway backstop: flatten-all if total gross notional exceeds gross_backstop_x x equity
-        # (guards a margin mis-estimate; inf by default = off, pending Alberto).
+        # #4 runaway backstop: if total gross notional exceeds gross_backstop_x x equity, TRIM the book back
+        # to gross_backstop_trim_target_x (default = the gross entry gate) by closing WORST-uPnL positions
+        # first -- shedding the risk that spiked us over without dumping winners (Alberto 2026-06-15). This is
+        # SELF-HEALING (not a permanent kill latch): once gross is back under target, normal trading resumes.
+        # The loss-based hard stops (-15% global, -25% daily) still flatten-all; this is leverage-only.
         if self._baseline_equity and self.gross_backstop_x != float("inf"):
             gross = sum(abs(p.get('size', 0) * self.mid_prices.get(p['coin'], 0))
                         for p in self.positions if p.get('filled'))
             if self._equity_cache and gross > self.gross_backstop_x * self._equity_cache:
-                if not self._kill_reasons.get("gross_backstop"):
+                trim_target_x = float(self.global_config.get(
+                    "gross_backstop_trim_target_x", self.global_config.get("gross_entry_gate_x", 3.5)))
+                self._trim_target_notional = trim_target_x * self._equity_cache
+                if not self._trim_requested:
                     logger.error(f"GROSS BACKSTOP: gross ${gross:.0f} > {self.gross_backstop_x}x "
-                                 f"eq ${self._equity_cache:.0f}. FLATTEN + entries off.")
-                    _tg(f"GROSS BACKSTOP {self.gross_backstop_x}x: gross ${gross:.0f} -- FLATTENING all")
-                self._kill_reasons["gross_backstop"] = True
-                self._flatten_requested = True
+                                 f"eq ${self._equity_cache:.0f}. TRIM to {trim_target_x}x (worst-first), keep winners.")
+                    _tg(f"GROSS BACKSTOP {self.gross_backstop_x}x: gross ${gross:.0f} -- TRIMMING to {trim_target_x}x")
+                self._trim_requested = True
 
         # Unified kill switch: active if ANY reason is present
         self._kill_switch_active = bool(self._kill_reasons)
@@ -5124,6 +5196,11 @@ class V17CopyTrader(V16CopyTrader):
         if not self._v17_trading_enabled:
             self._v17_stale_rejects += 1
             logger.warning(f"V17 ENTRY BLOCKED (trading_disabled/seed): {coin} {wallet}")
+            return
+        # codex 2026-06-15 (trim cleanup): block at the TOP of the V17 override too, so no V17 knet/cap
+        # metrics/stamps are consumed during a gross-backstop trim (base also blocks; this is for clean attribution).
+        if getattr(self, '_trim_requested', False):
+            logger.info(f"V17 ENTRY BLOCKED (gross-backstop TRIM in progress): {coin}")
             return
         # EXPANSION KILL gate (codex req #2/#3): block NEW ENTRIES on a disabled new coin. A coin is
         # disabled by its own per-coin kill or by the expansion-wide kill (which disables ALL new
