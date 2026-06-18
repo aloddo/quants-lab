@@ -523,6 +523,12 @@ class CopyTrader:
             "_tilt_mult": pos.get("_tilt_mult", 1.0),
             "updated_at": datetime.now(timezone.utc),
         }
+        # 2026-06-18 (codex review): carry _force_exit so an adopted orphan survives a restart as a
+        # force-exit row (the loader at __init__ expects it). Otherwise it reloads as a normal __orphan__
+        # row and never closes. Also carry the attempt counter so restarts don't reset the give-up backstop.
+        if pos.get("_force_exit"):
+            doc["_force_exit"] = True
+            doc["_force_exit_attempts"] = pos.get("_force_exit_attempts", 0)
         try:
             self.db[DB_OPEN_POSITIONS].update_one(key, {"$set": doc}, upsert=True)
         except Exception as e:
@@ -582,6 +588,9 @@ class CopyTrader:
                 # Previously dropped on load, leaving __orphan__ rows tracked but never closed.
                 if doc.get("_force_exit"):
                     pos["_force_exit"] = True
+                    # 2026-06-18 (codex review): preserve the give-up backstop counter across restarts
+                    # so a stuck force-exit can't retry forever by resetting to 0 each reboot.
+                    pos["_force_exit_attempts"] = doc.get("_force_exit_attempts", 0)
                 positions.append(pos)
             return positions
         except Exception as e:
@@ -662,8 +671,18 @@ class CopyTrader:
                 mid = entry_px if entry_px > 0 else self.mid_prices.get(coin, 1)
                 notional = abs(exch_sz) * mid
                 if coin not in tracked_coins and notional >= 5.0:
-                    # Orphan on exchange not in our DB: auto-close it
                     side = "BUY" if exch_sz > 0 else "SELL"
+                    # 2026-06-18 (codex review): only AUTO-CLOSE builder-dex (xyz:/flx:) orphans -- those
+                    # are the ones the cache bug can orphan. A non-builder orphan could be a manual / other-
+                    # strategy position on the same account; force-closing it would be destructive, so warn only.
+                    if not self._is_builder_dex(coin):
+                        logger.warning(
+                            f"ORPHAN ON EXCHANGE (non-builder, warn-only): {coin} {side} sz={abs(exch_sz)} "
+                            f"(${notional:.2f}) not in DB state -- NOT auto-closing (could be manual/other strategy)"
+                        )
+                        _tg(f"ORPHAN (warn-only): {coin} {side} ${notional:.2f} not tracked; left untouched")
+                        continue
+                    # Builder-dex orphan: adopt + auto-close (lost copy-context -> close cleanly).
                     logger.warning(
                         f"ORPHAN ON EXCHANGE: {coin} {side} sz={abs(exch_sz)} (${notional:.2f}) "
                         f"not in DB state -- queuing auto-close"
@@ -3366,6 +3385,12 @@ class CopyTrader:
                     if now_ts - fill_time < grace_s:
                         continue
                     coin = tp['coin']
+                    # 2026-06-18 (Alberto): builder-dex (xyz/flx) positions are NOT in the webData2
+                    # cache. On a cache fallback their absence is meaningless (cache can't see them) --
+                    # FAIL-CLOSED: never phantom-remove a builder-dex coin off an incomplete read.
+                    # A 429/cache-fallback must never drop a real position.
+                    if used_cache_fallback and self._is_builder_dex(coin):
+                        continue
                     # 2026-05-23: positive-confirmation needed; absent != zero
                     if coin not in exchange_positions:
                         # Coin had no entry in exchange_positions even though queries succeeded.
@@ -3511,8 +3536,31 @@ class CopyTrader:
                             f"ORPHAN DETECTED: {coin} sz={exch_sz} (${notional:.0f} notional) "
                             f"exists on exchange but NOT tracked by V17"
                         )
-                        _tg(f"ORPHAN: {coin} sz={exch_sz} on exchange, not tracked by V17. Manual close needed.")
                         self._orphan_reported.add(coin)
+                    # 2026-06-18 (Alberto): a re-detected orphan must START BEING TRACKED, not just warned.
+                    # Adopt ONLY on a COMPLETE read (all_queries_ok and not used_cache_fallback) so we never
+                    # adopt off a cache fallback / failed query. SCOPE to builder-dex coins only (codex review):
+                    # those are the ones the cache bug can orphan, and scoping avoids force-closing any manual /
+                    # other-strategy position on the same account (non-builder orphans stay warn-only).
+                    # Adopt as a managed '__orphan__' row with _force_exit -> engine closes it cleanly (L1994).
+                    if all_queries_ok and not used_cache_fallback and self._is_builder_dex(coin):
+                        already = any(tp.get('coin') == coin and tp.get('wallet') == '__orphan__'
+                                      for tp in self.positions)
+                        if not already:
+                            o_side = "BUY" if exch_sz > 0 else "SELL"
+                            o_px = self.mid_prices.get(coin, 0) or (notional / abs(exch_sz) if abs(exch_sz) > 1e-12 else 0)
+                            self.positions.append({
+                                'coin': coin, 'side': o_side, 'entry_px': o_px,
+                                'entry_time': time.time(), 'fill_time': time.time(),
+                                'size': abs(exch_sz), 'oid': 0, 'filled': True,
+                                'wallet': '__orphan__', 'target_coin': coin,
+                                '_recovered': True, '_force_exit': True,
+                            })
+                            logger.warning(
+                                f"ORPHAN ADOPTED: {coin} {o_side} sz={abs(exch_sz):.6f} -> tracked as "
+                                f"__orphan__ (_force_exit); engine will close it cleanly"
+                            )
+                            _tg(f"ORPHAN ADOPTED + force-exit queued: {coin} {o_side} ${notional:.0f}")
 
             # Size reconciliation: compare SUM of tracked sizes per coin vs exchange
             # This handles multi-wallet same-coin correctly
@@ -3524,6 +3572,10 @@ class CopyTrader:
                     tracked_by_coin[tp['coin']] += tp['size'] * sign
 
             for coin, tracked_net in tracked_by_coin.items():
+                # 2026-06-18 (Alberto): no false drift on an incomplete read -- builder-dex (xyz/flx)
+                # coins are absent from the webData2 cache, so a cache fallback makes them look drifted.
+                if used_cache_fallback and self._is_builder_dex(coin):
+                    continue
                 exch_sz = exchange_positions.get(coin, 0)
                 if abs(exch_sz) < 1e-10 and abs(tracked_net) < 1e-10:
                     continue
