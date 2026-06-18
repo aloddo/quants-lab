@@ -16,7 +16,8 @@ import sys
 from datetime import datetime
 
 LOG = "/tmp/ql-v12-copy-trader-launchd.log"
-DEPLOY = "2026-06-14 23:11:00"   # skill cohort live
+DEPLOY = "2026-06-15 10:33:00"   # RESET (Alberto 2026-06-15): this morning's engine change (gross-gate
+#                                  + trim bundle, engine READY 10:33:57 CEST). Log timestamps are CEST.
 BASELINE_BPS = 16.0              # old PnL cohort live effective edge
 BASELINE_MO = 51.0
 

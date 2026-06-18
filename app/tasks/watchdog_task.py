@@ -823,7 +823,7 @@ class WatchdogTask(BaseTask):
                 header = f"<b>Watchdog — {len(issues)} issue(s)</b>"
                 suffix = (
                     f"\n\nNext alert in {ALERT_COOLDOWN_MINUTES}m if unresolved.\n"
-                    f"Check: <code>bash scripts/status.sh</code>"
+                    f"Check: <code>bash tools/status.sh</code>"
                 )
                 alert_level = "warning"
 
@@ -836,7 +836,7 @@ class WatchdogTask(BaseTask):
                     elapsed = f" (unresolved {age_min:.0f}m)"
                 title = f"UNRESOLVED: Watchdog{elapsed}"
                 header = f"<b>\u26a0\ufe0f UNRESOLVED{elapsed} — {len(issues)} issue(s)</b>"
-                suffix = "\n\nCheck: <code>bash scripts/status.sh</code>"
+                suffix = "\n\nCheck: <code>bash tools/status.sh</code>"
                 alert_level = "error"
 
             else:  # level == 3
@@ -852,7 +852,7 @@ class WatchdogTask(BaseTask):
                 try:
                     import subprocess
                     proc = subprocess.run(
-                        ["bash", "scripts/status.sh"],
+                        ["bash", "tools/status.sh"],
                         capture_output=True, text=True, timeout=10,
                         cwd="/Users/hermes/quants-lab",
                     )
