@@ -534,6 +534,51 @@ class CopyTrader:
         except Exception as e:
             logger.warning(f"Failed to persist position {pos['coin']}: {e}")
 
+    def _adopt_orphan(self, coin: str, exch_sz: float, notional: float):
+        """Re-attach a re-detected orphan to the LIVE copy signal (Alberto 9696/9699), instead of blindly
+        force-closing it. If a cohort leader still holds the MATCHING coin+side, adopt it as a normal MANAGED
+        copy of that leader -> the engine holds it (that leader's SL/trail apply) and exits it naturally when
+        the leader closes (reverse-flow). Only force-close a TRUE orphan that NO leader holds.
+        Caller must have already confirmed a COMPLETE read + builder-dex scope."""
+        side = "BUY" if exch_sz > 0 else "SELL"
+        want_sign = 1 if exch_sz > 0 else -1
+        px = self.mid_prices.get(coin, 0) or (notional / abs(exch_sz) if abs(exch_sz) > 1e-12 else 0)
+        # leaders holding the matching coin+side, largest first (the most representative signal)
+        matches = sorted(
+            ((w, abs(szi)) for w, by in self._target_positions.items()
+             for szi in [by.get(coin, 0.0)] if szi * want_sign > 1e-9),
+            key=lambda x: x[1], reverse=True,
+        )
+        if matches:
+            # codex P0: _target_positions keys are RESOLVED leader addresses; map a vault leader back to its
+            # CONFIGURED wallet so wallet_config (SL/trail) AND the reverse-flow exit buffers match. (No merge
+            # branch: this helper is only called when `coin not in tracked_coins`, so a duplicate (wallet,coin)
+            # cannot occur -- codex P2.)
+            leader = self.leader_to_vault.get(matches[0][0], matches[0][0])
+            self.positions.append({
+                "coin": coin, "side": side, "entry_px": px,
+                "entry_time": time.time(), "fill_time": time.time(),
+                "size": abs(exch_sz), "oid": 0, "filled": True,
+                "wallet": leader, "target_coin": coin,
+                "_recovered": True, "_tilt_mult": 1.0, "_reattached": True,
+            })
+            logger.warning(
+                f"ORPHAN RE-ATTACHED: {coin} {side} sz={abs(exch_sz):.6f} -> managed copy of leader "
+                f"{leader[:10]} (still holds matching side); held + trail/SL, exits when leader closes")
+            _tg(f"ORPHAN RE-ATTACHED: {coin} {side} ${notional:.0f} -> leader {leader[:10]} (live copy kept)")
+        else:
+            # No leader holds the matching side -> TRUE orphan -> force-close cleanly.
+            self.positions.append({
+                "coin": coin, "side": side, "entry_px": px,
+                "entry_time": time.time(), "fill_time": time.time(),
+                "size": abs(exch_sz), "oid": 0, "filled": True,
+                "wallet": "__orphan__", "target_coin": coin,
+                "_recovered": True, "_force_exit": True,
+            })
+            logger.warning(
+                f"ORPHAN FORCE-CLOSE: {coin} {side} sz={abs(exch_sz):.6f} (no cohort leader holds it)")
+            _tg(f"ORPHAN FORCE-CLOSE: {coin} {side} ${notional:.0f} (no leader holds it)")
+
     def _record_oid(self, oid, coin: str, side: str, action: str, wallet: str = ""):
         """Record every order ID V17 generates for fill attribution."""
         if self.shadow_mode or not oid:
@@ -682,19 +727,10 @@ class CopyTrader:
                         )
                         _tg(f"ORPHAN (warn-only): {coin} {side} ${notional:.2f} not tracked; left untouched")
                         continue
-                    # Builder-dex orphan: adopt + auto-close (lost copy-context -> close cleanly).
-                    logger.warning(
-                        f"ORPHAN ON EXCHANGE: {coin} {side} sz={abs(exch_sz)} (${notional:.2f}) "
-                        f"not in DB state -- queuing auto-close"
-                    )
-                    _tg(f"ORPHAN AUTO-CLOSE: {coin} {side} ${notional:.2f}")
-                    self.positions.append({
-                        'coin': coin, 'side': side, 'entry_px': entry_px,
-                        'entry_time': time.time(), 'fill_time': time.time(),
-                        'size': abs(exch_sz), 'oid': 0, 'filled': True,
-                        'wallet': '__orphan__', 'target_coin': coin,
-                        '_recovered': True, '_force_exit': True,
-                    })
+                    # Builder-dex orphan: re-attach to the live signal (managed copy if a leader still holds
+                    # the matching side; force-close only a true orphan). If targets aren't seeded yet at this
+                    # point, _adopt_orphan finds no match and safely force-closes (same as before).
+                    self._adopt_orphan(coin, exch_sz, notional)
 
             # Check for significant drift between tracked net and exchange
             for coin, tracked_net in tracked_by_coin.items():
@@ -3537,30 +3573,16 @@ class CopyTrader:
                             f"exists on exchange but NOT tracked by V17"
                         )
                         self._orphan_reported.add(coin)
-                    # 2026-06-18 (Alberto): a re-detected orphan must START BEING TRACKED, not just warned.
-                    # Adopt ONLY on a COMPLETE read (all_queries_ok and not used_cache_fallback) so we never
-                    # adopt off a cache fallback / failed query. SCOPE to builder-dex coins only (codex review):
-                    # those are the ones the cache bug can orphan, and scoping avoids force-closing any manual /
-                    # other-strategy position on the same account (non-builder orphans stay warn-only).
-                    # Adopt as a managed '__orphan__' row with _force_exit -> engine closes it cleanly (L1994).
+                    # 2026-06-18 (Alberto 9685/9696/9699): a re-detected orphan must START BEING TRACKED.
+                    # Adopt ONLY on a COMPLETE read (never off a cache fallback / failed query) and only for
+                    # builder-dex coins (the ones the cache bug can orphan; avoids touching manual/other-strategy
+                    # positions). _adopt_orphan RE-ATTACHES to the live signal: managed copy if a leader still
+                    # holds the matching side, force-close only if a true orphan.
                     if all_queries_ok and not used_cache_fallback and self._is_builder_dex(coin):
-                        already = any(tp.get('coin') == coin and tp.get('wallet') == '__orphan__'
+                        already = any(tp.get('coin') == coin and tp.get('wallet') in ('__orphan__',)
                                       for tp in self.positions)
                         if not already:
-                            o_side = "BUY" if exch_sz > 0 else "SELL"
-                            o_px = self.mid_prices.get(coin, 0) or (notional / abs(exch_sz) if abs(exch_sz) > 1e-12 else 0)
-                            self.positions.append({
-                                'coin': coin, 'side': o_side, 'entry_px': o_px,
-                                'entry_time': time.time(), 'fill_time': time.time(),
-                                'size': abs(exch_sz), 'oid': 0, 'filled': True,
-                                'wallet': '__orphan__', 'target_coin': coin,
-                                '_recovered': True, '_force_exit': True,
-                            })
-                            logger.warning(
-                                f"ORPHAN ADOPTED: {coin} {o_side} sz={abs(exch_sz):.6f} -> tracked as "
-                                f"__orphan__ (_force_exit); engine will close it cleanly"
-                            )
-                            _tg(f"ORPHAN ADOPTED + force-exit queued: {coin} {o_side} ${notional:.0f}")
+                            self._adopt_orphan(coin, exch_sz, notional)
 
             # Size reconciliation: compare SUM of tracked sizes per coin vs exchange
             # This handles multi-wallet same-coin correctly
@@ -4579,6 +4601,10 @@ class V17CopyTrader(V16CopyTrader):
         if not (0 < self._v17_stop_pct <= 0.30):
             raise ValueError(f"V17: global_stop_pct {self._v17_stop_pct} outside (0, 0.30]")
         self._v17_knet_min = int(g.get("knet_min", 0))
+        # knet de-risk bypass: allow a knet-blocked SHORT through ONLY when it cuts our existing net-long on
+        # that coin. DEFAULT OFF (codex r1 P1.3): the aggregate-contrarian-short backtest does NOT yet validate
+        # this exact live predicate; flip on only after the exact-subset replay passes. Config-gated.
+        self._v17_knet_derisk_bypass = bool(g.get("knet_derisk_bypass", False))
         self._v17_netx_cap_x = float(g.get("netx_cap_x", 2.5))
         self._v17_coin_side_cap_x = float(g.get("coin_side_cap_x", 2.0))
         self._v17_seed_min = int(g.get("seed_min_wallets", 98))
@@ -5289,19 +5315,58 @@ class V17CopyTrader(V16CopyTrader):
                            f"(no fresh signal-time knet; non-signal entries do not open risk)")
             return
         if k < self._v17_knet_min:
-            self._v17_knet_rejects += 1
-            # Log EVERY knet reject at INFO (de-throttled; the %20 + restart-resetting counter hid most
-            # rejects from the human log even though they are all in mongo v17_gate_log).
-            logger.info(f"V17 KNET GATE: rejected {coin} {'BUY' if is_buy else 'SELL'} "
-                        f"knet={k} (total rejects {self._v17_knet_rejects})")
-            try:
-                self.db.v17_gate_log.insert_one({
-                    "coin": coin, "side": "BUY" if is_buy else "SELL", "knet": k,
-                    "wallet": wallet, "action": "rejected",
-                    "ts": datetime.now(timezone.utc)})
-            except Exception:
-                pass
-            return
+            # knet-fix (Alberto 9745/9747, validated 2026-06-19 knet_fix_backtest.py): a SHORT that REDUCES
+            # our EXISTING net-long exposure on THIS coin is a de-risking trade. The knet-blocked contrarian
+            # shorts are +130bps/88% win historically (vs +224bps for knet-allowed), so the blocked tail is
+            # real edge AND, in a drawdown, the de-risking short is the trade that cuts our bleeding longs.
+            # Bypass knet ONLY for that strict de-risking subset (net-long this coin AND the short shrinks
+            # |coin_net|). netx + gross + coin-side caps below still apply unchanged. knet_derisk_bypass
+            # config-gated DEFAULT OFF (codex r1 P1.3) -- enabled only after exact-subset replay validation.
+            derisk = False
+            if (not is_buy) and getattr(self, "_v17_knet_derisk_bypass", False):
+                coin_net = 0.0
+                for p in self.positions:
+                    if not (p.get("filled") and p.get("coin") == coin):
+                        continue
+                    s = 1 if p.get("side") == "BUY" else -1
+                    ps = abs(float(p.get("size", 0.0)))
+                    ppx = float(p.get("entry_px", 0.0) or 0.0)
+                    if ppx <= 0:
+                        _mid = float(self.mid_prices.get(coin, 0.0) or 0.0)
+                        _pv = float(self._exch_positions.get(coin, {}).get("positionValue", 0.0) or 0.0)
+                        ppx = _mid if _mid > 0 else (_pv / ps if (ps > 0 and _pv > 0) else 0.0)
+                    coin_net += s * ps * ppx
+                # codex r1 P1.2: fold IN-FLIGHT same-coin reservations so concurrent de-risk shorts cannot
+                # each see the same long and all qualify (each prior pending short already cuts the net here).
+                coin_net += (float(self._v17_pending_coin_side.get((coin, 1), 0.0))
+                             - float(self._v17_pending_coin_side.get((coin, -1), 0.0)))
+                resv_ds = self.order_size * self._tilt_cap
+                # de-risk iff currently net-LONG this coin AND the new short reduces |coin_net|
+                if coin_net > 0 and abs(coin_net - resv_ds) < abs(coin_net):
+                    derisk = True
+                    logger.info(f"V17 KNET BYPASS (de-risk short): {coin} knet={k} "
+                                f"coin_net_long={coin_net:+.0f} resv={resv_ds:.0f} -> allow (cuts net-long)")
+                    try:
+                        self.db.v17_gate_log.insert_one({
+                            "coin": coin, "side": "SELL", "knet": k, "wallet": wallet,
+                            "action": "knet_derisk_bypass", "coin_net": coin_net,
+                            "ts": datetime.now(timezone.utc)})
+                    except Exception:
+                        pass
+            if not derisk:
+                self._v17_knet_rejects += 1
+                # Log EVERY knet reject at INFO (de-throttled; the %20 + restart-resetting counter hid most
+                # rejects from the human log even though they are all in mongo v17_gate_log).
+                logger.info(f"V17 KNET GATE: rejected {coin} {'BUY' if is_buy else 'SELL'} "
+                            f"knet={k} (total rejects {self._v17_knet_rejects})")
+                try:
+                    self.db.v17_gate_log.insert_one({
+                        "coin": coin, "side": "BUY" if is_buy else "SELL", "knet": k,
+                        "wallet": wallet, "action": "rejected",
+                        "ts": datetime.now(timezone.utc)})
+                except Exception:
+                    pass
+                return
 
         # exposure caps from OUR live filled positions PLUS in-flight reservations (codex P1.4:
         # concurrent entry tasks could all pass the cap before any IOC fill lands in positions).
