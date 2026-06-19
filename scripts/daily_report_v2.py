@@ -99,7 +99,7 @@ def load_wallets():
     rows = []
     for w, lst in by.items():
         usd = sum(x[0] for x in lst); bps = [x[1] for x in lst]
-        sharpe = (np.mean(bps) / np.std(bps) * np.sqrt(len(bps))) if len(bps) > 1 and np.std(bps) > 0 else 0.0
+        sharpe = (np.mean(bps) / np.std(bps)) if len(bps) > 1 and np.std(bps) > 0 else 0.0  # PER-TRADE Sharpe (mean/std); NOT mean/std*sqrt(N)=t-stat
         rows.append(dict(wallet=w, n=len(lst), usd=usd, mean_bps=np.mean(bps), median_bps=np.median(bps),
                          win=np.mean([1 if b > 0 else 0 for b in bps]) * 100, sharpe=sharpe))
     return pd.DataFrame(rows).sort_values("usd", ascending=False).reset_index(drop=True)
@@ -142,7 +142,7 @@ def build(day):
     n = len(f)
     pct = min(100, n / TRUST_N * 100)
     allbps = f.bps.to_numpy()
-    sharpe = (allbps.mean() / allbps.std() * np.sqrt(len(allbps))) if len(allbps) > 1 and allbps.std() > 0 else 0.0
+    sharpe = (allbps.mean() / allbps.std()) if len(allbps) > 1 and allbps.std() > 0 else 0.0  # per-trade Sharpe (mean/std), NOT t-stat
 
     plt.rcParams.update({"axes.facecolor": BG, "figure.facecolor": BG, "savefig.facecolor": BG,
                          "text.color": FG, "axes.labelcolor": FG, "xtick.color": FG, "ytick.color": FG,
@@ -277,7 +277,7 @@ def insights(day, f, skill, eq, wl):
     pc = f.groupby("coin").pnl.sum().sort_values()
     worst = pc.head(2); best = pc.tail(2)
     allbps = f.bps.to_numpy()
-    sharpe = (allbps.mean()/allbps.std()*np.sqrt(len(allbps))) if len(allbps) > 1 and allbps.std() > 0 else 0.0
+    sharpe = (allbps.mean()/allbps.std()) if len(allbps) > 1 and allbps.std() > 0 else 0.0  # per-trade Sharpe (mean/std), NOT mean/std*sqrt(N)=t-stat
     lines = [f"COPY-TRADE DAILY  {day}", f"(since reset {RESET_STR}; {n}/{TRUST_N} closes)", ""]
     lines.append("INSIGHTS")
     lines.append(f"- Edge REAL + BOTH-SIDED: LONG mean {L.bps.mean():+.0f}/med {L.bps.median():+.0f}bps ({len(L)}), "
@@ -296,8 +296,10 @@ def insights(day, f, skill, eq, wl):
                  f"Drag: {', '.join(f'{c} ${v:+.0f}' for c, v in worst.items())}.")
     lines.append(f"- Realized ${tot:+.2f} (skill ${sk_tot:+.2f}, carried ${tot-sk_tot:+.2f}). Carried = old book unwinding, "
                  f"excluded from the skill verdict.")
-    lines.append(f"- VERDICT: HOLD. {n}/{TRUST_N} closes; no capital-scaling decision until the sample matures (~Mon). "
-                 f"Capital is not the blocker -- validation confidence is.")
+    lines.append(f"- VERDICT: HOLD. {n}/{TRUST_N} closes; point $/mo at target but the CI lower bound (~$70, heavy-tailed) "
+                 f"needs n>={TRUST_N} to clear. At the recent close rate, n>={TRUST_N} lands ~weeks out (not this Mon); "
+                 f"Mon is a preliminary checkpoint. Capital is not the blocker -- validation confidence is.")
+    lines.append(f"- Sharpe figures are PER-TRADE (mean/std), not mean/std*sqrt(N)=t-stat (fixed 2026-06-19).")
     return "\n".join(lines)
 
 
