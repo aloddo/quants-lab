@@ -65,7 +65,15 @@ def main():
         pick = rng.choice(day_keys, size=ndays_obs, replace=True)
         boot[i] = sum(day_sums[k] for k in pick) / ndays_obs * 30.4   # per-day mean * 30.4 = $/mo
     lo, hi = np.percentile(boot, [5, 95])
-    print(f"$/mo day-block bootstrap 90% CI: [${lo:+.0f}, ${hi:+.0f}]  (median ${np.median(boot):+.0f}, {ndays_obs} obs-days)")
+    # per-CLOSE i.i.d. bootstrap (n closes, tighter; assumes independence -> optimistic). Truth is BETWEEN the
+    # day-block (conservative, handles intra-day correlation but coarse w/ few days) and this one.
+    bc = np.empty(B)
+    for i in range(B):
+        bc[i] = rng.choice(pnls, size=n, replace=True).sum() / days * 30.4
+    lo_c, hi_c = np.percentile(bc, [5, 95])
+    print(f"$/mo day-block 90% CI:  [${lo:+.0f}, ${hi:+.0f}]  (conservative, {ndays_obs} obs-days)")
+    print(f"$/mo per-close 90% CI:  [${lo_c:+.0f}, ${hi_c:+.0f}]  (optimistic, n={n} closes i.i.d.)")
+    print(f"-> honest lower bound is BETWEEN ${lo:+.0f} (day-block) and ${lo_c:+.0f} (per-close).")
 
     # haircut table (plan)
     print("\nhaircut sensitivity ($/mo at current equity):")
