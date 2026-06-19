@@ -43,6 +43,16 @@ def main():
     usd_mo_point = total / days * 30.4
     print(f"realized ${total:+.2f} | mean ${pnls.mean():+.3f}/close | win {(pnls>0).mean()*100:.0f}% | $/mo point = ${usd_mo_point:+.0f}")
 
+    # close-rate + ETA to n>=200 (the timeline gate): use the RECENT rate (last 48h), not the overall, because
+    # the rate decays/varies. Surfaces honestly WHEN the verdict becomes trustworthy (do not assume "Monday").
+    ts = np.array([t for t, _ in closes])
+    last48 = int((ts > now - 2 * 86400e3).sum())
+    recent_rate = max(last48 / 2.0, 0.1)
+    overall_rate = n / days
+    eta_days = (N_TARGET - n) / recent_rate
+    print(f"close-rate: overall {overall_rate:.1f}/day | recent(48h) {recent_rate:.1f}/day | "
+          f"ETA to n={N_TARGET}: ~{eta_days:.0f}d (recent rate). {N_TARGET-n} closes to go.")
+
     # day-block bootstrap: resample whole days (handles intra-day correlation) -> $/mo distribution
     by_day = defaultdict(list)
     for t, p in closes:
