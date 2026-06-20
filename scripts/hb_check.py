@@ -55,10 +55,15 @@ def main():
                     longs.add(p["coin"])
     except Exception:
         pass
-    bug = [r["coin"] for r in recent if r.get("coin") in longs]
+    # point-in-time guard: only flag a reject as a possible bypass-miss if it is RECENT (<=15min), so the
+    # CURRENT net-long book is a valid proxy for the position at reject time. Older rejects on a coin we only
+    # went long AFTERWARDS are NOT bugs (the 2026-06-20 HYPE false-positive: rejects 06-19, long opened 06-20).
+    nowdt = datetime.now(timezone.utc)
+    bug = [r["coin"] for r in recent if r.get("coin") in longs
+           and (nowdt - r["ts"].replace(tzinfo=timezone.utc)).total_seconds() <= 900]
     print(f"[knet] bypasses={byp} | rejects-since-enable={rej} | recent SELL-reject coins={[r.get('coin') for r in recent]}")
     print(f"       our net-longs={sorted(longs)}")
-    print(f"       bypass-correctness: {'*** BUG: reject on our long ' + str(bug) if bug else 'OK (no reject on a net-long coin -> no missed de-risk)'}")
+    print(f"       bypass-correctness: {'*** CHECK: recent(<=15min) reject on our long ' + str(bug) + ' -- verify point-in-time' if bug else 'OK (no recent reject on a net-long coin)'}")
     print("=== end ===")
 
 
