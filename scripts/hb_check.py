@@ -33,9 +33,15 @@ def main():
     print("[portfolio]", sh(f"cd ~/quants-lab && set -a && source .env 2>/dev/null && set +a && {PY} tools/portfolio_snapshot.py 2>/dev/null | tail -1"))
     # 2. engine
     pid = sh("pgrep -f 'hl_copy_trader_v17.py --config' | head -1")
-    errs = sh(f"tail -250 {LOG} 2>/dev/null | grep -E 'ERROR|Traceback' | grep -vcE 'WS error: received 1000'")
+    # categorize errors: HL-infra (external, transient: WS 502/504/gateway/timeout/handshake/sync-fail) vs
+    # ENGINE (internal -> investigate). WS 1000 (normal close) already excluded.
+    allerr = sh(f"tail -250 {LOG} 2>/dev/null | grep -E 'ERROR|Traceback' | grep -vE 'WS error: received 1000'")
+    lines = [l for l in allerr.splitlines() if l.strip()]
+    infra = sum(1 for l in lines if any(k in l for k in ("HTTP 50", "Gateway Timeout", "timed out", "no close frame", "sync failed", "server rejected", "Connection reset", "Temporary failure")))
+    engine_err = len(lines) - infra
     stats = sh(f"tail -250 {LOG} 2>/dev/null | grep 'STATS:' | tail -1")
-    print(f"[engine] pid={pid or 'DOWN!'} | real-errors(250)={errs}")
+    flag = "" if engine_err == 0 else "  <-- INVESTIGATE"
+    print(f"[engine] pid={pid or 'DOWN!'} | errors(250): engine={engine_err}{flag} | HL-infra(transient)={infra}")
     if stats:
         print("        ", stats.split("] ", 1)[-1][:110])
     # 3. verdict
