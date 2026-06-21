@@ -82,9 +82,13 @@ def hl_perp_positions_by_dex() -> dict:
                 payload["dex"] = dex
             r = requests.post(HL_API, json=payload, timeout=10)
             d = r.json()
-            if not d or "assetPositions" not in d:
-                return 0
-            return len(d.get("assetPositions", []))
+            # A LEGIT zero-position dex returns {"assetPositions": []} (key present, empty list).
+            # A TRANSIENT bad response (200-but-empty / error body) lacks the key -> RAISE so _retry
+            # re-queries (the 2026-06-22 XYZ=0 glitch: returned 0 here, retry never fired). Only a
+            # present-but-empty list legitimately returns 0.
+            if not isinstance(d, dict) or "assetPositions" not in d:
+                raise ValueError(f"clearinghouseState missing assetPositions (dex={dex})")
+            return len(d["assetPositions"])
         name = dex if dex else "main"
         try:
             out[name] = _retry(_go)
