@@ -70,6 +70,35 @@ def z(x):
     return (x - x.mean()) / (x.std() + 1e-9)
 
 
+def mtm_dd_exclude(wallets):
+    """MARK-TO-MARKET drawdown gate (Phase 3, Alberto 9947 + codex). Closed-trip maxdd is BLIND to open
+    bags; this queries each candidate's CURRENT account mark-to-market equity (HL portfolio month history,
+    incl unrealized) and excludes the near-ruin tail. Codex drop-19 criterion: MTM maxDD>=70% OR (60-70%
+    AND month return<=-40%). Operational filter (current state = who is bag-holding/blown-up NOW); for
+    backtesting the rule use v15_m01 historical reconstruction instead. Returns set to exclude."""
+    import urllib.request, time
+    def post(b):
+        r = urllib.request.Request("https://api.hyperliquid.xyz/info", data=json.dumps(b).encode(),
+                                   headers={"Content-Type": "application/json"})
+        return json.load(urllib.request.urlopen(r, timeout=20))
+    excl = set()
+    for w in wallets:
+        try:
+            d = dict(post({"type": "portfolio", "user": w}))
+            avh = d.get("month", {}).get("accountValueHistory", [])
+            a = np.array([float(v) for _, v in avh]); a = a[a > 0]
+            if len(a) < 5:
+                continue
+            dd = ((np.maximum.accumulate(a) - a) / np.maximum.accumulate(a)).max() * 100
+            ret = (a[-1] / a[0] - 1) * 100
+            if (dd >= 70) or (60 <= dd < 70 and ret <= -40):
+                excl.add(w)
+        except Exception:
+            pass
+        time.sleep(0.05)
+    return excl
+
+
 def main():
     calib = set(json.load(open("/tmp/agentC_l2_calib_expanded.json")).keys())
     cols = ["wallet", "coin", "entry_ts", "realized_pnl", "net_realized_pnl",
@@ -112,6 +141,13 @@ def main():
     s = s[~s["martingale"]].copy()
     print(f"\n[Phase-3 martingale veto] eligible {len(s) + n_mart} -> vetoed {n_mart} martingales -> clean {len(s)}")
     s["skill"] = z(s.win) + z(s.sharpe) + z(-s.maxdd)
+    # MARK-TO-MARKET DD GATE (Phase 3): rank by skill, then drop the near-ruin tail by CURRENT account
+    # mark-to-market drawdown (incl unrealized -- the metric closed-trip maxdd is blind to). Query only the
+    # top candidates (API-bounded), exclude, then take top-K survivors.
+    cand = s.nlargest(int(K * 1.8), "skill")
+    excl = mtm_dd_exclude(list(cand.index))
+    print(f"[Phase-3 mark-to-market DD gate] top-{len(cand)} candidates -> excluded {len(excl)} near-ruin (MTM DD>=70% or 60-70%&down)")
+    s = s[~s.index.isin(excl)].copy()
     top = s.nlargest(K, "skill").reset_index()
     print(f"\n=== DEPLOYABLE SKILL COHORT (top {K}, copyable+active, data <= {ASOF}) ===")
     print(f"  pool: {len(s)} eligible | selected {len(top)}")
