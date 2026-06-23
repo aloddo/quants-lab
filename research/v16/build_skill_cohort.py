@@ -32,6 +32,30 @@ def max_dd(r):
     return float((np.maximum.accumulate(eq) - eq).max()) if len(eq) else 0.0
 
 
+def martingale_flags(df):
+    """HARD martingale veto (codex 2026-06-05, was dropped at the 06-14 build -> re-added, Phase 3).
+    High win-rate + low REALIZED drawdown is the SIGNATURE of averaging-down/martingale: hold losers,
+    size up after losses, realize only winners. Closed-trip metrics are blind to the open bag; this veto
+    catches the behavioral tell. Per wallet (journeys ordered by entry_ts): size-up-after-loss, holds-
+    losers ratio, win/loss magnitude, ~0% realized losses. Returns bool Series (True = martingale = veto)."""
+    out = {}
+    for w, g in df.sort_values("entry_ts").groupby("wallet"):
+        pnl = g["net_realized_pnl"].to_numpy(); ntl = g["max_position_notional"].to_numpy()
+        dur = g["duration_h"].to_numpy(); n = len(pnl)
+        if n < 10:
+            out[w] = False; continue
+        win = pnl > 0; loss = pnl < 0; nloss = int(loss.sum())
+        nal = ntl[1:][loss[:-1]]; naw = ntl[1:][win[:-1]]
+        su = (np.mean(nal) / np.mean(naw)) if (len(nal) and len(naw) and np.mean(naw) > 0) else np.nan
+        ha = (np.mean(dur[loss]) / np.mean(dur[win])) if (nloss > 0 and win.any() and np.mean(dur[win]) > 0) else np.nan
+        wm = (np.mean(pnl[win]) / np.mean(np.abs(pnl[loss]))) if (nloss > 0 and win.any() and np.mean(np.abs(pnl[loss])) > 0) else np.inf
+        lf = nloss / n
+        extreme = ((su == su and su > 3.0) or (ha == ha and ha > 5.0) or (lf < 0.02))
+        mild = int((su == su and su > 1.3) + (ha == ha and ha > 2.5) + (wm < 0.6) + (lf < 0.05))
+        out[w] = bool(extreme or mild >= 2)
+    return pd.Series(out)
+
+
 def skill_scores(df):
     g = df.groupby("wallet")
     s = g.agg(n=("ret", "size"), mean=("ret", "mean"), std=("ret", "std"),
@@ -80,6 +104,13 @@ def main():
     # ---- BUILD the deployable cohort (all data <= asof) ----
     s = skill_scores(j)
     s = s[(s.n >= MIN_J) & (s.index.isin(active)) & (s.hold >= HOLD_MIN_H) & (s.hold <= HOLD_MAX_H)].copy()
+    # HARD MARTINGALE VETO (Phase 3, codex 06-05 rule re-added). Closed-trip skill metrics select FOR
+    # martingales (high win + low realized DD); this disqualifies the behavioral tell BEFORE ranking.
+    mart = martingale_flags(j[j.wallet.isin(s.index)])
+    s["martingale"] = s.index.map(mart).fillna(False)
+    n_mart = int(s["martingale"].sum())
+    s = s[~s["martingale"]].copy()
+    print(f"\n[Phase-3 martingale veto] eligible {len(s) + n_mart} -> vetoed {n_mart} martingales -> clean {len(s)}")
     s["skill"] = z(s.win) + z(s.sharpe) + z(-s.maxdd)
     top = s.nlargest(K, "skill").reset_index()
     print(f"\n=== DEPLOYABLE SKILL COHORT (top {K}, copyable+active, data <= {ASOF}) ===")
