@@ -52,7 +52,7 @@
     "knet_derisk_bypass": true,
     "netx_cap_x": 2.5,
     "coin_side_cap_x": 2.0,
-    "seed_min_wallets": 67,
+    "seed_min_wallets": 86,
     "v17_authorization": "decisions/2026-06-11-v17-ship-with-changes + Alberto GO msg 9254",
     "expansion": {
       "coins": [
@@ -130,6 +130,13 @@
     "exit_twap_min_notional": 1000000000.0
   },
   "wallets": {
+    "0xae6b807ec47e0b7900d1fe2a53885b4602748b03": {
+      "group": "v16_skill_decile",
+      "rank": 1,
+      "skill_win": 0.997,
+      "skill_sharpe": 3.98,
+      "n_rt": 318
+    },
     "0x5ce0ce4387679de0335a3e8a1c9a7abb4f150a71": {
       "group": "v16_skill_decile",
       "rank": 2,
@@ -221,12 +228,33 @@
       "skill_sharpe": 1.31,
       "n_rt": 426
     },
+    "0xb567367a97986d3dce83fce96d7f4eae4e473693": {
+      "group": "v16_skill_decile",
+      "rank": 20,
+      "skill_win": 0.974,
+      "skill_sharpe": 1.26,
+      "n_rt": 307
+    },
     "0xa87e491b13115b762309a2884184b42748a6fbc4": {
       "group": "v16_skill_decile",
       "rank": 21,
       "skill_win": 0.957,
       "skill_sharpe": 1.21,
       "n_rt": 233
+    },
+    "0x2dd506b91052313cbd720a6b549d48dc8d0778e6": {
+      "group": "v16_skill_decile",
+      "rank": 22,
+      "skill_win": 0.978,
+      "skill_sharpe": 1.13,
+      "n_rt": 464
+    },
+    "0x240789e7b1b49cf6e77cbcb78c65f6ee6b1876e9": {
+      "group": "v16_skill_decile",
+      "rank": 23,
+      "skill_win": 0.93,
+      "skill_sharpe": 1.19,
+      "n_rt": 71
     },
     "0x565b1c32936bdaa526947178acc95c5b08cfacc4": {
       "group": "v16_skill_decile",
@@ -242,6 +270,13 @@
       "skill_sharpe": 1.11,
       "n_rt": 138
     },
+    "0x351d1fd0145ee8f6cc4ab2125f4a665c66bd3ed9": {
+      "group": "v16_skill_decile",
+      "rank": 26,
+      "skill_win": 0.971,
+      "skill_sharpe": 1.04,
+      "n_rt": 175
+    },
     "0x1ca4d75d24dcd969ad9c8ad455c76ab8241fdf63": {
       "group": "v16_skill_decile",
       "rank": 27,
@@ -256,12 +291,26 @@
       "skill_sharpe": 1.01,
       "n_rt": 49
     },
+    "0xd7905b6c7230236597efe83561123178b23bbbbd": {
+      "group": "v16_skill_decile",
+      "rank": 29,
+      "skill_win": 0.945,
+      "skill_sharpe": 1.05,
+      "n_rt": 55
+    },
     "0x0e66ea30180ea13ee91ca1d4d340f993cfb874ec": {
       "group": "v16_skill_decile",
       "rank": 31,
       "skill_win": 0.965,
       "skill_sharpe": 0.98,
       "n_rt": 375
+    },
+    "0x08e881cb053a76a5df7f057327f671fcb83c21a7": {
+      "group": "v16_skill_decile",
+      "rank": 32,
+      "skill_win": 0.907,
+      "skill_sharpe": 1.03,
+      "n_rt": 205
     },
     "0x3a6747c8e913085e243a2c22d188dafa8c6a612a": {
       "group": "v16_skill_decile",
@@ -368,12 +417,26 @@
       "skill_sharpe": 0.79,
       "n_rt": 166
     },
+    "0xfb8c435c9103643a326ae42ce34c5540ca797223": {
+      "group": "v16_skill_decile",
+      "rank": 51,
+      "skill_win": 0.855,
+      "skill_sharpe": 0.87,
+      "n_rt": 214
+    },
     "0xa49041de8ee64de3897d9c480f143e76129a9f40": {
       "group": "v16_skill_decile",
       "rank": 52,
       "skill_win": 0.873,
       "skill_sharpe": 0.83,
       "n_rt": 126
+    },
+    "0x6aa7fba9f2798cd0a696d99149136687386ebf3c": {
+      "group": "v16_skill_decile",
+      "rank": 54,
+      "skill_win": 0.903,
+      "skill_sharpe": 0.8,
+      "n_rt": 93
     },
     "0x8beef9d4859508142ff2eb936837a7873e11eab7": {
       "group": "v16_skill_decile",
@@ -424,6 +487,13 @@
       "skill_sharpe": 0.78,
       "n_rt": 122
     },
+    "0x31f849ca6caba9fe2b916aaf791b3620af7bae6f": {
+      "group": "v16_skill_decile",
+      "rank": 62,
+      "skill_win": 0.898,
+      "skill_sharpe": 0.72,
+      "n_rt": 49
+    },
     "0xd79656d9e6ec643c6df635b21fe78ba7c02cbdc5": {
       "group": "v16_skill_decile",
       "rank": 63,
@@ -431,12 +501,26 @@
       "skill_sharpe": 0.74,
       "n_rt": 65
     },
+    "0x0cb3968f8f0ec912cf255a0ac4d288f1628a7273": {
+      "group": "v16_skill_decile",
+      "rank": 64,
+      "skill_win": 0.948,
+      "skill_sharpe": 0.61,
+      "n_rt": 96
+    },
     "0x769232f7de58dcdb30659b34d9d51ded02537848": {
       "group": "v16_skill_decile",
       "rank": 65,
       "skill_win": 0.946,
       "skill_sharpe": 0.64,
       "n_rt": 828
+    },
+    "0x4205490915b8e97412fa2b624bd4d63f953e943c": {
+      "group": "v16_skill_decile",
+      "rank": 66,
+      "skill_win": 0.797,
+      "skill_sharpe": 0.79,
+      "n_rt": 64
     },
     "0x6d43ae52c309b37d9cc7a8419c776a92fa6691dd": {
       "group": "v16_skill_decile",
@@ -515,6 +599,20 @@
       "skill_sharpe": 0.56,
       "n_rt": 376
     },
+    "0x3d2b07cd0e9a2d3d8954f7f65d96e10e3d060630": {
+      "group": "v16_skill_decile",
+      "rank": 78,
+      "skill_win": 0.853,
+      "skill_sharpe": 0.66,
+      "n_rt": 75
+    },
+    "0x68191e792269d8d835ed033b55f09bb3762a73ec": {
+      "group": "v16_skill_decile",
+      "rank": 79,
+      "skill_win": 0.896,
+      "skill_sharpe": 0.59,
+      "n_rt": 77
+    },
     "0xe49175608c326c3554666438c0e5e6528aa10e37": {
       "group": "v16_skill_decile",
       "rank": 81,
@@ -578,6 +676,13 @@
       "skill_sharpe": 0.58,
       "n_rt": 297
     },
+    "0x6a8920163259584f3fe65a6b083a6dce1243c371": {
+      "group": "v16_skill_decile",
+      "rank": 91,
+      "skill_win": 0.904,
+      "skill_sharpe": 0.5,
+      "n_rt": 52
+    },
     "0x95da8596c44dd09f4b8becce87ad3b7894fb2328": {
       "group": "v16_skill_decile",
       "rank": 92,
@@ -585,12 +690,33 @@
       "skill_sharpe": 0.66,
       "n_rt": 42
     },
+    "0x870e7c8d2444d01b33e2d067624b3cf16800ab30": {
+      "group": "v16_skill_decile",
+      "rank": 93,
+      "skill_win": 0.909,
+      "skill_sharpe": 0.51,
+      "n_rt": 164
+    },
     "0x24dce34b24f631cb653022119c3244bff1e70630": {
       "group": "v16_skill_decile",
       "rank": 94,
       "skill_win": 0.974,
       "skill_sharpe": 0.45,
       "n_rt": 388
+    },
+    "0xea6b3f2138aed1b8e0d93c8e76d2e8bf2428aa4c": {
+      "group": "v16_skill_decile",
+      "rank": 95,
+      "skill_win": 0.928,
+      "skill_sharpe": 0.55,
+      "n_rt": 1787
+    },
+    "0x725c9df246d6fa36da8a376243a8f51332c1def3": {
+      "group": "v16_skill_decile",
+      "rank": 96,
+      "skill_win": 0.881,
+      "skill_sharpe": 0.52,
+      "n_rt": 201
     },
     "0xf352c4e38870d4b69042fd71f29bb87fe8c602ea": {
       "group": "v16_skill_decile",
@@ -605,6 +731,13 @@
       "skill_win": 0.816,
       "skill_sharpe": 0.6,
       "n_rt": 141
+    },
+    "0x1ecede8c168a42802067784f981ee9bc48fa0bf3": {
+      "group": "v16_skill_decile",
+      "rank": 99,
+      "skill_win": 0.888,
+      "skill_sharpe": 0.5,
+      "n_rt": 446
     },
     "0xf64f0e3ca949efe1e2996b1529048de496a3560e": {
       "group": "v16_skill_decile",
