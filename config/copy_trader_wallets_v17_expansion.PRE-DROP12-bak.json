@@ -52,7 +52,7 @@
     "knet_derisk_bypass": true,
     "netx_cap_x": 2.5,
     "coin_side_cap_x": 2.0,
-    "seed_min_wallets": 86,
+    "seed_min_wallets": 98,
     "v17_authorization": "decisions/2026-06-11-v17-ship-with-changes + Alberto GO msg 9254",
     "expansion": {
       "coins": [
@@ -144,6 +144,20 @@
       "skill_sharpe": 3.47,
       "n_rt": 122
     },
+    "0xc26aad50fc965758414715d28a05b0607db103e4": {
+      "group": "v16_skill_decile",
+      "rank": 3,
+      "skill_win": 1.0,
+      "skill_sharpe": 2.52,
+      "n_rt": 348
+    },
+    "0x1b4692e3c84464744c61b5324fee361b5e5b3363": {
+      "group": "v16_skill_decile",
+      "rank": 4,
+      "skill_win": 0.996,
+      "skill_sharpe": 2.41,
+      "n_rt": 253
+    },
     "0xdb0ba200d1a05594a4fbd6cb3e1da0ab3b469fec": {
       "group": "v16_skill_decile",
       "rank": 5,
@@ -158,12 +172,33 @@
       "skill_sharpe": 2.06,
       "n_rt": 455
     },
+    "0xe438e2d09ccb8e4728fc3a0a85f3cd868efcc04a": {
+      "group": "v16_skill_decile",
+      "rank": 7,
+      "skill_win": 0.998,
+      "skill_sharpe": 1.89,
+      "n_rt": 543
+    },
     "0x7c78232c7226e4facf49122850cab1c34fd03f0a": {
       "group": "v16_skill_decile",
       "rank": 8,
       "skill_win": 0.947,
       "skill_sharpe": 1.76,
       "n_rt": 152
+    },
+    "0x34ad1f870b8a4095a46effb093fa3bf70c121f5e": {
+      "group": "v16_skill_decile",
+      "rank": 9,
+      "skill_win": 0.999,
+      "skill_sharpe": 1.68,
+      "n_rt": 736
+    },
+    "0xafe52e764a7997670deccffe056312781dd5925f": {
+      "group": "v16_skill_decile",
+      "rank": 10,
+      "skill_win": 1.0,
+      "skill_sharpe": 1.62,
+      "n_rt": 755
     },
     "0x0d5c05fd3509dd7a35b956d73e0e4e8b2afdb82a": {
       "group": "v16_skill_decile",
@@ -298,6 +333,13 @@
       "skill_sharpe": 1.05,
       "n_rt": 55
     },
+    "0x2f06d4322fa80baa38badd57bf69be6353640e1d": {
+      "group": "v16_skill_decile",
+      "rank": 30,
+      "skill_win": 0.992,
+      "skill_sharpe": 0.97,
+      "n_rt": 237
+    },
     "0x0e66ea30180ea13ee91ca1d4d340f993cfb874ec": {
       "group": "v16_skill_decile",
       "rank": 31,
@@ -346,6 +388,13 @@
       "skill_win": 0.948,
       "skill_sharpe": 0.97,
       "n_rt": 445
+    },
+    "0xf46265a9acf0c5d333e0dfd39ce7146eb8db2241": {
+      "group": "v16_skill_decile",
+      "rank": 38,
+      "skill_win": 0.89,
+      "skill_sharpe": 0.99,
+      "n_rt": 118
     },
     "0x374b8890dbc7aef957ec44e9b80766118789f1a4": {
       "group": "v16_skill_decile",
@@ -396,6 +445,13 @@
       "skill_sharpe": 0.72,
       "n_rt": 41
     },
+    "0xd45cbc4ecce2ed4d920620b1bcd04f3996f27a1d": {
+      "group": "v16_skill_decile",
+      "rank": 46,
+      "skill_win": 0.879,
+      "skill_sharpe": 0.89,
+      "n_rt": 165
+    },
     "0x3454c7aa653c908850021eff43c0a141cd138c9e": {
       "group": "v16_skill_decile",
       "rank": 47,
@@ -409,6 +465,13 @@
       "skill_win": 0.874,
       "skill_sharpe": 0.85,
       "n_rt": 309
+    },
+    "0x2f4c122a93f5164debef5c7d290ae7eefdbc62c1": {
+      "group": "v16_skill_decile",
+      "rank": 49,
+      "skill_win": 0.935,
+      "skill_sharpe": 0.76,
+      "n_rt": 387
     },
     "0x09f2b610f85a5fea4d35b42cccdc52f1f71d6bc7": {
       "group": "v16_skill_decile",
@@ -430,6 +493,13 @@
       "skill_win": 0.873,
       "skill_sharpe": 0.83,
       "n_rt": 126
+    },
+    "0x1d4fd77b2d5676839d44fd653c9b20ca538ca4ad": {
+      "group": "v16_skill_decile",
+      "rank": 53,
+      "skill_win": 0.824,
+      "skill_sharpe": 0.9,
+      "n_rt": 1714
     },
     "0x6aa7fba9f2798cd0a696d99149136687386ebf3c": {
       "group": "v16_skill_decile",
@@ -613,6 +683,13 @@
       "skill_sharpe": 0.59,
       "n_rt": 77
     },
+    "0xcd4ece3b233c3e4b2d86a3a59508aeb3f1cd793f": {
+      "group": "v16_skill_decile",
+      "rank": 80,
+      "skill_win": 0.876,
+      "skill_sharpe": 0.61,
+      "n_rt": 170
+    },
     "0xe49175608c326c3554666438c0e5e6528aa10e37": {
       "group": "v16_skill_decile",
       "rank": 81,
@@ -668,6 +745,13 @@
       "skill_win": 0.828,
       "skill_sharpe": 0.66,
       "n_rt": 419
+    },
+    "0x04022c24d665fd621c0077be1258c9ec883da41f": {
+      "group": "v16_skill_decile",
+      "rank": 89,
+      "skill_win": 0.835,
+      "skill_sharpe": 0.61,
+      "n_rt": 115
     },
     "0x454bd0d4a9ec0f91d6d28c37a92c1d3fb4e905e4": {
       "group": "v16_skill_decile",
