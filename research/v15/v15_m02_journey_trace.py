@@ -639,15 +639,18 @@ def main() -> None:
             jw.add_many(r.get("journeys"))
         _log_one(r, len(wallets))
 
-    if budget.procs > 1:
-        with Pool(budget.procs, initializer=_init_worker,
-                  initargs=(args.anchor_parquet, budget.worker_soft_gb)) as pool:
-            for r in pool.imap_unordered(process_wallet, tasks):
-                _consume(r)
-    else:
-        _init_worker(args.anchor_parquet, budget.worker_soft_gb)
-        for tk in tasks:
-            _consume(process_wallet(tk))
+    # ALWAYS run via a Pool (even procs=1) with maxtasksperchild so the worker process is RECYCLED
+    # periodically -> the per-coin marks cache (m01._coin_series, which grows unbounded as a long-lived
+    # worker touches more of the 1830-coin universe) is RESET, keeping RSS under worker_soft_gb. Without
+    # this the procs=1 in-process loop blew the 2.5G soft cap at ~153 wallets (memory-guard abort, exit
+    # 137) once the marks cache grew (1830 coins to 06-24). maxtasksperchild forks a fresh worker every
+    # N wallets; on macOS spawn this re-imports m01 -> empty cache. (Fix 2026-06-25, codex marks-rebuild.)
+    MAXTASKS_PER_CHILD = 40
+    with Pool(max(1, budget.procs), initializer=_init_worker,
+              initargs=(args.anchor_parquet, budget.worker_soft_gb),
+              maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
+        for r in pool.imap_unordered(process_wallet, tasks):
+            _consume(r)
 
     n_actions = aw.close()
     n_journeys = jw.close()

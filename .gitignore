@@ -209,3 +209,10 @@ app/models/
 
 # Docker build context
 .docker-build/
+
+# Tool/editor backups + secrets backups (never commit)
+*.bak
+*.bak-*
+.env.bak*
+# Live copy-trader halt/pause flags (operational, machine-local)
+.HALT_COPY

@@ -238,8 +238,26 @@ def get_mark(coin: str, ts_ms: int, causal: bool = False) -> Optional[float]:
     i = int(np.searchsorted(mins, minute_key, side="right")) - 1  # latest candle minute <= minute_key
     if i < 0:
         return None
+    # STALENESS CAP (codex marks-gate 2026-06-24): the candle fallback is at-or-before with NO age
+    # bound, so a candle from hours ago was returned as if current -> silently-stale MTM that callers
+    # treat as a live mark (markable_all=True). Cap the as-of age: if the nearest prior 1m bar is older
+    # than CANDLE_MAX_AGE_MS, return None so the caller flags it (degraded / NO_ANCHOR) instead of
+    # marking on a stale price. With dense all-market candles this rarely triggers; it only catches the
+    # genuinely-dormant-coin case the cap is meant to surface.
+    if minute_key - int(mins[i]) > CANDLE_MAX_AGE_MS:
+        return None
     px = closes[i]
     return None if px != px else float(px)  # NaN-safe (missing close -> None)
+
+
+# Candle-fallback staleness cap (codex marks-gate 2026-06-24). The 1m candle close is an at-or-before
+# lookup; without a bound a stale bar (delisted/dormant coin, or a data gap) is returned as a live mark.
+# Set to 15min to MATCH ASSETCTX_MAX_AGE_MS (codex recheck 2026-06-24: prefer 15min for a deploy-driving
+# reconstruction; 60min still allows materially-stale MTM on a fast-moving thin coin). With dense
+# all-market 1m candles a held coin has a bar most minutes, so this fires only on genuine dormancy/gaps
+# -> caller flags degraded/NO_ANCHOR. The pre/post-05-24 coverage+staleness AUDIT validates the cap does
+# not over-flag thin HIP-3 instruments; bump back toward 60min only if the audit shows false positives.
+CANDLE_MAX_AGE_MS = 15 * 60 * 1000  # 15min (matches ASSETCTX_MAX_AGE_MS)
 
 
 # Oracle (setOracle) mark series, per-coin in-memory asof cache. Mirrors _coin_series.
