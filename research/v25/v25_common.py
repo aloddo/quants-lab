@@ -90,9 +90,9 @@ OPEN_BAG_TRAIL_DAYS = 30
 # asof AND >= 20 distinct active days in train.
 ACTIVITY_LAST_FILL_DAYS = 7
 MIN_ACTIVE_DAYS = 20
-# Coverage gate (frozen): wallet EXCLUDED if > 5% of its train JOURNEYS are unmarkable
-# (journey-level 95%). A journey is unmarkable iff ANY of its constituent actions lacks
-# a valid sizing mark (mark NaN or <= 0).
+# Coverage gate (frozen): wallet EXCLUDED if > 5% of its CLOSED train JOURNEYS
+# (exit_ts <= asof) are unmarkable (journey-level 95%). A journey is unmarkable iff ANY
+# of its constituent actions lacks a valid sizing mark (mark NaN or <= 0).
 COVERAGE_MAX_UNMARKABLE_FRAC = 0.05
 
 # FIRST_CLOSE live-parity semantics (frozen; gate-b blocker #5): copy exit triggers when
@@ -206,8 +206,9 @@ class MarksIndex:
     Repricing rule (spec, frozen): our fill price = close of the FIRST bar whose close time
     (bar_open + 60s) >= signal_ts + 2000ms, and that close time must be within 60s of the
     target, else the trade is dropped and counted. NEVER the prior bar (always-late).
-    cap_ms (window-boundary isolation, gate-b #5): a returned mark's close time may NEVER
-    exceed cap_ms -- no price beyond the fold/holdout end is ever read.
+    cap_ms (window-boundary isolation, gate-b #5): a returned mark's close time must be
+    strictly BELOW cap_ms -- the window is half-open [start, end), so a mark exactly AT
+    the end is UNREADABLE; no price at/beyond the fold/holdout end is ever read.
     Fail-closed: missing coin series => no mark => drop/count."""
 
     def __init__(self, cache_dir: Path = MARKS_CACHE_DIR, max_coins: int = 256):
@@ -239,9 +240,9 @@ class MarksIndex:
                   window_ms: int | None = REPRICE_WINDOW_MS,
                   cap_ms: int | None = None):
         """(fill_ts_ms, close) of the first bar CLOSING at >= signal + reprice_ms.
-        window_ms bounds how late the mark may be (None = unbounded). cap_ms: hard upper
-        bound on the mark close time (window-boundary isolation; None = no cap).
-        Returns (None, None) if unavailable."""
+        window_ms bounds how late the mark may be (None = unbounded). cap_ms: half-open
+        upper bound on the mark close time -- close_ts >= cap_ms is rejected
+        (window-boundary isolation; None = no cap). Returns (None, None) if unavailable."""
         mins, closes = self._series(coin)
         if mins.size == 0:
             return None, None
@@ -253,7 +254,7 @@ class MarksIndex:
         close_ts = int(mins[i]) + MS_MIN
         if window_ms is not None and close_ts - target > window_ms:
             return None, None
-        if cap_ms is not None and close_ts > cap_ms:
+        if cap_ms is not None and close_ts >= cap_ms:   # half-open: ts == cap unreadable
             return None, None
         v = float(closes[i])
         if v != v or v <= 0:

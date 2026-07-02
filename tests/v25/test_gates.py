@@ -171,6 +171,21 @@ class TestCoverageGate:
         assert row["unmarkable_frac"] == pytest.approx(1 / 25)
         assert row["pass_coverage"] is True and row["eligible"]
 
+    def test_closed_journeys_only(self, marks_dir):
+        """Gate-b round-2 residual #1: the unmarkable fraction is computed over CLOSED
+        train journeys only (exit_ts <= asof) -- an OPEN unmarkable journey must not
+        enter the numerator or the denominator."""
+        m0 = (ASOF // MS_MIN - 10) * MS_MIN
+        marks_dir("OPN", [m0], [100.0])           # open-bag gate still passes (flat)
+        marks = MarksIndex(cache_dir=marks_dir.dir)
+        wdf = _base_wallet_actions(open_pos=True)  # 25 closed BTC + 1 OPEN OPN journey
+        idx = wdf.index[wdf["coin"] == "OPN"]
+        wdf.loc[idx, "mark"] = np.nan              # the OPEN journey is unmarkable
+        row = wallet_gate_row("0xw", wdf, ASOF, marks)
+        assert row["n_closed_journeys"] == 25
+        assert row["unmarkable_frac"] == pytest.approx(0.0)   # NOT 1/26
+        assert row["pass_coverage"] is True
+
 
 class TestOpenBagGate:
     def test_zero_open_passes(self, marks_dir):

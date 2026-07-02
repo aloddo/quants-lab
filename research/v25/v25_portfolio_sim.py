@@ -33,9 +33,11 @@ Account caps (portfolio mode only, frozen): initial equity $500; gross notional 
 equity ("netx 2.5x", live gross_entry_gate_x semantics); per coin-side notional <= 2x
 equity; margin util <= 0.7 with reserve leverage 10x (live margin_reserve_max_lev).
 
-MTM drawdown (frozen, gate-b blocker #6): the equity series starts at the initial $500
-and is updated at EVERY simulated event (entry fill, exit fill, day-boundary mark
-refresh, terminal close) -- not daily endpoints.
+MTM drawdown (frozen, gate-b blocker #6 + round-2 residual #3): the equity/DD series
+starts at the initial $500 and is refreshed at EVERY 1m mark refresh while ANY position
+is held (per-minute while open), plus every fill and the terminal close -- not only
+fills and daily endpoints. Memory-light: running peak + max-DD scalars only; the daily
+endpoint series is the only retained series (for the bootstrap).
 """
 from __future__ import annotations
 
@@ -45,7 +47,8 @@ import numpy as np
 import pandas as pd
 
 from v25_common import (DROPOUT_P, DUST_USD, EXIT_TRIGGER_FRAC, INITIAL_EQUITY,
-                        MAX_COIN_SIDE_X, MAX_GROSS_X, MAX_MARGIN_UTIL, MS_DAY, ORDER_USD,
+                        MAX_COIN_SIDE_X, MAX_GROSS_X, MAX_MARGIN_UTIL, MS_DAY, MS_MIN,
+                        ORDER_USD,
                         REPRICE_MS, REPRICE_WINDOW_MS, RESERVE_LEV, ExecScenario,
                         MarksIndex, coin_is_spot, event_dropout)
 
@@ -111,7 +114,9 @@ class CopySim:
         self.counters = {k: 0 for k in COUNTER_KEYS}
         self._day_samples: list[tuple] = []       # (day_end_ms, equity)
         self._next_day_ms = ((self.start_ms // MS_DAY) + 1) * MS_DAY
-        # event-level MTM DD tracking (frozen): starts at the initial equity
+        self._next_min_ms = ((self.start_ms // MS_MIN) + 1) * MS_MIN
+        # per-mark MTM DD tracking (frozen): starts at the initial equity; running
+        # peak/max scalars only (memory-light, no full series retention)
         self._dd_peak = self.equity0
         self._max_dd = 0.0
 
@@ -159,11 +164,26 @@ class CopySim:
             return "margin"
         return None
 
-    # ---- day-boundary equity sampling (mark refresh events) ------------------------------ #
+    # ---- clock advance: per-1m-mark DD refresh + daily endpoint sampling ----------------- #
     def _advance_days(self, to_ms: int):
+        """Advance the sampled clock to to_ms (capped at end_ms). While ANY position is
+        held, the equity/DD series is refreshed at EVERY 1m mark close in between
+        (gate-b round-2 residual #3: intraday dips between fills with no signal events
+        MUST register). Memory-light: running peak/max scalars; only daily endpoints
+        are retained (for the bootstrap)."""
         if not self.portfolio:
             return
-        while self._next_day_ms <= min(to_ms, self.end_ms):
+        to = min(to_ms, self.end_ms)
+        if self.lots:
+            m = self._next_min_ms
+            while m <= to:
+                self._dd_update(m)
+                m += MS_MIN
+            self._next_min_ms = m
+        elif to >= self._next_min_ms:
+            # flat book: equity cannot move between events; skip ahead in O(1)
+            self._next_min_ms = ((to // MS_MIN) + 1) * MS_MIN
+        while self._next_day_ms <= to:
             self._day_samples.append((self._next_day_ms, self.equity(self._next_day_ms)))
             self._dd_update(self._next_day_ms)
             self._next_day_ms += MS_DAY

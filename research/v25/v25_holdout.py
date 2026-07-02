@@ -15,12 +15,15 @@ PASS iff (all frozen):
 Winner fails => STOP (no runner-up holdout). Report includes realized-trip mean,
 trips/day, long/short split (activity profile, reported ship input).
 
-WRITE-ONCE ENFORCEMENT: refuses to run if holdout_result.json already exists; the
-result file is chmod 444 after writing. Refuses to run before 2026-07-16 UTC.
+WRITE-ONCE ENFORCEMENT: the result path is acquired via EXCLUSIVE CREATE (O_EXCL) and
+chmod 444 BEFORE evaluation starts -- a crashed run leaves the read-only marker in
+place and there is NO silent re-run (manual deletion requires a new sign-off). The
+evaluated rule comes ONLY from the fold-stage winner in verdict.json (no --rule
+bypass exists). eval_end must be in the past at invocation (the holdout window must
+have fully elapsed). Refuses to run before 2026-07-16 UTC.
 
 USAGE
-    ... v25_holdout.py --actions PATH_TO_HOLDOUT_M02_ACTIONS --eval-end 2026-07-16 \
-        [--rule R1|R2]   # default: winner from verdict.json
+    ... v25_holdout.py --actions PATH_TO_HOLDOUT_M02_ACTIONS --eval-end 2026-07-16
 
 The --actions file must be the holdout-extended m02 rebuild (frozen m01/m02 code,
 checksummed BEFORE fold evaluation); its sha256 is recorded in the result.
@@ -56,41 +59,59 @@ def holdout_fold(eval_end_ms: int) -> dict:
             "test_days": (eval_end_ms - asof_ms) / 86_400_000}
 
 
+def acquire_result_lock():
+    """WRITE-ONCE lock (gate-b round-2 residual #4): EXCLUSIVE CREATE of the result
+    path + chmod 444 marker BEFORE evaluation starts. If two invocations race, exactly
+    one wins; if the winning run crashes mid-evaluation, the read-only marker stays --
+    there is NO silent re-run (manual deletion requires a new sign-off)."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(RESULT_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(f"HOLDOUT REFUSED: {RESULT_PATH} already exists. The holdout is "
+                         f"evaluated ONCE; there is no re-run.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"status": "EVALUATION_IN_PROGRESS", "locked_unix": time.time()}, fh,
+                  indent=2)
+    os.chmod(RESULT_PATH, 0o444)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--actions", type=Path, required=True,
                     help="holdout-extended m02 actions parquet (frozen m01/m02 rebuild)")
     ap.add_argument("--eval-end", required=True,
                     help="frozen eval_end (UTC date, half-open end of the holdout window)")
-    ap.add_argument("--rule", choices=["R1", "R2"], default=None,
-                    help="default: the fold-stage winner from verdict.json")
     args = ap.parse_args()
 
-    # ---- write-once + timing enforcement (frozen) ---------------------------------------- #
-    if RESULT_PATH.exists():
-        raise SystemExit(f"HOLDOUT REFUSED: {RESULT_PATH} already exists. The holdout is "
-                         f"evaluated ONCE; there is no re-run.")
+    # ---- timing enforcement (frozen) ------------------------------------------------------ #
     now_utc = pd.Timestamp.utcnow().tz_localize(None)
     if now_utc < HOLDOUT_EARLIEST_EVAL:
         raise SystemExit(f"HOLDOUT REFUSED: evaluation allowed on/after "
                          f"{HOLDOUT_EARLIEST_EVAL.date()} UTC (now: {now_utc}).")
-    rule = args.rule
-    if rule is None:
-        vp = OUT_DIR / "verdict.json"
-        if not vp.exists():
-            raise SystemExit("HOLDOUT REFUSED: no verdict.json (run folds first) and no "
-                             "--rule given")
-        with open(vp) as fh:
-            v = json.load(fh)
-        if not v.get("winner"):
-            raise SystemExit("HOLDOUT REFUSED: fold-stage winner is NONE (KILL); the "
-                             "frozen procedure has no holdout to run.")
-        rule = v["winner"]["rule"]
     eval_end = pd.Timestamp(args.eval_end)
+    if eval_end > now_utc:
+        raise SystemExit(f"HOLDOUT REFUSED: eval_end {eval_end.date()} is in the future "
+                         f"(now: {now_utc}); the holdout window must have fully elapsed.")
     eval_end_ms = int(eval_end.value // 10**6)
     fold = holdout_fold(eval_end_ms)
     if fold["test_days"] <= 0:
         raise SystemExit("HOLDOUT REFUSED: eval_end must be after 2026-06-11")
+
+    # ---- rule = the fold-stage winner ONLY (no bypass exists) ----------------------------- #
+    vp = OUT_DIR / "verdict.json"
+    if not vp.exists():
+        raise SystemExit("HOLDOUT REFUSED: no verdict.json -- the evaluated rule comes "
+                         "ONLY from the fold-stage winner (run v25_run_folds.py first)")
+    with open(vp) as fh:
+        v = json.load(fh)
+    if not v.get("winner"):
+        raise SystemExit("HOLDOUT REFUSED: fold-stage winner is NONE (KILL); the "
+                         "frozen procedure has no holdout to run.")
+    rule = v["winner"]["rule"]
+
+    # ---- write-once lock acquired BEFORE evaluation starts (frozen) ----------------------- #
+    acquire_result_lock()
 
     install_memory_guard(soft_gb=12, label="v25_holdout")
     work = OUT_DIR / "holdout_work"
@@ -160,6 +181,9 @@ def main():
     }
     trips.to_parquet(work / f"holdout_trips_{rule}.parquet", index=False)
     res["daily"].to_parquet(work / f"holdout_daily_{rule}.parquet", index=False)
+    # sole writer: replace the in-progress lock marker (acquired pre-evaluation) with
+    # the result, then re-seal read-only
+    os.chmod(RESULT_PATH, 0o644)
     with open(RESULT_PATH, "w") as fh:
         json.dump(result, fh, indent=2, default=float)
     os.chmod(RESULT_PATH, 0o444)          # write-once: read-only after the single write

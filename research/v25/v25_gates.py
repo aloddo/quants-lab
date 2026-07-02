@@ -7,9 +7,10 @@ half-open train window [train_start, asof)).
 Gates (each failure counted; a wallet can fail several):
 - activity (frozen; codex vetoed resolution 4): last perp fill <= 7 DAYS before asof
   AND >= 20 distinct active days (UTC dates with >= 1 perp action) in train
-- coverage (frozen, journey-level 95%): wallet EXCLUDED if > 5% of its train journeys
-  are unmarkable (a journey is unmarkable iff ANY of its actions lacks a valid mark);
-  zero train journeys => trivially passes (R1/R2 sample minima handle empty wallets)
+- coverage (frozen, journey-level 95%): wallet EXCLUDED if > 5% of its CLOSED train
+  journeys (exit_ts <= asof; train stats use only closed journeys) are unmarkable
+  (a journey is unmarkable iff ANY of its actions lacks a valid mark); zero closed
+  train journeys => trivially passes (R1/R2 sample minima handle empty wallets)
 - liquidation: NO is_liquidation action in train
 - exit_ts <= asof: enforced structurally -- train slice is ts < asof, so every closed
   train journey has exit_ts < asof
@@ -91,10 +92,11 @@ def wallet_gate_row(wallet: str, wdf: pd.DataFrame, asof_ms: int, marks: MarksIn
     closed = j[j["exit_ts"].notna() & (j["exit_ts"] <= asof_ms)] if len(j) else j
     row["n_closed_journeys"] = int(len(closed))
     row["n_train_journeys"] = int(len(j))
-    # frozen coverage gate: journey-level -- > 5% unmarkable train journeys => EXCLUDED;
-    # zero-journey denominator passes trivially
-    if len(j):
-        unm_frac = float(j["unmarkable"].mean())
+    # frozen coverage gate: journey-level -- > 5% unmarkable CLOSED train journeys
+    # (exit_ts <= asof; consistent with "train stats use only journeys with
+    # exit_ts <= asof") => EXCLUDED; zero-closed-journey denominator passes trivially
+    if len(closed):
+        unm_frac = float(closed["unmarkable"].mean())
     else:
         unm_frac = 0.0
     row["unmarkable_frac"] = unm_frac

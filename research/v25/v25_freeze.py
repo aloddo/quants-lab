@@ -2,9 +2,12 @@
 """v25 freeze record writer + validator (spec: contamination controls; gate-b blocker #8).
 
 freeze = JOINT (pre-registration doc content hash of the CURRENT /tmp/v25_prereg_v3.md,
-harness git commit with research/v25 TRACKED and clean, input sha256 manifest including
-m02_actions.parquet AND every marks-cache file under app/data/v15/marks_cache), recorded
-write-once in app/data/research/v25/FREEZE.json at codex gate (b).
+harness git commit with research/v25 TRACKED and clean, sha256 of every imported
+v15/v16 dependency module derived from the harness imports + the spec-parity files,
+input sha256 manifest including m02_actions.parquet AND every marks-cache file under
+app/data/v15/marks_cache), recorded write-once in app/data/research/v25/FREEZE.json at
+codex gate (b). Validation additionally requires current git HEAD == frozen commit and
+a clean working tree for the harness and all its v15/v16 dependencies.
 
 The fold runner (v25_run_folds.py) calls validate_freeze() at startup and REFUSES to run
 full folds on any mismatch between FREEZE.json and the current code + doc + inputs.
@@ -13,6 +16,7 @@ Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python research/v25/v25_freeze
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import subprocess
@@ -28,12 +32,62 @@ from v25_common import ACTIONS_PARQUET, L2_CALIB_PATH, MARKS_CACHE_DIR, OUT_DIR,
 HARNESS_FILES = ["v25_common.py", "v25_gates.py", "v25_r1_causal.py", "v25_r2_lcb.py",
                  "v25_portfolio_sim.py", "v25_bootstrap.py", "v25_run_folds.py",
                  "v25_holdout.py", "v25_ship_config.py", "v25_freeze.py"]
+# Spec-parity reference (gate-b round-2 residual #6): v15_fixed_notional_signals.py is
+# the canonical live copy-lifecycle the sim MIRRORS (FIRST_CLOSE / reverse-never-opens
+# semantics). It is not imported, but its content defines the parity contract, so it is
+# bound into the freeze alongside the import-derived dependencies.
+SPEC_PARITY_FILES = ["research/v15/v15_fixed_notional_signals.py"]
 FREEZE_PATH = OUT_DIR / "FREEZE.json"
 
 
 def harness_hashes() -> tuple[dict, str]:
     here = Path(__file__).resolve().parent
     hashes = {f: sha256_file(here / f) for f in HARNESS_FILES if (here / f).exists()}
+    combined = hashlib.sha256(
+        "".join(f"{k}:{v}" for k, v in sorted(hashes.items())).encode()).hexdigest()
+    return hashes, combined
+
+
+def v15_dependency_files() -> list[Path]:
+    """v15/v16 modules ACTUALLY imported by the v25 harness, derived from the AST of
+    the harness files (and transitively through the discovered v15/v16 modules) --
+    NOT a blind hardcoded list (gate-b round-2 residual #6). The spec-parity reference
+    files (SPEC_PARITY_FILES) are unioned in."""
+    here = Path(__file__).resolve().parent
+    dep_dirs = [REPO / "research" / "v15", REPO / "research" / "v16"]
+    deps: set[Path] = set()
+    todo = [here / f for f in HARNESS_FILES if (here / f).exists()]
+    scanned: set[Path] = set()
+    while todo:
+        src = todo.pop()
+        if src in scanned:
+            continue
+        scanned.add(src)
+        try:
+            tree = ast.parse(src.read_text())
+        except SyntaxError as e:
+            raise SystemExit(f"FREEZE ABORT: cannot parse {src} for import scan: {e}")
+        mods: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                mods.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                mods.add(node.module.split(".")[0])
+        for mname in mods:
+            for d in dep_dirs:
+                p = d / f"{mname}.py"
+                if p.exists():
+                    deps.add(p)
+                    todo.append(p)      # transitive: deps of v15/v16 deps count too
+    for rel in SPEC_PARITY_FILES:
+        p = REPO / rel
+        if p.exists():
+            deps.add(p)
+    return sorted(deps)
+
+
+def v15_dep_hashes() -> tuple[dict, str]:
+    hashes = {str(p.relative_to(REPO)): sha256_file(p) for p in v15_dependency_files()}
     combined = hashlib.sha256(
         "".join(f"{k}:{v}" for k, v in sorted(hashes.items())).encode()).hexdigest()
     return hashes, combined
@@ -54,6 +108,7 @@ def compute_freeze(include_marks_files: bool = True) -> dict:
     if not ACTIONS_PARQUET.exists():
         raise SystemExit(f"FREEZE ABORT: input missing at {ACTIONS_PARQUET}")
     hh, combined = harness_hashes()
+    deps_h, deps_combined = v15_dep_hashes()
     marks_hashes, marks_combined = marks_cache_manifest()
     freeze = {
         "prereg_doc": str(PREREG_DOC),
@@ -63,6 +118,9 @@ def compute_freeze(include_marks_files: bool = True) -> dict:
         "harness_dir": "research/v25",
         "harness_file_sha256": hh,
         "harness_combined_sha256": combined,
+        # imported v15/v16 dependencies (derived from imports + spec-parity files)
+        "v15_dep_file_sha256": deps_h,
+        "v15_dep_combined_sha256": deps_combined,
         "input_manifest": {
             str(ACTIONS_PARQUET.relative_to(REPO)): sha256_file(ACTIONS_PARQUET),
             str(L2_CALIB_PATH.relative_to(REPO)): sha256_file(L2_CALIB_PATH),
@@ -78,15 +136,19 @@ def compute_freeze(include_marks_files: bool = True) -> dict:
 
 
 def _harness_tracked_and_clean() -> str | None:
-    """Return an error string if research/v25 or tests/v25 is untracked/dirty in git."""
+    """Return an error string if research/v25, tests/v25, or ANY imported v15/v16
+    dependency (incl. spec-parity files) is untracked/dirty in git. Both freezing AND
+    validation refuse on a dirty dependency (gate-b round-2 residual #6)."""
+    dep_rels = [str(p.relative_to(REPO)) for p in v15_dependency_files()]
     try:
         dirty = subprocess.check_output(
-            ["git", "status", "--porcelain", "research/v25", "tests/v25"],
+            ["git", "status", "--porcelain", "research/v25", "tests/v25", *dep_rels],
             cwd=REPO).decode().strip()
     except Exception as e:
         return f"git status failed: {e}"
     if dirty:
-        return f"research/v25 or tests/v25 not clean in git:\n{dirty}"
+        return (f"research/v25, tests/v25 or imported v15/v16 dependencies not clean "
+                f"in git:\n{dirty}")
     return None
 
 
@@ -103,10 +165,23 @@ def validate_freeze(check_inputs: bool = True, freeze_path: Path = FREEZE_PATH) 
     if doc_hash != fz.get("prereg_doc_sha256"):
         errs.append(f"prereg doc hash mismatch: current {doc_hash} != frozen "
                     f"{fz.get('prereg_doc_sha256')}")
+    # frozen commit must BE the current git HEAD (gate-b round-2 residual #6a)
+    head = git_commit()
+    if head != fz.get("git_commit"):
+        errs.append(f"git HEAD mismatch: current {head} != frozen "
+                    f"{fz.get('git_commit')} (validation must run on the frozen commit)")
+    # working tree must be clean for the harness AND its v15/v16 dependencies (#6b)
+    dirty = _harness_tracked_and_clean()
+    if dirty:
+        errs.append(f"dirty working tree: {dirty}")
     _, combined = harness_hashes()
     if combined != fz.get("harness_combined_sha256"):
         errs.append(f"harness code hash mismatch: current {combined} != frozen "
                     f"{fz.get('harness_combined_sha256')}")
+    _, deps_combined = v15_dep_hashes()
+    if deps_combined != fz.get("v15_dep_combined_sha256"):
+        errs.append(f"v15/v16 dependency hash mismatch: current {deps_combined} != "
+                    f"frozen {fz.get('v15_dep_combined_sha256')}")
     if check_inputs:
         for rel, want in fz.get("input_manifest", {}).items():
             p = REPO / rel
@@ -138,6 +213,9 @@ def main():
     print(f"  doc sha256      {freeze['prereg_doc_sha256']}")
     print(f"  git commit      {freeze['git_commit']}")
     print(f"  harness sha256  {freeze['harness_combined_sha256']}")
+    print(f"  v15/v16 deps    {len(freeze['v15_dep_file_sha256'])} files, combined "
+          f"{freeze['v15_dep_combined_sha256'][:16]}... "
+          f"({', '.join(sorted(freeze['v15_dep_file_sha256']))})")
     print(f"  marks cache     {freeze['marks_cache_n_files']} files, combined "
           f"{freeze['marks_cache_combined_sha256'][:16]}...")
 

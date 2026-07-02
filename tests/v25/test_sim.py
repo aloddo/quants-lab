@@ -58,6 +58,16 @@ class TestRepricing:
         # without the cap the same call returns the future mark (control)
         assert m.next_mark("BTC", T0 + 70_000, window_ms=None)[1] == 105.0
 
+    def test_cap_ms_half_open_mark_at_end_unreadable(self, marks_dir):
+        """Gate-b round-2 residual #2: the window is half-open [start, end) -- a mark
+        whose close time is exactly AT end_ms must be UNREADABLE (>= cap rejected)."""
+        marks_dir("BTC", [T0, T0 + 10 * MS_MIN], [100.0, 105.0])
+        m = MarksIndex(cache_dir=marks_dir.dir)
+        cap = T0 + 11 * MS_MIN      # the future mark closes EXACTLY at the cap
+        assert m.next_mark("BTC", T0 + 70_000, window_ms=None, cap_ms=cap) == (None, None)
+        # one ms above the boundary: readable again (strictly-below semantics)
+        assert m.next_mark("BTC", T0 + 70_000, window_ms=None, cap_ms=cap + 1)[1] == 105.0
+
     def test_no_future_mark_at_all(self, marks_dir):
         marks_dir("BTC", [T0], [100.0])
         m = MarksIndex(cache_dir=marks_dir.dir)
@@ -372,6 +382,24 @@ class TestEventLevelDD:
         d = res["daily"]
         endpoint_dd = (d["equity"].cummax() - d["equity"]).max() / 500.0
         assert endpoint_dd < 0.001                # daily endpoints missed the dip
+
+    def test_intraday_dip_between_fills_no_events(self, marks_dir):
+        """Gate-b round-2 residual #3: a position that dips intraday between fills with
+        NO signal events at all during the dip MUST register the DD -- the equity/DD
+        series is refreshed at every 1m mark while a position is held, not only at
+        fills and daily boundaries."""
+        # BTC dips 100 -> 90 during minutes 300..330 of day 1; the ONLY events are the
+        # entry (minute 10) and the terminal close at window end
+        _flat_marks(marks_dir, coin="BTC",
+                    step_px=lambda i: 90.0 if 300 <= i < 330 else 100.0)
+        m = MarksIndex(cache_dir=marks_dir.dir)
+        a = actions([("BTC", T0 + 10 * MS_MIN, "ENTRY", 1.0, 100.0, 1.0, 1, False)])
+        res = simulate_portfolio(a, zero_cost(), m, T0, END)
+        # lot = 1.5 units x (90 - 100) = -$15 at the dip -> dd 3% vs the $500 peak
+        assert res["max_mtm_dd_frac"] == pytest.approx(15.0 / 500.0, rel=1e-6)
+        d = res["daily"]
+        endpoint_dd = (d["equity"].cummax() - d["equity"]).max() / 500.0
+        assert endpoint_dd < 0.001                # daily endpoints alone missed it
 
     def test_dd_starts_at_initial_equity(self, marks_dir):
         # immediate loss below $500 registers against the INITIAL equity peak

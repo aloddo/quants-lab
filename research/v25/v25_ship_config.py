@@ -35,10 +35,32 @@ from v25_common import (ACTIONS_PARQUET, EXIT_TRIGGER_FRAC, INITIAL_EQUITY,
 from v25_freeze import FREEZE_PATH
 
 
+def _universe_manifest(work: Path, fold_key) -> dict:
+    """Universe manifest at the ship asof (gate-b round-2 residual #5): the full
+    eligible wallet list, the entity map over eligible wallets, and the exclusion
+    counts, read from the persisted selection artifacts for this fold key."""
+    gp = work / f"gates_fold{fold_key}.parquet"
+    ep = work / f"entities_fold{fold_key}.parquet"
+    xp = work / "exclusions.json"
+    gates = pd.read_parquet(gp) if gp.exists() else pd.DataFrame()
+    ents = pd.read_parquet(ep) if ep.exists() else pd.DataFrame()
+    excl = {}
+    if xp.exists():
+        with open(xp) as fh:
+            excl = json.load(fh).get(f"fold{fold_key}", {})
+    eligible = (sorted(gates[gates["eligible"]]["wallet"].tolist())
+                if len(gates) else [])
+    emap = dict(zip(ents["wallet"], ents["entity"])) if len(ents) else {}
+    return {"eligible_wallets": eligible,
+            "entity_map": {w: emap[w] for w in sorted(emap)},
+            "exclusion_summary": excl}
+
+
 def build_roster(rule: str, asof: pd.Timestamp, actions_path: Path,
-                 from_run_dir: Path | None) -> tuple[pd.DataFrame, str]:
-    """Roster for (rule, asof). Fast path: reuse a harness roster parquet whose fold
-    asof matches. Otherwise recompute via the frozen selection pipeline."""
+                 from_run_dir: Path | None) -> tuple[pd.DataFrame, str, dict]:
+    """(roster, source, universe_manifest) for (rule, asof). Fast path: reuse a harness
+    roster parquet whose fold asof matches (universe read from the same run dir).
+    Otherwise recompute via the frozen selection pipeline."""
     if from_run_dir is not None:
         man_p = from_run_dir / "manifest.json"
         if man_p.exists():
@@ -49,7 +71,8 @@ def build_roster(rule: str, asof: pd.Timestamp, actions_path: Path,
                 if int(f["asof_ms"]) == asof_ms:
                     rp = from_run_dir / f"roster_{rule}_fold{f['fold']}.parquet"
                     if rp.exists():
-                        return pd.read_parquet(rp), f"reused:{rp}"
+                        return (pd.read_parquet(rp), f"reused:{rp}",
+                                _universe_manifest(from_run_dir, f["fold"]))
         raise SystemExit(f"--from-run-dir {from_run_dir}: no roster for {rule} @ "
                          f"{asof.date()} (asof must equal a fold test_start)")
     # recompute: frozen selection pipeline at this asof
@@ -62,7 +85,7 @@ def build_roster(rule: str, asof: pd.Timestamp, actions_path: Path,
         marks = MarksIndex()
         pass_a([fold], work, marks, actions_path=actions_path)
         rosters = select_rosters([fold], work, rules=[rule])
-        return rosters[(rule, "S")], "recomputed"
+        return rosters[(rule, "S")], "recomputed", _universe_manifest(work, "S")
 
 
 def main():
@@ -77,10 +100,18 @@ def main():
     install_memory_guard(soft_gb=12, label="v25_ship_config")
     asof = pd.Timestamp(args.asof)
 
-    roster, roster_source = build_roster(args.rule, asof, args.actions, args.from_run_dir)
+    roster, roster_source, universe = build_roster(args.rule, asof, args.actions,
+                                                   args.from_run_dir)
     if not len(roster):
         raise SystemExit(f"EMPTY ROSTER for {args.rule} @ {asof.date()}: refusing to "
                          f"emit a ship config")
+    # persist the universe manifest artifact next to the config; the provenance block
+    # carries its sha256 pointer + counts + the exclusion summary inline (residual #5)
+    uni_path = args.out.with_name(args.out.stem + ".universe.json")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with open(uni_path, "w") as fh:
+        json.dump(universe, fh, indent=2, sort_keys=True)
+    uni_sha = sha256_file(uni_path)
     freeze = None
     if FREEZE_PATH.exists():
         with open(FREEZE_PATH) as fh:
@@ -125,13 +156,22 @@ def main():
             "asof": str(asof.date()),
             "roster_source": roster_source,
             "n_entities": int(roster["entity"].nunique()),
+            # universe manifest at the ship asof (gate-b round-2 residual #5):
+            # eligible wallet list + entity map + exclusion counts, persisted as a
+            # sibling artifact and bound here by sha256
+            "universe_manifest": {
+                "file": str(uni_path),
+                "sha256": uni_sha,
+                "n_eligible_wallets": len(universe["eligible_wallets"]),
+                "n_universe_entities": len(set(universe["entity_map"].values())),
+                "exclusion_summary": universe["exclusion_summary"],
+            },
         },
     }
-    args.out.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as fh:
         json.dump(cfg, fh, indent=2, sort_keys=True)
     print(f"ship config written: {args.out} ({len(roster)} wallets, "
-          f"roster {roster_source})")
+          f"roster {roster_source}); universe manifest: {uni_path}")
 
 
 if __name__ == "__main__":
