@@ -20,8 +20,9 @@ Three components, each grounded in MEASURED data, not guesses:
 
 2. FEES (round-trip, fraction)
    Source: real HL userFees, app/data/v15/hl_fee_schedule.json
-     taker one-way 4.5bps, w/ 4% referral discount -> 4.32bps -> RT 8.64bps
-     maker one-way 1.5bps -> RT 3.0bps
+     live subaccounts do NOT receive the parent's referral discount
+     effective taker one-way 4.5bps -> RT 9.0bps
+     effective maker one-way 1.5bps -> RT 3.0bps
    fee_rt(maker=False).
 
 3. LATENCY (ms from leader fill to our fill)
@@ -55,7 +56,7 @@ LATENCY_MS = 1000               # leader-fill -> our-fill; TODO replace with mea
 _SLIP_ONEWAY: dict[str, float] = {}        # coin -> one-way slippage (fraction)
 _BASE_CALIB_COINS: set[str] = set()        # coins loaded from the committed l2_calib (the base 10);
                                            # register_slip_oneway must NOT silently overwrite these
-_FEES: dict[str, float] | None = None
+_FEES: dict[str, object] | None = None
 _HITS = {"calib": 0, "default": 0}
 
 
@@ -80,14 +81,38 @@ def _load_fees():
         return
     try:
         f = json.load(open(FEE_SCHEDULE))
-        taker_ow = float(f["base_taker_oneway"]) * (1 - float(f.get("referral_discount", 0.0)))
-        maker_ow = float(f["base_maker_oneway"]) * (1 - float(f.get("referral_discount", 0.0)))
-        _FEES = {"taker_rt": taker_ow * 2, "maker_rt": maker_ow * 2}
+        discount_applies = bool(f.get("referral_discount_applies_to_subaccounts", False))
+        discount = float(f.get("referral_discount", 0.0)) if discount_applies else 0.0
+        taker_ow = float(
+            f.get(
+                "effective_subaccount_taker_oneway",
+                float(f["base_taker_oneway"]) * (1 - discount),
+            )
+        )
+        maker_ow = float(
+            f.get(
+                "effective_subaccount_maker_oneway",
+                float(f["base_maker_oneway"]) * (1 - discount),
+            )
+        )
+        _FEES = {
+            "taker_rt": taker_ow * 2,
+            "maker_rt": maker_ow * 2,
+            "hip3_mult": float(f.get("hip3_mult", 2.0)),
+            # FeeSchedule/M7 interprets per_market values as one-way taker
+            # rates; keep the same contract here.
+            "per_market": {k: float(v) for k, v in f.get("per_market", {}).items()},
+        }
         logger.info(f"[exec] fees from {FEE_SCHEDULE.name}: taker_rt={_FEES['taker_rt']*1e4:.2f}bps "
                     f"maker_rt={_FEES['maker_rt']*1e4:.2f}bps")
     except Exception as e:
-        _FEES = {"taker_rt": 0.000864, "maker_rt": 0.00030}     # documented HL fallback
-        logger.warning(f"[exec] fee schedule load failed ({e}); fallback taker_rt=8.64bps")
+        _FEES = {
+            "taker_rt": 0.00090,
+            "maker_rt": 0.00030,
+            "hip3_mult": 2.0,
+            "per_market": {},
+        }     # conservative subaccount fallback
+        logger.warning(f"[exec] fee schedule load failed ({e}); fallback taker_rt=9.00bps")
 
 
 def set_slip_default_bps(bps: float):
@@ -151,10 +176,22 @@ def slip_oneway(coin: str) -> float:
     return v
 
 
-def fee_rt(maker: bool = False) -> float:
-    """Round-trip fee (fraction). Taker by default (copy needs speed = crossing)."""
+def fee_rt(maker: bool = False, coin: str | None = None) -> float:
+    """Round-trip fee fraction for a market.
+
+    ``coin=None`` retains the main-dex/base rate for compatibility. Prefixed
+    HIP-3 markets use a per-market one-way override when available, otherwise
+    the schedule's conservative multiplier. Callers researching an all-coin
+    universe must pass the coin; a single constant cannot price mixed dexes.
+    """
     _load_fees()
-    return _FEES["maker_rt"] if maker else _FEES["taker_rt"]
+    base = float(_FEES["maker_rt"] if maker else _FEES["taker_rt"])
+    if not coin or ":" not in coin:
+        return base
+    per_market = _FEES["per_market"]
+    if not maker and isinstance(per_market, dict) and coin in per_market:
+        return 2.0 * float(per_market[coin])
+    return base * float(_FEES["hip3_mult"])
 
 
 def apply_entry(coin: str, mark: float, is_long: bool, realistic: bool = True) -> float:

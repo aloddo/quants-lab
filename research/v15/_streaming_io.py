@@ -108,6 +108,14 @@ class ShardedParquetWriter:
             for p in parts:
                 t = pq.read_table(p)
                 if t.schema != unified:
+                    # Column ORDER can differ across shards (heterogeneous event dicts, e.g. ledger
+                    # deltas); align names to the unified order (adding all-null columns for any
+                    # field a shard never saw) before cast, which requires matching names+order.
+                    if t.schema.names != unified.names:
+                        missing = [n for n in unified.names if n not in t.schema.names]
+                        for n in missing:
+                            t = t.append_column(n, pa.nulls(t.num_rows, type=unified.field(n).type))
+                        t = t.select(unified.names)
                     t = t.cast(unified, safe=False)
                 writer.write_table(t)
                 del t
