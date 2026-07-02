@@ -42,15 +42,19 @@ def _universe_manifest(work: Path, fold_key) -> dict:
     gp = work / f"gates_fold{fold_key}.parquet"
     ep = work / f"entities_fold{fold_key}.parquet"
     xp = work / "exclusions.json"
-    gates = pd.read_parquet(gp) if gp.exists() else pd.DataFrame()
-    ents = pd.read_parquet(ep) if ep.exists() else pd.DataFrame()
-    excl = {}
-    if xp.exists():
-        with open(xp) as fh:
-            excl = json.load(fh).get(f"fold{fold_key}", {})
-    eligible = (sorted(gates[gates["eligible"]]["wallet"].tolist())
-                if len(gates) else [])
-    emap = dict(zip(ents["wallet"], ents["entity"])) if len(ents) else {}
+    # gate-b r3 #5: a ship config without full provenance is forbidden; REFUSE on any
+    # missing selection artifact instead of silently emitting an empty manifest
+    missing = [str(p) for p in (gp, ep, xp) if not p.exists()]
+    if missing:
+        raise SystemExit(
+            f"ship-config REFUSED: universe-manifest artifacts missing for fold{fold_key}: "
+            f"{missing} (rerun the selection pipeline; provenance may not be degraded)")
+    gates = pd.read_parquet(gp)
+    ents = pd.read_parquet(ep)
+    with open(xp) as fh:
+        excl = json.load(fh).get(f"fold{fold_key}", {})
+    eligible = sorted(gates[gates["eligible"]]["wallet"].tolist())
+    emap = dict(zip(ents["wallet"], ents["entity"]))
     return {"eligible_wallets": eligible,
             "entity_map": {w: emap[w] for w in sorted(emap)},
             "exclusion_summary": excl}

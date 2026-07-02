@@ -128,6 +128,10 @@ class CopySim:
     def equity(self, ts_ms: int) -> float:
         unreal = 0.0
         for lot in self.lots.values():
+            if lot.entry_fill_ts > ts_ms:
+                # gate-b r3 #3: a lot enters at its delayed FILL time; a mark sampled
+                # between signal and fill must not value the not-yet-open position
+                continue
             m = self._lot_mark(lot, ts_ms)
             unreal += lot.size * (m - lot.entry_px) * lot.side
         return self.equity0 + self.realized + unreal
@@ -229,6 +233,15 @@ class CopySim:
         self.realized -= fee                      # entry fee hits account equity immediately
         self.copied_journeys.add(jkey)
         self.counters["entries"] += 1
+        # gate-b r3 #3: the DD clock must cover through the delayed fill, not stop at
+        # signal time; _dd_update(fill_ts) samples the whole book at the fill, and the
+        # minute cursor advances past it so no held minute in (signal, fill] is skipped
+        if self.lots:
+            m = self._next_min_ms
+            while m <= min(fill_ts, self.end_ms):
+                self._dd_update(m)
+                m += MS_MIN
+            self._next_min_ms = m
         self._dd_update(fill_ts)
 
     def on_addon(self, wallet: str, coin: str, journey_id: int, leader_notional: float):
@@ -253,6 +266,14 @@ class CopySim:
             late = True
             self.counters["exits_late"] += 1
         px = self.sc.exit_px(lot.coin, mark, lot.side > 0)
+        # gate-b r3 #3: sample every held minute up to (but not at) the delayed exit
+        # fill with the position STILL in the book, so no held mark before an exit is
+        # skipped; the fill itself is sampled post-mutation at fill_ts below
+        m = self._next_min_ms
+        while m < min(fill_ts, self.end_ms + 1):
+            self._dd_update(m)
+            m += MS_MIN
+        self._next_min_ms = m
         fee = close_sz * px * self.sc.fee_oneway(lot.coin)
         lot.exits.append((fill_ts, close_sz, px, fee, late))
         gain = close_sz * (px - lot.entry_px) * lot.side
