@@ -21,11 +21,33 @@ class TestF3:
         assert r is not None and "fail" not in r
         assert r["r_unit"] == 10.0 and r["big_runs"] == 3
 
-    def test_zero_r_unit_fails(self):
-        # >= 20 losing journeys but all exactly 0 net bps: R_unit = |p25| = 0 => fail
+    def test_zero_return_journeys_are_not_losses(self):
+        # codex code-gate #1: losing = net bps STRICTLY < 0. 25 exactly-zero journeys
+        # are NOT losses, so this wallet has 0 losing journeys and FAILS the >= 20
+        # losses minimum (the amendment's "R_unit undefined => wallet fails" behavior)
         bps = np.concatenate([np.zeros(25), np.full(75, 5.0)])
+        assert f3_wallet_row(bps) is None
+
+    def test_strict_loss_boundary(self):
+        # 19 strict losses + 30 zeros: zeros must not top up the loss count => fail
+        bps = np.concatenate([np.full(19, -5.0), np.zeros(30), np.full(51, 60.0)])
+        assert f3_wallet_row(bps) is None
+        # 20 strict losses + 30 zeros: passes the minimum; R_unit computed over the
+        # STRICT losses only (all -5 => |p25| = 5), never diluted toward 0 by the zeros
+        bps = np.concatenate([np.full(20, -5.0), np.zeros(30), np.full(50, 60.0)])
         r = f3_wallet_row(bps)
-        assert r == {"fail": "zero_r_unit"}
+        assert r is not None and "fail" not in r
+        assert r["r_unit"] == 5.0
+
+    def test_zeros_do_not_shrink_r_unit(self):
+        # with the old <= 0 rule, 25 zeros dragged p25 of "losses" to 0 and killed the
+        # wallet as zero_r_unit; under strict < 0 the same wallet scores on its true
+        # losses (r_unit 10) and its big-run bar is 10 x 10 = 100 bps
+        bps = np.concatenate([np.full(20, -10.0), np.zeros(25),
+                              np.full(4, 100.0), np.full(51, 1.0)])
+        r = f3_wallet_row(bps)
+        assert r is not None and "fail" not in r
+        assert r["r_unit"] == 10.0 and r["big_runs"] == 4
 
     def test_big_run_threshold_max3_or_1pct(self):
         assert f3_wallet_row(bps_array(big_runs=2)) is None       # 2 < max(3, 1)

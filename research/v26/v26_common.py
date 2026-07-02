@@ -30,15 +30,20 @@ DOCUMENTED IMPLEMENTATION DECISIONS (ambiguities resolved here, disclosed in rep
 - D5 causal-tier trigger geometry: E2/E3 stop/trail scans price the accrued exit cost at
   the snapshot BASE-TIER taker rate. Realized fees are charged at the config's own
   causal-tier rate. At $150-500 order sizes the simulated 14d volume never reaches the
-  first VIP cutoff ($5M), so the two rates are identical; the engine asserts this
-  (tier_departed_base counter) and flags any config where it ever differs.
+  first VIP cutoff ($5M), so the two rates are identical; the assembly ASSERTS this
+  (fail closed, codex code-gate #5): any config whose realized (charged) rate ever
+  departs the base-tier schedule raises -> runtime_failure, never silently uses stale
+  trigger fees. tier_departed_base counts causal-tier departures in BOTH scenarios.
 - D6 fee snapshot mapping: BASE = snapshot tier rates x (1 - activeReferralDiscount)
   (reproduces the measured 4.32bps = 4.5 x 0.96 of v25 BASE); WORST = snapshot base-tier
-  rates with NO discount and NO tier evolution (4.5bps taker -- the same number as the
-  v25 WORST file schedule, now sourced from the snapshot). HIP-3 multiplier 2.0 (same
-  source as v25: 8.64/4.32). Slippage: BASE per-coin L2 calib, WORST flat 7.0bps, from
-  the frozen v25 scenarios; maker fills carry NO slippage by construction (adverse
-  selection is embedded in the cross/no-cross rule).
+  rates with NO discount as the FLOOR -- the causal tier engine still evolves tiers
+  (mechanism active and honest, codex code-gate #5) but an improved tier can never
+  reduce the charged WORST rate (4.5bps taker -- the same number as the v25 WORST file
+  schedule, now sourced from the snapshot). HIP-3 multiplier 2.0 (same source as v25:
+  8.64/4.32). Slippage: BASE per-coin L2 calib, WORST flat 7.0bps, from the frozen v25
+  scenarios; BASE maker fills carry NO slippage by construction (adverse selection is
+  embedded in the cross/no-cross rule); WORST maker fills DO pay the frozen 7.0bps
+  slip default on entry and exit (codex code-gate #6, amendment codex #9).
 - D7 equity/DD clock: the per-config equity, drawdown, and time-weighted gross series are
   evaluated on the 1m mark grid (the amendment's own trigger cadence: "the v25 per-mark
   DD clock") plus the terminal close. avg_gross_d weights = 60s per mark over the FULL
@@ -149,6 +154,8 @@ GRID_RESAMPLES = 100_000            # joint max-stat, SHARED draws
 HOLM_RESAMPLES = 200_000            # fallback
 GRID_SEED = 42
 GRID_BLOCK_DAYS = 7
+GRID_BLOCK_DAYS_ROBUST = 14         # inherited v25 block-robustness check: the 14d-block
+                                    # corrected conclusion must AGREE with 7d, else FAIL
 GRID_FAMILYWISE_LEVEL = 0.95        # one-sided 95% familywise (alpha 0.05, as v25)
 
 EPS = 1e-9
@@ -290,7 +297,32 @@ def taker_entry_fill(marks: MarksIndex, coin: str, signal_ts: int, end_ms: int):
 
 def canonical_sha256(df: pd.DataFrame) -> str:
     """Deterministic content hash of a DataFrame (sorted columns, CSV bytes) -- parquet
-    file bytes are not deterministic across writes, the CONTENT hash is."""
+    file bytes are not deterministic across writes, the CONTENT hash is. The EXPLORATORY
+    banner column (write_exploratory_parquet) is presentation, not content: excluded."""
     import hashlib
-    d = df[sorted(df.columns)]
+    d = df.drop(columns=["exploratory"], errors="ignore")
+    d = d[sorted(d.columns)]
     return hashlib.sha256(d.to_csv(index=False).encode()).hexdigest()
+
+
+# ---- EXPLORATORY labeling of EVERY output artifact (codex code-gate #8) ---------------------- #
+def write_exploratory_parquet(df: pd.DataFrame, path) -> None:
+    """Write a parquet artifact carrying the EXPLORATORY label BOTH as a file-level
+    metadata key (exploratory=true + the full label text) AND as a banner column, so no
+    reader can consume the artifact without seeing the epistemic status."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    d = df.copy()
+    d["exploratory"] = True
+    table = pa.Table.from_pandas(d, preserve_index=False)
+    meta = dict(table.schema.metadata or {})
+    meta[b"exploratory"] = b"true"
+    meta[b"label"] = EXPLORATORY_LABEL.encode()
+    pq.write_table(table.replace_schema_metadata(meta), path)
+
+
+def stamp_parquet_exploratory(path) -> None:
+    """Stamp an already-written parquet file (e.g. a ShardedParquetWriter stitch output)
+    with the file-level EXPLORATORY metadata key + banner column."""
+    import pyarrow.parquet as pq
+    write_exploratory_parquet(pq.read_table(path).to_pandas(), path)

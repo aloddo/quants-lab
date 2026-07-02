@@ -124,3 +124,56 @@ class TestAssemblyTimeWeighting:
         r = assemble_config_fold(trips, fm, fee, 2.5, "150", {})
         assert r["counters"]["dup_coalesced"] == 1      # one open lot per (wallet,coin)
         assert r["counters"]["entries"] == 1
+
+
+class TestExitFillClock:
+    """codex code-gate #4: the estimand/DD/gross clock runs to the DELAYED EXIT FILL,
+    not the exit signal (v25 gate-b r3 regression pattern adapted to the minute grid)."""
+
+    def _run(self, marks_dir, zero_fee_snapshot, exit_signal_min, exit_fill_min,
+             n_days=1, exit_px=98.0):
+        from v26_run_grid import assemble_config_fold
+        n_min = n_days * 1440
+        marks_dir("BTC", [T0 + i * MS_MIN for i in range(n_min)], [100.0] * n_min)
+        fm = FoldMarks(MarksIndex(cache_dir=marks_dir.dir), T0, T0 + n_days * MS_DAY)
+        trip = dict(zip(TRIP_COLS, [
+            "0xw", "BTC", 1, 1, 1000.0, T0, T0 + MS_MIN, 100.0, False,
+            "MIRROR", T0 + exit_signal_min * MS_MIN, T0 + exit_fill_min * MS_MIN,
+            exit_px, False, False, False, "ok", "",
+            float(T0 + exit_signal_min * MS_MIN)]))
+        fee = FeeEngine(zero_fee_snapshot, "BASE")
+        return assemble_config_fold(pd.DataFrame([trip]), fm, fee, 2.5, "150", {})
+
+    def test_gross_exposure_remains_until_exit_fill(self, marks_dir,
+                                                    zero_fee_snapshot):
+        # exit signal at minute 10, delayed fill at minute 12: the position must stay
+        # in the gross/unreal series through minute 11 (slots 1..11 = 11 held slots),
+        # not stop at the signal
+        r = self._run(marks_dir, zero_fee_snapshot, 10, 12)
+        assert abs(r["avg_gross"][0] - 150.0 * 11 / 1440) < 1e-9
+        assert abs(r["total_pnl"] - 150.0 * (98.0 / 100.0 - 1.0)) < 1e-9
+
+    def test_realized_pnl_lands_on_fill_day(self, marks_dir, zero_fee_snapshot):
+        # signal on day 0 (minute 1438), fill on day 1 (minute 1441): the realized
+        # PnL must land in day 1's attribution; day 0 ends flat-marked (unreal 0)
+        r = self._run(marks_dir, zero_fee_snapshot, 1438, 1441, n_days=2)
+        assert abs(r["daily_pnl"][0]) < 1e-9
+        assert abs(r["daily_pnl"][1] - 150.0 * (98.0 / 100.0 - 1.0)) < 1e-9
+        # exposure spans the day boundary through the fill
+        assert r["avg_gross"][1] > 0.0
+
+    def test_terminal_row_unchanged(self, marks_dir, zero_fee_snapshot):
+        # TERMINAL rows keep the window-end clock (fill == end)
+        from v26_run_grid import assemble_config_fold
+        n_min = 1440
+        marks_dir("BTC", [T0 + i * MS_MIN for i in range(n_min)], [100.0] * n_min)
+        fm = FoldMarks(MarksIndex(cache_dir=marks_dir.dir), T0, T0 + MS_DAY)
+        end = T0 + MS_DAY
+        trip = dict(zip(TRIP_COLS, [
+            "0xw", "BTC", 1, 1, 1000.0, T0, T0 + MS_MIN, 100.0, False,
+            "TERMINAL", end, end, 100.0, False, False, False, "ok", "",
+            float("nan")]))
+        fee = FeeEngine(zero_fee_snapshot, "BASE")
+        r = assemble_config_fold(pd.DataFrame([trip]), fm, fee, 2.5, "150", {})
+        assert r["n_terminal"] == 1 and r["n_realized"] == 0
+        assert abs(r["total_pnl"]) < 1e-9

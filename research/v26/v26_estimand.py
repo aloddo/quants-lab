@@ -17,18 +17,30 @@ excess-return units. Pass = adjusted LCB(shifted series) > 0 uniformly.
 Corrections (frozen): joint max-statistic over ALL RUN configs with SHARED bootstrap
 draws, 100,000 resamples of 7d stationary blocks on aligned calendar days (fold
 boundaries respected: each fold segment resampled independently, one draw per
-(resample, segment) applied to EVERY config). Fallback (same frozen trigger as v25: any
-exception or non-finite LCB): Holm-Bonferroni alpha 0.05 one-sided over the exact
-non-pruned family size, 200,000 resamples; per-config p-value on the RECENTERED null
-(null mean_b = boot_mean_b - observed mean), one-sided p = (1 + #null means >= observed
-mean) / (B + 1) (plus-one); runtime failures enter the family with p = 1. If the
-fallback also fails, the batch has NO winner (fail closed).
+(resample, segment) applied to EVERY config). Runtime-failure configs STAY in the
+max-stat family (codex code-gate #2): they enter with observed statistic -inf
+(worst case, n_failures rows appended to the joint deviation max) and Holm p = 1; the
+frozen family NEVER shrinks. Block-robustness (inherited v25 criterion, codex code-gate
+#3): the corrected conclusion is recomputed with 14d blocks; a config whose 14d
+above/below-hurdle conclusion disagrees with the 7d conclusion FAILS
+(block_robustness_agree, orchestrated in v26_run_grid).
+
+Fallback (same frozen trigger as v25: any exception or non-finite LCB at EITHER block
+size -- an all-NaN excess series yields a non-finite LCB and TRIGGERS the fallback, it
+never evades it): Holm-Bonferroni alpha 0.05 one-sided over the exact non-pruned family
+size, 200,000 resamples; per-config p-value on the RECENTERED null (null mean_b =
+boot_mean_b - observed mean), one-sided p = (1 + #null means >= observed mean) / (B + 1)
+(plus-one); runtime failures and all-NaN-series configs enter the family with p = 1 and
+LCB = -inf (fail closed). If the fallback also fails, the batch has NO winner (fail
+closed).
 
 A config's excess series is defined only on ITS nonzero-exposure days: a drawn day that
 is zero-exposure for config r contributes to neither numerator nor denominator of r's
 resampled mean (masked-mean bootstrap over the aligned day axis).
 """
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 
@@ -87,18 +99,36 @@ def _masked_boot_means(M: np.ndarray, W: np.ndarray):
 def joint_maxstat(M: np.ndarray, seg_lens: list[int],
                   n_resamples: int = GRID_RESAMPLES, seed: int = GRID_SEED,
                   block_days: float = GRID_BLOCK_DAYS,
-                  level: float = GRID_FAMILYWISE_LEVEL, chunk: int = 2000) -> dict:
+                  level: float = GRID_FAMILYWISE_LEVEL, chunk: int = 2000,
+                  n_failures: int = 0) -> dict:
     """THE method: joint max-statistic familywise LCBs with SHARED draws.
-    M: [n_cfg x total_days] shifted excess series (NaN = excluded day). Returns
-    {'c_maxstat', 'mean', 'lcb'} with lcb = mean - c per config. Raises on any
-    internal exception (the caller owns the frozen fallback trigger)."""
+    M: [n_cfg x total_days] shifted excess series (NaN = excluded day). n_failures:
+    runtime-failure family members with NO series -- they STAY in the family (codex
+    code-gate #2) as appended deviation rows at -inf (worst-case observed; they can
+    never support the max but the family never shrinks). Returns {'c_maxstat', 'mean',
+    'lcb', 'family_size'} with lcb = mean - c per M row. Raises on any internal
+    exception OR any non-finite LCB -- an all-NaN series row (NaN mean) is a non-finite
+    LCB and TRIGGERS the frozen fallback (the caller owns the trigger)."""
     n_cfg = M.shape[0]
-    hat = np.nanmean(np.where(np.isfinite(M), M, np.nan), axis=1)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)     # all-NaN rows: handled below
+        hat = np.nanmean(np.where(np.isfinite(M), M, np.nan), axis=1) \
+            if n_cfg else np.empty(0)
+    if n_cfg and not np.isfinite(hat).all():
+        # frozen trigger: lcb = hat - c would be non-finite for these rows
+        raise RuntimeError("joint_maxstat: non-finite LCB (config with an all-excluded "
+                           "excess series)")
+    if n_cfg == 0:
+        raise RuntimeError("joint_maxstat: no finite max-deviation draws "
+                           f"({n_failures} runtime-failure family members only)")
     d_parts = []
     for _b0, W in _draw_weights(seg_lens, n_resamples, block_days, seed, chunk):
         boot = _masked_boot_means(M, W)                       # [cfg x draws]
         dev = hat[:, None] - boot
         dev = np.where(np.isfinite(dev), dev, -np.inf)        # failed draw: no support
+        if n_failures:
+            # runtime failures: worst-case observed -inf, formally inside the joint max
+            dev = np.vstack([dev, np.full((n_failures, dev.shape[1]), -np.inf)])
         d_parts.append(dev.max(axis=0))
         del boot, dev, W
     d = np.concatenate(d_parts)
@@ -107,37 +137,51 @@ def joint_maxstat(M: np.ndarray, seg_lens: list[int],
         raise RuntimeError("joint_maxstat: no finite max-deviation draws")
     c = float(np.quantile(d[finite], level))
     lcb = hat - c
-    if not np.isfinite(lcb[np.isfinite(hat)]).all():
+    if not np.isfinite(lcb).all():
         raise RuntimeError("joint_maxstat: non-finite LCB")
     return {"method": "joint_maxstat", "c_maxstat": c, "mean": hat, "lcb": lcb,
-            "n_resamples": n_resamples}
+            "n_resamples": n_resamples, "family_size": n_cfg + n_failures}
 
 
 def holm_fallback(M: np.ndarray, seg_lens: list[int], family_size: int,
                   n_resamples: int = HOLM_RESAMPLES, seed: int = GRID_SEED,
                   block_days: float = GRID_BLOCK_DAYS, alpha: float = 0.05,
-                  chunk: int = 1000) -> dict:
+                  chunk: int = 1000, n_failures: int = 0) -> dict:
     """FROZEN fallback: Holm-Bonferroni over the EXACT non-pruned family size.
-    M rows = configs WITH a series; family_size >= M.shape[0] (runtime failures carry
-    p = 1 and are appended by the caller). Per-config recentered plus-one p; the
-    reported per-config LCB (winner ordering) = the alpha/family_size one-sided
-    percentile-method LCB of that config's own bootstrap means (v25 bonferroni_lcb
-    convention). Returns {'mean', 'p_raw', 'lcb'}."""
+    M rows = configs WITH a series; family_size >= M.shape[0] + n_failures. Runtime
+    failures (n_failures) are APPENDED as explicit family rows with p = 1, mean = -inf,
+    lcb = -inf (fail closed, family never shrinks). A row whose observed mean is
+    non-finite (all-NaN series) also gets p = 1 / lcb = -inf -- it can never look
+    significant. Per-config recentered plus-one p; the reported per-config LCB (winner
+    ordering) = the alpha/family_size one-sided percentile-method LCB of that config's
+    own bootstrap means (v25 bonferroni_lcb convention). Returns {'mean', 'p_raw',
+    'lcb'} arrays of length M.shape[0] + n_failures (failures last)."""
     n_cfg = M.shape[0]
-    hat = np.nanmean(np.where(np.isfinite(M), M, np.nan), axis=1)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)     # all-NaN rows: handled below
+        hat = np.nanmean(np.where(np.isfinite(M), M, np.nan), axis=1) \
+            if n_cfg else np.empty(0)
     ge_count = np.zeros(n_cfg, dtype="int64")
     boot_all = np.full((n_cfg, n_resamples), np.nan)
-    for b0, W in _draw_weights(seg_lens, n_resamples, block_days, seed, chunk):
-        boot = _masked_boot_means(M, W)
-        # recentered null: null_mean_b = boot_b - hat; one-sided #(null >= hat)
-        ge_count += np.nansum((boot - hat[:, None]) >= hat[:, None], axis=1)
-        boot_all[:, b0:b0 + boot.shape[1]] = boot
-        del boot, W
+    if n_cfg:
+        for b0, W in _draw_weights(seg_lens, n_resamples, block_days, seed, chunk):
+            boot = _masked_boot_means(M, W)
+            # recentered null: null_mean_b = boot_b - hat; one-sided #(null >= hat)
+            ge_count += np.nansum((boot - hat[:, None]) >= hat[:, None], axis=1)
+            boot_all[:, b0:b0 + boot.shape[1]] = boot
+            del boot, W
     p_raw = (1.0 + ge_count) / (n_resamples + 1.0)
     q = alpha / max(family_size, 1)
     lcb = np.array([float(np.nanquantile(boot_all[i], q))
                     if np.isfinite(boot_all[i]).any() else float("nan")
                     for i in range(n_cfg)])
+    bad = ~np.isfinite(hat)                    # all-NaN series: fail closed
+    p_raw[bad] = 1.0
+    lcb[bad] = -np.inf
+    if n_failures:
+        hat = np.concatenate([hat, np.full(n_failures, -np.inf)])
+        p_raw = np.concatenate([p_raw, np.ones(n_failures)])
+        lcb = np.concatenate([lcb, np.full(n_failures, -np.inf)])
     return {"method": "holm_fallback", "mean": hat, "p_raw": p_raw, "lcb": lcb,
             "n_resamples": n_resamples, "family_size": family_size}
 

@@ -4,7 +4,9 @@
 FREEZE-GRID.json binds together, write-once, BEFORE any test PnL is read:
 - content hash of the CURRENT /tmp/v26_grid_prereg.md
 - harness git commit (research/v26 tracked and clean) + per-file sha256
-- config registry sha256 + prune ledger sha256 (v26_registry, already written)
+- config registry + prune ledger hashes computed from the ACTUAL parquet files
+  (file-byte sha256 AND canonical content sha256; registry_sha.json is only
+  cross-checked at freeze time, never trusted at validation -- codex code-gate #7)
 - fee snapshot sha256 (app/data/research/v25/fee_snapshot_v26.json)
 - POINTERS to the v25 FREEZE (its file sha256 + its doc/commit/marks hashes are
   inherited, not recomputed -- the marks/artifact provenance lives there)
@@ -24,9 +26,12 @@ import subprocess
 import time
 from pathlib import Path
 
+import pandas as pd
+
 from v26_common import (DROPOUT_SEEDS, FEE_SNAPSHOT_PATH, FREEZE_GRID_PATH, GRID_PREREG_DOC,
                         GRID_RESAMPLES, GRID_SEED, HOLM_RESAMPLES, MAKER_MODEL_VERSION,
-                        REPO, V25_FREEZE_PATH, V26_DATA, git_commit, sha256_file)
+                        REPO, V25_FREEZE_PATH, V26_DATA, canonical_sha256, git_commit,
+                        sha256_file)
 
 HARNESS_FILES = ["v26_common.py", "v26_registry.py", "v26_families.py",
                  "v26_overlays.py", "v26_maker.py", "v26_fees.py", "v26_estimand.py",
@@ -51,6 +56,23 @@ def _clean() -> str | None:
     return f"research/v26 or tests/v26 not clean:\n{dirty}" if dirty else None
 
 
+def registry_content_hashes(data_dir: Path = None) -> dict:
+    """Hashes of the ACTUAL configs.parquet + prune_ledger.parquet (codex code-gate #7):
+    sha256 of the file BYTES plus the canonical CONTENT hash recomputed from the loaded
+    frames -- registry_sha.json is never trusted for freeze validation."""
+    d = data_dir if data_dir is not None else V26_DATA
+    out = {}
+    for name, key in [("configs.parquet", "registry"),
+                      ("prune_ledger.parquet", "prune_ledger")]:
+        p = d / name
+        if not p.exists():
+            raise SystemExit(f"FREEZE-GRID ABORT: {p} missing (build the registry "
+                             f"first)")
+        out[f"{key}_file_sha256"] = sha256_file(p)
+        out[f"{key}_sha256"] = canonical_sha256(pd.read_parquet(p))
+    return out
+
+
 def compute_freeze() -> dict:
     for p, what in [(GRID_PREREG_DOC, "grid pre-registration doc"),
                     (FEE_SNAPSHOT_PATH, "fee snapshot"),
@@ -61,6 +83,13 @@ def compute_freeze() -> dict:
             raise SystemExit(f"FREEZE-GRID ABORT: {what} missing at {p}")
     with open(V26_DATA / "registry_sha.json") as fh:
         reg_meta = json.load(fh)
+    reg_hashes = registry_content_hashes()
+    # cross-check: the build-time meta must agree with the actual file contents
+    for k in ("registry_sha256", "prune_ledger_sha256"):
+        if reg_meta.get(k) != reg_hashes[k]:
+            raise SystemExit(f"FREEZE-GRID ABORT: registry_sha.json {k} does not match "
+                             f"the actual parquet contents ({reg_meta.get(k)} != "
+                             f"{reg_hashes[k]}) -- rebuild the registry")
     with open(V25_FREEZE_PATH) as fh:
         v25fz = json.load(fh)
     hh, combined = harness_hashes()
@@ -71,8 +100,10 @@ def compute_freeze() -> dict:
         "harness_dir": "research/v26",
         "harness_file_sha256": hh,
         "harness_combined_sha256": combined,
-        "registry_sha256": reg_meta["registry_sha256"],
-        "prune_ledger_sha256": reg_meta["prune_ledger_sha256"],
+        "registry_sha256": reg_hashes["registry_sha256"],
+        "registry_file_sha256": reg_hashes["registry_file_sha256"],
+        "prune_ledger_sha256": reg_hashes["prune_ledger_sha256"],
+        "prune_ledger_file_sha256": reg_hashes["prune_ledger_file_sha256"],
         "registry_counts": {k: reg_meta[k] for k in ("n_cells", "n_run", "n_pruned")},
         "fee_snapshot": str(FEE_SNAPSHOT_PATH.relative_to(REPO)),
         "fee_snapshot_sha256": sha256_file(FEE_SNAPSHOT_PATH),
@@ -114,16 +145,22 @@ def validate_freeze_grid(freeze_path: Path = FREEZE_GRID_PATH) -> dict:
     if combined != fz.get("harness_combined_sha256"):
         errs.append(f"harness hash mismatch: {combined} != "
                     f"{fz.get('harness_combined_sha256')}")
-    reg_meta_p = V26_DATA / "registry_sha.json"
-    if not reg_meta_p.exists():
-        errs.append("registry_sha.json missing")
-    else:
-        with open(reg_meta_p) as fh:
-            reg_meta = json.load(fh)
-        if reg_meta.get("registry_sha256") != fz.get("registry_sha256"):
-            errs.append("registry sha mismatch (configs.parquet changed after freeze)")
-        if reg_meta.get("prune_ledger_sha256") != fz.get("prune_ledger_sha256"):
-            errs.append("prune ledger sha mismatch")
+    # codex code-gate #7: hash the ACTUAL configs.parquet + prune ledger contents
+    # (file bytes + canonical content), NEVER trust registry_sha.json
+    try:
+        reg_hashes = registry_content_hashes()
+    except SystemExit as e:
+        reg_hashes = None
+        errs.append(str(e))
+    if reg_hashes is not None:
+        for key, what in [("registry_file_sha256", "configs.parquet file bytes"),
+                          ("registry_sha256", "configs.parquet content"),
+                          ("prune_ledger_file_sha256", "prune_ledger.parquet file "
+                                                       "bytes"),
+                          ("prune_ledger_sha256", "prune_ledger.parquet content")]:
+            if reg_hashes[key] != fz.get(key):
+                errs.append(f"{what} sha mismatch (changed after freeze): "
+                            f"{reg_hashes[key]} != {fz.get(key)}")
     snap = sha256_file(FEE_SNAPSHOT_PATH) if FEE_SNAPSHOT_PATH.exists() else "MISSING"
     if snap != fz.get("fee_snapshot_sha256"):
         errs.append(f"fee snapshot hash mismatch: {snap} != "

@@ -21,7 +21,8 @@ Families:
   definitional band [2h,48h) intersected with the axis band (D1).
 - F2 scalp-LCB: closed-train median hold in [2,15)min, >= 30 closed journeys, cadence
   >= 5/day; rank R2-LCB.
-- F3 tail-asym (codex #11, frozen formula): >= 100 closed journeys AND >= 20 losing;
+- F3 tail-asym (codex #11, frozen formula): >= 100 closed journeys AND >= 20 losing
+  (losing = net bps STRICTLY < 0; zero-return journeys are NOT losses);
   R_unit_w = |p25 of losing journeys' net bps| (losses only; 0 => wallet fails,
   counted); tail_asym = p95(net bps) / max(|p5(net bps)|, 1e-9); big_run_count =
   #journeys with net bps >= 10 x R_unit_w, REQUIRE >= max(3, 1% of n). Rank: tail_asym
@@ -114,9 +115,12 @@ def f3_wallet_row(bps: np.ndarray) -> dict | None:
     n = int(bps.size)
     if n < F3_MIN_JOURNEYS:
         return None
-    # losing journey = net bps <= 0 (non-winning; makes the frozen "R_unit = 0 =>
-    # wallet fails" branch reachable exactly as the amendment specifies)
-    losses = bps[bps <= 0]
+    # losing journey = net bps STRICTLY < 0 (codex code-gate #1: zero-return journeys
+    # are NOT losses). A wallet whose "losses" are all exactly 0 has NO losing journeys
+    # and fails the >= F3_MIN_LOSSES minimum below (R_unit undefined -> wallet fails,
+    # the amendment's frozen fail-closed behavior). The zero_r_unit branch stays as a
+    # defensive fail-closed guard.
+    losses = bps[bps < 0]
     if losses.size < F3_MIN_LOSSES:
         return None
     r_unit = float(abs(np.percentile(losses, 25)))     # p25 of losses only, linear interp

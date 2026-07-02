@@ -258,7 +258,12 @@ def build_trip_stream(journeys: pd.DataFrame, exit_style: str, execution: str,
                             "exit_px": np.nan})
                 rows.append(row)
                 continue
-            entry_fill_ts, entry_px = me["fill_ts"], me["fill_px"]
+            entry_fill_ts = me["fill_ts"]
+            # BASE maker fills price AT the post (adverse selection embedded in the
+            # cross/no-cross rule); WORST maker fills ALSO pay the frozen slip default
+            # (7.0bps one-way, codex code-gate #6 / amendment codex #9)
+            entry_px = (scenario.entry_px(coin, me["fill_px"], side > 0)
+                        if scenario.name == "WORST" else me["fill_px"])
             entry_fee_rate = base_maker_fee(coin)
         else:
             fill_ts, mark = taker_entry_fill(marks, coin, int(r.entry_ts), end_ms)
@@ -296,7 +301,10 @@ def build_trip_stream(journeys: pd.DataFrame, exit_style: str, execution: str,
                 reason2 = reason
                 fill_ts = mx["fill_ts"]
                 if mx["is_maker"]:
-                    exit_px = float(mx["fill_px_mark"])   # at post, no slippage
+                    # BASE: at post, no slippage; WORST: + frozen slip default
+                    exit_px = (scenario.exit_px(coin, mx["fill_px_mark"], side > 0)
+                               if scenario.name == "WORST"
+                               else float(mx["fill_px_mark"]))
                     row["exit_is_maker"] = True
                 else:
                     exit_px = scenario.exit_px(coin, mx["fill_px_mark"], side > 0)

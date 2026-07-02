@@ -86,14 +86,19 @@ class TestFillRateDualEval:
                 "entity_net": {f"e{i}": mean_pnl for i in range(20)},
                 "coin_net": {"BTC": mean_pnl, "ETH": mean_pnl}}
 
-    def _agg(self, fills, missed, fb_worse=True):
+    def _agg(self, fills, missed, fb_worse=True, worst_fb_worse=True):
         from v26_run_grid import _agg_config
         base = self._variant(+1.0, fills=fills, missed=missed)
         fb = self._variant(-1.0 if fb_worse else +2.0, fills=fills, missed=missed)
+        worst_fb = self._variant(-2.0 if worst_fb_worse else +3.0,
+                                 fills=fills, missed=missed)
+        variants = {"BASE": base, "BASE_FB": fb, "WORST": base,
+                    "WORST_FB": worst_fb}
+        for s in (17, 42, 137):
+            variants[f"BASE_seed{s}"] = base
+            variants[f"BASE_seed{s}_FB"] = fb
         per_fold = [{"config_id": "c", "fold": 1, "k_real": 20,
-                     "variants": {"BASE": base, "BASE_FB": fb, "WORST": base,
-                                  "BASE_seed17": base, "BASE_seed42": base,
-                                  "BASE_seed137": base}}]
+                     "variants": variants}]
         cfg = {"config_id": "c", "K": 25, "execution": "maker_entry",
                "family": "F3", "hold_band": "any", "exit_style": "E2",
                "gross_cap": 2.5, "sizing": "150"}
@@ -113,3 +118,56 @@ class TestFillRateDualEval:
     def test_high_fill_rate_no_dual_eval(self):
         a = self._agg(fills=30, missed=10)
         assert a["maker_fill_rate"] == 0.75 and a["variant_used"] == "BASE"
+
+    def test_dual_eval_applies_to_worst_and_stress(self):
+        # codex code-gate #6: the <50% dual evaluation also applies to WORST and the
+        # dropout-seed stress runs; criteria use the worse, BOTH are persisted
+        a = self._agg(fills=10, missed=30)          # 25% < 50%
+        assert a["dual_eval_applied"]
+        assert a["worst_pooled_primary"] == 40.0    # +1.0 x 40 days
+        assert a["worst_pooled_fb"] == -80.0        # -2.0 x 40 days
+        assert a["worst_pooled"] == -80.0           # criteria use the worse
+        assert not a["criteria"]["worst_pooled_positive"]
+        for s in ("17", "42", "137"):
+            assert a["stress_by_seed_primary"][s] == 40.0
+            assert a["stress_by_seed_fb"][s] == -40.0
+            assert a["stress_by_seed"][s] == -40.0  # worse per seed
+        assert not a["criteria"]["stress_median_positive"]
+
+    def test_high_fill_rate_worst_stays_primary_both_persisted(self):
+        a = self._agg(fills=30, missed=10)          # 75% >= 50%: no dual eval
+        assert not a["dual_eval_applied"]
+        assert a["worst_pooled"] == a["worst_pooled_primary"] == 40.0
+        assert a["worst_pooled_fb"] == -80.0        # still persisted for the report
+        assert a["stress_by_seed"]["17"] == 40.0
+        assert a["criteria"]["worst_pooled_positive"]
+
+
+class TestWorstMakerSlippage:
+    def _stream(self, marks_dir, scen_name):
+        from v26_common import FoldMarks, scenario_base, scenario_worst
+        from v26_overlays import build_trip_stream
+        closes = [100, 99.5, 100.6, 101, 101, 101, 101, 101]
+        m = idx(marks_dir, closes)
+        fm = FoldMarks(m, T0, T0 + MS_DAY)
+        j = pd.DataFrame([{"wallet": "0xw", "coin": "BTC", "journey_id": 1,
+                           "side": 1, "entry_ts": T0, "leader_notional": 1000.0,
+                           "mirror_ts": float(T0 + 150_000)}])
+        sc = scenario_base() if scen_name == "BASE" else scenario_worst()
+        return build_trip_stream(j, "E1", "maker_both", sc,
+                                 lambda c: 0.0, lambda c: 0.0, m, fm, T0, T0 + MS_DAY)
+
+    def test_base_maker_fills_have_no_slippage(self, marks_dir):
+        r = self._stream(marks_dir, "BASE").iloc[0]
+        assert r["status"] == "ok" and r["entry_is_maker"]
+        assert r["entry_px"] == 100.0               # at post, no slippage (BASE)
+        assert r["exit_is_maker"] and r["exit_px"] == 100.6
+
+    def test_worst_maker_fills_pay_frozen_7bps_slip(self, marks_dir):
+        # codex code-gate #6: WORST maker fills include the frozen 7.0bps slip default
+        # on entry AND exit
+        r = self._stream(marks_dir, "WORST").iloc[0]
+        assert r["status"] == "ok" and r["entry_is_maker"]
+        assert abs(r["entry_px"] - 100.0 * 1.0007) < 1e-9
+        assert r["exit_is_maker"]
+        assert abs(r["exit_px"] - 100.6 * 0.9993) < 1e-9

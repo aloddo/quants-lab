@@ -26,7 +26,7 @@ import pandas as pd
 
 from v26_common import (EXECUTIONS, EXIT_STYLES, FAMILY_VARIANTS, FULL_CROSS, GROSS_CAPS,
                         HOLD_BANDS, K_GRID, SIZINGS, V26_DATA, canonical_sha256,
-                        config_id)
+                        config_id, write_exploratory_parquet)
 from v26_families import allowed_bands
 
 REGISTRY_COLS = ["config_id", "family", "K", "hold_band", "exit_style", "gross_cap",
@@ -78,9 +78,11 @@ def write_registry(registry: pd.DataFrame, out_dir: Path = V26_DATA) -> dict:
     """Write configs.parquet + prune_ledger.parquet + registry_sha.json.
     Returns {'registry_sha256', 'prune_ledger_sha256', counts...}."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    registry.to_parquet(out_dir / "configs.parquet", index=False)
+    # EXPLORATORY label on the registry artifacts (codex code-gate #8); the content
+    # sha256 excludes the banner column (canonical_sha256 drops it)
+    write_exploratory_parquet(registry, out_dir / "configs.parquet")
     ledger = registry[registry["status"] == "PRUNED"].reset_index(drop=True)
-    ledger.to_parquet(out_dir / "prune_ledger.parquet", index=False)
+    write_exploratory_parquet(ledger, out_dir / "prune_ledger.parquet")
     meta = {
         "registry_sha256": canonical_sha256(registry),
         "prune_ledger_sha256": canonical_sha256(ledger),
@@ -88,6 +90,7 @@ def write_registry(registry: pd.DataFrame, out_dir: Path = V26_DATA) -> dict:
         "n_run": int((registry["status"] == "RUN").sum()),
         "n_pruned": int(len(ledger)),
         "prune_reason_counts": ledger["prune_reason"].value_counts().to_dict(),
+        "exploratory": True,
     }
     with open(out_dir / "registry_sha.json", "w") as fh:
         json.dump(meta, fh, indent=2)

@@ -21,8 +21,11 @@ on_entry order -- dust skip, (wallet, coin) coalescing, event-hash dropout, acco
 (gross_cap axis; coin-side 2x and margin 0.7/10x inherited frozen), sizing (150 / 500 /
 pct2 = 2% of MTM equity at signal), and causal-tier fees (v26_fees), then builds the
 minute-grid equity / gross / drawdown series (decision D7) and the daily estimand
-inputs. Realized PnL accrues at exit-signal processing with fill-priced values and entry
-fees hit equity at the entry signal -- v25 CopySim parity.
+inputs. EXIT-FILL CLOCK (codex code-gate #4, v25 gate-b r3 parity): gross exposure and
+the unrealized MTM series run to the DELAYED EXIT FILL slot -- not the exit signal --
+and realized PnL lands on the minute grid at the fill slot, so time-weighted avg_gross,
+DD, and daily attribution all use fill timestamps. Entry fees hit equity at the entry
+signal -- v25 CopySim parity.
 """
 from __future__ import annotations
 
@@ -41,14 +44,16 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from v26_common import (DROPOUT_SEEDS, EXPLORATORY_LABEL, FREEZE_GRID_PATH, GRID_SEED,
+from v26_common import (DROPOUT_SEEDS, EXPLORATORY_LABEL, FREEZE_GRID_PATH,
+                        GRID_BLOCK_DAYS, GRID_BLOCK_DAYS_ROBUST, GRID_SEED,
                         INITIAL_EQUITY, MAKER_MIN_FILL_RATE, MAX_COIN_SIDE_X,
                         MAX_MARGIN_UTIL, MIN_NONZERO_DAYS, MS_DAY, MS_MIN, RESERVE_LEV,
                         FoldMarks, MarksIndex, ShardedParquetWriter, V26_DATA,
                         canonical_sha256, event_dropout, folds, git_commit,
                         install_memory_guard, iter_wallet_frames, k_real_tier,
-                        scenario_base, scenario_worst, v25_run_alive,
-                        v25_verdict_complete)
+                        scenario_base, scenario_worst, stamp_parquet_exploratory,
+                        v25_run_alive, v25_verdict_complete,
+                        write_exploratory_parquet)
 from v26_families import FoldContext, allowed_bands, build_fold_rankings
 from v26_fees import FeeEngine, load_snapshot
 from v26_overlays import build_trip_stream, extract_candidate_journeys
@@ -125,9 +130,13 @@ def assemble_config_fold(trips: pd.DataFrame, fm: FoldMarks, fee: FeeEngine,
         net = gain - exit_fee - lot["entry_fee"]
         realized += gain - exit_fee
         terminal = r.exit_reason == "TERMINAL"
-        inclusive = r.exit_reason in ("STOP", "TRAIL", "MAXHOLD")
+        # EXIT-FILL CLOCK (codex code-gate #4, v25 gate-b r3 / _fill_exit parity):
+        # the position stays marked (unreal + gross) through every minute STRICTLY
+        # before the delayed exit FILL; the fill mark itself is sampled post-mutation
+        # (inclusive=True: a fill on a minute boundary closes AT that slot), and the
+        # realized PnL lands at the fill slot -- daily attribution uses fill timestamps
         s_end = (n_slots - 1 if terminal
-                 else _step_slot(int(r.exit_signal_ts), inclusive))
+                 else _step_slot(int(r.exit_fill_ts), True))
         s0 = lot["s0"]
         if s0 < s_end:
             cl = fm.series(r.coin)[s0:s_end]
@@ -236,6 +245,15 @@ def assemble_config_fold(trips: pd.DataFrame, fm: FoldMarks, fee: FeeEngine,
             admitted_day[d] += order_usd
     _flush_exits(end_ms + 1)
     c["tier_departed_base"] = fee.tier_departed_base
+    if fee.rate_departed_base:
+        # decision D5 assertion (codex code-gate #5, fail closed): overlay trigger
+        # geometry prices accrued exit costs at BASE-TIER rates; a config whose
+        # realized (charged) rate schedule departs base would have used stale trigger
+        # fees -> fail LOUDLY (runtime_failure), never silently
+        raise RuntimeError(
+            f"tier_departed_base assertion: {fee.rate_departed_base} fills charged off "
+            f"the base-tier schedule while E2/E3 trigger geometry assumes base-tier "
+            f"fees (D5) -- config fails closed")
 
     equity = INITIAL_EQUITY + np.cumsum(real_steps) + unreal
     peak = np.maximum.accumulate(equity)
@@ -313,7 +331,7 @@ def _stream_worker(task):
                            _W["marks"], _W["fm"], f["asof_ms"], f["test_end_ms"])
     p = stream_path(_W["out_dir"], f["fold"], exit_style, execution, scen)
     p.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(p, index=False)
+    write_exploratory_parquet(df, p)
     return (task, len(df))
 
 
@@ -331,7 +349,7 @@ def build_fold_streams(fold_meta, cfgs: pd.DataFrame, out_dir: Path,
         ctx = FoldContext(k, fold_meta["train_start_ms"], fold_meta["asof_ms"])
         cells = sorted({(r.family, r.hold_band) for r in cfgs.itertuples(index=False)})
         rank_map, rank_df = build_fold_rankings(ctx, cells=cells)
-        rank_df.to_parquet(out_dir / f"rankings_fold{k}.parquet", index=False)
+        write_exploratory_parquet(rank_df, out_dir / f"rankings_fold{k}.parquet")
     rankings_all[k] = rank_map
     union = set()
     for roster in rank_map.values():
@@ -343,7 +361,7 @@ def build_fold_streams(fold_meta, cfgs: pd.DataFrame, out_dir: Path,
     cand = extract_candidate_journeys(actions, fold_meta["asof_ms"],
                                       fold_meta["test_end_ms"])
     cand_path = out_dir / f"candidates_fold{k}.parquet"
-    cand.to_parquet(cand_path, index=False)
+    write_exploratory_parquet(cand, cand_path)
     del actions
     t2 = time.time()
     combos = sorted({(r.exit_style, r.execution, s)
@@ -399,9 +417,12 @@ def _roster(fam: str, band: str, K: int) -> pd.DataFrame:
 
 
 def eval_config_fold(cfg: dict) -> dict:
-    """All assemblies for ONE config on the worker's fold: BASE primary, BASE fallback
-    variant (maker configs), WORST, 3 dropout-seed stress runs (BASE primary).
-    Fails closed: any exception => {'error': ...} (runtime_failure, decision D10)."""
+    """All assemblies for ONE config on the worker's fold: BASE primary, WORST, 3
+    dropout-seed stress runs (BASE), and -- for maker configs -- the all-missed-as-taker
+    fallback variant of EVERY one of those (codex code-gate #6: the <50%-fill-rate dual
+    evaluation applies to BASE, WORST and stress alike; both evaluations are persisted
+    and the criteria use the worse). Fails closed: any exception => {'error': ...}
+    (runtime_failure, decision D10)."""
     try:
         f = _W["fold"]
         fm = _W["fm"]
@@ -414,20 +435,22 @@ def eval_config_fold(cfg: dict) -> dict:
         # k_real == 0 (undersupplied beyond fold 1) still evaluates: an empty roster
         # trades nothing and yields all zero-exposure days (excluded by the estimand)
         is_maker = cfg["execution"] != "taker"
-        fb_lookup = None
+        fb = {"BASE": None, "WORST": None}      # per-scenario taker fallback lookups
         if is_maker:
-            tk = _get_stream(cfg["exit_style"], "taker", "BASE")
-            tk = tk[tk["wallet"].isin(wallets)]
-            fb_lookup = {(r.wallet, r.coin, int(r.journey_id)): r
-                         for r in tk.itertuples(index=False)}
-        runs = [("BASE", None, None)]
-        if is_maker:
-            runs.append(("BASE_FB", None, fb_lookup))
-        runs.append(("WORST", None, None))
+            for sc in ("BASE", "WORST"):
+                tk = _get_stream(cfg["exit_style"], "taker", sc)
+                tk = tk[tk["wallet"].isin(wallets)]
+                fb[sc] = {(r.wallet, r.coin, int(r.journey_id)): r
+                          for r in tk.itertuples(index=False)}
+        runs = [("BASE", None, None), ("WORST", None, None)]
         for s in DROPOUT_SEEDS:
             runs.append((f"BASE_seed{s}", s, None))
+        if is_maker:
+            runs += [(f"{name}_FB", seed, fb["WORST" if name.startswith("WORST")
+                                              else "BASE"])
+                     for name, seed, _ in list(runs)]
         for name, seed, fbl in runs:
-            scen = "WORST" if name == "WORST" else "BASE"
+            scen = "WORST" if name.startswith("WORST") else "BASE"
             df = _get_stream(cfg["exit_style"], cfg["execution"], scen)
             df = df[df["wallet"].isin(wallets)]
             eng = FeeEngine(_W["snapshot"], mode=scen)
@@ -496,8 +519,9 @@ def _agg_config(per_fold: list[dict], fold_list: list[dict], cfg: dict) -> dict:
     agg["excess_series"] = chosen
     agg["excess_series_base_hurdle"] = daily_excess(*p1, delta_mult=1.0)
 
-    # criteria inputs (v25-inherited + K-scaled, over the CHOSEN variant where daily,
-    # over the primary maker model for WORST/stress -- decision D9 scope)
+    # criteria inputs (v25-inherited + K-scaled, over the CHOSEN variant where daily;
+    # decision D9 scope per codex code-gate #6: the dual evaluation ALSO applies to
+    # WORST and stress -- criteria use the worse, both evaluations are persisted)
     vname = chosen_name if chosen_name in ("BASE", "BASE_FB") else "BASE"
     fold_pnls, dds = [], []
     n_real = n_term = n_long = n_short = 0
@@ -516,9 +540,20 @@ def _agg_config(per_fold: list[dict], fold_list: list[dict], cfg: dict) -> dict:
                        (v["coin_net"], coin_net)):
             for kk, vv in d.items():
                 dst[kk] = dst.get(kk, 0) + vv
-    worst_pooled = sum((r["variants"]["WORST"]["total_pnl"]) for r in per_fold)
-    stress = [sum(r["variants"][f"BASE_seed{s}"]["total_pnl"] for r in per_fold)
-              for s in DROPOUT_SEEDS]
+    def _pooled(variant):
+        if any(variant not in r["variants"] for r in per_fold):
+            return None
+        return sum(r["variants"][variant]["total_pnl"] for r in per_fold)
+
+    def _worse(primary, fb):
+        return primary if (fb is None or not use_fb) else min(primary, fb)
+
+    worst_primary = _pooled("WORST")
+    worst_fb = _pooled("WORST_FB")
+    worst_pooled = _worse(worst_primary, worst_fb)
+    stress_primary = [_pooled(f"BASE_seed{s}") for s in DROPOUT_SEEDS]
+    stress_fb = [_pooled(f"BASE_seed{s}_FB") for s in DROPOUT_SEEDS]
+    stress = [_worse(p, f) for p, f in zip(stress_primary, stress_fb)]
     total_days = sum(f["test_days"] for f in fold_list)
     n_folds = len(fold_list)
     crit = {}
@@ -546,7 +581,13 @@ def _agg_config(per_fold: list[dict], fold_list: list[dict], cfg: dict) -> dict:
     agg.update({"criteria": crit, "fold_pnls": fold_pnls, "dds": dds,
                 "n_realized": n_real, "n_terminal": n_term, "n_long": n_long,
                 "n_short": n_short, "worst_pooled": worst_pooled,
+                "worst_pooled_primary": worst_primary,
+                "worst_pooled_fb": worst_fb,
+                "dual_eval_applied": bool(use_fb),
                 "stress_by_seed": dict(zip(map(str, DROPOUT_SEEDS), stress)),
+                "stress_by_seed_primary": dict(zip(map(str, DROPOUT_SEEDS),
+                                                   stress_primary)),
+                "stress_by_seed_fb": dict(zip(map(str, DROPOUT_SEEDS), stress_fb)),
                 "trips_per_day": n_real / total_days if total_days else 0.0,
                 "n_entities_realized": n_entities})
     return agg
@@ -555,24 +596,39 @@ def _agg_config(per_fold: list[dict], fold_list: list[dict], cfg: dict) -> dict:
 def corrections_and_verdict(aggs: list[dict], fold_list: list[dict],
                             family_size: int, out_dir: Path,
                             n_resamples: int, holm_resamples: int) -> dict:
+    """Familywise corrections at BOTH block sizes (7d primary + inherited 14d
+    robustness, codex code-gate #3). Runtime-failure configs STAY in the family at both
+    block sizes (worst-case -inf observed / Holm p = 1, codex code-gate #2); any
+    exception or non-finite LCB at EITHER block size triggers the frozen Holm fallback.
+    A config whose 14d above/below-hurdle conclusion disagrees with 7d FAILS
+    (criteria['block_robustness_agree'], v25 frozen criterion)."""
     from v26_estimand import holm_adjust, holm_fallback, joint_maxstat
     seg_lens = [f["test_days"] for f in fold_list]
     total_days = sum(seg_lens)
     ok = [a for a in aggs if not a["runtime_failure"] and "excess_series" in a]
+    n_failures = sum(a["runtime_failure"] for a in aggs)
     M = (np.vstack([a["excess_series"] for a in ok]) if ok
          else np.empty((0, total_days)))
-    verdict = {"label": EXPLORATORY_LABEL, "family_size_nonpruned": family_size,
-               "n_evaluated": len(ok),
-               "n_runtime_failures": sum(a["runtime_failure"] for a in aggs)}
+    verdict = {"label": EXPLORATORY_LABEL, "exploratory": True,
+               "family_size_nonpruned": family_size,
+               "n_evaluated": len(ok), "n_runtime_failures": n_failures}
     method = None
-    lcb = mean = None
-    holm_pass = None
+    lcb = lcb14 = mean = None
+    pass7 = pass14 = None
     trigger = None
-    if len(ok):
+    if len(ok) or n_failures:
         try:
-            res = joint_maxstat(M, seg_lens, n_resamples=n_resamples)
-            method, mean, lcb = res["method"], res["mean"], res["lcb"]
-            verdict["c_maxstat"] = res["c_maxstat"]
+            res7 = joint_maxstat(M, seg_lens, n_resamples=n_resamples,
+                                 block_days=GRID_BLOCK_DAYS, n_failures=n_failures)
+            res14 = joint_maxstat(M, seg_lens, n_resamples=n_resamples,
+                                  block_days=GRID_BLOCK_DAYS_ROBUST,
+                                  n_failures=n_failures)
+            method, mean, lcb, lcb14 = (res7["method"], res7["mean"], res7["lcb"],
+                                        res14["lcb"])
+            pass7 = np.isfinite(lcb) & (lcb > 0)
+            pass14 = np.isfinite(lcb14) & (lcb14 > 0)
+            verdict["c_maxstat"] = res7["c_maxstat"]
+            verdict["c_maxstat_14d"] = res14["c_maxstat"]
         except Exception as e:
             trigger = {"type": "exception", "detail": f"{type(e).__name__}: {e}"}
         if method is None:
@@ -580,13 +636,25 @@ def corrections_and_verdict(aggs: list[dict], fold_list: list[dict],
             trigger["fallback"] = "holm_bonferroni_0.05_one_sided"
             trigger["trigger_unix"] = time.time()
             with open(out_dir / "manifest_grid.json", "w") as fh:
-                json.dump({"holm_trigger": trigger}, fh, indent=2)
+                json.dump({"holm_trigger": trigger, "exploratory": True,
+                           "label": EXPLORATORY_LABEL}, fh, indent=2)
             try:
-                res = holm_fallback(M, seg_lens, family_size,
-                                    n_resamples=holm_resamples)
-                method, mean, lcb = res["method"], res["mean"], res["lcb"]
-                p_adj = holm_adjust(res["p_raw"], family_size)
-                holm_pass = p_adj <= 0.05
+                res7 = holm_fallback(M, seg_lens, family_size,
+                                     n_resamples=holm_resamples,
+                                     block_days=GRID_BLOCK_DAYS,
+                                     n_failures=n_failures)
+                res14 = holm_fallback(M, seg_lens, family_size,
+                                      n_resamples=holm_resamples,
+                                      block_days=GRID_BLOCK_DAYS_ROBUST,
+                                      n_failures=n_failures)
+                method, mean, lcb, lcb14 = (res7["method"], res7["mean"], res7["lcb"],
+                                            res14["lcb"])
+                # arrays include the appended runtime-failure rows (p = 1, lcb -inf):
+                # the Holm adjustment sees the FULL family explicitly
+                p7_adj = holm_adjust(res7["p_raw"], family_size)
+                p14_adj = holm_adjust(res14["p_raw"], family_size)
+                pass7 = p7_adj <= 0.05
+                pass14 = p14_adj <= 0.05
                 verdict["holm"] = {"family_size": family_size}
             except Exception as e2:
                 verdict["fallback_failure"] = f"{type(e2).__name__}: {e2}"
@@ -595,14 +663,20 @@ def corrections_and_verdict(aggs: list[dict], fold_list: list[dict],
     for i, a in enumerate(ok):
         a["mean_excess"] = float(mean[i]) if mean is not None else float("nan")
         a["adjusted_lcb"] = float(lcb[i]) if lcb is not None else float("nan")
-        est_pass = (bool(holm_pass[i]) if holm_pass is not None
-                    else bool(lcb is not None and np.isfinite(lcb[i]) and lcb[i] > 0))
-        a["estimand_pass"] = est_pass and method not in (None, "FAILED")
+        a["adjusted_lcb_14d"] = float(lcb14[i]) if lcb14 is not None else float("nan")
+        p7 = bool(pass7[i]) if pass7 is not None else False
+        p14 = bool(pass14[i]) if pass14 is not None else False
+        # inherited v25 frozen criterion: 14d-block conclusion must AGREE with 7d
+        a["criteria"]["block_robustness_agree"] = (p7 == p14) and method not in (
+            None, "FAILED")
+        a["estimand_pass"] = p7 and method not in (None, "FAILED")
         a["PASS"] = bool(a["estimand_pass"] and all(a["criteria"].values()))
     for a in aggs:
         if a["runtime_failure"]:
-            a["mean_excess"] = float("nan")
-            a["adjusted_lcb"] = float("nan")
+            # codex code-gate #2: stays in the family with worst-case values
+            a["mean_excess"] = float("-inf")
+            a["adjusted_lcb"] = float("-inf")
+            a["adjusted_lcb_14d"] = float("-inf")
             a["estimand_pass"] = False
             a["PASS"] = False
             a["holm_p"] = 1.0
@@ -641,6 +715,7 @@ def write_outputs(aggs: list[dict], registry: pd.DataFrame, verdict: dict,
             "k_real_min": a.get("k_real_min", 0),
             "mean_excess": a.get("mean_excess", float("nan")),
             "adjusted_lcb": a.get("adjusted_lcb", float("nan")),
+            "adjusted_lcb_14d": a.get("adjusted_lcb_14d", float("nan")),
             "estimand_pass": bool(a.get("estimand_pass", False)),
             "PASS": bool(a.get("PASS", False)),
             "runtime_failure": bool(a.get("runtime_failure", False)),
@@ -648,6 +723,15 @@ def write_outputs(aggs: list[dict], registry: pd.DataFrame, verdict: dict,
             "trips_per_day": a.get("trips_per_day", 0.0),
             "maker_fill_rate": a.get("maker_fill_rate", float("nan")),
             "variant_used": a.get("variant_used", ""),
+            # dual evaluation (codex code-gate #6): BOTH evaluations persisted
+            "dual_eval_applied": bool(a.get("dual_eval_applied", False)),
+            "worst_pooled": a.get("worst_pooled"),
+            "worst_pooled_fb": a.get("worst_pooled_fb"),
+            "fb_mean_excess": a.get("fb_mean_excess"),
+            "stress_by_seed_json": json.dumps(a.get("stress_by_seed", {}),
+                                              default=float),
+            "stress_by_seed_fb_json": json.dumps(a.get("stress_by_seed_fb", {}),
+                                                 default=float),
             "labels": "|".join(labels),
             "criteria_json": json.dumps(a.get("criteria", {}), default=bool),
         })
@@ -663,8 +747,9 @@ def write_outputs(aggs: list[dict], registry: pd.DataFrame, verdict: dict,
                               "label": "EXPLORATORY"})
     frontier = pd.DataFrame(rows).sort_values(
         ["PASS", "adjusted_lcb"], ascending=[False, False], kind="mergesort")
-    frontier.to_parquet(out_dir / "frontier.parquet", index=False)
-    pd.DataFrame(kill_rows).to_parquet(out_dir / "kill_ledger.parquet", index=False)
+    write_exploratory_parquet(frontier, out_dir / "frontier.parquet")
+    write_exploratory_parquet(pd.DataFrame(kill_rows),
+                              out_dir / "kill_ledger.parquet")
     # marginals: DESCRIPTIVE, NON-DECISION-MAKING (codex #12): raw cell means with n
     marg_rows = []
     for axis in ["family", "K", "hold_band", "exit_style", "gross_cap", "execution",
@@ -676,7 +761,8 @@ def write_outputs(aggs: list[dict], registry: pd.DataFrame, verdict: dict,
                 "adjusted_lcb_cellmean": float(np.nanmean(g["adjusted_lcb"])),
                 "pass_rate": float(g["PASS"].mean()),
                 "label": "DESCRIPTIVE, NON-DECISION-MAKING (EXPLORATORY)"})
-    pd.DataFrame(marg_rows).to_parquet(out_dir / "marginals.parquet", index=False)
+    write_exploratory_parquet(pd.DataFrame(marg_rows), out_dir / "marginals.parquet")
+    verdict["exploratory"] = True
     with open(out_dir / "verdict_grid.json", "w") as fh:
         json.dump(verdict, fh, indent=2, default=float)
 
@@ -700,7 +786,7 @@ def build_registry_from_fold1(out_dir: Path) -> tuple[pd.DataFrame, dict]:
     f1 = folds()[0]
     ctx = FoldContext(1, f1["train_start_ms"], f1["asof_ms"])
     rank_map, rank_df = build_fold_rankings(ctx)          # all band-RUN cells
-    rank_df.to_parquet(out_dir / "rankings_fold1.parquet", index=False)
+    write_exploratory_parquet(rank_df, out_dir / "rankings_fold1.parquet")
     counts = {cell: len(roster) for cell, roster in rank_map.items()}
     registry = enumerate_registry(counts)
     meta = write_registry(registry, out_dir)
@@ -719,8 +805,14 @@ def main():
     ap.add_argument("--confirm-grid", action="store_true")
     ap.add_argument("--procs", type=int, default=6)
     ap.add_argument("--mem-gb", type=float, default=10.0)
-    ap.add_argument("--resamples", type=int, default=None)
+    ap.add_argument("--resamples", type=int, default=None,
+                    help="resample-count override, ALLOWED ONLY under --smoke "
+                         "(full runs use the frozen counts, codex code-gate #7)")
     args = ap.parse_args()
+    if args.resamples and not args.smoke:
+        raise SystemExit("--resamples is allowed ONLY under --smoke: full grid runs "
+                         "use the FROZEN resample counts (100,000 joint max-stat / "
+                         "200,000 Holm fallback)")
     print(BANNER)
 
     if args.build_registry:
@@ -809,8 +901,10 @@ def main():
                 dw.add({"config_id": cid, "fold": r["fold"], "day_idx": i,
                         "daily_pnl": float(v["daily_pnl"][i]),
                         "admitted_entry_notional": float(v["admitted"][i]),
-                        "avg_gross": float(v["avg_gross"][i])})
+                        "avg_gross": float(v["avg_gross"][i]),
+                        "exploratory": True})
     dw.close()
+    stamp_parquet_exploratory(out_dir / "daily_grid.parquet")
 
     aggs = [_agg_config(per_cfg[cfg["config_id"]], fold_list, cfg)
             for cfg in cfg_dicts]

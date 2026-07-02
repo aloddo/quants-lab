@@ -11,8 +11,12 @@ independent cold start (one engine instance per config x fold x scenario).
 Rate mapping (decision D6, v26_common):
 - BASE: snapshot tier rates x (1 - activeReferralDiscount). Base tier cross 0.00045 x
   0.96 = 4.32bps -- exactly the v25 BASE measured schedule; tiers upgrade causally.
-- WORST: snapshot base-tier rates, NO referral discount, NO tier evolution (4.5bps
-  taker, 1.5bps maker -- the v25 WORST taker number, now snapshot-sourced).
+- WORST (codex code-gate #5): snapshot base-tier rates with NO referral discount as the
+  FLOOR. The causal tier engine stays ACTIVE (volume accrues, tiers evolve, departures
+  are counted) but an improved tier can never reduce the charged WORST rate: charged =
+  max(evolved tier rate, base-tier rate). At our simulated volumes tiers never improve,
+  so the result equals the old fixed 4.5bps taker / 1.5bps maker -- but the mechanism
+  is present and honest.
 - HIP-3 (prefixed markets): multiplier 2.0 on the perp rate (same source as v25).
 - maker rate = the tier's "add" rate (negative mm rebate tiers are NOT modeled; we are
   not a maker-fraction market maker).
@@ -41,8 +45,15 @@ class FeeEngine:
 
     record_volume(ts_ms, notional) accrues the config's own simulated fill volume onto
     its UTC day; rate(ts_ms, coin, maker) returns the fee FRACTION for a fill at ts
-    using the tier implied by volume on the 14 strictly-prior days. tier_departed_base
-    counts fills priced at a non-base tier (decision D5 assertion)."""
+    using the tier implied by volume on the 14 strictly-prior days.
+
+    Counters (decision D5 assertion, codex code-gate #5):
+    - tier_departed_base: fills whose CAUSAL tier is non-base (both scenarios; in WORST
+      the tier still evolves even though the charged rate is floored at base).
+    - rate_departed_base: fills whose CHARGED rate schedule departed the base-tier
+      schedule (BASE only by construction; WORST is floored). Any config with
+      rate_departed_base > 0 FAILS LOUDLY in the assembly (trigger geometry prices
+      accrued exit costs at base-tier rates -- a departure would make them stale)."""
 
     def __init__(self, snapshot: dict, mode: str = "BASE"):
         assert mode in ("BASE", "WORST")
@@ -59,12 +70,14 @@ class FeeEngine:
         ref = snapshot["data"].get("activeReferralDiscount") or 0.0
         self.discount = float(ref) if mode == "BASE" else 0.0
         self.tier_departed_base = 0
+        self.rate_departed_base = 0
         self._vol: dict[int, float] = {}
 
     def reset(self):
         """Fold boundary: volume resets to zero (independent cold start)."""
         self._vol = {}
         self.tier_departed_base = 0
+        self.rate_departed_base = 0
 
     def record_volume(self, ts_ms: int, notional: float):
         d = int(ts_ms // MS_DAY)
@@ -74,8 +87,6 @@ class FeeEngine:
         return sum(self._vol.get(d, 0.0) for d in range(day - TRAIL_DAYS, day))
 
     def _tier_rates(self, ts_ms: int) -> tuple[float, float]:
-        if self.mode == "WORST":
-            return self.base_cross, self.base_add     # frozen: no tier evolution
         v = self._vol14(int(ts_ms // MS_DAY))
         cross, add = self.base_cross, self.base_add
         departed = False
@@ -83,7 +94,14 @@ class FeeEngine:
             if v >= t["cutoff"]:
                 cross, add, departed = t["cross"], t["add"], True
         if departed:
-            self.tier_departed_base += 1
+            self.tier_departed_base += 1      # causal evolution active in BOTH modes
+        if self.mode == "WORST":
+            # codex code-gate #5: WORST = base-tier-no-discount RATES as the floor;
+            # the tier evolved causally above, but can never reduce the charged rate
+            cross = max(cross, self.base_cross)
+            add = max(add, self.base_add)
+        if (cross, add) != (self.base_cross, self.base_add):
+            self.rate_departed_base += 1
         return cross, add
 
     def rate(self, ts_ms: int, coin: str, maker: bool) -> float:
