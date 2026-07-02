@@ -235,7 +235,9 @@ def assemble_config_fold(trips: pd.DataFrame, fm: FoldMarks, fee: FeeEngine,
         s0 = min(max(fm.slot_ceil(int(row.entry_fill_ts)), 0), n_slots - 1)
         open_lots[key] = {"row": row, "notional": order_usd, "entry_fee": entry_fee,
                           "fill_ts": int(row.entry_fill_ts), "s0": s0}
-        heapq.heappush(exit_heap, (int(row.exit_signal_ts), seq, key))
+        # codex cg-r2 #1: the position occupies its slot (caps, dup-coalescing,
+        # admissions) until the delayed exit FILL, not the exit signal
+        heapq.heappush(exit_heap, (int(row.exit_fill_ts), seq, key))
         seq += 1
         c["entries"] += 1
         if row.entry_is_maker:
@@ -245,15 +247,16 @@ def assemble_config_fold(trips: pd.DataFrame, fm: FoldMarks, fee: FeeEngine,
             admitted_day[d] += order_usd
     _flush_exits(end_ms + 1)
     c["tier_departed_base"] = fee.tier_departed_base
-    if fee.rate_departed_base:
-        # decision D5 assertion (codex code-gate #5, fail closed): overlay trigger
-        # geometry prices accrued exit costs at BASE-TIER rates; a config whose
-        # realized (charged) rate schedule departs base would have used stale trigger
-        # fees -> fail LOUDLY (runtime_failure), never silently
+    if fee.rate_departed_base or fee.tier_departed_base:
+        # decision D5 assertion (codex code-gate #5 + cg-r2 #2, fail closed): overlay
+        # trigger geometry prices accrued exit costs at BASE-TIER rates. ANY tier
+        # departure fails the config loudly -- in BASE mode a departed tier changes
+        # charged rates (rate_departed_base), and in WORST mode the floor masks the
+        # charged rate but the geometry claim is still voided (tier_departed_base).
         raise RuntimeError(
-            f"tier_departed_base assertion: {fee.rate_departed_base} fills charged off "
-            f"the base-tier schedule while E2/E3 trigger geometry assumes base-tier "
-            f"fees (D5) -- config fails closed")
+            f"tier-departure assertion (D5): rate_departed={fee.rate_departed_base} "
+            f"tier_departed={fee.tier_departed_base} fills while E2/E3 trigger "
+            f"geometry assumes base-tier fees -- config fails closed")
 
     equity = INITIAL_EQUITY + np.cumsum(real_steps) + unreal
     peak = np.maximum.accumulate(equity)
@@ -726,10 +729,14 @@ def write_outputs(aggs: list[dict], registry: pd.DataFrame, verdict: dict,
             # dual evaluation (codex code-gate #6): BOTH evaluations persisted
             "dual_eval_applied": bool(a.get("dual_eval_applied", False)),
             "worst_pooled": a.get("worst_pooled"),
+            # codex cg-r2 #3: BOTH dual evaluations persisted -- primary AND fb
+            "worst_pooled_primary": a.get("worst_pooled_primary"),
             "worst_pooled_fb": a.get("worst_pooled_fb"),
             "fb_mean_excess": a.get("fb_mean_excess"),
             "stress_by_seed_json": json.dumps(a.get("stress_by_seed", {}),
                                               default=float),
+            "stress_by_seed_primary_json": json.dumps(
+                a.get("stress_by_seed_primary", {}), default=float),
             "stress_by_seed_fb_json": json.dumps(a.get("stress_by_seed_fb", {}),
                                                  default=float),
             "labels": "|".join(labels),
@@ -809,7 +816,7 @@ def main():
                     help="resample-count override, ALLOWED ONLY under --smoke "
                          "(full runs use the frozen counts, codex code-gate #7)")
     args = ap.parse_args()
-    if args.resamples and not args.smoke:
+    if args.resamples is not None and not args.smoke:   # cg-r2 #5: 0 must not bypass
         raise SystemExit("--resamples is allowed ONLY under --smoke: full grid runs "
                          "use the FROZEN resample counts (100,000 joint max-stat / "
                          "200,000 Holm fallback)")

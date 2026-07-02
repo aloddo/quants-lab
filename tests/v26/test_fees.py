@@ -69,7 +69,7 @@ class TestCausalTiers:
             False, False, False, "ok", "", float(T0 + 60 * MS_MIN)]))
         fee = FeeEngine(tier_snapshot, "BASE")
         fee.record_volume(T0 - MS_DAY, 2000.0)   # prior-day volume crosses the cutoff
-        with pytest.raises(RuntimeError, match="tier_departed_base assertion"):
+        with pytest.raises(RuntimeError, match="tier-departure assertion"):
             assemble_config_fold(pd.DataFrame([trip]), fm, fee, 2.5, "150", {})
 
 

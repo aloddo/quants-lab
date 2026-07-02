@@ -94,6 +94,9 @@ def compute_freeze() -> dict:
         v25fz = json.load(fh)
     hh, combined = harness_hashes()
     return {
+        "exploratory": True,   # cg-r2 #4: the grid this freeze governs is screening
+        "exploratory_label": ("EXPLORATORY SCREENING EVIDENCE -- NEVER CONFIRMATORY; "
+                              "the sealed holdout is the sole confirmatory evidence"),
         "grid_prereg_doc": str(GRID_PREREG_DOC),
         "grid_prereg_sha256": sha256_file(GRID_PREREG_DOC),
         "git_commit": git_commit(),
