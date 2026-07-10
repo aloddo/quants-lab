@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +75,34 @@ def _run(fills, funding=None, anchors=None):
     )
     actions, journeys = m02.trace_wallet("0xtest", events, fills, funding)
     return events, actions, journeys
+
+
+def test_core_m02_does_not_reconstruct_equity(monkeypatch):
+    """The default lifecycle lane must run while M01 is absent or distrusted."""
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(3000, "BTC", "A", 1, 110, 1, tid=2, closed=10.0),
+    ]
+    for i, fill in enumerate(fills):
+        fill["fill_seq"] = i
+        fill["causal_order_ok"] = True
+    monkeypatch.setattr(m02.m01, "load_wallet_fills", lambda *_: fills)
+    monkeypatch.setattr(m02.m01, "load_wallet_funding", lambda *_: [])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("core M02 consulted M01 equity reconstruction")
+
+    monkeypatch.setattr(m02.m01, "reconstruct_wallet_event_equity", forbidden)
+    result = m02.process_wallet(("0xtest", 0, 10_000, False))
+
+    assert "error" not in result
+    assert len(result["actions"]) == 2
+    assert len(result["journeys"]) == 1
+    assert result["n_anchors"] is None
+    assert result["inter_drift"] is None
+    assert all(a["equity_basis_mode"] == "NOT_REQUESTED" for a in result["actions"])
+    assert all(a["source_equity_post"] is None for a in result["actions"])
+    assert all(a["target_exposure_pct"] is None for a in result["actions"])
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +181,44 @@ def test_entry_addon_trim_exit_sequence():
     # position_after sanity
     assert abs(actions[1]["position_after"] - 2.0) < 1e-9
     assert abs(actions[3]["position_after"]) < 1e-9
+
+
+def test_fill_fee_components_are_not_double_counted():
+    f = _fill(2000, "BTC", "B", 1, 100, 0, tid=1)
+    f.update(fee=0.40, builderFee=0.10, deployerFee=0.05)
+
+    # Hyperliquid reports fee as the total; the two component fields are
+    # disclosures within that total.
+    assert m01.fill_cash_delta(f) == pytest.approx(-100.40)
+    assert m02._fill_fee_usd_actual(f) == pytest.approx(0.40)
+
+
+def test_liquidation_ledger_summary_is_recognized_as_non_cash():
+    e = {
+        "delta": {
+            "type": "liquidation",
+            "accountValue": "25.0",
+            "liquidatedNtlPos": "1000.0",
+            "liquidatedPositions": [{"coin": "BTC", "szi": "0.01"}],
+        }
+    }
+    d = m01.ledger_cash_delta(e, "0xtest")
+    assert d.cash == 0.0
+    assert d.ext_flow == 0.0
+    assert d.unknown is False
+
+
+def test_hip4_outcome_fills_are_not_perp_actions_or_cash_flows():
+    f = _fill(2000, "#42", "B", 10, 0.4, 0, tid=1, dir_="Buy")
+    assert m01.coin_is_allowed_perp(f["coin"]) is False
+    assert m01.fill_cash_delta(f) == 0.0
+    assert m01.build_event_stream([f], [], []) == []
+
+
+def test_named_spot_pair_is_not_a_perp():
+    f = _fill(2000, "PURR/USDC", "B", 10, 0.1, 0, tid=2, dir_="Buy")
+    assert m01.coin_is_allowed_perp(f["coin"]) is False
+    assert m01.build_event_stream([f], [], []) == []
 
 
 def test_reverse_two_journey_ids():
@@ -270,6 +337,91 @@ def test_future_coin_does_not_affect_earlier_equity(monkeypatch):
     assert abs(e_t2.position_value - 500.0) < 1e-6
 
 
+def test_daily_walk_gross_notional_does_not_net_opposing_coins(monkeypatch):
+    monkeypatch.setattr(m01, "get_mark", lambda coin, ts_ms, causal=False: 100.0)
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(2100, "ETH", "A", 1, 100, 0, tid=2),
+    ]
+    stream = [(f["time"], "fill", f) for f in fills]
+    wr = m01.compute_eq_at(stream, fills, _Anchor(), "0xtest", 3000, 1000, 1000.0)
+    assert wr.position_value == pytest.approx(0.0)
+    assert wr.gross_position_notional == pytest.approx(200.0)
+
+
+def test_inter_anchor_drift_validates_causal_not_future_snapshot_seed(monkeypatch):
+    """The quarantine audit must use the same causal seed as emitted equity.
+
+    A future snapshot says BTC=10, while the observed burst causally opens only
+    3 BTC in this segment.  The old audit-only ex-post path back-solved a
+    pre-anchor position of 7 from that future snapshot and measured a different
+    equity path from the one actually emitted.
+    """
+    monkeypatch.setattr(
+        m01,
+        "get_mark",
+        lambda coin, ts_ms, causal=False: 100.0 if ts_ms <= 1000 else 200.0,
+    )
+    fills = m01.order_wallet_fills_causally([
+        _fill(1500, "BTC", "B", 1, 100, 0, tid=20),
+        _fill(1500, "BTC", "B", 2, 100, 1, tid=10),
+    ])
+    stream = [(f["time"], "fill", f) for f in fills]
+    anchor = _Anchor()
+    anchor.positions = {"BTC": 10.0}
+    # Causal path: buy 3 at 100, mark at 200 -> +$300 equity.
+    out = m01.inter_anchor_drift(
+        stream, fills, anchor, "0xtest", [(1000, 1000.0), (2000, 1300.0)]
+    )
+    assert out["n_checks"] == 1
+    assert out["max_drift_pct"] == pytest.approx(0.0)
+
+    # Explicit diagnostic ex-post mode remains different and cannot be used to
+    # accept the causal artifact.
+    leaked = m01.inter_anchor_drift(
+        stream, fills, anchor, "0xtest", [(1000, 1000.0), (2000, 1300.0)],
+        causal_seed=False,
+    )
+    assert leaked["max_drift_pct"] > 0.5
+
+
+def test_daily_causal_walk_folds_carry_when_first_revealed(monkeypatch):
+    """Daily M1 must match the per-event bridge's causal carry-in behavior."""
+    monkeypatch.setattr(
+        m01,
+        "get_mark",
+        lambda coin, ts_ms, causal=False: 100.0 if ts_ms <= 1000 else 110.0,
+    )
+    # First observed fill is a trim of a long 10 position held at the anchor.
+    fill = _fill(2000, "BTC", "A", 2, 100, 10, tid=1)
+    wr = m01.compute_eq_at(
+        [(2000, "fill", fill)], [fill], _Anchor(), "0xtest",
+        t_ms=3000, anchor_ms=1000, anchor_eq=1000.0, causal_seed=True,
+    )
+    assert wr.positions["BTC"] == pytest.approx(8.0)
+    # Anchor: cash=0, position=10*$100. Trim receives $200; remaining
+    # position is worth 8*$110 => equity $1,080.
+    assert wr.cash == pytest.approx(200.0)
+    assert wr.position_value == pytest.approx(880.0)
+    assert wr.equity == pytest.approx(1080.0)
+
+
+def test_segment_reconcile_does_not_double_count_closed_pnl(monkeypatch):
+    monkeypatch.setattr(m01, "get_mark", lambda coin, ts_ms, causal=False: 100.0)
+    fills = [
+        _fill(1200, "BTC", "B", 1, 100, 0, tid=1, closed=0.0),
+        _fill(1800, "BTC", "A", 1, 110, 1, tid=2, closed=10.0),
+    ]
+    stream = [(f["time"], "fill", f) for f in fills]
+    out = m01.segment_reconcile(
+        stream, fills, _Anchor(), "0xtest",
+        [(1000, 1000.0), (2000, 1010.0)], fills,
+        causal_seed=True,
+    )
+    assert out["n_segments"] == 1
+    assert out["max_err_usd"] == pytest.approx(0.0)
+
+
 # --------------------------------------------------------------------------- #
 # CAUSALITY BUG 2 — same-ms fills (no tid) get distinct correct actions
 # --------------------------------------------------------------------------- #
@@ -301,6 +453,46 @@ def test_same_ms_fills_distinct_correct_actions():
     assert abs(btc[1]["signed_size"] - 2.0) < 1e-9
 
 
+def test_same_ms_tid_is_identity_not_causal_order():
+    # Real S3 pattern: numerical tid order differs from position evolution.
+    # Correct chain: -573 -> -1428 -> -3011 -> -3584.
+    fills = [
+        _fill(3000, "BTC", "A", 855, 100, -573, tid=10, dir_="Open Short"),
+        _fill(3000, "BTC", "A", 573, 100, -3011, tid=20, dir_="Open Short"),
+        _fill(3000, "BTC", "A", 1583, 100, -1428, tid=30, dir_="Open Short"),
+    ]
+    ordered = m01.order_wallet_fills_causally(fills)
+    assert [f["startPosition"] for f in ordered] == [-573.0, -1428.0, -3011.0]
+    stream = m01.build_event_stream(fills, [], [])
+    assert [e["ev"]["startPosition"] for e in stream] == [-573.0, -1428.0, -3011.0]
+    assert all(e["ev"]["causal_order_ok"] for e in stream)
+
+
+def test_position_gap_resyncs_and_invalidates_interrupted_journey():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1, dir_="Open Long"),
+        # Missing fills moved the real position from 1 to 5 before this trim.
+        _fill(3000, "BTC", "A", 1, 100, 5, tid=2, dir_="Close Long"),
+        _fill(4000, "BTC", "A", 4, 100, 4, tid=3, dir_="Close Long"),
+    ]
+    _, actions, journeys = _run(fills, anchors=[(1000, 1000.0)])
+    assert actions[1]["state_resynced"] is True
+    assert actions[1]["position_after"] == pytest.approx(4.0)
+    assert actions[1]["action_type"] == "TRIM"
+    assert any(not j["lifecycle_valid"] and j["state_discontinuity"] for j in journeys)
+    # The gap is learned after action 0 was emitted, so validity must propagate
+    # backward to the entire interrupted journey.
+    assert actions[0]["lifecycle_valid"] is False
+    # The current transition can seed a new historical journey from its
+    # authoritative startPosition, but a raw live stream cannot self-repair.
+    assert actions[1]["lifecycle_valid"] is True
+    assert actions[1]["stream_replay_valid"] is False
+    assert actions[2]["lifecycle_valid"] is True
+    assert actions[2]["stream_replay_valid"] is False
+    assert all("stream_replay_valid" in j for j in journeys)
+    assert not any(j["stream_replay_valid"] for j in journeys)
+
+
 # --------------------------------------------------------------------------- #
 # M01 spot/collateral invariant
 # --------------------------------------------------------------------------- #
@@ -323,6 +515,72 @@ def test_m01_spot_collateral_invariant():
     assert abs(last.equity_post - 1000.0) < 1e-6
     assert abs(last.position_value) < 1e-6  # nothing held
     assert abs(last.cash - 1000.0) < 1e-6   # all equity is collateral/cash
+
+
+def test_spot_fill_cannot_create_perp_equity_or_ranking_action():
+    """M1/M2/M7 are a perp-copy chain. A spot buy must be absent from both
+    reconstructed perp equity and wallet-ranking actions.
+
+    Regression: the whole-account experiment added the spot asset position but
+    charged zero cash, turning a 10 @ $5 buy into a fake +$50 equity gain.
+    """
+    fill = _fill(3000, "@107", "B", 10, 5, 0, tid=1, dir_="Buy")
+    fill["is_spot"] = True
+    events, actions, journeys = _run([fill], anchors=[(2000, 1000.0)])
+
+    assert events == []
+    assert actions == []
+    assert journeys == []
+
+
+def test_wallet_fill_loader_excludes_spot_fast_path(tmp_path, monkeypatch):
+    wallet = "0x" + "b" * 40
+    rows = [
+        _fill(3000, "@107", "B", 10, 5, 0, tid=1, dir_="Buy"),
+        _fill(4000, "BTC", "B", 0.01, 100_000, 0, tid=2, dir_="Open Long"),
+    ]
+    pd.DataFrame(rows).to_parquet(tmp_path / f"{wallet}.parquet", index=False)
+    monkeypatch.setattr(m01, "S3_BY_WALLET_DIR", tmp_path)
+
+    loaded = m01.load_wallet_fills(wallet, 0, 10_000)
+
+    assert [fill["coin"] for fill in loaded] == ["BTC"]
+
+
+def test_perp_ledger_transfer_scope_is_flow_neutralized():
+    wallet = "0x" + "a" * 40
+    into_perp = {"delta": {"type": "accountClassTransfer", "usdc": "250", "toPerp": True}}
+    out_of_perp = {"delta": {"type": "accountClassTransfer", "usdc": "250", "toPerp": False}}
+    spot_only = {"delta": {"type": "spotTransfer", "usdc": "250"}}
+
+    assert m01.ledger_cash_delta(into_perp, wallet).cash == 250.0
+    assert m01.ledger_cash_delta(into_perp, wallet).ext_flow == 250.0
+    assert m01.ledger_cash_delta(out_of_perp, wallet).cash == -250.0
+    assert m01.ledger_cash_delta(out_of_perp, wallet).ext_flow == -250.0
+    assert m01.ledger_cash_delta(spot_only, wallet).cash == 0.0
+
+
+def test_non_usdc_hip3_collateral_send_uses_usdc_value():
+    wallet = "0xtest"
+    into_flx = {"delta": {
+        "type": "send", "user": wallet, "destination": wallet,
+        "sourceDex": "spot", "destinationDex": "flx", "token": "USDH",
+        "amount": "100", "usdcValue": "99.5", "fee": "0",
+    }}
+    out_of_cash = {"delta": {
+        "type": "send", "user": wallet, "destination": wallet,
+        "sourceDex": "cash", "destinationDex": "spot", "token": "USDT0",
+        "amount": "50", "usdcValue": "50.1", "fee": "0",
+    }}
+    spot_only = {"delta": {
+        "type": "send", "user": wallet, "destination": "0xother",
+        "sourceDex": "spot", "destinationDex": "spot", "token": "HYPE",
+        "amount": "10", "usdcValue": "400", "fee": "0",
+    }}
+    assert m01.ledger_cash_delta(into_flx, wallet).cash == pytest.approx(99.5)
+    assert m01.ledger_cash_delta(into_flx, wallet).ext_flow == pytest.approx(99.5)
+    assert m01.ledger_cash_delta(out_of_cash, wallet).cash == pytest.approx(-50.1)
+    assert m01.ledger_cash_delta(spot_only, wallet).cash == 0.0
 
 
 def test_snapshot_seed_independent_of_future_fills(monkeypatch):

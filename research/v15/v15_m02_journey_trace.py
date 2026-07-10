@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""V15 M02 — Causal journey_trace + per-action sizing stream.
+"""V15 M02 — Causal fill lifecycles with optional equity enrichment.
 
 Converts each source wallet's Hyperliquid PERP fills into:
-  (1) PRIMARY: a per-ACTION stream (one row per ordered fill event) carrying the
-      causal whole-account equity-% sizing target that drives the mirror (M08).
+  (1) PRIMARY: an equity-independent per-ACTION stream (one row per ordered
+      fill event) suitable for lifecycle and fixed-notional research.
   (2) DERIVED: a per-JOURNEY summary (groupby journey_id) driving ranking (M04).
+
+M01 is NOT a prerequisite for the default M02 path.  ``--equity-enrichment``
+is an optional lane that adds causal whole-account equity-% sizing targets for
+strategies that explicitly require leader-equity-relative sizing.
 
 This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
 ENTRY/ADDON/TRIM/EXIT/REVERSE state machine and its realized-PnL / fee / funding /
@@ -33,6 +37,7 @@ CLI:
     python v15_m02_journey_trace.py --wallets-file W.txt \
         --start 2025-12-01 --end 2026-05-23 \
         --actions-out actions.parquet --journeys-out journeys.parquet [--procs N]
+        [--equity-enrichment]
 """
 from __future__ import annotations
 
@@ -99,6 +104,16 @@ class EquityBasis:
     frozen_value: float
     frozen_age_s: float
     frozen_materiality_frac: float
+
+
+@dataclass
+class LifecycleFillEvent:
+    """Minimal M02 event contract; deliberately contains no leader equity."""
+
+    ts: int
+    event_order: int
+    fill: dict
+    type: str = "fill"
 
 
 def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
@@ -183,23 +198,19 @@ FEE_RATE = SOURCE_ASSUMED_TAKER_FEE_BPS / 10000.0
 
 
 def _fill_fee_usd_actual(f: dict) -> Optional[float]:
-    """Wallet-charged fee = fee + builderFee + deployerFee (signed; rebate<0).
-    None only if all three are absent (loader defaults them to 0.0, so present)."""
-    vals = [f.get("fee"), f.get("builderFee"), f.get("deployerFee")]
-    if all(v is None for v in vals):
+    """Return the signed total wallet fee reported by Hyperliquid.
+
+    ``builderFee`` and ``deployerFee`` are component disclosures already
+    included in ``fee``. They are deliberately ignored here.
+    """
+    v = f.get("fee")
+    if v is None:
         return None
-    tot = 0.0
-    for v in vals:
-        if v is None:
-            continue
-        try:
-            fv = float(v)
-        except (TypeError, ValueError):
-            return None
-        if fv != fv:  # NaN
-            return None
-        tot += fv
-    return tot
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if fv != fv else fv
 
 
 def _fill_fee_usd(notional: float) -> float:
@@ -262,13 +273,15 @@ def trace_wallet(
     events: list["m01.EventEquity"],
     fills: list[dict],
     funding: list[dict],
+    *,
+    equity_enriched: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """Walk the ordered FILL events for one wallet and emit (actions, journeys).
 
-    `events` is M01's per-event equity series in TOTAL EVENT ORDER (fills+funding+
-    ledger). We index it by event_order so each FILL action reads its own
-    source_equity_post. Funding/ledger events advance equity (already baked into
-    equity_post) but produce no action rows.
+    In the default/core lane, ``events`` contains only ``LifecycleFillEvent``
+    rows and no M01 reconstruction is consulted.  In the optional enriched
+    lane it is M01's total event stream so each fill can receive its causal
+    source-equity target. Funding/ledger rows never emit actions.
     """
     # Fill events in `events` carry type=='fill' AND the EXACT fill payload on
     # ee.fill (codex r4 BUG 2). We consume that payload DIRECTLY off the ordered
@@ -293,6 +306,7 @@ def trace_wallet(
             "n_exit": 0, "n_reverse": 0, "n_carry_in": 0,
             "realized_pnl": 0.0, "fees_paid": 0.0, "fee_scope": "standard_perp",
             "carry_in_status": None, "liq_closed": False,
+            "lifecycle_valid": True, "state_discontinuity": False,
         }
 
     def _finalize(coin: str, st: dict, close_ts: int) -> Optional[dict]:
@@ -317,6 +331,8 @@ def trace_wallet(
             "liq_closed": st["liq_closed"],
             "open_at_window_end": False,
             "carry_in_status": st["carry_in_status"] or "SEEDED",
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            "state_discontinuity": bool(st.get("state_discontinuity", False)),
         }
 
     # Walk events in event_order (already sorted).
@@ -328,6 +344,11 @@ def trace_wallet(
             continue
 
         coin = f["coin"]
+        # Defensive parity with M1 and M7/live: the research strategy copies
+        # perps only. Spot must not affect journey/ranking metrics even if an
+        # externally supplied event stream contains it.
+        if m01.coin_is_spot(coin):
+            continue
         st = coin_state.setdefault(coin, _new_state())
         signed = f["signed_sz"]
         if abs(signed) <= EPS:
@@ -343,9 +364,26 @@ def trace_wallet(
 
         # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
         first_fill = not coin_seen_first_fill.get(coin, False)
+        sp = float(f.get("startPosition", 0.0) or 0.0)
+        state_resynced = False
+        if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+            # Missing/ambiguous fills: never continue a fabricated lifecycle.
+            # Close the interrupted journey as INVALID, then causally reseed
+            # from the current fill's authoritative pre-position.
+            if st["open"]:
+                st["lifecycle_valid"] = False
+                st["state_discontinuity"] = True
+                j = _finalize(coin, st, ts)
+                if j is not None:
+                    journeys.append(j)
+            st = _new_state()
+            coin_state[coin] = st
+            position = 0.0
+            cost_basis = 0.0
+            first_fill = True
+            state_resynced = True
         if first_fill:
             coin_seen_first_fill[coin] = True
-            sp = float(f.get("startPosition", 0.0) or 0.0)
             if abs(sp) > EPS:
                 # Open an already-in-progress journey, sized causally.
                 coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
@@ -360,6 +398,9 @@ def trace_wallet(
                 cost_basis = price
             else:
                 st["carry_in_status"] = "SEEDED"  # flat carry-in = cleanly known
+
+        if not bool(f.get("causal_order_ok", True)):
+            st["lifecycle_valid"] = False
 
         # closedPnl ground truth (fallback to cost-basis derived).
         raw_pnl = f.get("closedPnl", None)
@@ -480,15 +521,27 @@ def trace_wallet(
 
         st["position"] = new_pos
 
-        # ---- equity basis (causal) + action row ----
-        basis = select_equity_basis(ee)
-        # SIZING signal: use only a bar that has closed by ts.
-        mark = m01.get_mark(coin, ts, causal=True)
-        sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
-        if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
-            target_pct = None
+        # ---- optional equity basis + action row ----
+        # Core M02 deliberately does not read M01, anchors, or market marks.
+        if equity_enriched:
+            basis = select_equity_basis(ee)
+            # SIZING signal: use only a bar that has closed by ts.
+            mark = m01.get_mark(coin, ts, causal=True)
+            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
+            if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
+                target_pct = None
+            else:
+                target_pct = (new_pos * mark) / basis.equity
         else:
-            target_pct = (new_pos * mark) / basis.equity
+            basis = EquityBasis(
+                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+                anchor_ts=None, mark_ts=None, degraded=False,
+                frozen_value=0.0, frozen_age_s=0.0,
+                frozen_materiality_frac=float("nan"),
+            )
+            mark = None
+            sizing_mark_ts = None
+            target_pct = None
 
         actions.append({
             "wallet": wallet, "coin": coin, "ts": ts,
@@ -511,6 +564,18 @@ def trace_wallet(
             "closing_journey_id": closing_jid,
             "journey_id": opening_jid,  # back-compat = opening side
             "carry_in_status": st["carry_in_status"],
+            "state_resynced": state_resynced,
+            "causal_order_ok": bool(f.get("causal_order_ok", True)),
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            # Final value is recomputed after every journey has been finalized.
+            # A future gap can retroactively invalidate earlier actions in the
+            # interrupted journey; a raw live trade stream also cannot repair
+            # the resync row because it does not carry startPosition.
+            "stream_replay_valid": bool(
+                st.get("lifecycle_valid", True)
+                and bool(f.get("causal_order_ok", True))
+                and not state_resynced
+            ),
         })
 
     # Positions still open at window end → flag (not finalized).
@@ -522,6 +587,46 @@ def trace_wallet(
                 j["exit_ts"] = None
                 journeys.append(j)
 
+    # Lifecycle validity is only known once the whole wallet has been walked.
+    # If a later position discontinuity interrupts a journey, propagate that
+    # failure back to every already-emitted action belonging to that journey.
+    # Without this pass, downstream code can filter lifecycle_valid=True and
+    # still ingest the beginning of a journey proven broken later.
+    invalid_journeys = {
+        (str(j["coin"]), int(j["journey_id"]))
+        for j in journeys
+        if not bool(j.get("lifecycle_valid", True)) and j.get("journey_id") is not None
+    }
+    invalid_stream_journeys = set(invalid_journeys)
+    for action in actions:
+        if action.get("state_resynced", False):
+            invalid_stream_journeys.update(
+                (str(action["coin"]), int(jid))
+                for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+                if jid is not None
+            )
+    for action in actions:
+        involved = {
+            (str(action["coin"]), int(jid))
+            for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+            if jid is not None
+        }
+        lifecycle_valid = bool(action.get("causal_order_ok", True)) and not bool(
+            involved & invalid_journeys
+        )
+        action["lifecycle_valid"] = lifecycle_valid
+        action["stream_replay_valid"] = bool(
+            lifecycle_valid
+            and not action.get("state_resynced", False)
+            and not bool(involved & invalid_stream_journeys)
+        )
+    for journey in journeys:
+        key = (str(journey["coin"]), int(journey["journey_id"]))
+        journey["stream_replay_valid"] = bool(
+            journey.get("lifecycle_valid", True)
+            and key not in invalid_stream_journeys
+        )
+
     return actions, journeys
 
 
@@ -532,28 +637,50 @@ def trace_wallet(
 _ANCHOR_DF = None
 
 
-def _init_worker(anchor_parquet: str, worker_mem_gb: float = 3.0) -> None:
+def _init_worker(
+    anchor_parquet: str, worker_mem_gb: float = 3.0,
+    equity_enriched: bool = False,
+) -> None:
     global _ANCHOR_DF
-    _ANCHOR_DF = pd.read_parquet(anchor_parquet)
+    _ANCHOR_DF = pd.read_parquet(anchor_parquet) if equity_enriched else None
     # codex perf-r1 #5: guard WORKERS too (per-wallet reconstruction + per-process mark-series cache
     # live here). Backstop: abort a runaway worker loudly instead of a silent aggregate OS OOM.
     install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
 
 
 def process_wallet(args: tuple) -> dict:
-    wallet, start_ms, end_ms = args
+    wallet, start_ms, end_ms, equity_enriched = args
     try:
-        anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
-        res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
-        if "error" in res:
-            return {"wallet": wallet, "error": res["error"]}
+        if equity_enriched:
+            anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
+            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+            if "error" in res:
+                return {"wallet": wallet, "error": res["error"]}
+            events = res["events"]
+            fills = res["fills"]
+            funding = res["funding"]
+            n_anchors = len(res["weekly_anchors"])
+            inter_drift = res["inter_anchor_drift"]
+        else:
+            fills = m01.load_wallet_fills(wallet, start_ms, end_ms)
+            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+            events = [
+                LifecycleFillEvent(
+                    ts=int(fill["time"]),
+                    event_order=int(fill.get("fill_seq", i)),
+                    fill=fill,
+                )
+                for i, fill in enumerate(fills)
+            ]
+            n_anchors = None
+            inter_drift = None
         actions, journeys = trace_wallet(
-            wallet, res["events"], res["fills"], res["funding"]
+            wallet, events, fills, funding, equity_enriched=equity_enriched
         )
         return {
             "wallet": wallet, "actions": actions, "journeys": journeys,
-            "n_anchors": len(res["weekly_anchors"]),
-            "inter_drift": res["inter_anchor_drift"],
+            "n_anchors": n_anchors,
+            "inter_drift": inter_drift,
         }
     except Exception as e:  # noqa: BLE001
         return {"wallet": wallet, "error": f"exception:{e!r}"}
@@ -573,13 +700,20 @@ def main() -> None:
     ap.add_argument("--journeys-out", required=True)
     ap.add_argument("--procs", type=int, default=4,
                     help="REQUESTED workers (ceiling; auto-capped to fit RAM by the aggregate budget).")
-    ap.add_argument("--per-worker-gb", type=float, default=2.0,
-                    help="Per-worker peak RSS (GB). MEASURED 2026-06-10: base + 15MB anchor df + full "
-                         "marks-cache ceiling 0.73GB + transient per-wallet reconstruction -> ~1.3GB "
-                         "worst case; 2.0 adds ~50%% margin. Aggregate budget caps procs by this.")
-    ap.add_argument("--headroom-gb", type=float, default=6.0,
-                    help="RAM reserved for the live baseline (agents + mongod + postgres).")
+    ap.add_argument(
+        "--per-worker-gb", type=float, default=None,
+        help="Per-worker peak RSS. Default: 0.5GB for core fill lifecycles; 2.0GB "
+             "for optional M01 equity reconstruction/mark caches.",
+    )
+    ap.add_argument(
+        "--headroom-gb", type=float, default=None,
+        help="RAM reserved outside M02. Default: 2GB core; 6GB equity-enriched.",
+    )
     ap.add_argument("--anchor-parquet", default=str(m01.ANCHOR_PARQUET))
+    ap.add_argument(
+        "--equity-enrichment", action="store_true",
+        help="Opt in to M01 causal equity targets. Core actions/journeys do not require M01.",
+    )
     ap.add_argument("--flush-rows", type=int, default=2_000_000,
                     help="MANDATORY streaming: flush a parquet part + free RAM every N buffered rows.")
     ap.add_argument("--mem-soft-gb", type=float, default=12.0,
@@ -597,13 +731,13 @@ def main() -> None:
         wallets = [l.strip().lower() for l in fh if l.strip() and not l.startswith("#")]
     logger.info(f"Loaded {len(wallets):,} wallets")
 
-    tasks = [(w, start_ms, end_ms) for w in wallets]
+    tasks = [(w, start_ms, end_ms, args.equity_enrichment) for w in wallets]
     t0 = time.time()
 
     # PRECOMPUTE marks cache ONCE (perf: avoids N workers each re-scanning Mongo for coin price
     # series, which left the pool ~74% I/O-idle). Freshness-checked (codex perf-r1 #3): rebuild if
     # the coin-set or latest candle changed since the cache was built.
-    if not args.skip_marks_cache:
+    if args.equity_enrichment and not args.skip_marks_cache:
         tmc = time.time()
         st = m01.marks_cache_status()
         force = args.rebuild_marks_cache or not st["fresh"]
@@ -623,8 +757,14 @@ def main() -> None:
     # AGGREGATE memory budget (2026-06-10 OOM fix): per-process guards do not compose; cap worker
     # count from ACTUAL free RAM so N x per_worker + baseline cannot blow past physical RAM.
     # --mem-soft-gb acts as the upper cap on the main-process guard.
-    budget = plan_memory_budget(requested_procs=args.procs, per_worker_gb=args.per_worker_gb,
-                                headroom_gb=args.headroom_gb, main_soft_cap=args.mem_soft_gb)
+    per_worker_gb = args.per_worker_gb
+    if per_worker_gb is None:
+        per_worker_gb = 2.0 if args.equity_enrichment else 0.5
+    headroom_gb = args.headroom_gb
+    if headroom_gb is None:
+        headroom_gb = 6.0 if args.equity_enrichment else 2.0
+    budget = plan_memory_budget(requested_procs=args.procs, per_worker_gb=per_worker_gb,
+                                headroom_gb=headroom_gb, main_soft_cap=args.mem_soft_gb)
     install_memory_guard(soft_gb=budget.main_soft_gb, label="m02")
     Path(args.actions_out).parent.mkdir(parents=True, exist_ok=True)
     aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
@@ -647,7 +787,7 @@ def main() -> None:
     # N wallets; on macOS spawn this re-imports m01 -> empty cache. (Fix 2026-06-25, codex marks-rebuild.)
     MAXTASKS_PER_CHILD = 40
     with Pool(max(1, budget.procs), initializer=_init_worker,
-              initargs=(args.anchor_parquet, budget.worker_soft_gb),
+              initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
               maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
         for r in pool.imap_unordered(process_wallet, tasks):
             _consume(r)
@@ -667,7 +807,8 @@ def _log_one(r: dict, n: int) -> None:
     else:
         logger.info(
             f"  {r['wallet'][:12]} -> {len(r['actions'])} actions, "
-            f"{len(r['journeys'])} journeys, {r['n_anchors']} anchors"
+            f"{len(r['journeys'])} journeys"
+            + (f", {r['n_anchors']} anchors" if r.get("n_anchors") is not None else "")
         )
 
 

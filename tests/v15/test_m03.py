@@ -139,3 +139,22 @@ def test_pretest_is_train_plus_val():
     # pretest never includes test: 0xa active in F1 test but NOT F1 train/val -> pretest False
     f1a = wide[(wide["key"] == "0xa") & (wide["fold_id"] == 1)].iloc[0]
     assert f1a["active_test"] and not f1a["active_pretest"]
+
+
+def test_activity_excludes_unreplayable_actions_and_journeys():
+    folds = m03.build_folds()
+    ts = m03._ms(folds[0].test_start) + 1
+    actions = pd.DataFrame([
+        {"wallet": "0xgood", "ts": ts, "stream_replay_valid": True},
+        {"wallet": "0xbad", "ts": ts, "stream_replay_valid": False},
+    ])
+    journeys = pd.DataFrame([
+        {"wallet": "0xgood", "entry_ts": ts, "lifecycle_valid": True,
+         "stream_replay_valid": True},
+        {"wallet": "0xbad", "entry_ts": ts, "lifecycle_valid": True,
+         "stream_replay_valid": False},
+    ])
+    _, summary = m03.build_activity(folds, actions, journeys)
+    got = summary.set_index("key")
+    assert got.loc["0xgood", "active_test_folds"] == 1
+    assert "0xbad" not in got.index

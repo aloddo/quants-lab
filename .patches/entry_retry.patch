@@ -1,0 +1,54 @@
+--- strategies/live/hl_copy_trader_v17.py	2026-06-30 20:03:35
++++ /tmp/hl_v17_patched.py	2026-07-06 17:00:11
+@@ -1868,16 +1868,42 @@
+             self._pending_gross_notional = max(0, self._pending_gross_notional - entry_notional)
+             return
+ 
+-        # IOC taker entry
++        # IOC taker entry.
++        # The rest of the engine already retries transient failures (exit poll, leverage-set 60s
++        # backoff, reconcile REST fallback); the ENTRY path was the one gap -- a 429 on order
++        # placement dropped the copy signal (the 2026-07-06 MORPHO miss). A 429 means the request was
++        # THROTTLED, not placed, so retrying is safe (no double-fill); the aggressive IOC limit
++        # (best +/-30bps) prevents a bad fill regardless. Refresh the WS book each attempt so a moving
++        # market still gets a live aggressive limit. Bounded attempts + short backoff keep it fast.
+         try:
+-            if is_buy:
+-                px = self._round_price(best_ask * 1.003)
+-            else:
+-                px = self._round_price(best_bid * 0.997)
+-
+-            result = await asyncio.to_thread(
+-                self.exchange.order, coin, is_buy, sz, px, {"limit": {"tif": "Ioc"}}
+-            )
++            result = None
++            _ENTRY_MAX_ATTEMPTS = 3
++            for _attempt in range(_ENTRY_MAX_ATTEMPTS):
++                if is_buy:
++                    px = self._round_price(best_ask * 1.003)
++                else:
++                    px = self._round_price(best_bid * 0.997)
++                try:
++                    result = await asyncio.to_thread(
++                        self.exchange.order, coin, is_buy, sz, px, {"limit": {"tif": "Ioc"}}
++                    )
++                    break  # got an exchange RESPONSE (fill / reject / no-fill) -- never retry a placed order
++                except Exception as _oe:
++                    _is_rate_limit = "429" in str(_oe) or (
++                        isinstance(getattr(_oe, "args", None), tuple) and _oe.args and _oe.args[0] == 429
++                    )
++                    if _is_rate_limit and _attempt < _ENTRY_MAX_ATTEMPTS - 1:
++                        logger.warning(
++                            f"ENTRY 429 rate-limited {coin} (attempt {_attempt+1}/{_ENTRY_MAX_ATTEMPTS}) "
++                            f"-- refreshing book + retrying"
++                        )
++                        await asyncio.sleep(0.4 * (_attempt + 1))
++                        _rb = self._book_depth.get(coin)
++                        if _rb and _rb.get("best_bid") and _rb.get("best_ask"):
++                            best_bid = _rb["best_bid"]
++                            best_ask = _rb["best_ask"]
++                        continue
++                    raise  # non-429, or 429 attempts exhausted -> outer handler logs "Entry error" + drops
+             statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
+ 
+             if statuses and "filled" in statuses[0]:

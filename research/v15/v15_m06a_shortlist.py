@@ -74,6 +74,7 @@ DEFAULT_MANIFEST = {
     "recency_gate": True,                # drop entities with no action/open-position in the most recent 14d block
     "contamination_status": "clean_oos", # clean_oos | exploratory_calibration | alberto_override
     "persistence_horizon_days": HORIZON_DAYS,
+    "score_basis": "equity_roe",          # equity_roe | activity_only
 }
 
 
@@ -178,6 +179,9 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
     recency_gate = bool(manifest["recency_gate"])
     mver = manifest["manifest_version"]
     contam = manifest.get("contamination_status", "clean_oos")
+    score_basis = manifest.get("score_basis", "equity_roe")
+    if score_basis not in ("equity_roe", "activity_only"):
+        raise ValueError(f"unknown score_basis {score_basis!r}")
     # codex code-r1 #7: disabling the recency gate is a production-design change -> only in a
     # non-clean (explicitly diagnostic) manifest.
     if not recency_gate and contam == "clean_oos":
@@ -237,7 +241,9 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
         if folds["train_start"].min().tzinfo is None \
         else int(pd.Timestamp(folds["train_start"].min()).timestamp() * 1000)
 
-    # --- per-PRIMARY action ts arrays (sorted), once (action-based persistence) ---
+    # --- per-PRIMARY replayable action ts arrays, once ---
+    if "stream_replay_valid" in actions.columns:
+        actions = actions[actions["stream_replay_valid"].fillna(False).astype(bool)].copy()
     act = actions[["wallet", "ts"]].sort_values(["wallet", "ts"])
     act_by: dict[str, np.ndarray] = {w: g["ts"].to_numpy(dtype="int64")
                                      for w, g in act.groupby("wallet", sort=False)}
@@ -286,14 +292,24 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
             # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
             # the real post-engine ranking. We still require FINITE inputs (NaN would be a true data breach).
             if elig_row:
-                if not np.isfinite(roe):
-                    raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
-                if not (np.isfinite(dd) and njr_finite and njr_n >= 0):
-                    raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd/n_journeys (dd={dd_n}, nj={njr_n}).")
-                if not COPYABILITY_ONLY and roe <= 0:
-                    raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
-                # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.
-                score = roe * pr.persistence_term * math.log1p(njr) * dd_term
+                if not (njr_finite and njr_n >= 0):
+                    raise AssertionError(
+                        f"ELIGIBLE row entity {eid} fold {fid} has invalid n_journeys={njr_n}."
+                    )
+                if score_basis == "activity_only":
+                    # Equity-independent high-recall bouncer. Performance is
+                    # deliberately deferred to fixed-position M7 and M6b.
+                    dd_term = 1.0
+                    score = pr.persistence_term * math.log1p(njr)
+                else:
+                    if not np.isfinite(roe):
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
+                    if not np.isfinite(dd):
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd={dd_n}.")
+                    if not COPYABILITY_ONLY and roe <= 0:
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
+                    # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.
+                    score = roe * pr.persistence_term * math.log1p(njr) * dd_term
             else:
                 score = float("nan")
 
@@ -322,6 +338,7 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
                 "g5_pool_candidate_pass": bool(pinfo.get("g5_pool_candidate_pass", False)) if len(pinfo) else False,
                 "as_of_ms": test_start_ms,
                 "run_mode": mode, "manifest_version": mver,
+                "score_basis": score_basis,
             })
 
     sl = pd.DataFrame(rows)
@@ -341,6 +358,7 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
         sl.loc[inelig_mask, "shortlist_reason"] = "ineligible"
 
     waterfall = {"run_mode": mode, "manifest_version": mver,
+                 "score_basis": score_basis,
                  "recency_gate": recency_gate, "folds": {}}
     if mode == "shortlist":
         waterfall["shortlist_n_per_fold"] = N
@@ -436,7 +454,9 @@ def main():
             raise ValueError("provide --m04-dir for fold-pure M4 or --entities for compatibility mode")
         entities = pd.read_parquet(args.entities)
         entities_by_fold = None
-    actions = pd.read_parquet(args.actions, columns=["wallet", "ts"])
+    actions = pd.read_parquet(
+        args.actions, columns=["wallet", "ts", "stream_replay_valid"]
+    )
     n_entities = sum(len(v) for v in entities_by_fold.values()) if entities_by_fold is not None else len(entities)
     logger.info(f"elig={len(elig):,} pool={len(pool):,} folds={len(folds)} entities_rows={n_entities:,} actions={len(actions):,}")
 

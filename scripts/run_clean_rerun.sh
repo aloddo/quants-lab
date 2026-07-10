@@ -28,7 +28,7 @@ log(){ echo "[clean-rerun $(date +%H:%M:%S)] $*"; }
 
 # Guard: refuse to run if the live copy trader is somehow active (this is research; bot must stay paused).
 # self-match-proof: only a REAL python trader counts (bare pgrep self-matches our own check-shells).
-if ps -axo command | grep -v grep | grep "strategies/live/hl_prop_copy.py" | grep -qi "python"; then
+if ps -axo command | grep -v grep | grep -E "strategies/live/(hl_prop_copy|hl_copy_trader[^ ]*)\.py" | grep -qi "python"; then
   echo "ABORT: live trader running; this is a research re-run, bot must be paused."; exit 3; fi
 
 log "Clean re-run START. $(wc -l < $WALLETS) wallets, $NSHARD shards, procs=$PROCS, ceil=${CEIL}GB."

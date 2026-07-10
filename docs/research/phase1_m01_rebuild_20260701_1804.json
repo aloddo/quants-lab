@@ -1,0 +1,40 @@
+{
+  "run_id": "phase1_m01_rebuild_20260701_1804",
+  "status": "invalidated_stopped",
+  "stopped_at": "2026-07-01T18:07:32+03:00",
+  "stopped_after_wallet": 84,
+  "invalidation_reason": "Daily causal compute_eq_at did not fold a pre-anchor carry-in first revealed by a post-anchor fill; per-event M2 equity already did. This could preserve cash identity at flat prices while producing the wrong position and mark-to-market PnL.",
+  "started_at": "2026-07-01T18:04:59+03:00",
+  "git_head": "03009b784558bb8f272e7a56e49491487bb798a7",
+  "source_sha256": {
+    "research/v15/v15_m01_equity_reconstruct.py": "02633727dc8fd41daa3989fbf37465e22e2427dd5c7165eca6ffbc1f7de1aa55",
+    "research/v15/_streaming_io.py": "daee1f3b70c676a2550ce4612894de04ba0e01e87355147ee44cce667a038f17"
+  },
+  "wallet_file": {
+    "path": "app/data/v15/m01_universe_20k_wallets.txt",
+    "rows": 20378,
+    "sha256": "5e2d53780470b51d9d92e9f07a9f1f1e7a328451f85ebc0c1718f4f2909794a7"
+  },
+  "anchor_file": {
+    "path": "app/data/v13/wallet_anchor_state.parquet",
+    "sha256": "e46ab0d4a382b523ff9a2e09d78788697053762da99d19c50072ad50e11b35f4"
+  },
+  "window": {
+    "start": "2025-12-01",
+    "end_inclusive": "2026-05-23"
+  },
+  "seed_mode": "causal",
+  "audit_seed_mode": "causal",
+  "headroom_gb": 1.0,
+  "output": "app/data/v15/phase1_rebuild_20260701_1804/m01_universe_series.parquet",
+  "audit_output": "app/data/v15/phase1_rebuild_20260701_1804/m01_universe_series.audit.parquet",
+  "validation_output": "app/data/v15/phase1_rebuild_20260701_1804/m01_validation.json",
+  "log": "/tmp/phase1_m01_rebuild_20260701_1804.log",
+  "preflight": {
+    "smoke_series": "/tmp/phase1_m01_causal_audit_smoke.parquet",
+    "smoke_validation": "/tmp/phase1_m01_causal_audit_smoke.validation.json",
+    "hard_fail": false,
+    "quarantined_wallets": 7,
+    "missing_no_valid_anchor": 1
+  }
+}

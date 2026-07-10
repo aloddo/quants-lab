@@ -14,6 +14,7 @@ tolerated+flagged, NOT force-trimmed (winners compound untouched; strategy §7).
 """
 from __future__ import annotations
 
+import copy
 import logging
 import tempfile
 from dataclasses import dataclass, field
@@ -45,6 +46,8 @@ class M9Manifest:
     # action clears min-notional. viable_slice = min_order_notional / min_action_exposure_frac, with a
     # floor so a tiny exposure_frac doesn't demand an absurd slice. accessible_frac (M5) refines it.
     min_accessible_frac: float = 0.50      # need >=50% of actions to clear min-notional to be feasible
+    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
+    fixed_target_exposure: float = 0.10
 
 
 def sizing_chain_weight(quality_weight: float, m4_confidence: float, survival_mult: float) -> float:
@@ -148,7 +151,10 @@ def cap_aware_waterfill(desired: dict, carried_exposure: dict, caps: dict, m: M9
     }
 
 
-def expected_leverage(adf: Optional[pd.DataFrame]) -> float:
+def expected_leverage(
+    adf: Optional[pd.DataFrame], sizing_mode: str = "leader_equity",
+    fixed_target_exposure: float = 0.10,
+) -> float:
     """Decision-time proxy for the leverage the FOLLOWER will run for an entity = the leader's typical
     absolute target exposure (target_exposure_pct is SIGNED gross exposure as a fraction of equity; M7
     sizes notional = target_exposure_pct x subaccount_equity, so |target_exposure_pct| IS the per-leader
@@ -156,7 +162,31 @@ def expected_leverage(adf: Optional[pd.DataFrame]) -> float:
     conservative, representative peak rather than the mean) so the levered-margin budget reserves enough
     headroom for the gross the leader actually runs. Floors at 1.0 (a copied position is at least its
     margin in notional). Returns 1.0 if no actions / column missing (degrade to unlevered budgeting)."""
-    if adf is None or len(adf) == 0 or "target_exposure_pct" not in adf.columns:
+    if adf is None or len(adf) == 0:
+        return 1.0
+    if "stream_replay_valid" in adf.columns:
+        adf = adf[adf["stream_replay_valid"].fillna(False).astype(bool)]
+    if sizing_mode == "fixed_position":
+        if not {"coin", "position_after"}.issubset(adf.columns):
+            return 1.0
+        open_coins: set[str] = set()
+        gross = []
+        order = [c for c in ("ts", "event_order") if c in adf.columns]
+        rows = adf.sort_values(order).itertuples() if order else adf.itertuples()
+        for row in rows:
+            pa = pd.to_numeric(
+                pd.Series([getattr(row, "position_after")]), errors="coerce"
+            ).iloc[0]
+            coin = str(getattr(row, "coin"))
+            if pd.notna(pa) and abs(float(pa)) > 1e-12:
+                open_coins.add(coin)
+            else:
+                open_coins.discard(coin)
+            gross.append(len(open_coins) * abs(float(fixed_target_exposure)))
+        return float(max(gross)) if gross else 1.0
+    if sizing_mode != "leader_equity":
+        raise ValueError(f"unknown sizing_mode {sizing_mode!r}")
+    if "target_exposure_pct" not in adf.columns:
         return 1.0
     te = pd.to_numeric(adf["target_exposure_pct"], errors="coerce").abs().dropna()
     if te.empty:
@@ -307,10 +337,33 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
     AGGREGATE levered-margin / gross cap (total resulting notional <= bankroll x gross_cap; per-leader
     leverage copied untouched). Cash from selected-but-unrunnable entities (no wallet / funded<=0) is
     RETURNED to cash (no leak). Fixed bankroll, no-hindsight rebalance, causal, G4-DD-kill intact."""
+    # Matched-null pool construction is not wired yet. Previously the argument
+    # was ignored, so a caller could request ``matched_null`` and receive the
+    # ranked strategy path mislabeled as a null sample. Fail closed until M10's
+    # quality-matched provider is implemented and tested.
+    if pool_provider != "ranked":
+        raise NotImplementedError(f"unsupported M9 pool_provider: {pool_provider!r}")
     install_memory_guard(soft_gb=mem_soft_gb, label="m09_chained")
     conf_map = {"CLEAN": 1.0, "UNCERTAIN": 0.25, "SUSPICIOUS": 0.10, "KILL": 0.0}
     corr = corr or {}
-    ent = m04_entities.set_index("entity_id")[["primary_wallet", "entity_tier"]].to_dict("index")
+    if "fold_id" in m04_entities.columns:
+        ent_fold = m04_entities.set_index(["entity_id", "fold_id"])[
+            ["primary_wallet", "entity_tier"]
+        ].to_dict("index")
+        ent_global = None
+    else:
+        logger.warning(
+            "M9 received a single global M4 entity map; this is not fold-pure and is provisional"
+        )
+        ent_global = m04_entities.set_index("entity_id")[[
+            "primary_wallet", "entity_tier"
+        ]].to_dict("index")
+        ent_fold = None
+
+    def _entity(eid: int, fid: int) -> dict:
+        if ent_fold is not None:
+            return ent_fold.get((int(eid), int(fid)), {})
+        return ent_global.get(int(eid), {}) if ent_global is not None else {}
     tiers = m08_tiers.set_index(["entity_id", "fold_id"]).to_dict("index")
     fold_rows = folds.sort_values("oos_chain_order")
     pool = m06b_pool[m06b_pool["in_pool"]]
@@ -330,6 +383,31 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
     max_dd = 0.0
     last_equity = float(b0)
     fold_caps_applied = []        # diagnostics: which aggregate constraints bound, per fold
+
+    def _flatten_at_boundary(eid: int, record: dict, ts_ms: int, fid: int) -> float:
+        """Close a dropped carried state through M7 execution mechanics."""
+        state = record["state"]
+        if not getattr(state, "positions", None):
+            return float(record["equity"])
+        rows = []
+        for order, (coin, pos) in enumerate(sorted(state.positions.items())):
+            rows.append({
+                "coin": coin, "ts": int(ts_ms), "event_order": order,
+                "action_type": "EXIT", "signed_size": -float(pos.szi),
+                "position_after": 0.0, "target_exposure_pct": 0.0,
+                "is_liquidation": False, "carry_in_status": "SEEDED",
+                "lifecycle_valid": True, "stream_replay_valid": True,
+            })
+        params = eng.EngineParams(slippage_band="base", start_policy="future_delta_only")
+        params.copy_latency_ms = 0
+        params.sizing_mode = m.sizing_mode
+        params.fixed_target_exposure = m.fixed_target_exposure
+        res = eng.step_subaccount(
+            pd.DataFrame(rows), md, float(record["equity"]), params,
+            end_ts_ms=int(ts_ms), start_ts_ms=int(ts_ms),
+            start_state=state, entity_id=eid, fold_id=fid,
+        )
+        return float(res["summary"]["final_equity"])
 
     for fr in fold_rows.itertuples():
         fid = int(fr.fold_id)
@@ -351,7 +429,7 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
             surv = float(tk.get("survival_multiplier", 1.0))
             if surv <= 0 or tk.get("tier") == "kill":
                 continue
-            etier = str(ent.get(eid, {}).get("entity_tier", "UNCERTAIN"))
+            etier = str(_entity(eid, fid).get("entity_tier", "UNCERTAIN"))
             conf = conf_map.get(etier, 0.25)
             w = sizing_chain_weight(r.quality_weight, conf, surv)
             if w > 0:
@@ -372,7 +450,10 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         # DROP: carried entities not reselected (incl. anti-corr-pruned) -> flatten to cash at carried eq.
         for eid in list(carried):
             if eid not in selected:
-                cash += carried[eid]["equity"]
+                before = float(carried[eid]["equity"])
+                after = _flatten_at_boundary(eid, carried[eid], t0, fid)
+                cash += after
+                entity_pnl[eid] = entity_pnl.get(eid, 0.0) + (after - before)
                 del carried[eid]
 
         # SIZE new/top-up via cap-aware water-filling against the running portfolio equity.
@@ -405,11 +486,13 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         adf_cache = {}
         lev = {}
         for eid in selected:
-            wallet = ent.get(eid, {}).get("primary_wallet")
+            wallet = _entity(eid, fid).get("primary_wallet")
             test_adf = acts_loader(wallet, t0, t1) if wallet is not None else None
             adf_cache[eid] = (wallet, test_adf)
             pre_adf = acts_loader(wallet, pt0, pt1) if wallet is not None else None
-            lev[eid] = expected_leverage(pre_adf)        # causal: pretest leverage, no look-ahead
+            lev[eid] = expected_leverage(
+                pre_adf, m.sizing_mode, m.fixed_target_exposure
+            )  # causal: pretest leverage, no look-ahead
         # FIXED-BANKROLL thesis: the gross budget keys off the FIXED bankroll b0, NOT live portfolio
         # equity -- winners must NOT expand portfolio capacity fold-to-fold (no equity-following leverage).
         gross_budget = m.gross_cap * float(b0)
@@ -421,6 +504,8 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
 
         # RUN M7 per selected subaccount on this fold's TEST actions (carried or new).
         params = eng.EngineParams(slippage_band="base", start_policy="causal_carry_in")
+        params.sizing_mode = m.sizing_mode
+        params.fixed_target_exposure = m.fixed_target_exposure
         sub_eq = {}
         new_carried = {}
         deployed_new = 0.0                                 # NEW margin that actually reached the engine
@@ -430,12 +515,16 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                 cash += funded.get(eid, 0.0)
                 continue
             if eid in carried:                         # continuing winner: carried state + any top-up
-                start_state = carried[eid]["state"]
+                start_state = copy.deepcopy(carried[eid]["state"])
                 # CASH CONSERVATION: a carried entity can receive a water-fill TOP-UP (funded[eid]); that
                 # margin was already debited from cash, so it MUST enter the carried subaccount's starting
                 # equity. Dropping it (start from old equity only) silently vanishes that cash.
-                start_eq = carried[eid]["equity"] + funded.get(eid, 0.0)
-                deployed_new += funded.get(eid, 0.0)
+                topup = funded.get(eid, 0.0)
+                start_state.cross_collateral["main"] = (
+                    start_state.cross_collateral.get("main", 0.0) + topup
+                )
+                start_eq = carried[eid]["equity"] + topup
+                deployed_new += topup
             else:                                       # new entity: cold-start from the funded slice
                 if funded.get(eid, 0.0) <= 0:
                     cash += funded.get(eid, 0.0)           # RETURN unfunded-but-selected cash (no leak)
@@ -536,8 +625,14 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
     final_equity = sum(c["equity"] for c in carried.values()) + cash
     chained_roe = final_equity / b0 - 1.0 if b0 > 0 else 0.0
     n_pos = sum(1 for f in per_fold if f["fold_pnl"] > 0)
-    total_pnl = sum(entity_pnl.values()) or 1.0
-    top_share = max((v / total_pnl for v in entity_pnl.values()), default=0.0)
+    total_pnl = sum(entity_pnl.values())
+    if total_pnl > 0:
+        top_share = max((max(v, 0.0) / total_pnl for v in entity_pnl.values()), default=0.0)
+    else:
+        # A losing/flat strategy cannot satisfy a positive-PnL concentration
+        # gate.  Avoid nonsensical positive shares created by dividing losses
+        # by a negative total.
+        top_share = float("inf") if entity_pnl else 0.0
     max_chained_calmar = chained_roe / max(max_dd, 1e-9)
     if _tmp is not None:                                   # temp output: clean up the streamed parts
         import shutil
@@ -556,8 +651,9 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         "any_intervention": any(f.get("intervention") for f in per_fold),
         "top_entity_pnl_share": top_share, "per_fold": per_fold, "fold_caps_applied": fold_caps_applied,
         "equity_path": equity_path,
-        "_simplifications": "dropped=flatten-to-carried-mark; carried top-up applied to start_eq; "
-                            "G4/global-DD breach flattens carried to cash at breach (no recovery carried)",
+        "_simplifications": "dropped entities exit through M7 at fold boundary; "
+                            "G4/global-DD breach uses marked breach equity because historical "
+                            "per-subaccount state snapshots are not yet emitted",
     }
 
 

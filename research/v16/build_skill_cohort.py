@@ -16,10 +16,28 @@ Run: ~/miniforge3/envs/quants-lab/bin/python research/v16/build_skill_cohort.py
 """
 import json
 import os
+import sys as _sys
+from pathlib import Path as _Path
 import numpy as np
 import pandas as pd
 
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "v15"))
+from leadlag_clean_rank_sim import mark_at as _mark_at  # noqa: E402  (page-cached asof marks for MAE)
+
 ASOF = "2026-05-23"          # selection uses data <= asof (live cohort_asof)
+
+# ── MAE (Maximum Adverse Excursion) gate = the DIRECT martingale/bag-holding criterion (Alberto
+#    2026-07-07: "MAE is the martingale prevention"). Measures how deep a position goes underwater
+#    DURING the hold (absolute %, entry-relative, direction-signed) + time-spent-underwater. A wallet is
+#    vetoed if its bag-rate (share of positions that excurse past MAE_DEEP) exceeds MAE_BAGRATE_MAX OR it
+#    SITS underwater (median time-underwater > MAE_TUW_MAX). DEFAULT OFF (MAE_GATE unset) => byte-identical
+#    to the historical build; opt in with MAE_GATE=1. Additive convention, same as GATE/UNIVERSE above.
+MAE_GATE = os.environ.get("MAE_GATE", "").strip() in ("1", "true", "yes")
+MAE_DEEP = float(os.environ.get("MAE_DEEP", "0.20"))            # a position past -20% MtM = a real bag
+MAE_BAGRATE_MAX = float(os.environ.get("MAE_BAGRATE_MAX", "0.06"))  # max share of positions that go deep
+MAE_TUW_MAX = float(os.environ.get("MAE_TUW_MAX", "0.01"))     # max median fraction-of-hold spent past -5%
+MAE_UW = 0.05                                                   # "underwater" threshold for time-in-red
+_MAE_MAX_SAMPLES = 40
 # GATE selects the near-ruin DD gate. DEFAULT = "leader_dd" => byte-identical to the historical build
 # (calls mtm_dd_exclude, which queries each candidate's LEADER HL account month MTM-DD). Opt-in
 # GATE=our_dd => call our_dd_gate.our_dd_exclude instead (marginal-cohort OUR-DD greedy-LOO at OUR
@@ -86,6 +104,61 @@ def martingale_flags(df):
         mild = int((su == su and su > 1.3) + (ha == ha and ha > 2.5) + (wm < 0.6) + (lf < 0.05))
         out[w] = bool(extreme or mild >= 2)
     return pd.Series(out)
+
+
+def _journey_mae(coin, side, entry_ts, exit_ts):
+    """Signed entry-relative MtM path over [entry, exit]; (worst_excursion, frac_time_underwater) or None.
+    worst < 0 = deepest adverse excursion during the hold; direction-signed (long: adverse=price down)."""
+    if entry_ts is None or exit_ts is None or entry_ts != entry_ts or exit_ts != exit_ts:
+        return None  # NaN entry/exit (open/incomplete journey) -> no MAE
+    e = _mark_at(coin, int(entry_ts))
+    if not e or e <= 0:
+        return None
+    span = max(int(exit_ts) - int(entry_ts), 0)
+    step = int(min(max(span / _MAE_MAX_SAMPLES, 5 * 60_000), 3_600_000)) or 3_600_000
+    is_long = (side == "long")
+    worst = 0.0; uw = 0; n = 0; t = int(entry_ts)
+    while t <= int(exit_ts):
+        m = _mark_at(coin, t)
+        if m and m > 0:
+            r = (m - e) / e if is_long else (e - m) / e
+            if r < worst:
+                worst = r
+            if r <= -MAE_UW:
+                uw += 1
+            n += 1
+        t += step
+    if n == 0:
+        return None
+    return worst, uw / n
+
+
+def mae_martingale_veto(df):
+    """MAE-based martingale/bag veto (Alberto 2026-07-07 'MAE is the martingale prevention'). Per wallet
+    (needs df cols: wallet, coin, side, entry_ts, exit_ts), reconstruct each journey's MtM excursion and
+    veto if bag-rate (share of positions past -MAE_DEEP) > MAE_BAGRATE_MAX OR the wallet SITS underwater
+    (median time-underwater > MAE_TUW_MAX). Returns (bool Series index=wallet True=veto, metrics dict).
+    CAUSAL: computed only from the journeys passed in (caller slices to train)."""
+    per = {}
+    for r in df.itertuples(index=False):
+        res = _journey_mae(r.coin, r.side, r.entry_ts, r.exit_ts)
+        if res is None:
+            continue
+        worst, fuw = res
+        d = per.setdefault(r.wallet, {"deep": 0, "cov": 0, "uws": []})
+        d["cov"] += 1
+        d["uws"].append(fuw)
+        if worst <= -MAE_DEEP:
+            d["deep"] += 1
+    veto = {}; metrics = {}
+    for w, d in per.items():
+        if d["cov"] == 0:
+            continue
+        bagrate = d["deep"] / d["cov"]
+        tuw = float(np.median(d["uws"])) if d["uws"] else 0.0
+        metrics[w] = {"bag_rate": round(bagrate, 4), "med_tuw": round(tuw, 4), "cov": d["cov"]}
+        veto[w] = (bagrate > MAE_BAGRATE_MAX) or (tuw > MAE_TUW_MAX)
+    return pd.Series(veto, dtype=bool), metrics
 
 
 def skill_scores(df, ret_col="ret"):
@@ -237,6 +310,10 @@ def causal_validate(j, asof, ret_col, select, calib10, k=K, window_days=30, use_
         ts["consistency"] = ts.index.map(cons_tr).fillna(0.0)
     mart_tr = martingale_flags(tr[tr.wallet.isin(ts.index)])
     ts = ts[~ts.index.map(mart_tr).fillna(False)].copy()
+    # MAE martingale/bag veto (CAUSAL: computed on TRAIN slice only). Default OFF => byte-identical.
+    if MAE_GATE:
+        mae_veto_tr, _m = mae_martingale_veto(tr[tr.wallet.isin(ts.index)])
+        ts = ts[~ts.index.map(mae_veto_tr).fillna(False)].copy()
     ts["skill"] = z(ts.win) + z(ts.sharpe) + z(-ts.maxdd) + (z(ts.consistency) if use_consistency else 0.0)
     # SELECT the cohort from TRAIN ONLY (codex 2026-06-28 r2 BLOCKER: no forward info in eligibility).
     # The old code pre-filtered the pool to wallets with >=10 forward journeys before selecting -- that
@@ -344,7 +421,7 @@ def walk_forward(j_full, ret_col, select, calib10, k=K, window_days=30, use_cons
 
 def main():
     if WALKFORWARD:
-        cols = ["wallet", "coin", "entry_ts", "realized_pnl", "net_realized_pnl",
+        cols = ["wallet", "coin", "entry_ts", "exit_ts", "side", "realized_pnl", "net_realized_pnl",
                 "max_position_notional", "liq_closed", "duration_h"]
         j = pd.read_parquet("app/data/v15/m02_journeys.parquet", columns=cols)
         j = j[j.max_position_notional > 10].copy()
@@ -372,7 +449,7 @@ def main():
                                 "Set UNIVERSE=all to intend the full universe.")
     calib = set(json.load(open("/tmp/agentC_l2_calib_expanded.json")).keys()) if UNIVERSE == "calib" else None
     calib10 = set(json.load(open("app/data/v15/l2_calib_10coin.json")).keys())
-    cols = ["wallet", "coin", "entry_ts", "realized_pnl", "net_realized_pnl",
+    cols = ["wallet", "coin", "entry_ts", "exit_ts", "side", "realized_pnl", "net_realized_pnl",
             "max_position_notional", "liq_closed", "duration_h"]
     j = pd.read_parquet("app/data/v15/m02_journeys.parquet", columns=cols)
     if UNIVERSE == "all" or calib is None:
@@ -438,6 +515,20 @@ def main():
     n_mart = int(s["martingale"].sum())
     s = s[~s["martingale"]].copy()
     print(f"\n[Phase-3 martingale veto] eligible {len(s) + n_mart} -> vetoed {n_mart} martingales -> clean {len(s)}")
+    # MAE martingale/bag veto (Alberto 2026-07-07 'MAE is the martingale prevention'). The DIRECT measure:
+    # veto wallets whose positions routinely excurse deep underwater / sit in the red. Default OFF.
+    if MAE_GATE:
+        mae_veto, mae_metrics = mae_martingale_veto(j[j.wallet.isin(s.index)])
+        n_before = len(s)
+        s["mae_veto"] = s.index.map(mae_veto).fillna(False)
+        # how many MAE catches that the heuristic martingale gate did NOT (both ran on the same pool minus
+        # the already-removed heuristic martingales, so this is the incremental catch)
+        n_mae = int(s["mae_veto"].sum())
+        s = s[~s["mae_veto"]].copy()
+        json.dump(mae_metrics, open("/tmp/mae_gate_metrics.json", "w"), indent=2)
+        print(f"[Phase-3 MAE martingale/bag veto] thresh bag-rate>{MAE_BAGRATE_MAX:.0%} (past -{MAE_DEEP:.0%}) "
+              f"OR med-time-underwater>{MAE_TUW_MAX:.0%} | pool {n_before} -> vetoed {n_mae} bag-holders "
+              f"the heuristic missed -> clean {len(s)} (metrics /tmp/mae_gate_metrics.json)")
     s["skill"] = z(s.win) + z(s.sharpe) + z(-s.maxdd) + (z(s.consistency) if V17 else 0.0)
     # MARK-TO-MARKET DD GATE (Phase 3): rank by skill, then drop the near-ruin tail by CURRENT account
     # mark-to-market drawdown (incl unrealized -- the metric closed-trip maxdd is blind to). Query only the
@@ -504,8 +595,10 @@ def main():
            "wallets": cohort}
     outpath = "/tmp/skill_cohort_v17_allcoin.json" if V17 else "/tmp/skill_cohort_deploy.json"
     json.dump(out, open(outpath, "w"), indent=2)
-    cur = set(json.load(open("config/copy_trader_wallets_v17_expansion.json"))["wallets"].keys())
-    print(f"  overlap with current live cohort: {len(set(cohort) & cur)}/{len(cohort)}")
+    _live_cfg = os.environ.get("LIVE_CFG", "config/copy_trader_wallets_gate1_v4.json")
+    if os.path.exists(_live_cfg):
+        cur = set(json.load(open(_live_cfg))["wallets"].keys())
+        print(f"  overlap with current live cohort ({os.path.basename(_live_cfg)}): {len(set(cohort) & cur)}/{len(cohort)}")
     print(f"  saved {outpath} ({len(cohort)} wallets)")
 
 

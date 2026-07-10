@@ -54,6 +54,8 @@ class M8Manifest:
     smaller_slice_frac: float = 0.25           # "survives at a smaller slice" probe
     min_slice_capital: float = 50.0            # ~ min deployable subaccount (HL min-notional regime)
     inferential_layer_active: bool = False
+    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
+    fixed_target_exposure: float = 0.10
     # outcome -> tier
     indeterminate_heavy_frac: float = 0.25     # >this share of indeterminate minutes -> cap at UNCERTAIN
 
@@ -66,8 +68,11 @@ def _run_stress(actions: pd.DataFrame, md: E.MarketData, start_equity: float, t0
                 m: M8Manifest) -> dict:
     """One counterfactual-survival run: M7 at the STRESS slice (high slippage + adl, causal carry-in,
     NO source top-ups -- the replica lives on its slice + PnL). Returns the typed outcome."""
-    params = E.EngineParams(slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
-                            start_policy="causal_carry_in")
+    params = E.EngineParams(
+        slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
+        start_policy="causal_carry_in", sizing_mode=m.sizing_mode,
+        fixed_target_exposure=m.fixed_target_exposure,
+    )
     res = E.step_subaccount(actions, md, start_equity, params, end_ts_ms=t1, start_ts_ms=t0)
     s = res["summary"]
     window_min = max((t1 - t0) / 60_000.0, 1.0)
@@ -235,6 +240,10 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
     pp = Path(pool_path) if pool_path else (data_dir / "m06b_pool.parquet")
     pool = pd.read_parquet(pp)
     pool = pool[pool["in_pool"]].copy()
+    if "investable" not in pool.columns or not pool["investable"].fillna(False).all():
+        raise ValueError(
+            "M8 requires an investable M6b pool; provisional/uncalibrated ranking cannot be tiered for deployment"
+        )
     folds = pd.read_parquet(data_dir / "m03_folds.parquet")
     ent, m04_fold_pure = _load_m04_entities(data_dir, folds, m04_dir)
     fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
@@ -274,7 +283,10 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
             continue
         t0, t1 = fold_win[fid]
         md.set_slip_calib(per_fold.get(fid), cal.get("version") if slip_calib_path else None)
-        wdf = acts_ds.to_table(filter=ds.field("wallet") == r.primary_wallet).to_pandas()
+        filt = ((ds.field("wallet") == r.primary_wallet)
+                & (ds.field("stream_replay_valid") == True)  # noqa: E712
+                & (ds.field("lifecycle_valid") == True))  # noqa: E712
+        wdf = acts_ds.to_table(filter=filt).to_pandas()
         adf = wdf[(wdf.ts >= t0) & (wdf.ts < t1)]
         # TIER-DOMAIN FAIL-CLOSED (codex M8 confirm): a non-canonical entity_tier (e.g. a literal "nan"
         # string or unknown label from corrupted/nonstandard M4 input) must NOT silently get the 0.25
@@ -343,8 +355,17 @@ def main():
                     help="directory with fold-pure m04_entities_f{fold_id}.parquet")
     ap.add_argument("--nominal-capital", type=float, default=10_000.0,
                     help="bankroll scale for absolute survival stress slices (default: 10000.0)")
+    ap.add_argument(
+        "--sizing-mode", choices=("leader_equity", "fixed_position"),
+        default="leader_equity",
+    )
+    ap.add_argument("--fixed-target-exposure", type=float, default=0.10)
     args = ap.parse_args()
-    man = replace(M8Manifest(), nominal_capital=args.nominal_capital)
+    man = replace(
+        M8Manifest(), nominal_capital=args.nominal_capital,
+        sizing_mode=args.sizing_mode,
+        fixed_target_exposure=args.fixed_target_exposure,
+    )
     run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
             limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None)
 

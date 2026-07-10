@@ -2,6 +2,14 @@
 
 Per Module 12 spec at brain:projects/quant/v13/modules/12-unit-test-contract.
 """
+import sys
+from pathlib import Path
+
+# V13 moved from scripts/ to research/v13/ in the 2026-05-30 restructure.
+# Individual legacy tests still prepend scripts/, so expose the canonical module
+# directory centrally until those repetitive imports are cleaned up.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "research" / "v13"))
+
 import pytest
 import pandas as pd
 import numpy as np

@@ -164,7 +164,7 @@ tasks:
     tags: [data, funding, hyperliquid, exotic]
 
   hyperliquid_microstructure_1s:
-    enabled: false  # TEMP DISABLED 2026-05-27 15:25 CEST: V11 sync=2845s under full-ledger-enum API load; freeing rate budget. RE-ENABLE after enum + sign-fix re-run.
+    enabled: true  # RE-ENABLED 2026-07-03: disable reason obsolete (V11 dead, API budget free). Fresh L2 needed for v27 G2 size-impact calibration; historical books dropped in the 2026-07-02 approved cleanup.
     task_class: app.tasks.data_collection.hyperliquid_microstructure_task.HyperliquidMicrostructureTask
     schedule:
       type: cron

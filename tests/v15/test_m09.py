@@ -15,6 +15,15 @@ import v15_m09_sim as M9  # noqa: E402
 M = M9.M9Manifest()
 
 
+def test_unimplemented_matched_null_provider_fails_closed():
+    with pytest.raises(NotImplementedError, match="matched_null"):
+        M9.run_m09_chained(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+            eng=None, md=None, acts_loader=None, m=M, b0=500.0,
+            pool_provider="matched_null",
+        )
+
+
 def test_sizing_chain_is_product():
     assert M9.sizing_chain_weight(0.5, 0.25, 0.1) == pytest.approx(0.0125)
     assert M9.sizing_chain_weight(1.0, 1.0, 1.0) == 1.0
@@ -201,6 +210,15 @@ def test_apply_gross_budget_carried_consumes_budget_no_force_trim():
     assert gross == pytest.approx(300.0)                       # carried notional preserved (not trimmed)
 
 
+def test_expected_leverage_fixed_position_counts_concurrent_open_coins():
+    actions = pd.DataFrame([
+        {"ts": 1, "event_order": 0, "coin": "BTC", "position_after": 1.0},
+        {"ts": 2, "event_order": 1, "coin": "ETH", "position_after": -2.0},
+        {"ts": 3, "event_order": 2, "coin": "BTC", "position_after": 0.0},
+    ])
+    assert M9.expected_leverage(actions, "fixed_position", 0.25) == pytest.approx(0.50)
+
+
 def test_apply_gross_budget_under_budget_passthrough():
     out, returned, gross = M9.apply_gross_budget(
         funded={1: 50.0}, carried_exposure={}, lev={1: 2.0}, gross_budget_notional=1000.0)
@@ -252,6 +270,19 @@ class _FakeEng:
                                      "positions": {}},
             "summary": {"final_equity": end_eq},
         }
+
+
+class _StateCheckingEng(_FakeEng):
+    """Flat fake that verifies carried top-ups reach AccountState, not only a scalar."""
+
+    def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                        start_state=None, entity_id=None, fold_id=None):
+        if start_state is not None and not start_state.positions:
+            assert sum(start_state.cross_collateral.values()) == pytest.approx(start_equity)
+        return super().step_subaccount(
+            adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+            start_state=start_state, entity_id=entity_id, fold_id=fold_id,
+        )
 
 
 def _chained_inputs(extra_wallet=None):
@@ -387,10 +418,102 @@ def test_chained_carried_topup_cash_conserved(tmp_path):
         {"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
         {"entity_id": 2, "primary_wallet": "0xbbb", "entity_tier": "CLEAN"},
     ])
-    eng = _FakeEng(ret_by_eid={1: 0.0, 2: 0.0})           # flat: pure conservation check
+    eng = _StateCheckingEng(ret_by_eid={1: 0.0, 2: 0.0})  # checks state-level conservation too
     out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
                              m=M9.M9Manifest(per_entity_cap=1.0), b0=500.0, out_dir=str(tmp_path))
     assert out["final_equity"] == pytest.approx(500.0)    # no cash leaked by the carried top-up
+
+
+def test_chained_uses_fold_pure_primary_wallet(tmp_path):
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+         "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+         "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02",
+         "pretest_start": "2024-12-02", "pretest_end_excl": "2025-01-02",
+         "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+    ])
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0},
+        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 1.0},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0,
+         "tier": "ok", "max_survivable_slice": np.inf},
+        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0,
+         "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xfold0", "entity_tier": "CLEAN"},
+        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xfold1", "entity_tier": "CLEAN"},
+    ])
+    seen = []
+
+    def loader(wallet, t0, t1):
+        seen.append(wallet)
+        return pd.DataFrame({"target_exposure_pct": [1.0]})
+
+    M9.run_m09_chained(
+        m06b, m08, m04, folds, _FakeEng(), md=None, acts_loader=loader,
+        m=M9.M9Manifest(per_entity_cap=1.0), b0=500.0, out_dir=str(tmp_path),
+    )
+    assert "0xfold0" in seen and "0xfold1" in seen
+
+
+def test_dropped_entity_pays_boundary_exit_cost(tmp_path):
+    class Pos:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class ExitCostEngine(_FakeEng):
+        Position = Pos
+
+        def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                            start_state=None, entity_id=None, fold_id=None):
+            if start_state is not None and len(adf):
+                end_eq = start_equity - 10.0
+                return {
+                    "equity": [{"ts": end_ts_ms, "subaccount_equity": end_eq}],
+                    "ending_account_state": {"cross_collateral": {"main": end_eq},
+                                             "cooldown_until_ms": 0, "positions": {}},
+                    "summary": {"final_equity": end_eq},
+                }
+            return {
+                "equity": [{"ts": start_ts_ms, "subaccount_equity": start_equity},
+                           {"ts": end_ts_ms, "subaccount_equity": start_equity}],
+                "ending_account_state": {
+                    "cross_collateral": {"main": start_equity}, "cooldown_until_ms": 0,
+                    "positions": {"BTC": {"coin": "BTC", "szi": 1.0, "entry_px": 100.0,
+                                              "mode": "cross", "leverage": 10.0,
+                                              "cum_funding": 0.0, "isolated_margin": 0.0}},
+                },
+                "summary": {"final_equity": start_equity},
+            }
+
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+         "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+         "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02",
+         "pretest_start": "2024-12-02", "pretest_end_excl": "2025-01-02",
+         "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+    ])
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0,
+         "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([
+        {"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+    ])
+    out = M9.run_m09_chained(
+        m06b, m08, m04, folds, ExitCostEngine(), md=None,
+        acts_loader=_acts(1.0), m=M9.M9Manifest(per_entity_cap=1.0),
+        b0=500.0, out_dir=str(tmp_path),
+    )
+    assert out["final_equity"] == pytest.approx(490.0)
 
 
 def test_gross_budget_fixed_at_b0_across_folds(tmp_path):

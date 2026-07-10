@@ -72,6 +72,7 @@ DEFAULT_IMPACT_ALPHA = 0.5
 BLOCK_MS = 14 * 86_400_000        # CHANGE 1: 14d consistency sub-split block (M6b D4 anchor cadence)
 DEFAULT_HALF_SPREAD_BPS = 1.0
 CAPACITY_PARTICIPATION_CAP = 0.05           # execution-reality depth cap (NOT allocation)
+MARK_MAX_AGE_MS = 15 * MS_MIN               # reject stale/delisted 1m execution marks
 
 # CHANGE B: latency adverse-drift haircut tunable (latency_model="bar_drift_v1"). Multiplies the
 # fraction-of-a-1m-bar our copy latency spans by the bar's |directional move|, applied ALWAYS-adverse
@@ -92,7 +93,9 @@ def coin_dex(coin: str) -> str:
 
 
 def coin_is_spot(coin: str) -> bool:
-    return coin.startswith("@") or coin == "USDC"
+    # ``#`` assets are HIP-4 outcome markets with settlement semantics, not
+    # perpetuals. The historical engine is perp-only.
+    return coin.startswith(("@", "#")) or "/" in coin or coin == "USDC"
 
 
 def default_margin_mode(coin: str) -> str:
@@ -109,9 +112,10 @@ def _f(x) -> float:
 
 def build_ohlc_cache(coins: list[str], out_dir: Path = OHLC_CACHE_DIR,
                      mongo_uri: str = "mongodb://localhost:27017", force: bool = False) -> int:
-    """Precompute per-coin 1m (minute, open, high, low, close) arrays to .npy (page-cached, shared,
+    """Precompute per-coin 1m (minute, open, high, low, close, volume) arrays to .npy (page-cached, shared,
     read with mmap) so the engine inner loop reads marks/extremes with NO per-row Mongo (CLAUDE.md
-    Key Rule 8). Idempotent: skips coins already cached unless force. Returns #coins written."""
+    Key Rule 8). Legacy 5-row OHLC caches are rebuilt automatically because
+    capacity requires dollar volume. Returns #coins written."""
     import pymongo
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     db = pymongo.MongoClient(mongo_uri)["quants_lab"]
@@ -119,20 +123,27 @@ def build_ohlc_cache(coins: list[str], out_dir: Path = OHLC_CACHE_DIR,
     for coin in coins:
         p = out_dir / f"{_ulib.quote(coin, safe='')}.npy"
         if p.exists() and not force:
-            continue
+            try:
+                if np.load(p, mmap_mode="r").shape[0] >= 6:
+                    continue
+            except Exception:
+                pass
         cur = db.hyperliquid_candles.find(
             {"coin": coin, "interval": "1m"},
-            projection={"timestamp_utc": 1, "open": 1, "high": 1, "low": 1, "close": 1, "_id": 0},
+            projection={"timestamp_utc": 1, "open": 1, "high": 1, "low": 1, "close": 1,
+                        "volume": 1, "_id": 0},
         ).sort("timestamp_utc", 1)
-        mins, o, h, lo, c = [], [], [], [], []
+        mins, o, h, lo, c, volume = [], [], [], [], [], []
         for d in cur:
             t = d.get("timestamp_utc")
             if t is None:
                 continue
             mins.append(int(t)); o.append(_f(d.get("open"))); h.append(_f(d.get("high")))
             lo.append(_f(d.get("low"))); c.append(_f(d.get("close")))
+            volume.append(_f(d.get("volume")))
         arr = np.vstack([np.asarray(mins, "float64"), np.asarray(o, "float64"), np.asarray(h, "float64"),
-                         np.asarray(lo, "float64"), np.asarray(c, "float64")]) if mins else np.empty((5, 0), "float64")
+                         np.asarray(lo, "float64"), np.asarray(c, "float64"),
+                         np.asarray(volume, "float64")]) if mins else np.empty((6, 0), "float64")
         tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         with open(tmp, "wb") as fh:
             np.save(fh, arr)
@@ -226,7 +237,12 @@ class FeeSchedule:
         if Path(path).exists():
             d = json.loads(Path(path).read_text())
             self.versioned = True
-            self.base_taker = float(d.get("base_taker_oneway", DEFAULT_TAKER_FEE_ONEWAY))
+            self.base_taker = float(
+                d.get(
+                    "effective_subaccount_taker_oneway",
+                    d.get("base_taker_oneway", DEFAULT_TAKER_FEE_ONEWAY),
+                )
+            )
             self.hip3_mult = float(d.get("hip3_mult", HIP3_FEE_MULT_FALLBACK))
             self.per_market = {k: float(v) for k, v in d.get("per_market", {}).items()}
 
@@ -249,6 +265,7 @@ class MarketData:
         self._require_cache = require_cache
         self._db = None
         self._ohlc: dict[str, tuple] = {}
+        self._volume: dict[str, np.ndarray] = {}
         self._funding: dict[str, tuple] = {}
         self.meta = HLMeta().load()
         self.fees = FeeSchedule()
@@ -277,6 +294,10 @@ class MarketData:
         if p.exists():
             try:
                 arr = np.load(p, mmap_mode="r")
+                self._volume[coin] = (
+                    np.asarray(arr[5], dtype="float64")
+                    if arr.shape[0] >= 6 else np.empty(0, "float64")
+                )
                 return tuple(np.asarray(arr[i], dtype=("int64" if i == 0 else "float64")) for i in range(5))
             except Exception:
                 pass
@@ -284,15 +305,18 @@ class MarketData:
             return (np.empty(0, "int64"),) + tuple(np.empty(0, "float64") for _ in range(4))
         cur = self._mongo().hyperliquid_candles.find(
             {"coin": coin, "interval": "1m"},
-            projection={"timestamp_utc": 1, "open": 1, "high": 1, "low": 1, "close": 1, "_id": 0},
+            projection={"timestamp_utc": 1, "open": 1, "high": 1, "low": 1, "close": 1,
+                        "volume": 1, "_id": 0},
         ).sort("timestamp_utc", 1)
-        mins, o, h, lo, c = [], [], [], [], []
+        mins, o, h, lo, c, volume = [], [], [], [], [], []
         for d in cur:
             t = d.get("timestamp_utc")
             if t is None:
                 continue
             mins.append(int(t)); o.append(_f(d.get("open"))); h.append(_f(d.get("high")))
             lo.append(_f(d.get("low"))); c.append(_f(d.get("close")))
+            volume.append(_f(d.get("volume")))
+        self._volume[coin] = np.asarray(volume, "float64")
         return (np.asarray(mins, "int64"), np.asarray(o, "float64"), np.asarray(h, "float64"),
                 np.asarray(lo, "float64"), np.asarray(c, "float64"))
 
@@ -302,6 +326,11 @@ class MarketData:
             s = self._load_ohlc(coin)
             self._ohlc[coin] = s
         return s
+
+    def volume(self, coin: str) -> np.ndarray:
+        if coin not in self._ohlc:
+            self.ohlc(coin)
+        return self._volume.get(coin, np.empty(0, "float64"))
 
     def mark(self, coin: str, ts_ms: int, causal: bool = True) -> Optional[float]:
         """Close of the last bar whose CLOSE time <= ts (causal: timestamp_utc is the bar OPEN, so the
@@ -314,6 +343,10 @@ class MarketData:
         key = (ts_ms // MS_MIN) * MS_MIN - (MS_MIN if causal else 0)
         i = int(np.searchsorted(mins, key, side="right")) - 1
         if i < 0:
+            return None
+        # An unbounded as-of lookup can reuse a hours-old/delisted candle as an
+        # executable price. Fail closed when the last available bar is stale.
+        if key - int(mins[i]) > MARK_MAX_AGE_MS:
             return None
         v = c[i]
         return None if v != v else float(v)
@@ -365,23 +398,34 @@ class MarketData:
             return self._liq_prior(0.0, cal, cal_cov)
         end_key = (ts_ms // MS_MIN) * MS_MIN - MS_MIN     # last completed bar
         i = int(np.searchsorted(mins, end_key, side="right"))   # exclusive upper on completed bars
-        lo = max(0, i - 1440)
+        # ADV is a wall-clock daily quantity. ``i - 1440`` is only valid for a
+        # dense 24/7 series; on sparse HIP-3 markets it can span many days and
+        # materially overstate capacity.
+        lo = int(np.searchsorted(mins, end_key - 24 * MS_HOUR, side="left"))
         if i <= lo:
             return self._liq_prior(0.0, cal, cal_cov)
         cc, hh, ll = c[lo:i], h[lo:i], low[lo:i]
-        mean_px = np.nanmean(cc) if cc.size else float("nan")
         rng = np.nanmean((hh - ll) / np.where(cc == 0, np.nan, cc)) if cc.size else float("nan")
         bar_half_spread = float(np.clip((rng * 1e4) / 2.0 if rng == rng else DEFAULT_HALF_SPREAD_BPS,
                                         DEFAULT_HALF_SPREAD_BPS, 50.0))
-        adv = float(mean_px) * 1440.0 if mean_px == mean_px else 0.0
+        volume = self.volume(coin)
+        if volume.size != c.size:
+            return self._liq_prior(0.0, cal, cal_cov, adv_unavailable=True)
+        vv = volume[lo:i]
+        valid = np.isfinite(vv) & np.isfinite(cc) & (vv >= 0.0) & (cc > 0.0)
+        adv = float(np.sum(vv[valid] * cc[valid])) if valid.any() else 0.0
+        if not np.isfinite(adv) or adv <= 0.0:
+            return self._liq_prior(0.0, cal, cal_cov, adv_unavailable=True)
         if cal_cov:
             return {"adv": adv, "half_spread_bps": float(cal["base_half_spread_bps"]),
                     "impact_k_bps": float(cal.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)),
                     "impact_alpha": float(cal.get("impact_alpha", DEFAULT_IMPACT_ALPHA)),
-                    "uncalibrated": False}
-        return {"adv": adv, "half_spread_bps": bar_half_spread, "uncalibrated": True}
+                    "uncalibrated": False, "adv_unavailable": False}
+        return {"adv": adv, "half_spread_bps": bar_half_spread, "uncalibrated": True,
+                "adv_unavailable": False}
 
-    def _liq_prior(self, adv: float, cal: Optional[dict], cal_cov: bool) -> dict:
+    def _liq_prior(self, adv: float, cal: Optional[dict], cal_cov: bool,
+                   adv_unavailable: bool = True) -> dict:
         """No-bar fallback. CALIBRATION is a per-coin structural property (v2: every coin has a class
         comp), independent of whether trailing bars exist at this ts -> a COVERED coin still returns
         its calibrated half-spread with uncalibrated=False (adv=0 disables the bar-derived capacity/
@@ -390,8 +434,9 @@ class MarketData:
             return {"adv": adv, "half_spread_bps": float(cal["base_half_spread_bps"]),
                     "impact_k_bps": float(cal.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)),
                     "impact_alpha": float(cal.get("impact_alpha", DEFAULT_IMPACT_ALPHA)),
-                    "uncalibrated": False}
-        return {"adv": adv, "half_spread_bps": DEFAULT_HALF_SPREAD_BPS, "uncalibrated": True}
+                    "uncalibrated": False, "adv_unavailable": adv_unavailable}
+        return {"adv": adv, "half_spread_bps": DEFAULT_HALF_SPREAD_BPS, "uncalibrated": True,
+                "adv_unavailable": adv_unavailable}
 
 
 # --------------------------------------------------------------------------- #
@@ -438,9 +483,25 @@ class EngineParams:
     adl_stress: bool = False
     start_policy: str = "future_delta_only"   # future_delta_only | causal_carry_in (design D9)
     follower_trail: Optional[float] = None     # FOLLOWER trailing exit ("exit before them"): if our copy
+    sizing_mode: str = "leader_equity"         # leader_equity | fixed_position
+    fixed_target_exposure: float = 0.10         # signed direction gets this absolute follower exposure
     # equity draws down >= follower_trail from its running peak, FLATTEN all positions and sit out the rest
     # of the fold (independent of source). None = disabled (copy source exposure verbatim). Checked at
     # every action boundary + fold-end using REAL engine equity (fills/fees/funding/liq priced in).
+
+
+def _action_target_pct(action: dict, params: EngineParams) -> float:
+    """Return the declared source target under the selected sizing policy."""
+    if params.sizing_mode == "leader_equity":
+        return _f(action.get("target_exposure_pct"))
+    if params.sizing_mode == "fixed_position":
+        pa = _f(action.get("position_after"))
+        if pa != pa:
+            return float("nan")
+        if abs(pa) <= 1e-12:
+            return 0.0
+        return float(np.sign(pa) * abs(params.fixed_target_exposure))
+    raise ValueError(f"unknown sizing_mode {params.sizing_mode!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -454,6 +515,13 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     caller's start_state (deep-copied). `start_ts_ms` anchors the risk cursor (fold start) so carried
     start_state positions accrue funding/MTM/liquidation even when there are no actions (M9 chaining).
     Returns fills/events/equity/ending_account_state/summary."""
+    # Defensive contract for every caller, including M8/M9 direct calls that do
+    # not pass through run_shortlist's parquet predicate.
+    if not actions.empty and "stream_replay_valid" in actions.columns:
+        actions = actions[actions["stream_replay_valid"].fillna(False).astype(bool)].copy()
+    if not actions.empty and "lifecycle_valid" in actions.columns:
+        actions = actions[actions["lifecycle_valid"].fillna(False).astype(bool)].copy()
+
     st = copy.deepcopy(start_state) if start_state is not None else AccountState(cross_collateral={"main": float(start_equity)})
     if not st.cross_collateral:
         st.cross_collateral = {"main": float(start_equity)}
@@ -619,7 +687,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             prev_ts = our_ts
             continue
 
-        tgt_pct = _f(a.get("target_exposure_pct"))
+        tgt_pct = _action_target_pct(a, params)
         if tgt_pct != tgt_pct:
             prev_ts = our_ts
             continue
@@ -704,7 +772,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             if ats > cur and pen > 0:
                 summary["_te_weighted_sum"] += (ats - cur) * pen
                 summary["tracking_error_active_ms"] += (ats - cur)
-            tp = _f(a.get("target_exposure_pct"))
+            tp = _action_target_pct(a, params)
             if tp == tp:
                 ex = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
                 src_target[a["coin"]] = (0.0 if ex else tp)
@@ -725,7 +793,12 @@ def _new_summary(entity_id, fold_id, start_equity, n_actions, params, md):
         "total_fees": 0.0, "total_funding": 0.0, "slip_bps_notional_sum": 0.0, "notional_traded": 0.0,
         "outcome_states": set(), "n_indeterminate_minutes": 0, "max_dd": 0.0, "time_to_ruin_ms": None,
         "slippage_band": params.slippage_band, "start_policy": params.start_policy,
+        "sizing_mode": params.sizing_mode,
+        "fixed_target_exposure": (
+            float(params.fixed_target_exposure) if params.sizing_mode == "fixed_position" else None
+        ),
         "slippage_uncalibrated": False, "metadata_uncertain": False, "mode_uncertain": False,
+        "adv_unavailable": False,
         "fee_unversioned": (not md.fees.versioned), "ruin": False,
         "slippage_calibration_version": None,
         # CHANGE 2 tracking_error accumulators (finalized in _finalize): time-weighted L1 signed
@@ -816,15 +889,19 @@ def _seed_carry_in(st, md, first_row, params, summary):
     mark = md.mark(coin, our_ts)
     if mark is None or mark != mark or mark <= 0:
         return
-    post_pct = _f(first_row.get("target_exposure_pct"))    # SIGNED exposure% AFTER the first action
+    post_pct = _action_target_pct(first_row, params)       # SIGNED exposure% AFTER the first action
     pa = _f(first_row.get("position_after"))               # source signed size after the first action
     ss = _f(first_row.get("signed_size"))                  # the first action's own signed delta
     if post_pct == post_pct and pa == pa and ss == ss and pa != 0 and pa != ss:  # had a prior position
         eq = sum(st.cross_collateral.values())
-        # source exposure% BEFORE the first observed action = post% scaled by the pre/post size ratio.
-        # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
-        # shorts -- codex code-r4 #3). The main loop's first order then trades to the post target.
-        pre_pct = post_pct * (pa - ss) / pa
+        pre_pos = pa - ss
+        if params.sizing_mode == "fixed_position":
+            pre_pct = float(np.sign(pre_pos) * abs(params.fixed_target_exposure))
+        else:
+            # source exposure% BEFORE the first observed action = post% scaled by the pre/post size ratio.
+            # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
+            # shorts -- codex code-r4 #3). The main loop's first order then trades to the post target.
+            pre_pct = post_pct * pre_pos / pa
         seed_szi = pre_pct * eq / mark
         if abs(seed_szi) > 0:
             mode = default_margin_mode(coin)
@@ -850,9 +927,9 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
 
     force_close (codex follower-trail review bug #5): a RISK exit (breaker flatten) must reliably close
     the full position. It still pays realistic fee + slippage, but is NOT blocked by the min-notional
-    skip and is NOT downsized by the participation/capacity cap (you can always market-close in reality;
-    the cap models impact, not an inability to exit). Impact slippage is still charged, with participation
-    clamped to the capacity cap so a forced close eats bounded-realistic (not unbounded) impact."""
+    skip and is NOT downsized by the participation/capacity cap. Exit impact is charged on the FULL
+    order/ADV ratio; capping impact at the entry participation limit would make emergency exits
+    optimistically cheap exactly when capacity is breached."""
     if abs(delta_szi) < 1e-15:
         return
     szdec = md.meta.szdec(coin)
@@ -865,6 +942,10 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
 
     mode = default_margin_mode(coin)
     liq = md.liquidity(coin, our_ts)
+    if liq.get("adv_unavailable") and not force_close:
+        summary["adv_unavailable"] = True
+        summary["n_rejected"] += 1
+        return
     if liq.get("uncalibrated"):
         summary["slippage_uncalibrated"] = True
     elif getattr(md, "slip_calib_version", None) is not None:
@@ -882,9 +963,9 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
             if delta_notional < MIN_ORDER_NOTIONAL:
                 return
 
-    participation = (delta_notional / adv) if adv > 0 else CAPACITY_PARTICIPATION_CAP
-    if force_close:
-        participation = min(participation, CAPACITY_PARTICIPATION_CAP)   # bounded-realistic exit impact
+    # If ADV is unavailable on a forced close, use a full-ADV conservative
+    # fallback. New exposure already fails closed above.
+    participation = (delta_notional / adv) if adv > 0 else (1.0 if force_close else CAPACITY_PARTICIPATION_CAP)
     impact_k = liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)        # D1: calibrated-or-prior slope
     impact_alpha = liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA)
     impact_bps = impact_k * (participation ** impact_alpha) * band
@@ -1390,15 +1471,29 @@ def _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks
 
 
 def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
-    """Close (part of) a position as a forced market-liq order FILL with the forced-liq slippage.
-    Appends the fill to summary['_fills_ref'] (the engine's fills list)."""
+    """Close via a forced market-liq order with uncapped full-order impact.
+
+    Hyperliquid sends these orders to the book and charges no clearance fee.
+    Thirty bps is a conservative floor, not a size-independent execution
+    price: larger orders also pay the normal half-spread + full order/ADV impact
+    curve with no participation cap.
+    """
     p = st.positions.get(coin)
     if p is None:
         return
     if close_szi is None:
         close_szi = -p.szi
     side = 1 if close_szi > 0 else -1
-    fill_px = mark * (1 + side * FORCED_LIQ_SLIP_BPS / 1e4)
+    close_notional = abs(close_szi) * mark
+    liq = md.liquidity(coin, ts_ms)
+    adv = float(liq.get("adv", 0.0) or 0.0)
+    participation = close_notional / adv if adv > 0 else 1.0
+    half_spread_bps = float(liq.get("half_spread_bps", DEFAULT_HALF_SPREAD_BPS))
+    impact_k = float(liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS))
+    impact_alpha = float(liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA))
+    curve_slip_bps = half_spread_bps + impact_k * (participation ** impact_alpha)
+    forced_slip_bps = max(FORCED_LIQ_SLIP_BPS, curve_slip_bps)
+    fill_px = mark * (1 + side * forced_slip_bps / 1e4)
     # realized PnL on the closed portion (forced-liq order; no fee, design D12)
     realized = min(abs(close_szi), abs(p.szi)) * (fill_px - p.entry_px) * (1 if p.szi > 0 else -1)
     if p.mode == "cross":
@@ -1413,7 +1508,8 @@ def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
         fl.append({"entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
                    "our_ts": ts_ms, "source_ts": ts_ms, "side": "buy" if side > 0 else "sell",
                    "our_fill_size": float(close_szi), "our_fill_px": float(fill_px), "ref_mark": float(mark),
-                   "half_spread_bps": 0.0, "impact_bps": float(FORCED_LIQ_SLIP_BPS), "fee": 0.0,
+                   "half_spread_bps": half_spread_bps,
+                   "impact_bps": float(forced_slip_bps - half_spread_bps), "fee": 0.0,
                    "fill_type": "market_liq_order", "capacity_capped": False, "margin_mode": p.mode})
     summary["n_market_liq_orders"] += 1
     summary["outcome_states"].add("position_liquidated")
@@ -1496,11 +1592,27 @@ def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
 # --------------------------------------------------------------------------- #
 # Runner — pre-shard actions by wallet (no per-seat full-file scan), streaming out (design §8)
 # --------------------------------------------------------------------------- #
+def _require_action_schema(dataset) -> None:
+    """Reject pre-fix M2 artifacts that cannot prove lifecycle observability."""
+    required = {
+        "wallet", "coin", "ts", "event_order", "action_type", "signed_size",
+        "position_after", "target_exposure_pct", "is_liquidation",
+        "carry_in_status", "lifecycle_valid", "stream_replay_valid",
+    }
+    missing = required - set(dataset.schema.names)
+    if missing:
+        raise ValueError(
+            "M7 requires a rebuilt causal M2 action artifact; missing columns: "
+            f"{sorted(missing)}"
+        )
+
+
 def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, out_dir: Path,
                   band: str = "base", limit_entities: Optional[int] = None, start_equity: float = 10_000.0,
                   flush_rows: int = 1_000_000, require_cache: bool = True, window: str = "test",
                   slip_calib_path: Optional[str] = None, follower_trail: Optional[float] = None,
-                  copy_latency_ms: int = 2_000):
+                  copy_latency_ms: int = 2_000, sizing_mode: str = "leader_equity",
+                  fixed_target_exposure: float = 0.10):
     import shutil
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1542,9 +1654,12 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
         shutil.rmtree(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
     dataset = ds.dataset(actions_path, format="parquet")
+    _require_action_schema(dataset)
     cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size", "position_after",
-            "target_exposure_pct", "is_liquidation", "carry_in_status"]
-    scanner = dataset.scanner(columns=cols, filter=ds.field("wallet").isin(wallets), batch_size=200_000)
+            "target_exposure_pct", "is_liquidation", "carry_in_status",
+            "lifecycle_valid", "stream_replay_valid"]
+    replayable = ds.field("wallet").isin(wallets) & (ds.field("stream_replay_valid") == True)  # noqa: E712
+    scanner = dataset.scanner(columns=cols, filter=replayable, batch_size=200_000)
     ds.write_dataset(scanner, shard_dir, format="parquet", partitioning=["wallet"],
                      partitioning_flavor="hive", existing_data_behavior="overwrite_or_ignore",
                      max_rows_per_file=2_000_000, max_rows_per_group=200_000)
@@ -1553,7 +1668,7 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     # PRELOAD market caches for the shortlist coin set so the inner loop never hits Mongo (codex
     # code-r2 #7). Build the OHLC cache (close-only marks_cache is insufficient) if missing.
     coins = set()
-    for b in dataset.scanner(columns=["coin", "wallet"], filter=ds.field("wallet").isin(wallets),
+    for b in dataset.scanner(columns=["coin", "wallet"], filter=replayable,
                              batch_size=500_000).to_batches():
         coins.update(c for c in b.column("coin").to_pylist() if c and not coin_is_spot(c))
     logger.info("M7 runner: preloading OHLC+funding caches for %d coins", len(coins))
@@ -1575,7 +1690,11 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     ew = ShardedParquetWriter(out_dir / "m07_events.parquet", flush_rows=flush_rows)
     sw = ShardedParquetWriter(out_dir / "m07_summary.parquet", flush_rows=200_000)
     qw = ShardedParquetWriter(out_dir / "m07_equity.parquet", flush_rows=flush_rows)  # CHANGE 1
-    params = EngineParams(slippage_band=band, follower_trail=follower_trail, copy_latency_ms=copy_latency_ms)
+    params = EngineParams(
+        slippage_band=band, follower_trail=follower_trail,
+        copy_latency_ms=copy_latency_ms, sizing_mode=sizing_mode,
+        fixed_target_exposure=fixed_target_exposure,
+    )
 
     for w in wallets:
         try:
@@ -1615,11 +1734,21 @@ def main():
                     help="follower trailing-exit threshold (e.g. 0.07 = flatten+halt on 7% copy-equity DD)")
     ap.add_argument("--copy-latency-ms", type=int, default=2_000,
                     help="copy entry lag in ms (2000=typical, 15000=P95 tail stress)")
+    ap.add_argument(
+        "--sizing-mode", choices=("leader_equity", "fixed_position"),
+        default="leader_equity",
+    )
+    ap.add_argument(
+        "--fixed-target-exposure", type=float, default=0.10,
+        help="Absolute follower exposure per open leader position in fixed_position mode.",
+    )
     args = ap.parse_args()
     run_shortlist(Path(args.actions), Path(args.shortlist), Path(args.folds), Path(args.out),
                   band=args.band, limit_entities=args.limit, start_equity=args.start_equity,
                   require_cache=args.require_cache, window=args.window, slip_calib_path=args.slip_calib,
-                  follower_trail=args.follower_trail, copy_latency_ms=args.copy_latency_ms)
+                  follower_trail=args.follower_trail, copy_latency_ms=args.copy_latency_ms,
+                  sizing_mode=args.sizing_mode,
+                  fixed_target_exposure=args.fixed_target_exposure)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,573 @@
+{
+  "global": {
+    "strategy": "v17_cluster_letrun",
+    "sizing_mode": "fixed",
+    "order_size_usd": 15.0,
+    "min_entry_notional": 10.0,
+    "max_margin_util": 0.7,
+    "max_daily_loss": -25.0,
+    "global_stop_pct": 0.15,
+    "max_leverage_cap": 10,
+    "cooldown_s": 30,
+    "exit_poll_s": 10,
+    "exit_min_trim_pct": 0.85,
+    "full_exit_trim_pct": 0.85,
+    "exit_min_trim_usd": 1000000000.0,
+    "max_chase_bps": 50,
+    "max_spread_bps": 20,
+    "min_book_depth_usd": 3000,
+    "target_equity_max_age_s": 120,
+    "mark_max_age_s": 30,
+    "margin_reserve_max_lev": 10,
+    "trim_over_frac": 0.2,
+    "gross_backstop_x": 5.0,
+    "tilt_enabled": false,
+    "tilt_h17_t1": 1.5,
+    "tilt_h17_t3": 0.66,
+    "tilt_e1_fav": 1.3,
+    "tilt_e1_unfav": 0.66,
+    "tilt_e1_kopp_max": 3,
+    "tilt_cap": 2.0,
+    "tilt_floor": 0.33,
+    "tilt_equity_enabled": false,
+    "tilt_equity_mid": 1.4,
+    "tilt_equity_minnow": 0.66,
+    "_tilt_note": "H17xE1 BOTH-tilt-moderate (agent N; Alberto A msg 9391 + both-tilt msg 9394; codex GO). NEW entries only: H17 cohort T1(low-crossed) x1.5 / T3 x0.66; E1 anti-crowd k_opp<=3 x1.3 / crowded x0.66; clamp [0.33, 2.0]. ~96% capital (self-balancing), +19.7bps fwd lift. codex-required counterfactual auto-disable: engine kills the tilt if notional-wt (tilted-minus-baseline) adv <= -10bps over last 100 exit slices; disable state persisted to DB (survives restart). crossed_share terciles from app/data/v16/v17_cohort_crossed_share.parquet.",
+    "_tilt_equity_note": "MID-equity selection tilt (3rd factor; brain plans/quant/2026-06-13-mid-equity-tilt-design + research/2026-06-13-mid-equity-coverage-recovery, HOLD verdict). Validated edge: $10k-100k leader-account-equity cohort carries +26/+31 bps (folds) / +77.5 bps (forward) higher copy ov_bps vs rest, INDEPENDENT of H17 (corr 0.14 train_taker / -0.07 train_n) -> STACKS multiplicatively. NEW entries only: band==mid x1.4 BOOST / band==minnow(<$10k) x0.66 CUT / pro/whale/unknown x1.0 NEUTRAL (NEVER penalize unknown). Bands from app/data/v16/v17_cohort_equity_band.parquet (89/100 cohort wallets banded: mid 33, minnow 45, pro 10, whale 1, unknown 11). POST-HOC band selection -> moderate multipliers + the SAME counterfactual auto-disable self-validates it live (kills the 3-factor tilt if it does not beat baseline by >-10bps/100 slices). Clamp [0.33,2.0] still bounds the product: max H17 1.5 x E1 1.3 x eq 1.4 = 2.73 -> clamps to 2.0, so MID adds room only to non-saturated entries (conservative, by design).",
+    "coin_whitelist": [
+      "ADA",
+      "AVAX",
+      "BNB",
+      "BTC",
+      "CRV",
+      "DOGE",
+      "ETH",
+      "HYPE",
+      "LINK",
+      "SOL"
+    ],
+    "cohort_asof": "2026-05-23T23:59:59.000000+00:00",
+    "cohort_window_days": 75,
+    "knet_min": 0,
+    "knet_derisk_bypass": true,
+    "netx_cap_x": 2.5,
+    "coin_side_cap_x": 2.0,
+    "seed_min_wallets": 67,
+    "v17_authorization": "decisions/2026-06-11-v17-ship-with-changes + Alberto GO msg 9254",
+    "expansion": {
+      "coins": [],
+      "_coins_disabled_note": "2026-06-28 cluster audit: expansion.coins emptied so the runtime universe == the validated 10-coin clustering whitelist (codex engine-review finding #2). The 42-coin expansion list is preserved in config/copy_trader_wallets_v17_expansion.json; restore from there if the cluster test ever graduates to the full universe.",
+      "per_coin_kill_usd": -25.0,
+      "per_coin_kill_n": 20,
+      "expansion_kill_usd": -75.0
+    },
+    "_expansion_note": "V17 universe-expansion config (agent K, 2026-06-12). expansion.coins = the 29 NET-POSITIVE deploy coins (7 crypto-main perps + 22 xyz builder coins) from the expansion research. coin_whitelist stays the validated BASELINE 10 (V16 asserts it == l2_calib_10coin keys EXACTLY); the engine MERGES baseline coin_whitelist + expansion.coins into the live whitelist AFTER super().__init__() (hl_copy_trader_v17._v17_init_expansion), so all 29 are admitted at both choke points and WS-subscribed (crypto via main dex, xyz via builder dex) without breaking the V16 exact-match assert. Guards: per-coin kill (realized<=-$25 OR n>=20 AND fee-net mean<0), expansion-wide kill (aggregate realized<=-$50). Each new coin disables itself (and, in aggregate, all new coins) without touching the baseline 10. Engine: absent 'expansion' block => guards inert, byte-identical to the live 10-coin config. Cross-wallet stacking is an ACCEPTED decision (Alberto: 'stacking is totally fine'); the caps + the -$50 expansion kill bound it -- no coin-level cap (codex P1.3).",
+    "_liquidalt_note": "2026-06-14 SHIP: added 13 net-positive LIQUID crypto alts (AAVE APT ARB BCH DOT FIL ICP INJ LTC SEI SUI TAO UNI) to expansion.coins. DATA: research/2026-06-14-fulluniverse-replay-account-is-the-ceiling -- full-universe capture replay (25,378 faithful-copy journeys, calibrated_share 74% via agentC measured HL L2 slip) shows majors+liquid-alts = +46.5bps/trade $185/mo (vs 10-major $25/mo), all 15 slots filled. Per-coin calibrated edge (ship gate): all 13 net-positive +12 to +181bps, ALL beat majors +13bps. EXCLUDED ATOM(-14) ZEC(-29 despite #1 supply 5/day = frequency trap) OP(-79). Additive ship (no orphan risk); per-coin kill (-$25 / n>=20 fee-net<0) + expansion kill (-$50) bound each. Goal: PROVE the breadth lever lifts realized $/mo off $51 at current $950 equity, then scale capital (Alberto msg 9530). 15-slot account is the throughput ceiling; $500/mo absolute = ~$1300 equity at this rate.",
+    "_bundle2_note": "2026-06-14 SHIP: concentration cap 0.35->0.50 (data: +10-25% return flat Calmar, 0.35 clipped high-edge entries; codex-verified safe fraction; brain research/2026-06-14-concentration-marginutil-cap-optimality). HELD: addon (inert via config -- engine never copies leader adds, needs a code change; codex 2026-06-14).",
+    "_marginutil_note": "2026-06-14 SHIP: max_margin_util 0.40->0.48 (DATA, not gut -- Alberto: risk params are data questions). Research/2026-06-14-concentration-marginutil-cap-optimality verdict: now that $150 base is LIVE, 0.40 binds at ~12-13 positions and truncates the copy book (live-confirmed: engine sat at 13 open, 0.370 budget-util, right at the 0.40 cap). CODEX r1 (2026-06-14) caught 0.50 == 5.0x gross == gross_backstop_x EXACTLY -> zero buffer between the operating ceiling and the flatten-all kill switch (slippage/mark-move past 5.0x would trigger an unexpected flatten). FIX: 0.48 = 4.8x gross, keeps a buffer below the 5.0x backstop (backstop unchanged = hard failsafe with headroom). Un-truncates to ~15 positions = more validated diversified copy edge, far from the 10x liquidation cap. Codex-agreed (rule 13).",
+    "_skill_cohort_note": "2026-06-14 SKILL COHORT v2 (research/2026-06-14-skill-selector-forward-validated-wins): re-selected by SKILL rank z(win)+z(sharpe)+z(-maxdd), NO return, on copyable/calibrated coins, active, n>=40, LAG-ROBUST hold 2-48h, + LIVE-ACTIVE preflight (all 100 resolve on HL now, seed_min_wallets=98 PASS). Forward-validated OOS: SKILL +101bps net vs PnL +24bps. Codex SHIP-WITH-CHANGES addressed (seed preflight, group relabel; max_dd-sort + train-active are codex-confirmed immaterial). ~90% replacement; global/defaults/expansion unchanged.",
+    "gross_entry_gate_x": 4.0,
+    "_gross_gate_note_v2": "2026-06-22 SHIP 3.5->4.0 (Alberto GO msg 9857). Validated cap_level_sweep_v2 (codex r2 SHIP): +8-11% $/mo across N{150,225,300}, maxDD flat/better, 0 backstop trips at 4.0; rejected 4.5 (25.9% maxDD + trip at N=225). netx 2.5 unchanged (protective). margin-util 46%->~61% realizable. Live evidence: gross blocked ~35% of opens on 06-21. Buffer to 5.0x backstop = 1.0x (4.0<=backstop-0.5=4.5 validator OK). Reversible 1-line. Baseline captured pre-deploy (cap_impact_tracker).",
+    "_gross_gate_note": "2026-06-15 SHIP: gross_entry_gate_x=3.5 (DATA-verified + codex BUILD-3.5x). Caps NEW entries at gross notional/equity <= 3.5x (PREDICTABLE risk control), replacing the noisy margin-util proxy (loosened 0.48->0.70 so the gross gate binds first). Keeps the 5x flatten-all backstop as the failsafe. Verification (research/2026-06-15-gross-gate-corrected-verification): edge holds flat with capacity (+139bps marginal, 95%CI[+125,+154]); +47% $/mo vs current ~2.3x; backstop fires ~yearly at 3.5x (needs >8.6% correlated move) vs ~monthly at 4x. 4x reachable by config switch but flagged ~monthly-flatten. Codex required: reject/admit gross logging (added), post-launch backstop-proximity + rejected-fill + marginal-PnL monitoring.",
+    "gross_backstop_trim_target_x": 3.5,
+    "_backstop_trim_note": "2026-06-15 SHIP: gross backstop changed flatten-all -> TRIM-to-target (Alberto). On gross > 5x equity, close WORST-uPnL positions first until gross <= gross_backstop_trim_target_x (3.5x), keep winners, then RESUME (self-healing, not a permanent kill). The -15% global + -25% daily LOSS stops still flatten-all (those are loss kills; this is leverage-only). codex-reviewed impl.",
+    "cluster_mode": true,
+    "cluster_threshold": 8,
+    "cluster_window_s": 3600,
+    "decoupled_exit": true,
+    "cluster_max_concurrent": 5
+  },
+  "defaults": {
+    "group": "v16_top_decile",
+    "entry_mode": "instant",
+    "twap_window_s": 0,
+    "min_twap_notional": 0,
+    "max_addon_multiplier": 1,
+    "max_coin_concentration": 1.0,
+    "max_coin_notional_pct": 0.5,
+    "exit_type": "FIRST_CLOSE",
+    "sl_bps": -1500,
+    "trail_activate_bps": 1000,
+    "trail_bps": 2000,
+    "max_hold_s": 604800,
+    "exit_twap_min_notional": 1000000000.0
+  },
+  "wallets": {
+    "0x5ce0ce4387679de0335a3e8a1c9a7abb4f150a71": {
+      "group": "v16_skill_decile",
+      "rank": 2,
+      "skill_win": 1.0,
+      "skill_sharpe": 3.47,
+      "n_rt": 122
+    },
+    "0xdb0ba200d1a05594a4fbd6cb3e1da0ab3b469fec": {
+      "group": "v16_skill_decile",
+      "rank": 5,
+      "skill_win": 0.989,
+      "skill_sharpe": 2.06,
+      "n_rt": 904
+    },
+    "0xaa22b49a630f40267e2bd0be458c798c13a242dd": {
+      "group": "v16_skill_decile",
+      "rank": 6,
+      "skill_win": 0.974,
+      "skill_sharpe": 2.06,
+      "n_rt": 455
+    },
+    "0x7c78232c7226e4facf49122850cab1c34fd03f0a": {
+      "group": "v16_skill_decile",
+      "rank": 8,
+      "skill_win": 0.947,
+      "skill_sharpe": 1.76,
+      "n_rt": 152
+    },
+    "0x0d5c05fd3509dd7a35b956d73e0e4e8b2afdb82a": {
+      "group": "v16_skill_decile",
+      "rank": 11,
+      "skill_win": 0.986,
+      "skill_sharpe": 1.62,
+      "n_rt": 425
+    },
+    "0x14261696e629e97643bd126d47e46a29bf8e44d3": {
+      "group": "v16_skill_decile",
+      "rank": 12,
+      "skill_win": 0.925,
+      "skill_sharpe": 1.6,
+      "n_rt": 239
+    },
+    "0x7bc5239180bea2255f4dd243d79481d39adee41e": {
+      "group": "v16_skill_decile",
+      "rank": 13,
+      "skill_win": 0.966,
+      "skill_sharpe": 1.53,
+      "n_rt": 409
+    },
+    "0xb9ffc505d1cb65d4b1b9f53d252d700fda6f0a07": {
+      "group": "v16_skill_decile",
+      "rank": 14,
+      "skill_win": 0.946,
+      "skill_sharpe": 1.5,
+      "n_rt": 74
+    },
+    "0xf4a9c1fb2623f813d5975f1d73c31215c08eaa32": {
+      "group": "v16_skill_decile",
+      "rank": 15,
+      "skill_win": 0.963,
+      "skill_sharpe": 1.4,
+      "n_rt": 408
+    },
+    "0x1f4ab7e9acebb8b591e74b81e34bebe8be9bc934": {
+      "group": "v16_skill_decile",
+      "rank": 16,
+      "skill_win": 0.949,
+      "skill_sharpe": 1.4,
+      "n_rt": 447
+    },
+    "0x008f32a2b8c5efc0ecd55c9dfa90d319f7b0dd2b": {
+      "group": "v16_skill_decile",
+      "rank": 17,
+      "skill_win": 0.954,
+      "skill_sharpe": 1.31,
+      "n_rt": 410
+    },
+    "0x6fa7bc97c3a5543d374444ecae2ef62b4f95ef10": {
+      "group": "v16_skill_decile",
+      "rank": 18,
+      "skill_win": 0.963,
+      "skill_sharpe": 1.27,
+      "n_rt": 82
+    },
+    "0x504ec17f392b0aea095a1774146316bbeb464683": {
+      "group": "v16_skill_decile",
+      "rank": 19,
+      "skill_win": 0.944,
+      "skill_sharpe": 1.31,
+      "n_rt": 426
+    },
+    "0xa87e491b13115b762309a2884184b42748a6fbc4": {
+      "group": "v16_skill_decile",
+      "rank": 21,
+      "skill_win": 0.957,
+      "skill_sharpe": 1.21,
+      "n_rt": 233
+    },
+    "0x565b1c32936bdaa526947178acc95c5b08cfacc4": {
+      "group": "v16_skill_decile",
+      "rank": 24,
+      "skill_win": 0.985,
+      "skill_sharpe": 1.09,
+      "n_rt": 200
+    },
+    "0xcdc8e762abf9add546118205ad014baf17e91ab8": {
+      "group": "v16_skill_decile",
+      "rank": 25,
+      "skill_win": 0.935,
+      "skill_sharpe": 1.11,
+      "n_rt": 138
+    },
+    "0x1ca4d75d24dcd969ad9c8ad455c76ab8241fdf63": {
+      "group": "v16_skill_decile",
+      "rank": 27,
+      "skill_win": 0.986,
+      "skill_sharpe": 1.0,
+      "n_rt": 221
+    },
+    "0xaa9caecf3ea0a42fa1dde0e202825b67117ab068": {
+      "group": "v16_skill_decile",
+      "rank": 28,
+      "skill_win": 0.98,
+      "skill_sharpe": 1.01,
+      "n_rt": 49
+    },
+    "0x0e66ea30180ea13ee91ca1d4d340f993cfb874ec": {
+      "group": "v16_skill_decile",
+      "rank": 31,
+      "skill_win": 0.965,
+      "skill_sharpe": 0.98,
+      "n_rt": 375
+    },
+    "0x3a6747c8e913085e243a2c22d188dafa8c6a612a": {
+      "group": "v16_skill_decile",
+      "rank": 33,
+      "skill_win": 0.924,
+      "skill_sharpe": 1.03,
+      "n_rt": 118
+    },
+    "0x04c653d2b4aa55313b86a3873a59d6fcb726f27b": {
+      "group": "v16_skill_decile",
+      "rank": 34,
+      "skill_win": 0.974,
+      "skill_sharpe": 0.93,
+      "n_rt": 388
+    },
+    "0x615da5bb122164d657d69d6201d28ef969d1dd38": {
+      "group": "v16_skill_decile",
+      "rank": 35,
+      "skill_win": 0.939,
+      "skill_sharpe": 1.04,
+      "n_rt": 836
+    },
+    "0x2bcd8898a678050efa5f41f4c6012045dee1b5c3": {
+      "group": "v16_skill_decile",
+      "rank": 36,
+      "skill_win": 0.977,
+      "skill_sharpe": 0.92,
+      "n_rt": 171
+    },
+    "0xa5f58e092c3cb6479eebce341394003eef1c68e8": {
+      "group": "v16_skill_decile",
+      "rank": 37,
+      "skill_win": 0.948,
+      "skill_sharpe": 0.97,
+      "n_rt": 445
+    },
+    "0x374b8890dbc7aef957ec44e9b80766118789f1a4": {
+      "group": "v16_skill_decile",
+      "rank": 39,
+      "skill_win": 0.912,
+      "skill_sharpe": 0.96,
+      "n_rt": 285
+    },
+    "0x9a3ec40c1710064487193f8560f1c95fcd43b5ba": {
+      "group": "v16_skill_decile",
+      "rank": 40,
+      "skill_win": 0.917,
+      "skill_sharpe": 0.95,
+      "n_rt": 336
+    },
+    "0x61cc8482401e12fb70f03dff2fa1c326c434e60f": {
+      "group": "v16_skill_decile",
+      "rank": 41,
+      "skill_win": 0.916,
+      "skill_sharpe": 0.93,
+      "n_rt": 619
+    },
+    "0xd7cd873ccce129485d2b22628e3bddbd0c2d1594": {
+      "group": "v16_skill_decile",
+      "rank": 42,
+      "skill_win": 0.905,
+      "skill_sharpe": 0.94,
+      "n_rt": 95
+    },
+    "0x8444c8e6f4e97a8b6bbeb71a90adaff9c5bb9950": {
+      "group": "v16_skill_decile",
+      "rank": 43,
+      "skill_win": 0.943,
+      "skill_sharpe": 0.87,
+      "n_rt": 122
+    },
+    "0x0b2f3cabfeeb27ac5bfb99ae129ac2e0a2eb306e": {
+      "group": "v16_skill_decile",
+      "rank": 44,
+      "skill_win": 0.964,
+      "skill_sharpe": 0.84,
+      "n_rt": 140
+    },
+    "0xdbcbf37557ec7cf8273faef29bc0866bcfe9d6c1": {
+      "group": "v16_skill_decile",
+      "rank": 45,
+      "skill_win": 1.0,
+      "skill_sharpe": 0.72,
+      "n_rt": 41
+    },
+    "0x3454c7aa653c908850021eff43c0a141cd138c9e": {
+      "group": "v16_skill_decile",
+      "rank": 47,
+      "skill_win": 0.919,
+      "skill_sharpe": 0.84,
+      "n_rt": 198
+    },
+    "0xf3a3ad04ff84484b02f08bbf11eecc01f9d78dbf": {
+      "group": "v16_skill_decile",
+      "rank": 48,
+      "skill_win": 0.874,
+      "skill_sharpe": 0.85,
+      "n_rt": 309
+    },
+    "0x09f2b610f85a5fea4d35b42cccdc52f1f71d6bc7": {
+      "group": "v16_skill_decile",
+      "rank": 50,
+      "skill_win": 0.91,
+      "skill_sharpe": 0.79,
+      "n_rt": 166
+    },
+    "0x8beef9d4859508142ff2eb936837a7873e11eab7": {
+      "group": "v16_skill_decile",
+      "rank": 55,
+      "skill_win": 0.854,
+      "skill_sharpe": 0.83,
+      "n_rt": 89
+    },
+    "0x5ba4c8d16464621608b7333fd44b1e74a1b8d189": {
+      "group": "v16_skill_decile",
+      "rank": 56,
+      "skill_win": 0.878,
+      "skill_sharpe": 0.85,
+      "n_rt": 148
+    },
+    "0x4dd6ebc4ee518bf5d4e338ad99a2609abb36560a": {
+      "group": "v16_skill_decile",
+      "rank": 57,
+      "skill_win": 0.869,
+      "skill_sharpe": 0.8,
+      "n_rt": 183
+    },
+    "0x1003d8c532e5178673668e5f3aa48dc399ee940c": {
+      "group": "v16_skill_decile",
+      "rank": 58,
+      "skill_win": 0.79,
+      "skill_sharpe": 0.88,
+      "n_rt": 157
+    },
+    "0x8e72bb69abd6f0cf7907fac5ad6fb3f66870e0c6": {
+      "group": "v16_skill_decile",
+      "rank": 59,
+      "skill_win": 0.827,
+      "skill_sharpe": 0.84,
+      "n_rt": 284
+    },
+    "0xb27bbaadcdfeab937069b4d966ee6bf5a32c999b": {
+      "group": "v16_skill_decile",
+      "rank": 60,
+      "skill_win": 0.891,
+      "skill_sharpe": 0.77,
+      "n_rt": 55
+    },
+    "0x8f844d3c0c06526387fa01d165fba8c3984efdac": {
+      "group": "v16_skill_decile",
+      "rank": 61,
+      "skill_win": 0.861,
+      "skill_sharpe": 0.78,
+      "n_rt": 122
+    },
+    "0xd79656d9e6ec643c6df635b21fe78ba7c02cbdc5": {
+      "group": "v16_skill_decile",
+      "rank": 63,
+      "skill_win": 0.877,
+      "skill_sharpe": 0.74,
+      "n_rt": 65
+    },
+    "0x769232f7de58dcdb30659b34d9d51ded02537848": {
+      "group": "v16_skill_decile",
+      "rank": 65,
+      "skill_win": 0.946,
+      "skill_sharpe": 0.64,
+      "n_rt": 828
+    },
+    "0x6d43ae52c309b37d9cc7a8419c776a92fa6691dd": {
+      "group": "v16_skill_decile",
+      "rank": 67,
+      "skill_win": 0.912,
+      "skill_sharpe": 0.69,
+      "n_rt": 228
+    },
+    "0x957f996d64fd4ab8dc07140ae0fc1eba281a7808": {
+      "group": "v16_skill_decile",
+      "rank": 68,
+      "skill_win": 0.958,
+      "skill_sharpe": 0.59,
+      "n_rt": 96
+    },
+    "0xf7474b6e76b6994f9ec4541d64ed9cc94e096366": {
+      "group": "v16_skill_decile",
+      "rank": 69,
+      "skill_win": 0.95,
+      "skill_sharpe": 0.61,
+      "n_rt": 300
+    },
+    "0xc9e839a529d1a3a46e2b48d20c461d4afecb72e4": {
+      "group": "v16_skill_decile",
+      "rank": 70,
+      "skill_win": 0.911,
+      "skill_sharpe": 0.64,
+      "n_rt": 123
+    },
+    "0xc4e23966cafbfb6a6dbc9b8e0a22e00dba69a717": {
+      "group": "v16_skill_decile",
+      "rank": 71,
+      "skill_win": 0.958,
+      "skill_sharpe": 0.55,
+      "n_rt": 48
+    },
+    "0x7ef07bd027da41ace2a4847d55e9314b4164d340": {
+      "group": "v16_skill_decile",
+      "rank": 72,
+      "skill_win": 0.988,
+      "skill_sharpe": 0.57,
+      "n_rt": 586
+    },
+    "0xe9c312d4a2e69e4247a1e2ba12dedd098010a419": {
+      "group": "v16_skill_decile",
+      "rank": 73,
+      "skill_win": 0.96,
+      "skill_sharpe": 0.61,
+      "n_rt": 499
+    },
+    "0x34940c3f11485eae09e649cb9ae80b8c5fda055f": {
+      "group": "v16_skill_decile",
+      "rank": 74,
+      "skill_win": 0.869,
+      "skill_sharpe": 0.66,
+      "n_rt": 658
+    },
+    "0x056b410cd12ed145f8c24f341d3e03b77ab7a8f4": {
+      "group": "v16_skill_decile",
+      "rank": 75,
+      "skill_win": 0.854,
+      "skill_sharpe": 0.68,
+      "n_rt": 144
+    },
+    "0x0fe0251e8382afc65758a3bb4d39fc1ff628be8e": {
+      "group": "v16_skill_decile",
+      "rank": 76,
+      "skill_win": 0.901,
+      "skill_sharpe": 0.61,
+      "n_rt": 334
+    },
+    "0x75f0f24a090ee2923b2662d40ca44d14e33faf5e": {
+      "group": "v16_skill_decile",
+      "rank": 77,
+      "skill_win": 0.934,
+      "skill_sharpe": 0.56,
+      "n_rt": 376
+    },
+    "0xe49175608c326c3554666438c0e5e6528aa10e37": {
+      "group": "v16_skill_decile",
+      "rank": 81,
+      "skill_win": 0.903,
+      "skill_sharpe": 0.64,
+      "n_rt": 578
+    },
+    "0x13eecea1813ae2eb3116c45c622af1ec0fb7e6c4": {
+      "group": "v16_skill_decile",
+      "rank": 82,
+      "skill_win": 0.959,
+      "skill_sharpe": 0.45,
+      "n_rt": 49
+    },
+    "0x67abcb7c78d8af212b2df8aa534491bf10a4f53b": {
+      "group": "v16_skill_decile",
+      "rank": 83,
+      "skill_win": 0.899,
+      "skill_sharpe": 0.55,
+      "n_rt": 228
+    },
+    "0x9ffd4e6286b9dd3c8f55ce349e3398cde416b829": {
+      "group": "v16_skill_decile",
+      "rank": 84,
+      "skill_win": 0.85,
+      "skill_sharpe": 0.59,
+      "n_rt": 266
+    },
+    "0xbef4dca8b1737ef8614e2057624ab1945945b2fb": {
+      "group": "v16_skill_decile",
+      "rank": 85,
+      "skill_win": 0.906,
+      "skill_sharpe": 0.56,
+      "n_rt": 608
+    },
+    "0x002d4ae035f08c0f15da4842404027f03c1bc173": {
+      "group": "v16_skill_decile",
+      "rank": 86,
+      "skill_win": 0.987,
+      "skill_sharpe": 0.4,
+      "n_rt": 151
+    },
+    "0x61cbeb3fc69e6015a881319188effd6da730b11c": {
+      "group": "v16_skill_decile",
+      "rank": 87,
+      "skill_win": 0.854,
+      "skill_sharpe": 0.6,
+      "n_rt": 198
+    },
+    "0x8813dba4eb786d61de01d5a53bdd793fb33dfea1": {
+      "group": "v16_skill_decile",
+      "rank": 88,
+      "skill_win": 0.828,
+      "skill_sharpe": 0.66,
+      "n_rt": 419
+    },
+    "0x454bd0d4a9ec0f91d6d28c37a92c1d3fb4e905e4": {
+      "group": "v16_skill_decile",
+      "rank": 90,
+      "skill_win": 0.916,
+      "skill_sharpe": 0.58,
+      "n_rt": 297
+    },
+    "0x95da8596c44dd09f4b8becce87ad3b7894fb2328": {
+      "group": "v16_skill_decile",
+      "rank": 92,
+      "skill_win": 0.786,
+      "skill_sharpe": 0.66,
+      "n_rt": 42
+    },
+    "0x24dce34b24f631cb653022119c3244bff1e70630": {
+      "group": "v16_skill_decile",
+      "rank": 94,
+      "skill_win": 0.974,
+      "skill_sharpe": 0.45,
+      "n_rt": 388
+    },
+    "0xf352c4e38870d4b69042fd71f29bb87fe8c602ea": {
+      "group": "v16_skill_decile",
+      "rank": 97,
+      "skill_win": 0.914,
+      "skill_sharpe": 0.48,
+      "n_rt": 267
+    },
+    "0x8ba1d0af4e2f0945feb889105196e74622710d21": {
+      "group": "v16_skill_decile",
+      "rank": 98,
+      "skill_win": 0.816,
+      "skill_sharpe": 0.6,
+      "n_rt": 141
+    },
+    "0xf64f0e3ca949efe1e2996b1529048de496a3560e": {
+      "group": "v16_skill_decile",
+      "rank": 100,
+      "skill_win": 0.826,
+      "skill_sharpe": 0.59,
+      "n_rt": 46
+    }
+  }
+}

@@ -368,13 +368,6 @@
       "skill_sharpe": 0.79,
       "n_rt": 166
     },
-    "0xa49041de8ee64de3897d9c480f143e76129a9f40": {
-      "group": "v16_skill_decile",
-      "rank": 52,
-      "skill_win": 0.873,
-      "skill_sharpe": 0.83,
-      "n_rt": 126
-    },
     "0x8beef9d4859508142ff2eb936837a7873e11eab7": {
       "group": "v16_skill_decile",
       "rank": 55,

@@ -11,9 +11,14 @@ READ AND FOLLOW ~/.bun/install/global/node_modules/gbrain/skills/RESOLVER.md
 
 | Activity | Skill | Path |
 |----------|-------|------|
+| Transcribe a Telegram voice note (EVERY .oga, use the shared helper) | transcribe-voice | ~/.claude/skills/transcribe-voice/SKILL.md |
 | Strategy governance/gates | quant-governance | skills/quant-governance/SKILL.md |
 | Research process | research-process | skills/research-process/SKILL.md |
 | Backtesting | backtesting | skills/backtesting/SKILL.md |
+| Copy-trading research/validation (WHO/HOW to copy, end-to-end harness) | copy-research | skills/copy-research/SKILL.md |
+| Feature store / data pipeline ops (sources, features, quality, health) | data-pipeline | skills/data-pipeline/SKILL.md |
+| Operate the live trading pipeline (Mac Mini: DAG, LaunchDaemons, Mongo, reconciliation) | system-operations | skills/system-operations/SKILL.md |
+| NotebookLM research digests | notebooklm | skills/notebooklm/SKILL.md |
 
 ## Thinking Skills (gstack)
 

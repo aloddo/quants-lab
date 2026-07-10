@@ -2,6 +2,7 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "research" / "v15"))
@@ -27,6 +28,15 @@ def mk(**kw):
     for k, v in kw.items():
         setattr(s, k, v)
     return s
+
+
+def test_anchor_returns_neutralize_external_capital_flows():
+    # Equity 100 -> 200 solely because of a $100 deposit.  The weekly residual
+    # after subtracting external flow is zero, so performance return is zero.
+    got = g._flow_adjusted_anchor_returns(
+        fund_week=np.array([0.0]), resid=np.array([0.0]), vals=np.array([100.0, 200.0])
+    )
+    assert got.tolist() == [0.0]
 
 
 # === tier truth table (_own_tier) ===

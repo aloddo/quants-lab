@@ -42,8 +42,10 @@ def compute_features() -> Optional[RegimeFeatures]:
     client = MongoClient(MONGO_URI)
     db = client["quants_lab"]
 
-    # Latest DVOL
-    dvol_rec = db["deribit_dvol_full"].find_one(
+    # Latest DVOL. Repointed 2026-07-04 from deribit_dvol_full (collector died 2026-05-16,
+    # caused stale-implied-vol false NEUTRAL signals) to deribit_dvol (fresh, maintained; the
+    # backtest load_data uses this same series; the two are byte-identical where they overlap).
+    dvol_rec = db["deribit_dvol"].find_one(
         {"currency": "BTC"}, sort=[("timestamp_utc", -1)]
     )
     if not dvol_rec:

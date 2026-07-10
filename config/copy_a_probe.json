@@ -1,0 +1,118 @@
+{
+ "global": {
+  "order_size_usd": 50.0,
+  "alloc_usd": 460.0,
+  "admit_ceiling_usd": 900.0,
+  "max_leverage": 2.0,
+  "max_loss_usd": 92.0,
+  "cooldown_s": 30.0,
+  "stop_frac": 0.05,
+  "trail_frac": 0.03,
+  "trail_arm_frac": 0.02,
+  "max_hold_s": 21600,
+  "kill_path": "~/.hermes-kernel/quant/quant-kill",
+  "sole_writer": true
+ },
+ "pairs": {
+  "0x6d91e49b8dc6eb2ba01f85f80626ef0878d3a39b:BTC": {
+   "wallet": "0x6d91e49b8dc6eb2ba01f85f80626ef0878d3a39b",
+   "coin": "BTC",
+   "order_size_usd": 50.0
+  },
+  "0x2ec97e86e72acb09832b33a752e271e2d8c66869:BTC": {
+   "wallet": "0x2ec97e86e72acb09832b33a752e271e2d8c66869",
+   "coin": "BTC",
+   "order_size_usd": 50.0
+  },
+  "0x4e79e5fa948aa817568f63daf21aa1b54437a22c:ETH": {
+   "wallet": "0x4e79e5fa948aa817568f63daf21aa1b54437a22c",
+   "coin": "ETH",
+   "order_size_usd": 50.0
+  },
+  "0x906d82985051127f315e34bff35c9ae43b4697ad:BTC": {
+   "wallet": "0x906d82985051127f315e34bff35c9ae43b4697ad",
+   "coin": "BTC",
+   "order_size_usd": 50.0
+  },
+  "0xb9991b5dc46fb1fc5bda76cccf52ed4a38384538:ETH": {
+   "wallet": "0xb9991b5dc46fb1fc5bda76cccf52ed4a38384538",
+   "coin": "ETH",
+   "order_size_usd": 50.0
+  },
+  "0x8af3032c19e57cebfb0562cfec638f4f9952e9ee:ETH": {
+   "wallet": "0x8af3032c19e57cebfb0562cfec638f4f9952e9ee",
+   "coin": "ETH",
+   "order_size_usd": 50.0
+  },
+  "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04:HYPE": {
+   "wallet": "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04",
+   "coin": "HYPE",
+   "order_size_usd": 50.0
+  },
+  "0xd6fa01d54b53e40ecfb59710558af1f8174f4db1:HYPE": {
+   "wallet": "0xd6fa01d54b53e40ecfb59710558af1f8174f4db1",
+   "coin": "HYPE",
+   "order_size_usd": 50.0
+  },
+  "0x9cc53c5af67fb83a16cc41f61e242bade875ab3d:BTC": {
+   "wallet": "0x9cc53c5af67fb83a16cc41f61e242bade875ab3d",
+   "coin": "BTC",
+   "order_size_usd": 50.0
+  },
+  "0xf8adb65dd158a09a970141aa167e08ad3718e2ef:HYPE": {
+   "wallet": "0xf8adb65dd158a09a970141aa167e08ad3718e2ef",
+   "coin": "HYPE",
+   "order_size_usd": 50.0
+  },
+  "0xdc899ed4a80e7bbe7c86307715507c828901f196:HYPE": {
+   "wallet": "0xdc899ed4a80e7bbe7c86307715507c828901f196",
+   "coin": "HYPE",
+   "order_size_usd": 50.0
+  },
+  "0x2b315aaa2554382940e00f256134f37c4e5a3c14:SOL": {
+   "wallet": "0x2b315aaa2554382940e00f256134f37c4e5a3c14",
+   "coin": "SOL",
+   "order_size_usd": 50.0
+  },
+  "0x8b9d073a3baa5bcd521a06a46ec13e6954ba609a:ETH": {
+   "wallet": "0x8b9d073a3baa5bcd521a06a46ec13e6954ba609a",
+   "coin": "ETH",
+   "order_size_usd": 50.0
+  },
+  "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04:SUI": {
+   "wallet": "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04",
+   "coin": "SUI",
+   "order_size_usd": 50.0
+  },
+  "0x58c09b7c574f1b1459968818477074dc1810eb90:SOL": {
+   "wallet": "0x58c09b7c574f1b1459968818477074dc1810eb90",
+   "coin": "SOL",
+   "order_size_usd": 50.0
+  },
+  "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04:SOL": {
+   "wallet": "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04",
+   "coin": "SOL",
+   "order_size_usd": 50.0
+  },
+  "0x6adc6084b9765e0130a3cbff02af6f11edb0072d:SOL": {
+   "wallet": "0x6adc6084b9765e0130a3cbff02af6f11edb0072d",
+   "coin": "SOL",
+   "order_size_usd": 50.0
+  },
+  "0x3751c1c4cb83c76c624a622a81418c6a635fb02d:ZEC": {
+   "wallet": "0x3751c1c4cb83c76c624a622a81418c6a635fb02d",
+   "coin": "ZEC",
+   "order_size_usd": 50.0
+  },
+  "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04:XRP": {
+   "wallet": "0xa1b6d8efbcb2fb750a84dbc05649fa4968034f04",
+   "coin": "XRP",
+   "order_size_usd": 50.0
+  },
+  "0x42cb3c0bba4785637cf30d99f552d6b189473e00:ZEC": {
+   "wallet": "0x42cb3c0bba4785637cf30d99f552d6b189473e00",
+   "coin": "ZEC",
+   "order_size_usd": 50.0
+  }
+ }
+}

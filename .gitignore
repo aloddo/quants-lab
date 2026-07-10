@@ -190,6 +190,11 @@ app/data/v15/perp_anchor_cache/
 app/data/v15/shards_20k/
 # Keep small curated inputs under app/data/v15 (wallet lists) but never the parquet outputs
 app/data/v15/*.parquet
+# Catch-all (2026-07-10 cleanup): raw data is SACRED and NEVER committed. Ignore ALL of app/data to
+# close the gaps the per-name rules above missed (app/data/research ~4.2G, copyA, live, options,
+# *_manifest.json). Already-tracked curated inputs (fee schedule, wallet lists, hl_meta) stay tracked;
+# use `git add -f` to update one deliberately.
+app/data/**
 
 # Operational lock files
 .claude/scheduled_tasks.lock

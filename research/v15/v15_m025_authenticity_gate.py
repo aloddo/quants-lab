@@ -6,7 +6,8 @@ unhedged, DIRECTIONAL risk. Conservative by design (drop a real edge before copy
 a phantom at leverage).
 
 Spec: brain projects/quant/v15/m025-authenticity-gate-spec (codex 3-round APPROVED).
-Input set: the non-erroring M01 wallets (app/data/v15/m01_nonerroring_wallets.txt).
+Input set: the full fill-derived wallet universe. M01 reconstruction status is
+not an authenticity prerequisite.
 
 Pipeline order (codex note 1): STAGE A scalars for ALL wallets -> STAGE B entities ->
 STAGE C/D/E/F -> combine. No interleave.
@@ -168,6 +169,17 @@ def _weekly_anchor_series(wallet, fills, funding, ledger, lo_ms, hi_ms):
         resid.append(tc - fw - ef)
     return ("ok", np.array(ts[1:]), np.array(total_change), np.array(fund_week),
             np.array(resid), np.array(vals))
+
+
+def _flow_adjusted_anchor_returns(fund_week, resid, vals):
+    """Anchor returns excluding external capital flows.
+
+    ``resid = total_change - funding - external_flow``; adding funding back
+    yields trading+funding PnL while leaving deposits/withdrawals neutralized.
+    """
+    pnl = np.asarray(resid, dtype=float) + np.asarray(fund_week, dtype=float)
+    base = np.asarray(vals[:-1], dtype=float)
+    return pnl / np.maximum(base, 1e-9)
 
 
 def _last_price_by_coin(*fill_lists):
@@ -353,7 +365,10 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
         s.funding_frac = (float(np.sum(np.abs(fund_week))) / denom
                           if denom > 1e-9 else float("nan"))
         # weekly return Sharpe + leverage flag
-        rets = total_change/np.maximum(vals[:-1], 1e-9)
+        # Raw account-value changes include deposits/withdrawals and can create
+        # a fabricated Sharpe/primary ranking. Use flow-neutral trading+funding
+        # PnL; all components are bounded by hi_ms in _weekly_anchor_series.
+        rets = _flow_adjusted_anchor_returns(fund_week, resid, vals)
         if len(rets) >= MIN_ANCHORS and np.std(rets) > 1e-9:
             s.sharpe = float(np.mean(rets)/np.std(rets)*np.sqrt(52))
             gross_hr = _median_leverage(all_fills, vals, lo_ms=lo_ms, seed_pos=seed_pos)

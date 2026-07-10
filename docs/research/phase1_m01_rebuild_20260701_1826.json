@@ -1,0 +1,51 @@
+{
+  "run_id": "phase1_m01_rebuild_20260701_1826",
+  "status": "complete",
+  "completed_at": "2026-07-01T22:34:35+03:00",
+  "wall_minutes": 247.11,
+  "started_at": "2026-07-01T18:26:51+03:00",
+  "git_head": "03009b784558bb8f272e7a56e49491487bb798a7",
+  "source_sha256": {
+    "research/v15/v15_m01_equity_reconstruct.py": "6e4d8ff11d6358018e1279ea4c3638a9ca6c86342c03a25cef219ae99bb076ce",
+    "research/v15/_streaming_io.py": "daee1f3b70c676a2550ce4612894de04ba0e01e87355147ee44cce667a038f17"
+  },
+  "wallet_file": {
+    "path": "app/data/v15/m01_universe_20k_wallets.txt",
+    "rows": 20378,
+    "sha256": "5e2d53780470b51d9d92e9f07a9f1f1e7a328451f85ebc0c1718f4f2909794a7"
+  },
+  "anchor_file": {
+    "path": "app/data/v13/wallet_anchor_state.parquet",
+    "sha256": "e46ab0d4a382b523ff9a2e09d78788697053762da99d19c50072ad50e11b35f4"
+  },
+  "window": {"start": "2025-12-01", "end_inclusive": "2026-05-23"},
+  "seed_mode": "causal_with_observed_carry_in",
+  "audit_seed_mode": "causal_with_observed_carry_in",
+  "hip3_exact_mark_max_age_minutes": 15,
+  "minimum_inter_anchor_checks": 2,
+  "headroom_gb": 1.0,
+  "output": "app/data/v15/phase1_rebuild_20260701_1826/m01_universe_series.parquet",
+  "audit_output": "app/data/v15/phase1_rebuild_20260701_1826/m01_universe_series.audit.parquet",
+  "validation_output": "app/data/v15/phase1_rebuild_20260701_1826/m01_validation.json",
+  "log": "/tmp/phase1_m01_rebuild_20260701_1826.log",
+  "preflight": {
+    "smoke_series": "/tmp/phase1_m01_mark15m_smoke.parquet",
+    "smoke_validation": "/tmp/phase1_m01_mark15m_smoke.validation.json",
+    "hard_fail": false,
+    "quarantined_wallets": 7,
+    "missing_no_valid_anchor": 1,
+    "regression_tests_passed": 429
+  },
+  "validation": {
+    "hard_fail": false,
+    "series_rows": 2986973,
+    "reconstructed_wallets": 20156,
+    "quarantined_wallets": 10475,
+    "trusted_wallets": 9681,
+    "missing_from_audit": 222,
+    "duplicate_wallet_days": 0,
+    "nonfinite_complete_equity": 0,
+    "gross_lt_abs_net": 0,
+    "quarantine_rule_mismatches": 0
+  }
+}

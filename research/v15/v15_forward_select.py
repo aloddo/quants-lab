@@ -56,8 +56,18 @@ def forward_backtest(score_fn, k_select: int, b0: float = 500.0, min_trail: int 
     """Run a selection rule forward through folds 2..8 (fold 1 has no trailing -> seeded by score on
     pretest only) and grade via the M9 chained sim. score_fn(features)->Series. Top-k_select per fold."""
     oos, pre, m5 = load_panels()
-    ent = pd.read_parquet(DATA / "m04_entities.parquet")
     folds = pd.read_parquet(DATA / "m03_folds.parquet")
+    entity_parts = []
+    for fid in sorted(folds["fold_id"].astype(int).unique()):
+        p = DATA / f"m04_entities_f{fid}.parquet"
+        if not p.exists():
+            raise FileNotFoundError(
+                f"forward selection requires fold-pure M4 entities: missing {p}"
+            )
+        d = pd.read_parquet(p)
+        d["fold_id"] = int(fid)
+        entity_parts.append(d)
+    ent = pd.concat(entity_parts, ignore_index=True)
     import json
     cal = json.loads((DATA / "slippage_calib_v11.json").read_text())
     perfold = {int(x): v for x, v in cal["per_fold_asof"].items()}

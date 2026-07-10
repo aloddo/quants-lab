@@ -50,6 +50,29 @@ def test_twr_structural_ruin():
     assert m5.flow_adjusted_twr(df)["structural_ruin"] is True
 
 
+def test_twr_excludes_incomplete_reconstruction_days():
+    df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=3, freq="D").date,
+        "equity_usd": [1000.0, 1_000_000.0, 1100.0],
+        "ext_flow_cum": [0.0, 0.0, 0.0],
+        "recon_incomplete": [False, True, False],
+    })
+    r = m5.flow_adjusted_twr(df)
+    assert r["roe"] == pytest.approx(0.10)
+    assert r["n_incomplete_excluded"] == 1
+
+
+def test_leverage_uses_gross_notional_not_signed_position_value():
+    df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=3, freq="D").date,
+        "equity_usd": [100.0, 100.0, 100.0],
+        "ext_flow_cum": [0.0, 0.0, 0.0],
+        "position_value_usd": [0.0, 0.0, 0.0],
+        "gross_position_notional_usd": [2000.0, 2000.0, 2000.0],
+    })
+    assert m5.flow_adjusted_twr(df)["median_leverage"] == pytest.approx(20.0)
+
+
 # === journey_metrics + floors ===
 def _jr(wallet, entry_d, exit_d, pnl, coin="BTC", notional=1000.0):
     return {"wallet": wallet, "coin": coin,
@@ -71,6 +94,20 @@ def _good_jm():
 def test_floor_pass():
     ok, f = m5.apply_floors(_good_eqm(), _good_jm())
     assert ok and not f
+
+
+def test_copyability_lane_does_not_require_m01_equity():
+    unavailable = {
+        "roe": float("nan"), "max_dd": float("nan"), "n_days": 0,
+        "structural_ruin": True, "median_equity": 0.0,
+        "median_leverage": float("nan"), "n_active_days": 0,
+        "frac_days_green": float("nan"),
+    }
+    ok, reasons = m5.apply_floors(
+        unavailable, _good_jm(), equity_required=False
+    )
+    assert ok
+    assert not any("equity" in reason or "structural_ruin" in reason for reason in reasons)
 
 
 def test_floor_fail_negative_pnl():
@@ -153,6 +190,17 @@ def test_journey_metrics_censored_hold_for_open_position():
     assert jm2["n_journeys"] == 0  # not closed-in-pretest -> excluded from count/PnL
 
 
+def test_journey_metrics_excludes_invalid_lifecycle():
+    lo = ms(date(2025, 12, 1)); hi = ms(date(2025, 12, 30))
+    rows = [
+        {**_jr("0xw", date(2025, 12, 2), date(2025, 12, 3), 100), "lifecycle_valid": True},
+        {**_jr("0xw", date(2025, 12, 4), date(2025, 12, 5), 9999), "lifecycle_valid": False},
+    ]
+    jm = m5.journey_metrics(pd.DataFrame(rows), lo, hi, None)
+    assert jm["n_journeys"] == 1
+    assert jm["net_pnl"] == pytest.approx(100.0)
+
+
 def test_data_gap_account_not_falsely_failed():
     # codex finding b: a data gap (missing equity_usd day) must NOT drag median_equity to 0 via the
     # 0.0-fill. Raw non-null median stays well above the $2k floor.
@@ -183,6 +231,25 @@ def test_median_equity_emitted_in_elig_rows():
     assert "median_equity_pretest" in elig.columns
     f1 = elig[(elig["primary_wallet"] == "0xg") & (elig["fold_id"] == 1)].iloc[0]
     assert f1["median_equity_pretest"] > 2000.0
+
+
+def test_m01_quarantine_hard_excludes_wallet():
+    journeys = pd.DataFrame([
+        _jr("0xg", date(2025, 12, 5), date(2025, 12, 6), 100),
+        _jr("0xg", date(2025, 12, 10), date(2025, 12, 11), 100),
+        _jr("0xg", date(2026, 1, 2), date(2026, 1, 3), 100),
+        _jr("0xg", date(2026, 1, 8), date(2026, 1, 9), 100),
+    ])
+    eq = pd.DataFrame({"wallet": "0xg",
+                       "date": pd.date_range("2025-12-01", "2026-01-25", freq="D").date,
+                       "equity_usd": np.linspace(10000, 13000, 56), "ext_flow_cum": 0.0})
+    elig, pool, _ = m5.run(
+        FOLDS, journeys, eq, _m04(["0xg"]), quarantined_wallets={"0xg"}
+    )
+    row = elig[(elig["primary_wallet"] == "0xg") & (elig["fold_id"] == 1)].iloc[0]
+    assert row["eligible"] is False or not bool(row["eligible"])
+    assert "reconstruction_quarantined" in row["fail_reasons"]
+    assert not bool(pool.loc[pool["primary_wallet"] == "0xg", "g5_pool_candidate_pass"].iloc[0])
 
 
 def test_floor_accessibility_unknown_does_not_fail():

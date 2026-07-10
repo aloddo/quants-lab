@@ -15,11 +15,7 @@ from pathlib import Path
 import numpy as np, pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import leadlag_clean_rank_sim as S
-from execution_model import fee_rt, set_latency_ms
-
-FEE_TAKER = fee_rt(maker=False)
-FEE_MAKER = fee_rt(maker=True)
-
+from execution_model import fee_rt, set_latency_ms, slip_oneway
 
 def roundtrips(fills):
     """fills: list of (ts, coin, signed_size, price) ts-sorted. Yield round-trips per coin:
@@ -38,14 +34,23 @@ def roundtrips(fills):
                 if pos == 0:
                     ets = ts; cdir = 1 if s > 0 else -1; en = es = ex = exs = 0.0
                 en += abs(s) * p; es += abs(s); pos += s
-            else:                                          # reduce / close
+            else:                                          # reduce / close / reverse
                 cl = min(abs(s), abs(pos))
                 ex += cl * p; exs += cl; pos += s
-                if abs(pos) < 1e-9 and es > 0 and exs > 0:
+                closed_or_reversed = abs(pos) < 1e-9 or (pos > 0) != (cdir > 0)
+                if closed_or_reversed and es > 0 and exs > 0:
                     evw = en / es; xvw = ex / exs
                     g = cdir * (xvw - evw) / evw
                     out.append((c, cdir, ets, ts, evw, xvw, g))
-                    pos = 0.0; en = es = ex = exs = 0.0
+                    # A reversal closes the old position and opens the residual
+                    # opposite leg at this same fill price.
+                    residual = pos
+                    en = es = ex = exs = 0.0
+                    if abs(residual) < 1e-9:
+                        pos = 0.0
+                    else:
+                        pos = residual; ets = ts; cdir = 1 if residual > 0 else -1
+                        en = abs(residual) * p; es = abs(residual)
     return out
 
 
@@ -57,7 +62,7 @@ def main():
     ap.add_argument("--min-rt", type=int, default=20)
     ap.add_argument("--liquid-only", action="store_true", help="restrict to l2_calib liquid coins (kills microcap mark artifacts).")
     ap.add_argument("--cap-bps", type=float, default=500.0, help="clip per-trade net to +/- this (kills reconstruction outliers).")
-    ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt")
+    ap.add_argument("--universe-file", default="app/data/v15/m01_universe_20k_wallets.txt")
     args = ap.parse_args()
     set_latency_ms(args.latency_s * 1000)
     ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
@@ -94,7 +99,10 @@ def main():
                 continue
             og = max(-cap, min(cap, dir_ * (ex - ent) / ent))   # cap kills reconstruction outliers
             their.append(max(-cap, min(cap, g)))
-            ours_t.append(og - FEE_TAKER); ours_m.append(og - FEE_MAKER)
+            slip_rt = 2.0 * slip_oneway(c)
+            ours_t.append(og - fee_rt(maker=False, coin=c) - slip_rt)
+            # Maker is an optimistic fill-probability bound; no crossing slip.
+            ours_m.append(og - fee_rt(maker=True, coin=c))
         if len(ours_t) < args.min_rt:
             continue
         rows.append({"wallet": w, "n_rt": len(ours_t),

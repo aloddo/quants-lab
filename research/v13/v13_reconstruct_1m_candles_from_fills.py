@@ -64,6 +64,14 @@ def aggregate_one_day(day_path: Path, coin_filter: set | None = None) -> pd.Data
     if df.empty:
         return pd.DataFrame()
 
+    # v2 enriched fills (hl_s3_fills_v2) store price/size as STRINGS (M01 load_wallet_fills
+    # casts them too). Coerce to float before any numeric compare/aggregation; failed casts -> NaN
+    # are dropped by the dropna below. Without this the `> 0` filter raises str-vs-int (v13 was
+    # originally written for the v1 numeric-schema fills). Price-only OHLC is unaffected by the
+    # both-sides volume nuance handled downstream.
+    for _c in ("price", "size"):
+        df[_c] = pd.to_numeric(df[_c], errors="coerce")
+
     df = df.dropna(subset=["coin", "time", "price", "size", "side"])
     df = df[(df["price"] > 0) & (df["size"] > 0)]
     if df.empty:

@@ -142,7 +142,7 @@ def main():
     ap.add_argument("--skill-k", type=int, default=100, help="live-cohort-equivalent skill top-K (default 100=live)")
     ap.add_argument("--latency-s", type=int, default=2)
     ap.add_argument("--all-coin", action="store_true")
-    ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt")
+    ap.add_argument("--universe-file", default="app/data/v15/m01_universe_20k_wallets.txt")
     ap.add_argument("--seed", type=int, default=17)
     args = ap.parse_args()
     set_latency_ms(args.latency_s * 1000); lat = args.latency_s * 1000

@@ -9,7 +9,7 @@
 set -euo pipefail
 
 FOLDS=${1:-app/data/v15/m03_folds.parquet}
-WALLETS=${2:-app/data/v15/m01_nonerroring_wallets.txt}
+WALLETS=${2:-app/data/v15/m01_universe_20k_wallets.txt}
 OUTDIR=${3:-app/data/v15}
 PY=${PY:-/Users/hermes/miniforge3/envs/quants-lab/bin/python}
 SAFE=${SAFE:-scripts/mem_safe_run.sh --floor-gb 4}

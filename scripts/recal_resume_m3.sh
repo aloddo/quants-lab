@@ -29,7 +29,7 @@ $SAFE --label m03_ -- $PY research/v15/v15_m03_fold_geometry.py --actions $D/m02
 log "M4 authenticity (FOLD-PURE: per-fold as-of each fold test_start -- no cross-fold leak)"
 PY="$PY" SAFE="$SAFE" PROCS="$PROCS" scripts/build_m4_perfold.sh "$D/m03_folds.parquet" "$WALLETS" "$D" 2>&1 | tail -6
 log "M5 eligibility (corrected equity)"
-$SAFE --label m05_ -- $PY research/v15/v15_m05_eligibility.py --folds $D/m03_folds.parquet --journeys $D/m02_journeys.parquet --equity $EQUITY --m04-dir $D --m03-activity $D/m03_wallet_activity_summary.parquet --outdir $D 2>&1 | tail -3
+$SAFE --label m05_ -- $PY research/v15/v15_m05_eligibility.py --folds $D/m03_folds.parquet --journeys $D/m02_journeys.parquet --equity $EQUITY --m01-audit $D/m01_rerun_universe.audit.parquet --m04-dir $D --m03-activity $D/m03_wallet_activity_summary.parquet --outdir $D 2>&1 | tail -3
 log "M6a shortlist"
 $SAFE --label m06a -- $PY research/v15/v15_m06a_shortlist.py --eligibility $D/m05_eligibility.parquet --pool-summary $D/m05_pool_summary.parquet --folds $D/m03_folds.parquet --m04-dir $D --actions $D/m02_actions.parquet --outdir $D 2>&1 | tail -3
 log "M7 engine PRETEST"

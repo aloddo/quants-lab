@@ -1,0 +1,27 @@
+{
+ "_note": "GATE-1 LIVE PROBE DRAFT (2026-07-05, Path B, WALLET-LEVEL). NOT LIVE. DRY-RUN by default. Pending Fable re-review + (codex or waive) + ONE final Alberto go. Params LOCKED by Alberto TG10792/TG10802: base $150/position, approved WALLETS (copy ANY coin they trade -- no coin whitelist), main+xyz dexes (exclude flx/others), 5x ACCOUNT-TOTAL leverage cap, disaster stop -25%. Policy = mirror ENTRY+EXIT at fixed size, NO pyramiding (decide_net_mirror). Trailing TP DISABLED (trail_arm_frac=99). Long max_hold. Leverage = HL per-coin default on-exchange; risk_broker enforces only the gross/equity 5x gate. admit_ceiling_usd = 5x the $460 alloc (belt-and-suspenders; the 5x gross/equity gate is the real control). per-coin cap is DYNAMIC in code = n_wallets x order_size x (1+buffer). HARD SAFETY: every copied coin (main OR xyz) MUST have a fresh live mark or the runner refuses to open / escalates to REST-fallback flatten. Fable/codex to sanity-check the cap + leverage math.",
+ "global": {
+  "order_size_usd": 150.0,
+  "alloc_usd": 460.0,
+  "admit_ceiling_usd": 2300.0,
+  "max_leverage": 5.0,
+  "max_loss_usd": 120.0,
+  "cross_frac": 0.005,
+  "cooldown_s": 30.0,
+  "stop_frac": 0.25,
+  "trail_frac": 99.0,
+  "trail_arm_frac": 99.0,
+  "max_hold_s": 2592000,
+  "kill_path": "~/.hermes-kernel/quant/quant-kill",
+  "sole_writer": true,
+  "position_dexes": ["", "xyz"]
+ },
+ "wallets": [
+  "0x36c097864a03c7f0215c0d43165a734152a12e0b",
+  "0x6f83ab8890ed38bf38a31010aa9a5e9ca743bfad",
+  "0xe46eafafb60af2eea3a59768106a9342aec59ec3",
+  "0x5f34dbb8088cb7b4d15bad969e107f0a34b16790",
+  "0xc0cecc9cc4ab23536045a65c91dc962a04234ee8",
+  "0x552b6ad871f27a9729162c18d769050363f2d57e"
+ ]
+}

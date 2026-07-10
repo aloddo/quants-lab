@@ -52,7 +52,7 @@ def main():
     ap.add_argument("--hold-min", type=int, default=60)
     ap.add_argument("--latency-s", type=int, default=2)
     ap.add_argument("--min-trades", type=int, default=30)
-    ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt")
+    ap.add_argument("--universe-file", default="app/data/v15/m01_universe_20k_wallets.txt")
     ap.add_argument("--out", default="app/data/v15/wallet_maker_scores.parquet")
     args = ap.parse_args()
     set_latency_ms(args.latency_s * 1000)

@@ -113,6 +113,32 @@ def test_coin_dex_scope():
     assert E.coin_dex("BTC") == "main"
     assert E.coin_dex("xyz:AMD") == "xyz"
     assert E.coin_dex("flx:FOO") == "flx"
+    assert E.coin_is_spot("#42") is True
+    assert E.coin_is_spot("PURR/USDC") is True
+
+
+def test_fixed_position_sizing_runs_without_leader_equity():
+    md = FakeMarketData(_flat_ohlc("BTC", T0 - E.MS_MIN, 20, 100.0))
+    acts = pd.DataFrame([
+        _action("BTC", T0 + 2 * E.MS_MIN, np.nan, "ENTRY", position_after=1.0),
+        _action("BTC", T0 + 3 * E.MS_MIN, np.nan, "EXIT", position_after=0.0, signed_size=-1.0),
+    ])
+    params = E.EngineParams(
+        copy_latency_ms=0, sizing_mode="fixed_position", fixed_target_exposure=0.25
+    )
+    out = _run(acts, md, eq=1_000.0, params=params, end=T0 + 4 * E.MS_MIN)
+    assert out["summary"]["sizing_mode"] == "fixed_position"
+    assert out["summary"]["n_fills"] == 2
+    assert out["ending_account_state"]["positions"] == {}
+
+
+def test_m7_rejects_stale_m2_schema_without_stream_validity(tmp_path):
+    import pyarrow.dataset as ds
+
+    p = tmp_path / "old_actions.parquet"
+    pd.DataFrame({"wallet": ["0x1"], "coin": ["BTC"], "ts": [T0]}).to_parquet(p)
+    with pytest.raises(ValueError, match="rebuilt causal M2"):
+        E._require_action_schema(ds.dataset(p, format="parquet"))
 
 
 def test_margin_mode_inference():
@@ -127,6 +153,70 @@ def test_hlmeta_maint_rate_from_real_cache():
     r = meta.maint_rate("BTC", 1000.0)
     assert 0 < r < 0.5
     assert abs(r - 1.0 / (2.0 * meta.tier_maxlev("BTC", 1000.0))) < 1e-9
+
+
+def test_m7_fee_schedule_uses_effective_subaccount_rate(tmp_path):
+    p = tmp_path / "fees.json"
+    p.write_text(__import__("json").dumps({
+        "base_taker_oneway": 0.000432,
+        "effective_subaccount_taker_oneway": 0.00045,
+        "hip3_mult": 2.0,
+    }))
+    f = E.FeeSchedule(p)
+    assert f.taker("BTC") == pytest.approx(0.00045)
+    assert f.taker("xyz:TEST") == pytest.approx(0.0009)
+
+
+def test_liquidity_adv_is_trailing_dollar_volume_not_price_proxy():
+    md = E.MarketData(allow_mongo=False)
+    mins = np.arange(3, dtype="int64") * E.MS_MIN + T0
+    px = np.full(3, 100.0)
+    md._ohlc["BTC"] = (mins, px.copy(), px.copy(), px.copy(), px.copy())
+    md._volume["BTC"] = np.array([1.0, 2.0, 3.0])
+
+    liq = md.liquidity("BTC", T0 + 4 * E.MS_MIN)
+
+    assert liq["adv"] == pytest.approx(600.0)
+    assert liq["adv_unavailable"] is False
+
+
+def test_liquidity_adv_uses_24h_wall_clock_for_sparse_bars():
+    md = E.MarketData(allow_mongo=False)
+    mins = np.array([T0, T0 + 48 * E.MS_HOUR], dtype="int64")
+    px = np.array([100.0, 100.0])
+    md._ohlc["xyz:TEST"] = (mins, px.copy(), px.copy(), px.copy(), px.copy())
+    md._volume["xyz:TEST"] = np.array([10.0, 2.0])
+
+    liq = md.liquidity("xyz:TEST", T0 + 48 * E.MS_HOUR + 2 * E.MS_MIN)
+
+    assert liq["adv"] == pytest.approx(200.0)
+
+
+def test_missing_adv_rejects_new_exposure_fail_closed():
+    class MissingAdv(FakeMarketData):
+        def liquidity(self, coin, ts_ms):
+            return {
+                "adv": 0.0,
+                "half_spread_bps": 1.0,
+                "uncalibrated": False,
+                "adv_unavailable": True,
+            }
+
+    md = MissingAdv(_flat_ohlc("BTC", T0 - 10 * E.MS_MIN, 600, 100.0))
+    out = _run(pd.DataFrame([_action("BTC", T0, 0.1)]), md)
+
+    assert out["summary"]["n_fills"] == 0
+    assert out["summary"]["n_rejected"] == 1
+    assert out["summary"]["adv_unavailable"] is True
+
+
+def test_market_data_mark_rejects_stale_asof_bar():
+    md = E.MarketData(allow_mongo=False)
+    px = np.array([100.0])
+    md._ohlc["BTC"] = (np.array([T0], dtype="int64"), px, px, px, px)
+
+    assert md.mark("BTC", T0 + E.MS_MIN, causal=True) == 100.0
+    assert md.mark("BTC", T0 + E.MARK_MAX_AGE_MS + 2 * E.MS_MIN, causal=True) is None
 
 
 def test_account_equity_derivation():
@@ -222,6 +312,26 @@ def test_market_liquidation_path_produces_liq_fill():
     if s["n_market_liq_orders"] >= 1:
         assert liq_fills and all(f["fee"] == 0.0 for f in liq_fills)   # forced-liq fills carry no fee
     assert s["final_equity"] >= -1e-6
+
+
+def test_market_liquidation_charges_full_order_adv_impact_above_floor():
+    md = FakeMarketData(
+        ohlc=_flat_ohlc("BTC", T0, 10, 100.0), adv=1_000.0,
+        half_spread_bps=1.0,
+    )
+    st = E.AccountState(cross_collateral={"main": 20_000.0})
+    st.positions["BTC"] = E.Position(
+        "BTC", szi=1_000.0, entry_px=100.0, mode="cross", leverage=10.0
+    )
+    summary = E._new_summary(None, None, 20_000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+    summary["_fills_ref"] = []
+    E._rt_open(summary, "BTC")
+    E._liq_close(st, md, "BTC", 100.0, T0 + E.MS_MIN, summary)
+    fill = summary["_fills_ref"][0]
+    total_slip = fill["half_spread_bps"] + fill["impact_bps"]
+    assert total_slip > E.FORCED_LIQ_SLIP_BPS
+    assert fill["our_fill_px"] < 100.0 * (1 - E.FORCED_LIQ_SLIP_BPS / 1e4)
+    assert fill["fee"] == 0.0
 
 
 def test_isolated_position_posts_margin_and_can_liquidate():
@@ -622,6 +732,9 @@ def test_follower_trail_force_close_ignores_min_notional_and_capacity():
                             end_ts_ms=T0 + 8 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     assert any(e.get("event_type") == "follower_trail_exit" for e in res["events"])
     assert res["ending_account_state"]["positions"] == {}, "no position (incl dust) may survive a breaker flatten"
+    btc_exit = max((f for f in res["fills"] if f["coin"] == "BTC"), key=lambda f: abs(f["our_fill_size"]))
+    capped_impact = E.DEFAULT_IMPACT_K_BPS * E.CAPACITY_PARTICIPATION_CAP ** E.DEFAULT_IMPACT_ALPHA
+    assert btc_exit["impact_bps"] > capped_impact, "forced-exit impact must use full order/ADV participation"
 
 
 # --------------------------------------------------------------------------- #

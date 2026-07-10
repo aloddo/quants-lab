@@ -91,7 +91,7 @@ def main():
     ap.add_argument("--post-offset-mult", type=float, default=1.0,
                     help="1.0=post at bid/ask (passive, adverse); 0.0=post at mark (reactive/join-leader).")
     ap.add_argument("--min-fills", type=int, default=20)
-    ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt")
+    ap.add_argument("--universe-file", default="app/data/v15/m01_universe_20k_wallets.txt")
     args = ap.parse_args()
     set_latency_ms(args.latency_s * 1000)
     global POST_OFFSET_MULT

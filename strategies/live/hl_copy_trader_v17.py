@@ -164,6 +164,24 @@ class CopyTrader:
         # #4 runaway backstop: flatten-all if total gross notional exceeds this x equity (NOT a mirror
         # cap -- a blow-up guard against margin mis-estimate). inf = pure uncapped (pending Alberto).
         self.gross_backstop_x = float(self.global_config.get("gross_backstop_x", float("inf")))
+
+        # ── CLUSTER MODE (2026-06-28, clustering + let-winners-run live test) ────────────────
+        # Gate entries on CLUSTERING: open ONE position per coin only when >= cluster_threshold
+        # distinct cohort wallets enter the same coin+side within cluster_window_s. Exit decoupled
+        # (our stop/trail/maxhold, NOT leader reverse-flow). All additive + guarded by cluster_mode.
+        self.cluster_mode = bool(self.global_config.get("cluster_mode", False))
+        self.cluster_threshold = int(self.global_config.get("cluster_threshold", 8))
+        self.cluster_window_s = float(self.global_config.get("cluster_window_s", 3600))
+        self.cluster_max_concurrent = int(self.global_config.get("cluster_max_concurrent", 5))
+        self.decoupled_exit = bool(self.global_config.get("decoupled_exit", False))
+        self._cluster_window = {}     # (coin, is_buy) -> list of (ts, wallet)  rolling cluster window
+        self._cluster_open = {}       # coin -> is_buy   (one cluster position per coin; netting)
+        self._cluster_pending = {}    # coin -> claim_ts (entry order in flight, not yet a filled position)
+        self._cluster_pending_timeout_s = 120.0  # release a stuck claim after this if no fill appears
+        self._cluster_audit = []      # per-trigger audit rows (also -> mongo v17_cluster_audit)
+        if self.cluster_mode:
+            logger.info(f"V17 CLUSTER MODE: threshold={self.cluster_threshold} window={self.cluster_window_s}s "
+                        f"decoupled_exit={self.decoupled_exit} size=${self.order_size} maxconc={self.cluster_max_concurrent}")
         self._baseline_equity = None      # session-start equity for the % global stop
         self._flatten_requested = False   # set by the % loss stops -> _check_exits flattens all
         self._trim_requested = False      # set by the gross backstop -> _check_exits TRIMS to target (self-heal)
@@ -202,6 +220,20 @@ class CopyTrader:
                 self.exchange = Exchange(
                     self.account, HL_API, account_address=self.agent_address,
                     perp_dexs=all_dexes,
+                )
+                # HARD-STOP FIX (2026-06-30): SDK market_close() resolves the position to close via
+                # info.user_state(account_address); agent_address (0xdf67) holds NO positions, so the
+                # emergency-flatten/trim would close NOTHING. Dedicated close-Exchange bound to the PARENT
+                # (0x11ca, where positions live) is used ONLY at the two bare market_close callsites. Agent
+                # key still signs. Entries/normal exits keep self.exchange (explicit coin/side/size order(),
+                # no user_state lookup) -- unchanged. Proven by tools/flatten_all_offline.py (PARENT addr).
+                # codex 2026-06-30: bounded HTTP timeout so a stalled SDK request in market_close
+                # (run inside _emergency_flatten/_emergency_trim via to_thread) cannot wedge the
+                # hard-stop loop with no retry. On timeout it raises -> except logs -> idempotent
+                # loop retries next poll until positions==0.
+                self.close_exchange = Exchange(
+                    self.account, HL_API, account_address=self.parent_address,
+                    perp_dexs=all_dexes, timeout=10,
                 )
                 break
             except Exception as e:
@@ -310,6 +342,15 @@ class CopyTrader:
         }
         self._last_successful_sync = 0
 
+        # Dedup/tracking state that the initial fill sync DEPENDS ON must exist before the sync runs.
+        # FIX 2026-06-28 (go-live): these were initialized ~20 lines below, so the boot
+        # _do_exchange_fill_sync() threw AttributeError on _seen_liq_tids and silently SKIPPED live
+        # reconciliation -> stale (shadow-era) PnL in STATS + phantom open positions. Moved up here;
+        # the later duplicate assignments were removed. (codex go-live finding follow-up.)
+        self._seen_tids = {}
+        self._seen_liq_tids = set()       # liquidation fill tids already recorded (dedup)
+        self._liquidated_coins = {}       # coin -> ts of last confirmed liquidation (reconciler trigger)
+
         # Initial sync from exchange (blocking, must succeed before trading)
         try:
             self._do_exchange_fill_sync()
@@ -333,9 +374,7 @@ class CopyTrader:
         self._mid_price_ts = {}
         self._exit_twap_buffer = {}
         self._book_depth = {}
-        self._seen_tids = {}
-        self._seen_liq_tids = set()       # liquidation fill tids already recorded (dedup)
-        self._liquidated_coins = {}       # coin -> ts of last confirmed liquidation (reconciler trigger)
+        # _seen_tids / _seen_liq_tids / _liquidated_coins moved ABOVE the boot fill sync (see fix note there).
         self._leverage_set = set()        # coins whose leverage/margin-mode we've set on the exchange
         self._leverage_set_fail = {}      # coin -> ts of last failed set (60s backoff before retry)
         self._post_exit_cooldown = {}  # (wallet, coin) -> timestamp of last exit
@@ -663,11 +702,33 @@ class CopyTrader:
 
             # Validate against exchange: sum tracked per coin vs exchange net
             self._validate_against_exchange()
+            self._seed_cluster_open_from_positions()
             return
 
         # Step 2: Fallback for first run (no DB state yet) -- old exchange-based recovery
         logger.info("No persistent state found, falling back to exchange-based recovery")
         self._recover_from_exchange()
+        self._seed_cluster_open_from_positions()
+
+    def _seed_cluster_open_from_positions(self):
+        """CLUSTER MODE: rebuild the per-coin netting claim from recovered positions after a restart
+        (codex r1 #4). Without this, _cluster_open is empty on boot and a coin that already holds an
+        open cluster position could be re-triggered (double-open). A recovered filled position is treated
+        as a settled (non-pending) claim."""
+        if not self.cluster_mode:
+            return
+        seeded = 0
+        for pos in self.positions:
+            if not pos.get('filled'):
+                continue
+            coin = pos['coin']
+            if coin in self._cluster_open:
+                continue
+            self._cluster_open[coin] = (pos.get('side') == 'BUY')   # long -> is_buy True
+            seeded += 1
+        if seeded:
+            logger.info(f"V17 CLUSTER: seeded {seeded} open-coin claim(s) from recovered positions: "
+                        f"{sorted(self._cluster_open)}")
 
     def _validate_against_exchange(self):
         """Compare DB-loaded positions against exchange. Warn on drift, don't overwrite."""
@@ -1585,8 +1646,13 @@ class CopyTrader:
     # ── Entry ────────────────────────────────────────────────────────────────
 
     async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None,
-                              skip_cooldown: bool = False):
+                              skip_cooldown: bool = False, notional_override: float = None):
         """Place an order to copy the target wallet's trade. Supports add-ons per wallet config.
+
+        notional_override: EXACT per-order notional (USD) for this ONE call, used by the backfill pass
+        so it never mutates the shared self.order_size (a real concurrent WS entry must keep reading the
+        config size). None (every non-backfill call) => size off self.order_size exactly as before. Only
+        honored in the fixed-mode sizing branch (backfill hard-aborts in proportional mode upstream).
 
         skip_cooldown: set True when the CALLER already checked + set the (wallet,coin) cooldown
         immediately before spawning this task. The instant-entry handler does exactly that ("Fix #5:
@@ -1731,12 +1797,17 @@ class CopyTrader:
                              f"(delta ${entry_notional:.0f} < min ${self.min_entry_notional:.0f}) -- no add")
                 return
         else:
-            entry_notional = self.order_size
+            # notional_override (backfill only): use the EXACT per-order notional threaded in, never the
+            # shared self.order_size (which a concurrent live WS entry must keep reading). None => config
+            # size, byte-identical to before.
+            entry_notional = notional_override if notional_override is not None else self.order_size
 
         # H17 x E1 BOTH-tilt: scale NEW entries (not add-ons) by the favored/unfavored multiplier.
         # Applied to entry_notional so the margin check, round_size, and pending-margin all see the
         # ACTUAL tilted notional (codex: tilt is the safe direction; sz<=0 + min_entry_notional guard dust).
-        if existing is None:
+        # P4: NEVER tilt a backfill order (notional_override set) -- the backfill size is exact and already
+        # clamped to [min_notional, max_notional]; a tilt could push it past the clamp.
+        if existing is None and notional_override is None:
             tilt_mult, _tilt_kopp = self._tilt_mult(twap_wallet, coin, is_buy)
         else:
             tilt_mult, _tilt_kopp = 1.0, None
@@ -1807,16 +1878,42 @@ class CopyTrader:
             self._pending_gross_notional = max(0, self._pending_gross_notional - entry_notional)
             return
 
-        # IOC taker entry
+        # IOC taker entry.
+        # The rest of the engine already retries transient failures (exit poll, leverage-set 60s
+        # backoff, reconcile REST fallback); the ENTRY path was the one gap -- a 429 on order
+        # placement dropped the copy signal (the 2026-07-06 MORPHO miss). A 429 means the request was
+        # THROTTLED, not placed, so retrying is safe (no double-fill); the aggressive IOC limit
+        # (best +/-30bps) prevents a bad fill regardless. Refresh the WS book each attempt so a moving
+        # market still gets a live aggressive limit. Bounded attempts + short backoff keep it fast.
         try:
-            if is_buy:
-                px = self._round_price(best_ask * 1.003)
-            else:
-                px = self._round_price(best_bid * 0.997)
-
-            result = await asyncio.to_thread(
-                self.exchange.order, coin, is_buy, sz, px, {"limit": {"tif": "Ioc"}}
-            )
+            result = None
+            _ENTRY_MAX_ATTEMPTS = 3
+            for _attempt in range(_ENTRY_MAX_ATTEMPTS):
+                if is_buy:
+                    px = self._round_price(best_ask * 1.003)
+                else:
+                    px = self._round_price(best_bid * 0.997)
+                try:
+                    result = await asyncio.to_thread(
+                        self.exchange.order, coin, is_buy, sz, px, {"limit": {"tif": "Ioc"}}
+                    )
+                    break  # got an exchange RESPONSE (fill / reject / no-fill) -- never retry a placed order
+                except Exception as _oe:
+                    _is_rate_limit = "429" in str(_oe) or (
+                        isinstance(getattr(_oe, "args", None), tuple) and _oe.args and _oe.args[0] == 429
+                    )
+                    if _is_rate_limit and _attempt < _ENTRY_MAX_ATTEMPTS - 1:
+                        logger.warning(
+                            f"ENTRY 429 rate-limited {coin} (attempt {_attempt+1}/{_ENTRY_MAX_ATTEMPTS}) "
+                            f"-- refreshing book + retrying"
+                        )
+                        await asyncio.sleep(0.4 * (_attempt + 1))
+                        _rb = self._book_depth.get(coin)
+                        if _rb and _rb.get("best_bid") and _rb.get("best_ask"):
+                            best_bid = _rb["best_bid"]
+                            best_ask = _rb["best_ask"]
+                        continue
+                    raise  # non-429, or 429 attempts exhausted -> outer handler logs "Entry error" + drops
             statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
 
             if statuses and "filled" in statuses[0]:
@@ -1928,7 +2025,8 @@ class CopyTrader:
                     n += 1
                     try:
                         # SDK market-close: reduce-only market order at default slippage, no book needed.
-                        await asyncio.to_thread(self.exchange.market_close, coin)
+                        # close_exchange bound to PARENT so user_state finds the position (hard-stop fix 2026-06-30).
+                        await asyncio.to_thread(self.close_exchange.market_close, coin)
                         logger.error(f"EMERGENCY FLATTEN: market_close {coin} szi={szi}")
                     except Exception as e:
                         logger.error(f"EMERGENCY FLATTEN failed {coin}: {e}")
@@ -1978,7 +2076,8 @@ class CopyTrader:
             if cur_gross <= target_notional:
                 break
             try:
-                await asyncio.to_thread(self.exchange.market_close, coin)
+                # close_exchange bound to PARENT so user_state finds the position (hard-stop fix 2026-06-30).
+                await asyncio.to_thread(self.close_exchange.market_close, coin)
                 cur_gross -= notional
                 logger.error(f"GROSS TRIM: market_close {coin} (notional ${notional:.0f} uPnL ${upnl:.2f}); "
                              f"gross -> ~${cur_gross:.0f} / target ${target_notional:.0f}")
@@ -2172,6 +2271,12 @@ class CopyTrader:
                     still_open.append(pos)
                 continue
 
+            # DECOUPLED EXIT (cluster let-winners-run): do NOT mirror the leader's exit. The SL / trailing /
+            # max-hold layers above are the ONLY exits. Skip the reverse-flow path and keep the position open.
+            if self.decoupled_exit:
+                still_open.append(pos)
+                continue
+
             # PRIMARY EXIT: trade-stream based reverse TWAP detection
             exit_key = (wallet, coin)
             exit_min_trim_pct = self.global_config.get("exit_min_trim_pct", 0.05)
@@ -2270,6 +2375,27 @@ class CopyTrader:
         known_ids = {id(pos) for pos in still_open} | exited_ids
         new_during_exit = [p for p in self.positions if id(p) not in known_ids]
         self.positions = still_open + new_during_exit
+
+        # CLUSTER MODE: reconcile _cluster_open -> a coin that no longer has an open position is released
+        # so a future cluster can re-trigger it. (Audit of realized exits is captured by the engine's
+        # exchange-truth fill stream + v17_cluster_audit triggers; PnL is read from the exchange, not here.)
+        if self.cluster_mode and self._cluster_open:
+            open_coins = {p['coin'] for p in self.positions if p.get('filled')}
+            _now = time.time()
+            for c in list(self._cluster_open):
+                if c in open_coins:
+                    self._cluster_pending.pop(c, None)   # entry filled -> no longer pending
+                    continue
+                # Not filled. Do NOT release while the entry order is still in flight (codex r1 #3):
+                # a premature release lets a second trigger double-submit before the first fills.
+                pend_ts = self._cluster_pending.get(c)
+                if pend_ts is not None and (_now - pend_ts) < self._cluster_pending_timeout_s:
+                    continue                              # order in flight -> keep the claim
+                if pend_ts is not None:
+                    logger.warning(f"V17 CLUSTER: {c} claim pending {_now - pend_ts:.0f}s with no fill -> releasing (stuck order)")
+                self._cluster_open.pop(c, None)
+                self._cluster_pending.pop(c, None)
+                logger.info(f"V17 CLUSTER: {c} position closed/unfilled -> released (can re-trigger)")
 
     async def _exit_position(self, pos: dict, trim_size: float = None) -> bool:
         """Exit a position (full or partial trim).
@@ -2777,9 +2903,52 @@ class CopyTrader:
                     ebuf['reverse_notional'] += notional
                     ebuf['count'] += 1
 
+    def _cluster_gate(self, wallet: str, coin: str, is_buy: bool, now: float) -> bool:
+        """CLUSTER MODE gate. Records this cohort-wallet entry in the rolling (coin,is_buy) window and
+        returns True ONLY when a fresh cluster should OPEN one position for this coin: >= threshold distinct
+        wallets within cluster_window_s, no existing cluster position on the coin (netting), concurrency ok.
+        Otherwise accumulates and returns False. Liquid-whitelist enforced by the existing V16 guard."""
+        # codex r2 must-fix: only TRUE leader OPENS may pollute the cluster window. Reverse/close flows are
+        # routed into this base handler (for exit handling) but with decoupled_exit they are ignored as exits;
+        # if recorded here they would survive in the 1h window and, after our position closes + the coin is
+        # released, count toward a FALSE opposite-side cluster. _is_opening_trade is a pure read (no side effects).
+        if not self._is_opening_trade(wallet, coin, is_buy):
+            return False
+        key = (coin, is_buy)
+        w = self._cluster_window.setdefault(key, [])
+        w.append((now, wallet))
+        cutoff = now - self.cluster_window_s
+        # prune BOTH sides' stale entries for this coin (keep memory strictly bounded -- codex r1 #8)
+        for side_key in ((coin, True), (coin, False)):
+            if side_key in self._cluster_window:
+                pruned = [(t, x) for (t, x) in self._cluster_window[side_key] if t >= cutoff]
+                if pruned:
+                    self._cluster_window[side_key] = pruned
+                else:
+                    self._cluster_window.pop(side_key, None)
+        if coin in self._cluster_open or coin in self._cluster_pending:
+            return False                      # already long/short OR entry in flight -> net (one position/coin)
+        distinct = len({x for (t, x) in self._cluster_window[key]})
+        if distinct < self.cluster_threshold:
+            return False                      # accumulate; not enough consensus yet
+        if len(self._cluster_open) >= self.cluster_max_concurrent:
+            logger.info(f"V17 CLUSTER: {coin} trigger ({distinct} wallets) but concurrency full ({len(self._cluster_open)})")
+            return False
+        self._cluster_open[coin] = is_buy     # claim the coin BEFORE the async order (prevents double-open)
+        self._cluster_pending[coin] = now     # entry in flight; reconcile must NOT release until fill or timeout
+        self._cluster_audit.append({"ts": now, "coin": coin, "side": "BUY" if is_buy else "SELL",
+                                    "n_wallets": distinct, "trigger_wallet": wallet})
+        logger.warning(f"V17 CLUSTER TRIGGER: {coin} {'BUY' if is_buy else 'SELL'} -- {distinct} distinct good "
+                       f"wallets in {self.cluster_window_s:.0f}s -> OPEN 1 position")
+        _tg(f"CLUSTER TRIGGER: {coin} {'BUY' if is_buy else 'SELL'} ({distinct} good wallets) -> opening")
+        return True
+
     def _handle_instant_entry(self, wallet: str, coin: str, is_buy: bool,
                                px: float, notional: float, now: float, wc: dict):
         """V10-style immediate entry with entry guards."""
+        # CLUSTER MODE: gate on multi-wallet clustering; open ONE position per coin on threshold (else accumulate).
+        if self.cluster_mode and not self._cluster_gate(wallet, coin, is_buy, now):
+            return
         cooldown_s = self.global_config["cooldown_s"]
         max_chase_bps = self.global_config["max_chase_bps"]
         max_spread_bps = self.global_config["max_spread_bps"]
@@ -2892,6 +3061,10 @@ class CopyTrader:
     def _handle_twap_entry(self, wallet: str, coin: str, is_buy: bool,
                             px: float, notional: float, now: float, wc: dict):
         """V9-style TWAP accumulation entry."""
+        # CLUSTER MODE: gate on clustering (defensive -- cluster config forces entry_mode=instant, but if any
+        # wallet routes here, the same gate applies so we never open an ungated cluster position).
+        if self.cluster_mode and not self._cluster_gate(wallet, coin, is_buy, now):
+            return
         twap_window_s = wc.get("twap_window_s", 120)
         min_twap_notional = wc.get("min_twap_notional", 100)
 
@@ -4236,6 +4409,17 @@ class CopyTrader:
                     }))
 
                     logger.info("WS subscribed")
+
+                    # BACKFILL: spawn the one-shot startup pass after marks warm up (OFF unless
+                    # global.backfill.enabled). Guarded by _backfill_task_spawned + _backfill_done so
+                    # WS reconnects never spawn a duplicate. getattr-default keeps a bare base instance
+                    # byte-identical when the flag/block is absent.
+                    if getattr(self, "_backfill_enabled", False) \
+                            and not getattr(self, "_backfill_task_spawned", False) \
+                            and not getattr(self, "_backfill_done", False):
+                        self._backfill_task_spawned = True
+                        asyncio.create_task(self._backfill_after_warmup())
+
                     if not hasattr(self, '_ws_ever_connected'):
                         self._ws_ever_connected = True
                         _tg(
@@ -4333,6 +4517,28 @@ class V16CopyTrader(CopyTrader):
     """V15 engine + liquid whitelist guard + faithful-copy config asserts."""
 
     def __init__(self, config_path: str, order_size_override: float = None, shadow: bool = False):
+        # ── PRE-SUPER FAIL-CLOSED: a sub-30 cohort is UNVALIDATED and allowed only in shadow. The
+        # full guard re-checks below, but base.__init__ can do startup exchange side-effects (recovery,
+        # leverage setup) before that guard raises -- so we reject a sub-30 LIVE config from the RAW
+        # file here, before super() touches the account at all. (codex gate B follow-up 2026-06-28.)
+        with open(config_path) as _f:
+            _raw_g = json.load(_f).get("global", {})
+        _gmc = int(_raw_g.get("min_cohort_wallets", 30))
+        # A sub-30 cohort is below the validated-density floor. It is allowed live ONLY with an
+        # EXPLICIT, auditable authorization flag (live_below_floor_authorized=true) -- never silently.
+        # Set 2026-06-28 on Alberto's direct voice GO ("just go alive", TG voice 10244/10255) to take
+        # the corrected K=20 setcover selection live at small size. See global.v17_authorization.
+        _below_floor_ok = bool(_raw_g.get("live_below_floor_authorized", False))
+        if _gmc < 30 and not shadow and not _below_floor_ok:
+            raise ValueError(
+                f"min_cohort_wallets={_gmc} (<30) declares an UNVALIDATED cohort -- allowed live ONLY "
+                f"with live_below_floor_authorized=true; refusing to start live (pre-super fail-closed, "
+                f"no account mutation)")
+        if _gmc < 30 and not shadow and _below_floor_ok:
+            logger.warning(
+                f"LIVE BELOW FLOOR: min_cohort_wallets={_gmc} (<30 validated floor) + "
+                f"live_below_floor_authorized=true -- REAL-CAPITAL run on a below-density cohort. "
+                f"Auth: {_raw_g.get('v17_authorization', '<none>')}")
         # ── PnL epoch BEFORE super().__init__: the base engine runs its blocking fill sync INSIDE
         # __init__, and that sync reads self.pnl_epoch_ms. Setting it afterwards let the first sync
         # fall back to the legacy V9 epoch and pollute v16_exchange_fills with pre-V16 history
@@ -4403,7 +4609,25 @@ class V16CopyTrader(CopyTrader):
         _req(abs(float(g.get("full_exit_trim_pct", 0.90)) - float(g["exit_min_trim_pct"])) < 1e-9,
              "full_exit_trim_pct must equal exit_min_trim_pct (no partial-trim band; codex r2 #2)")
         n_wallets = len(self.wallet_configs)
-        _req(n_wallets >= 30, f"cohort {n_wallets} < 30 minimum (re-run selection)")
+        # ── wallet floor: config-gated, default 30 (the validated-cohort floor). Lowering it below
+        # 30 declares "this is no longer the validated V16/V17 cohort" -- so it is allowed ONLY in
+        # shadow (no real orders). A sub-30 floor with shadow=False is rejected so this can never
+        # silently become a live-capital config. (2026-06-28 Alberto GO on K=20 shadow; codex gate B.)
+        min_cohort = int(g.get("min_cohort_wallets", 30))
+        below_floor_ok = bool(g.get("live_below_floor_authorized", False))
+        # Emergency reduced-cohort live control: after a live leader-quality failure,
+        # rejected wallets may need to be removed before a replacement cohort exists.
+        # Live sub-30 remains gated by live_below_floor_authorized below.
+        _req(1 <= min_cohort <= 100, f"min_cohort_wallets {min_cohort} out of [1,100]")
+        if min_cohort < 30:
+            _req(self.shadow_mode or below_floor_ok,
+                 f"min_cohort_wallets={min_cohort} (<30) declares an UNVALIDATED cohort -- "
+                 f"allowed live ONLY with live_below_floor_authorized=true")
+            logger.warning(
+                f"V16 WALLET FLOOR LOWERED TO {min_cohort} (<30 validated floor) -- "
+                f"{'SHADOW (no real orders)' if self.shadow_mode else 'LIVE (explicitly authorized below floor)'}. "
+                f"This is NOT the validated V16/V17 cohort.")
+        _req(n_wallets >= min_cohort, f"cohort {n_wallets} < {min_cohort} minimum (min_cohort_wallets)")
         _req(n_wallets <= 100, f"cohort {n_wallets} > 100 cap")
 
         # ── 3. feed scope: subscribe trades ONLY for whitelist coins (base subscribes everything).
@@ -4442,6 +4666,33 @@ class V16CopyTrader(CopyTrader):
                 upsert=True)
             self.pnl_epoch_ms = int(self.db.v16_meta.find_one({"_id": "epoch"})["epoch_ms"])
         logger.info(f"V16 PnL epoch: {datetime.fromtimestamp(self.pnl_epoch_ms/1000, timezone.utc)}")
+
+        # ── BACKFILL entry mode (OFF BY DEFAULT). Optional global.backfill block. When the block is
+        # absent, _backfill_enabled=False and behavior is byte-identical to pre-backfill (no task
+        # spawned, no order_size mutation, no ledger side effects beyond an empty read). See
+        # _backfill_existing / _backfill_after_warmup. Idempotency ledger loaded here so a KeepAlive
+        # restart never re-backfills (wallet:coin) and stacks.
+        _bf = g.get("backfill") or {}
+        self._backfill_enabled = bool(_bf.get("enabled", False))
+        self._backfill_target_lev = float(_bf.get("target_leverage", 5.0))
+        self._backfill_warmup_s = int(_bf.get("warmup_s", 25))
+        self._backfill_throttle_ms = int(_bf.get("throttle_ms", 400))
+        self._backfill_min_notional = float(_bf.get("min_notional_usd", 12.0))
+        self._backfill_max_notional = float(_bf.get("max_notional_usd", 150.0))
+        self._backfill_done = False
+        self._backfill_task_spawned = False
+        self._backfilled_keys = set()
+        try:
+            for _d in self.db.v17_backfill_ledger.find({}, {"_id": 1}):
+                self._backfilled_keys.add(_d["_id"])
+        except Exception as _e:
+            logger.warning(f"BACKFILL: ledger preload failed ({_e}); in-memory set empty "
+                           f"(idempotency still enforced by held-coin check before every open)")
+        if self._backfill_enabled:
+            logger.info(
+                f"BACKFILL ENABLED: target={self._backfill_target_lev}x warmup={self._backfill_warmup_s}s "
+                f"throttle={self._backfill_throttle_ms}ms clamp=[${self._backfill_min_notional:.0f},"
+                f"${self._backfill_max_notional:.0f}] ledger_preloaded={len(self._backfilled_keys)}")
 
         logger.info(
             f"V16 READY: cohort={n_wallets} wallets (asof {g['cohort_asof']}), "
@@ -4540,14 +4791,15 @@ class V16CopyTrader(CopyTrader):
 
     # ── choke point 2: order path -- nothing outside the whitelist can ever reach the exchange ──────
     async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None,
-                              skip_cooldown: bool = False):
+                              skip_cooldown: bool = False, notional_override: float = None):
         if coin not in self.coin_whitelist:
             logger.error(f"V16 GUARD BREACH BLOCKED: _enter_position called for non-whitelist {coin} "
                          f"(wallet={wallet}) -- investigate the caller")
             _tg(f"V16 GUARD: blocked non-whitelist entry attempt {coin}")
             return
         return await super()._enter_position(coin, is_buy, twap_dedup_key=twap_dedup_key,
-                                             wallet=wallet, skip_cooldown=skip_cooldown)
+                                             wallet=wallet, skip_cooldown=skip_cooldown,
+                                             notional_override=notional_override)
 
     # ── codex finding #4: TAKER/IOC exits for V16. The base engine posts a maker (ALO) exit and waits
     # up to 60s before IOC fallback -- unmodeled delay + adverse selection, worst on SL/trail exits.
@@ -4559,6 +4811,153 @@ class V16CopyTrader(CopyTrader):
             pos['_maker_exit_time'] = 0.0         # elapsed >= 60s instantly -> IOC path now
         return await super()._exit_position(pos, trim_size=trim_size)
 
+    # ── BACKFILL PASS (OFF BY DEFAULT via global.backfill.enabled) ─────────────────────────────────
+    # Once per process, after a warmup that lets marks populate, open ONE position matching each
+    # leader's CURRENTLY-HELD position (self._v16_leader_pos) so pre-existing holdings are copied, not
+    # just fresh opens; adds/trims/exits then copy normally through the live signal path. Idempotent
+    # across the frequent KeepAlive restarts via the Mongo v17_backfill_ledger + a held-coin check.
+    # REUSES self._enter_position (whitelist guard, spread/depth/mark gates, per-coin/gross/margin
+    # caps, 429-retry) -- no gate is bypassed. Sizing reaches toward target_leverage across breadth,
+    # every order clamped to [min_notional, max_notional]; the engine's gross/margin caps bound total.
+    async def _backfill_after_warmup(self):
+        try:
+            await asyncio.sleep(self._backfill_warmup_s)
+            await self._backfill_existing()
+        except Exception as e:
+            logger.error(f"BACKFILL after-warmup error: {e}")
+
+    async def _backfill_existing(self):
+        # fail-closed guards
+        if not getattr(self, "_backfill_enabled", False):
+            return
+        if self._backfill_done:
+            return
+        if not getattr(self, "_v17_trading_enabled", False):
+            logger.info("BACKFILL: skipped (trading not enabled / seed incomplete)")
+            return
+        # latch DONE first so a mid-pass error or a WS reconnect can never re-trigger the pass
+        self._backfill_done = True
+        if getattr(self, "_kill_switch_active", False):
+            logger.warning("BACKFILL: kill switch active -- pass aborted before any open")
+            return
+        # P2: backfill sizing (notional_override) is only honored in the fixed-mode sizing branch. In
+        # proportional mode the base would size to the FULL leader-exposure delta and ignore the clamp,
+        # so hard-abort. V16 __init__ already asserts sizing_mode=="fixed"; this is defense-in-depth.
+        if getattr(self, "sizing_mode", "fixed") != "fixed":
+            logger.warning(f"BACKFILL: sizing_mode={self.sizing_mode!r} != 'fixed' -- pass aborted "
+                           f"(backfill sizing is fixed-mode only; proportional would ignore the clamp)")
+            try:
+                _tg(f"BACKFILL ABORTED: sizing_mode={self.sizing_mode} (fixed-mode only)")
+            except Exception:
+                pass
+            return
+
+        eps = 1e-12
+        held_coins = {p["coin"] for p in self.positions if p.get("filled")}
+        eligible = []
+        for (waddr, coin), sz in self._v16_leader_pos.items():
+            if abs(sz) <= eps:
+                continue
+            if coin not in self.coin_whitelist:
+                continue
+            key = f"{waddr}:{coin}"
+            if key in self._backfilled_keys:
+                continue
+            if coin in held_coins:
+                continue
+            eligible.append((waddr, coin, float(sz), key))
+
+        n_elig = len(eligible)
+        if n_elig == 0:
+            logger.info("BACKFILL: 0 eligible leader holdings (all already held/ledgered or empty book)")
+            try:
+                _tg("BACKFILL PASS: 0 eligible holdings (already held/ledgered or empty leader book)")
+            except Exception:
+                pass
+            return
+
+        # sizing toward target_leverage across breadth, clamped per order.
+        # _equity_cache is HL spot-only USDC (Hard Rule 16); STATS reports the same value as `eq`.
+        eq = float(getattr(self, "_equity_cache", 0.0) or 0.0)
+        raw = (self._backfill_target_lev * eq) / n_elig if eq > 0 else self._backfill_min_notional
+        backfill_size = max(self._backfill_min_notional, min(self._backfill_max_notional, raw))
+
+        opened = 0
+        skipped_held = 0
+        skipped_ledger = 0
+        skipped_noopen = 0    # _enter_position returned/raised without landing a position (gate/no-price/cap)
+        gross_opened = 0.0
+
+        # P1: DO NOT mutate the shared self.order_size. The pass runs ~warmup_s AFTER WS subscribe, so
+        # real live WS entries run CONCURRENTLY; mutating order_size would mis-size a REAL leader-open.
+        # Each backfill open threads its exact size via notional_override (base honors it in fixed mode).
+        logger.info(
+            f"BACKFILL PASS start: {n_elig} eligible, size=${backfill_size:.2f} "
+            f"(target {self._backfill_target_lev}x on eq ${eq:.0f}), throttle {self._backfill_throttle_ms}ms")
+        for (waddr, coin, sz, key) in eligible:
+            if not self.running:
+                logger.warning("BACKFILL: engine stopping -- pass halted")
+                break
+            if getattr(self, "_kill_switch_active", False):
+                logger.warning("BACKFILL: kill switch active -- pass halted mid-way")
+                break
+            # re-check just-before-open (state can change during throttle sleeps / concurrent fills)
+            if key in self._backfilled_keys:
+                skipped_ledger += 1
+                continue
+            if coin in {p["coin"] for p in self.positions if p.get("filled")}:
+                skipped_held += 1
+                continue
+            is_buy = sz > 0
+            # P3: capture whether OUR (coin, wallet) already has a filled lot BEFORE the open, so the
+            # landed-check keys on THIS backfill's coin+wallet -- never on list length, which a
+            # concurrent WS entry on a DIFFERENT coin would satisfy and poison the ledger.
+            had_before = any(p.get("filled") and p.get("coin") == coin and p.get("wallet") == waddr
+                             for p in self.positions)
+            try:
+                # backfill=True skips ONLY the class-A signal-freshness vetoes (stale-tracker + knet-
+                # stamp); ALL class-B risk/exposure caps stay in force. notional_override sizes THIS
+                # order exactly, without touching shared order_size (P1).
+                await self._enter_position(coin, is_buy, wallet=waddr, backfill=True,
+                                           notional_override=backfill_size)
+            except Exception as e:
+                skipped_noopen += 1
+                logger.error(f"BACKFILL open failed {coin} {waddr[:10]}: {e}")
+                await asyncio.sleep(self._backfill_throttle_ms / 1000.0)
+                continue
+            # Ledger ONLY when THIS open actually landed: a filled lot for (coin, wallet) that did not
+            # exist before this open. _enter_position appends to self.positions synchronously within the
+            # await on fill; it can also return early (no fresh mark / cap gate) WITHOUT opening --
+            # ledgering those would permanently block a valid holding from ever backfilling, so we don't.
+            landed = any(p.get("filled") and p.get("coin") == coin and p.get("wallet") == waddr
+                         for p in self.positions) and not had_before
+            if landed:
+                self._backfilled_keys.add(key)
+                try:
+                    self.db.v17_backfill_ledger.update_one(
+                        {"_id": key},
+                        {"$setOnInsert": {"wallet": waddr, "coin": coin,
+                                          "ts": datetime.now(timezone.utc)}},
+                        upsert=True)
+                except Exception as e:
+                    logger.error(f"BACKFILL ledger write failed {key}: {e}")
+                opened += 1
+                gross_opened += backfill_size
+            else:
+                skipped_noopen += 1
+                logger.info(f"BACKFILL: {coin} {waddr[:10]} open returned no position "
+                            f"(gate/no-price/cap -- not ledgered, retried next restart)")
+            await asyncio.sleep(self._backfill_throttle_ms / 1000.0)
+
+        logger.info(
+            f"BACKFILL PASS done: opened {opened} (~${gross_opened:.0f} gross), "
+            f"skipped {skipped_held} held / {skipped_ledger} ledgered / {skipped_noopen} gate-or-fail")
+        try:
+            _tg(f"BACKFILL PASS: opened {opened} (~${gross_opened:.0f} gross), "
+                f"skipped {skipped_held} held / {skipped_ledger} ledgered; "
+                f"target {self._backfill_target_lev}x")
+        except Exception:
+            pass
 
 
 # ===== v17 layer (entry gate + expansion) =====
@@ -5270,7 +5669,17 @@ class V17CopyTrader(V16CopyTrader):
 
     # ── order path: gate + caps + seed/staleness kills, then defer to V16 (whitelist) ──
     async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None,
-                              skip_cooldown: bool = False):
+                              skip_cooldown: bool = False, backfill: bool = False,
+                              notional_override: float = None):
+        # backfill=True (startup one-shot pass only): skip ONLY the class-(A) SIGNAL-FRESHNESS vetoes
+        # (stale-tracker + knet-stamp), because a currently-held leader position has no fresh signal
+        # stamp by design. EVERY class-(B) risk/exposure cap below stays fully in force: trading-enabled
+        # switch, gross-backstop TRIM, per-coin expansion kill, netx cap, coin-side cap, and (via
+        # super()) whitelist guard, cooldown, spread/depth/mark gate, per-coin/gross/margin budget.
+        wc = self._wallet_config(wallet or "")
+        if bool(wc.get("entry_disabled", False)):
+            logger.warning(f"V17 ENTRY BLOCKED (wallet entry_disabled): {coin} {wallet}")
+            return
         if not self._v17_trading_enabled:
             self._v17_stale_rejects += 1
             logger.warning(f"V17 ENTRY BLOCKED (trading_disabled/seed): {coin} {wallet}")
@@ -5290,17 +5699,20 @@ class V17CopyTrader(V16CopyTrader):
             logger.warning(f"V17 EXPANSION KILL: ENTRY blocked for disabled new coin {coin} "
                            f"(wallet={wallet}); existing position exits normally.")
             return
-        # stale-tracker kill: knet is meaningless if we have not seen target flow recently
+        # stale-tracker kill (class A, signal-freshness): knet is meaningless if we have not seen
+        # target flow recently. Bypassed for backfill (currently-held position has no recent fill).
         age = time.time() - self._v17_last_target_fill_ts
-        if age > 30.0:
+        if age > 30.0 and not backfill:
             self._v17_stale_rejects += 1
             logger.warning(f"V17 STALE-TRACKER: last target fill {age:.0f}s ago; entry blocked {coin}")
             return
 
-        # knet gate: consume the signal-time stamp (FIFO). Missing/expired stamp = REJECT
-        # (codex P1.3: recompute-at-entry-time is a different, unvalidated gate; recovery and
-        # non-signal paths must not open NEW risk).
-        q = self._v17_knet_pending.get((wallet, coin))
+        # knet gate (class A, signal-freshness): consume the signal-time stamp (FIFO). Missing/expired
+        # stamp = REJECT (codex P1.3: recompute-at-entry-time is a different, unvalidated gate; recovery
+        # and non-signal paths must not open NEW risk). For backfill: do NOT even read _v17_knet_pending
+        # (q=None => stamp never consumed, so a concurrently-pending REAL signal is untouched), k stays
+        # None, and both the no-stamp reject and the knet-min gate below are skipped.
+        q = self._v17_knet_pending.get((wallet, coin)) if not backfill else None
         k = None
         while q:
             cand = q.pop(0)
@@ -5309,12 +5721,12 @@ class V17CopyTrader(V16CopyTrader):
                 break
         if q is not None and not q:
             self._v17_knet_pending.pop((wallet, coin), None)
-        if k is None:
+        if k is None and not backfill:
             self._v17_stale_rejects += 1
             logger.warning(f"V17 NO-STAMP REJECT: {coin} {'BUY' if is_buy else 'SELL'} wallet={wallet} "
                            f"(no fresh signal-time knet; non-signal entries do not open risk)")
             return
-        if k < self._v17_knet_min:
+        if k is not None and k < self._v17_knet_min:
             # knet-fix (Alberto 9745/9747, validated 2026-06-19 knet_fix_backtest.py): a SHORT that REDUCES
             # our EXISTING net-long exposure on THIS coin is a de-risking trade. The knet-blocked contrarian
             # shorts are +130bps/88% win historically (vs +224bps for knet-allowed), so the blocked tail is
@@ -5377,7 +5789,12 @@ class V17CopyTrader(V16CopyTrader):
         #    bakes in whatever tilt they were opened with (more accurate than the old order_size proxy).
         eq = max(float(getattr(self, "_equity_cache", 0.0) or 0.0), 1.0)
         side_new = 1 if is_buy else -1
-        resv = self.order_size * self._tilt_cap   # conservative reserved notional for the new entry
+        # conservative reserved notional for the new entry (drives the netx + coin-side caps AND the
+        # in-flight reservation below). Normal path: order_size * tilt_cap (over-reserve for tilt).
+        # Backfill: the order notional is EXACTLY notional_override with tilt forced to 1.0 (P4), so
+        # reserve exactly that -- reserving the smaller config order_size would under-reserve and let a
+        # large backfill order slip past the netx/coin-side caps.
+        resv = (notional_override if notional_override is not None else self.order_size * self._tilt_cap)
         net = float(self._v17_pending_net)
         coin_side = float(self._v17_pending_coin_side.get((coin, side_new), 0.0))
         for p in self.positions:
@@ -5444,7 +5861,8 @@ class V17CopyTrader(V16CopyTrader):
             self._v17_pending_coin_side.get((coin, side_new), 0.0) + resv
         try:
             return await super()._enter_position(coin, is_buy, twap_dedup_key=twap_dedup_key,
-                                                 wallet=wallet, skip_cooldown=skip_cooldown)
+                                                 wallet=wallet, skip_cooldown=skip_cooldown,
+                                                 notional_override=notional_override)
         finally:
             self._v17_pending_net -= side_new * resv
             _rem = self._v17_pending_coin_side.get((coin, side_new), 0.0) - resv

@@ -34,7 +34,7 @@ METHOD (re-anchored forward walk, adapted from v8 compute_eq_at):
     For each weekly perpAllTime anchor (t_a, eq_a):
       seed pre-anchor positions; snap cash := eq_a - Sum pos*mark(t_a);
       walk the merged fill/ledger/funding event stream in (t_a, t]:
-        fill   -> cash += -signed_sz*px - (fee+builderFee+deployerFee);
+        fill   -> cash += -signed_sz*px - fee;
                   pos[coin] += signed_sz
         ledger -> cash += taxonomy_cash_delta; ext_flow_cum += neutralize_delta
         funding-> cash += usdc
@@ -55,7 +55,8 @@ DATA SOURCES (all LOCAL except the API anchor + today cross-check):
     ts. Candles END 2026-05-23 13:55 UTC -> window end clamped to 2026-05-23.
 
 OUTPUTS (parquet, one row per wallet-DAY):
-    wallet, date, equity_usd, cash, position_value_usd, n_positions,
+    wallet, date, equity_usd, cash, position_value_usd,
+    gross_position_notional_usd, n_positions,
     ext_flow_cum (true series cumulative), segment_ext_flow (per-anchor segment),
     n_unmarkable_positions, unmarkable_notional_usd, anchor_age_h,
     return_since_anchor_pct, recon_incomplete, has_liquidation_in_day,
@@ -166,6 +167,9 @@ ZERO_LEDGER_TYPES = frozenset(
         "spotTransfer",
         "cStakingTransfer",
         "spotGenesis",
+        # Informational liquidation summary. Liquidation position/cash effects
+        # are already represented by the corresponding fills and their fees.
+        "liquidation",
         # staking / validator layer (do not touch USDC perp account):
         "CDeposit",
         "CWithdrawal",
@@ -259,13 +263,20 @@ def get_mark(coin: str, ts_ms: int, causal: bool = False) -> Optional[float]:
 # not over-flag thin HIP-3 instruments; bump back toward 60min only if the audit shows false positives.
 CANDLE_MAX_AGE_MS = 15 * 60 * 1000  # 15min (matches ASSETCTX_MAX_AGE_MS)
 
+# Equity-dependent selection requires repeated out-of-sample anchor checks.
+# One or zero segments is not enough evidence that the reconstruction is
+# stable; such wallets remain usable only in the equity-independent lane.
+MIN_INTER_ANCHOR_CHECKS = 2
 
-# Oracle (setOracle) mark series, per-coin in-memory asof cache. Mirrors _coin_series.
-# Oracle is the EXACT mark HL uses for accountValue on HIP-3 dexes. ORACLE_MAX_AGE_MS
-# caps how stale an at-or-before oracle point may be before we fall back to the candle
-# (extract cadence is 30-60min; slow exotic commodities -> a few hours is safe).
+
+# Oracle/setOracle series, per-coin in-memory asof cache. ``mark_px`` is the
+# exact account-value mark when observed, but a sparse historical extraction is
+# not permission to reuse it for hours. The 30-wallet multi-dex sensitivity
+# showed 15 minutes weakly dominated 6 hours on inter-anchor drift (6 improved,
+# 0 worsened for median drift; 7 improved, 0 worsened for max drift). Older
+# observations therefore fall back to the contemporaneous trade candle.
 _oracle_series: dict[str, tuple] = {}
-ORACLE_MAX_AGE_MS = 6 * 3600 * 1000  # 6h staleness cap
+ORACLE_MAX_AGE_MS = 15 * 60 * 1000
 
 
 def _load_oracle_from_mongo(coin: str) -> tuple:
@@ -540,12 +551,17 @@ def _coin_series(coin: str) -> tuple:
 
 
 def coin_is_spot(coin: str) -> bool:
-    """@-prefix = spot token; USDC = the quote asset. Both excluded from perp."""
-    return coin.startswith("@") or coin == "USDC"
+    """Return true for non-perp trade assets excluded from reconstruction.
+
+    ``@`` and slash-delimited symbols denote spot pairs; ``#`` denotes HIP-4
+    outcome markets. Outcome fills have Buy/Sell/Settlement semantics, not perp
+    position semantics.
+    """
+    return coin.startswith(("@", "#")) or "/" in coin or coin == "USDC"
 
 
 def coin_is_dropped(coin: str) -> bool:
-    """flx: perps are dropped from the V15 reconstruction (Alberto directive)."""
+    """Return whether a configured perp-dex prefix is excluded."""
     return any(coin.startswith(p) for p in DROPPED_DEX_PREFIXES)
 
 
@@ -561,8 +577,8 @@ def coin_dex(coin: str) -> str:
 # `dex` param is IGNORED -> verified 2026-05-30, it returns the same whole-account
 # number for dex=main/xyz/default). So reconstructing EVERY perp dex makes our
 # equity match the anchor instead of fighting it. Any perp coin (any "<dex>:"
-# prefix, incl flx:, or unprefixed main) is in scope; only spot (@-tokens, USDC)
-# is excluded.
+# prefix, incl flx:, or unprefixed main) is in scope; spot (@-tokens,
+# slash-delimited pairs, USDC) and HIP-4 outcome markets (#-tokens) are excluded.
 # (USDC capital-flow dex scoping is handled by dex_in_scope(): any non-spot dex.)
 # Dexes with a row in wallet_anchor_state.parquet (position seed source). main +
 # xyz + flx are seedable from the parquet; cash/hyna/para/vntl seed from fills
@@ -571,7 +587,7 @@ ANCHOR_COVERED_DEXES = frozenset({"main", "xyz", "flx"})
 
 
 def coin_is_allowed_perp(coin: str) -> bool:
-    """True for ANY perp coin (all dexes in scope). Excludes only spot (@/USDC)."""
+    """True for any in-scope perp; excludes spot and HIP-4 outcomes."""
     return not coin_is_spot(coin)
 
 
@@ -728,10 +744,71 @@ def get_clearinghouse(wallet: str, dex: Optional[str], retries: int = 3) -> Opti
 # --------------------------------------------------------------------------- #
 
 
+def _position_key(value: float) -> float:
+    """Stable key for decimal position values represented as float."""
+    return round(float(value), 10)
+
+
+def _order_fill_burst(group: list[dict]) -> tuple[list[dict], bool]:
+    """Order one same-wallet/coin/millisecond burst by position continuity.
+
+    ``tid`` identifies a trade but is not a causal sequence number. Each fill's
+    startPosition and signed size define an edge in the actual position path.
+    """
+    if len(group) <= 1:
+        return list(group), True
+    from collections import Counter
+
+    starts = [_position_key(f["startPosition"]) for f in group]
+    ends = [_position_key(f["startPosition"] + f["signed_sz"]) for f in group]
+    start_counts, end_counts = Counter(starts), Counter(ends)
+    path_starts = [k for k, n in start_counts.items() if n > end_counts.get(k, 0)]
+    if len(path_starts) == 1:
+        current = path_starts[0]
+    elif all(f["signed_sz"] > 0 for f in group):
+        current = min(starts)
+    elif all(f["signed_sz"] < 0 for f in group):
+        current = max(starts)
+    else:
+        current = min(starts, key=lambda x: (abs(x), x))
+
+    unused = set(range(len(group)))
+    ordered: list[dict] = []
+    complete = True
+    while unused:
+        candidates = [i for i in unused if starts[i] == current]
+        if not candidates:
+            complete = False
+            candidates = list(unused)
+        i = min(candidates, key=lambda j: (int(group[j].get("tid", 0) or 0), j))
+        ordered.append(group[i])
+        unused.remove(i)
+        current = ends[i]
+    return ordered, complete
+
+
+def order_wallet_fills_causally(fills: list[dict]) -> list[dict]:
+    """Causally order fills and attach a stable per-wallet ``fill_seq``."""
+    groups: dict[tuple[int, str], list[dict]] = {}
+    for f in fills:
+        groups.setdefault((int(f["time"]), str(f["coin"])), []).append(f)
+    out: list[dict] = []
+    for key in sorted(groups):
+        burst, complete = _order_fill_burst(groups[key])
+        for f in burst:
+            f["causal_order_ok"] = bool(complete)
+            out.append(f)
+    for seq, f in enumerate(out):
+        f["fill_seq"] = seq
+    return out
+
+
 def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
     """Load ALL markable perp fills for one wallet in [t0, t1].
 
-    Includes every dex prefix EXCEPT dropped (flx:) and spot (@-prefix, USDC).
+    Includes every perp dex prefix except explicitly dropped prefixes. Spot
+    fills (@-prefix, USDC) are excluded: M1 is anchored to ``perpAllTime`` and
+    M7/live copy execution is perp-only.
     Casts string numerics, computes signed_sz (+size if side=='B' else -size),
     and tags liquidation fills via the `dir` column.
 
@@ -749,9 +826,8 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
         out: list[dict] = []
         for rec in df.to_dict("records"):
             coin = str(rec["coin"])
-            # WHOLE-ACCOUNT (2026-06-08): keep spot fills (tag is_spot) -- their USDC + token value are part
-            # of the allTime anchor we reconstruct against. coin_is_allowed_perp excludes ONLY spot.
-            is_spot = coin_is_spot(coin)
+            if not coin_is_allowed_perp(coin):
+                continue
             size = float(rec["size"])
             try:
                 tid = int(rec.get("tid", 0) or 0)
@@ -773,7 +849,7 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
             }
             d["signed_sz"] = size if rec["side"] == "B" else -size
             d["is_liquidation"] = d["dir"] in LIQUIDATION_DIRS
-            d["is_spot"] = is_spot
+            d["is_spot"] = False
             out.append(d)
         return out
 
@@ -785,9 +861,7 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
             df = df[[c for c in cols if c in df.columns]].copy()
             df["time"] = df["time"].astype("int64")
             df = df[(df["time"] >= t0) & (df["time"] <= t1)]
-            fills = _normalize(df)
-            fills.sort(key=lambda x: (x["time"], x["tid"]))
-            return fills
+            return order_wallet_fills_causally(_normalize(df))
         except Exception:
             fills = []
 
@@ -815,8 +889,7 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"  skip {Path(ff).name}: {e!r}")
             continue
-    fills.sort(key=lambda x: (x["time"], x["tid"]))
-    return fills
+    return order_wallet_fills_causally(fills)
 
 
 def load_wallet_funding(wallet: str, t0: int, t1: int) -> list[dict]:
@@ -971,15 +1044,16 @@ def load_wallet_anchor(wallet: str, anchor_df: pd.DataFrame) -> Optional[AnchorS
 
 
 def fill_cash_delta(f: dict) -> float:
-    """Per fill: -signed_sz*price - (fee + builderFee + deployerFee).
+    """Per fill: ``-signed_sz * price - fee``.
 
-    fee is SIGNED in S3 (negative = maker rebate). Spot/dropped already excluded
-    at load time, but guard defensively.
+    Hyperliquid's API defines ``fee`` as the total wallet charge (signed;
+    negative means maker rebate). ``builderFee`` and ``deployerFee`` are
+    informational components of that total and must not be added again. Spot
+    and dropped markets are excluded at load time, but guard defensively.
     """
     if not coin_is_allowed_perp(f["coin"]):
         return 0.0
-    fee = f["fee"] + f["builderFee"] + f["deployerFee"]
-    return -f["signed_sz"] * f["price"] - fee
+    return -f["signed_sz"] * f["price"] - f["fee"]
 
 
 @dataclass
@@ -1021,34 +1095,42 @@ def ledger_cash_delta(e: dict, wallet_lc: str) -> LedgerDelta:
         c = -(_f("usdc") + _f("fee"))
         return LedgerDelta(c, c)
     if k == "accountClassTransfer":
-        # WHOLE-ACCOUNT (2026-06-08): spot<->perp class transfer is INTERNAL to the account (allTime
-        # already spans both) -> no effect on total equity. (Was +/- perp in the perp-only model.)
-        return LedgerDelta(0.0, 0.0)
+        # Perp-account model: spot -> perp is an inflow and perp -> spot an
+        # outflow. Neutralize both as external/non-copyable capital flow.
+        amt = abs(_f("usdc", "amount"))
+        c = amt if bool(d.get("toPerp")) else -amt
+        return LedgerDelta(c, c)
     if k == "send":
-        if d.get("token") != "USDC":
-            return LedgerDelta(0.0, 0.0)
-        # WHOLE-ACCOUNT: a send moves USDC between THIS wallet (spot or perp) and a COUNTERPARTY. It only
-        # changes total equity when the counterparty is ANOTHER wallet (external); a self-send (spot<->perp
-        # or spot->spot within our account) is internal -> 0. Classify by counterparty, not by dex.
+        # Perp-account model: only a leg touching an in-scope perp dex changes
+        # reconstructed perp cash. HIP-3 dexes can use non-USDC collateral
+        # (e.g. USDH on flx/km, USDT0 on cash); ``usdcValue`` is the canonical
+        # USD value for those sends. Spot-only token transfers remain zero
+        # because neither leg is in scope. Self-transfers spot<->perp remain
+        # perp inflows/outflows and are neutralized from trading ROE.
         user = (d.get("user") or "").lower()
         dest = (d.get("destination") or "").lower()
-        amt = _f("usdcValue", "amount")
+        src_dex = str(d.get("sourceDex", "")).strip().lower()
+        dst_dex = str(d.get("destinationDex", "")).strip().lower()
+        if d.get("usdcValue") is not None:
+            amt = _f("usdcValue")
+        elif d.get("token") == "USDC":
+            amt = _f("amount")
+        else:
+            # A non-USDC perp transfer without a USD valuation cannot be
+            # reconstructed safely. Quarantine rather than treating token
+            # quantity as dollars.
+            touches_perp = dex_in_scope(src_dex) or dex_in_scope(dst_dex)
+            return LedgerDelta(0.0, 0.0, unknown=touches_perp)
         fee = _f("fee")
-        if user == wallet_lc and dest != wallet_lc:
-            return LedgerDelta(-(amt + fee), -(amt + fee))   # external OUT
-        if dest == wallet_lc and user != wallet_lc:
-            return LedgerDelta(amt, amt)                     # external IN
-        return LedgerDelta(0.0, 0.0)                         # self -> internal
+        c = 0.0
+        if user == wallet_lc and dex_in_scope(src_dex):
+            c -= amt + fee
+        if dest == wallet_lc and dex_in_scope(dst_dex):
+            c += amt
+        return LedgerDelta(c, c)
     if k == "spotTransfer":
-        # WHOLE-ACCOUNT: token transfer in/out of our spot. External when counterparty != us.
-        user = (d.get("user") or "").lower()
-        dest = (d.get("destination") or "").lower()
-        amt = _f("usdcValue", "usdc", "amount")
-        fee = _f("fee")
-        if user == wallet_lc and dest != wallet_lc:
-            return LedgerDelta(-(amt + fee), -(amt + fee))
-        if dest == wallet_lc and user != wallet_lc:
-            return LedgerDelta(amt, amt)
+        # Spot-side balance movement; accountClassTransfer/send carry any
+        # corresponding movement into or out of perp cash.
         return LedgerDelta(0.0, 0.0)
     if k == "internalTransfer":
         if d.get("token") not in (None, "USDC"):
@@ -1127,15 +1209,13 @@ def ledger_cash_delta(e: dict, wallet_lc: str) -> LedgerDelta:
 
 
 def funding_cash_delta(e: dict) -> float:
-    """Funding usdc (signed, wallet perspective). Whole-account: keep ALL dexes
-    except dropped flx:. (xyz:/cash:/etc funding IS part of whole-account perp.)
+    """Funding USDC (signed, wallet perspective) for all included perp dexes.
     """
     d = e.get("delta", {})
     if d.get("type") != "funding":
         return 0.0
     coin = str(d.get("coin", ""))
-    # Only funding on an included perp coin counts. Drops flx:, spot @-tokens,
-    # USDC, and any unlisted dex prefix (parity with the fills/position guard).
+    # Only funding on an included perp coin counts (parity with fills/positions).
     if not coin_is_allowed_perp(coin):
         return 0.0
     return float(d.get("usdc", 0))
@@ -1178,6 +1258,7 @@ class WalkResult:
     positions: dict[str, float]
     equity: float
     position_value: float  # independent mark-derived sum
+    gross_position_notional: float  # sum(abs(szi * mark)); never net long/short legs
     n_unmarkable: int
     unmarkable_notional: float  # |szi * entry-ish proxy| for coins lacking a mark
     ext_flow_cum: float  # ext flow within (anchor_ms, t_ms] (per-SEGMENT, not series)
@@ -1259,10 +1340,8 @@ def seed_positions(
     cur = anchor.positions
     start_positions = {}
     for coin, fs in by_coin.items():
-        # WHOLE-ACCOUNT: spot tokens are seeded too (their value is in the allTime anchor). The fetch-time
-        # anchor snapshot (cur) is PERP-only, so spot has no snapshot -> burst-aware backward seed only
-        # applies to perp; spot uses the forward (earliest-fill startPosition) seed.
-        spot_coin = coin_is_spot(coin)
+        if not coin_is_allowed_perp(coin):
+            continue
         t0 = fs[0]["time"]
         burst = sum(1 for f in fs if f["time"] == t0) > 1
         net_all = 0.0
@@ -1271,10 +1350,10 @@ def seed_positions(
             net_all += f["signed_sz"]
             if f["time"] <= anchor_ms:
                 cum_le += f["signed_sz"]
-        if burst and not spot_coin:
+        if burst:
             p0 = float(cur.get(coin, 0.0)) - net_all  # backward: perp snapshot-anchored
         else:
-            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill (always for spot)
+            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill
         pos = p0 + cum_le
         if abs(pos) > 1e-9:
             start_positions[coin] = pos
@@ -1326,14 +1405,36 @@ def compute_eq_at(
     cash = anchor_eq - anchor_pos_value
 
     positions = dict(start_positions)
+    # Coins present in the anchor seed are already folded into both position
+    # value and the cash snap. A coin first observed AFTER the anchor can still
+    # reveal a pre-anchor carry via its authoritative startPosition. In causal
+    # mode we fold that carry only when its first fill becomes observable; this
+    # mirrors compute_event_equity and avoids both future leakage and the old
+    # error of treating a trim as a fresh short/open.
+    carried_in = set(start_positions)
     ext_flow_cum = 0.0
     had_unknown = False
     for ts, typ, ev in stream:
         if ts <= anchor_ms or ts > t_ms:
             continue
         if typ == "fill":
-            cash += fill_cash_delta(ev)
+            if not coin_is_allowed_perp(ev["coin"]):
+                continue
             coin = ev["coin"]
+            if causal_seed and coin not in carried_in:
+                carried_in.add(coin)
+                sp = float(ev.get("startPosition", 0.0) or 0.0)
+                if abs(sp) > 1e-9:
+                    positions[coin] = positions.get(coin, 0.0) + sp
+                    anchor_mark = get_mark(coin, anchor_ms)
+                    if anchor_mark is None:
+                        # The anchor cash allocation for this newly revealed
+                        # carry is unknowable. Flag the walk incomplete rather
+                        # than silently absorbing it into cash.
+                        anchor_unmarkable += 1
+                    else:
+                        cash -= sp * anchor_mark
+            cash += fill_cash_delta(ev)
             positions[coin] = positions.get(coin, 0.0) + ev["signed_sz"]
             if abs(positions[coin]) < 1e-9:
                 positions.pop(coin, None)
@@ -1347,6 +1448,7 @@ def compute_eq_at(
 
     # Mark-to-market at t_ms (independent of cash).
     pos_value = 0.0
+    gross_position_notional = 0.0
     n_unmarkable = 0
     unmarkable_notional = 0.0
     for c, sz in positions.items():
@@ -1366,12 +1468,14 @@ def compute_eq_at(
             unmarkable_notional += abs(sz) * proxy_px
             continue
         pos_value += sz * mark
+        gross_position_notional += abs(sz * mark)
     equity = cash + pos_value
     return WalkResult(
         cash=cash,
         positions=positions,
         equity=equity,
         position_value=pos_value,
+        gross_position_notional=gross_position_notional,
         n_unmarkable=n_unmarkable,
         unmarkable_notional=unmarkable_notional,
         anchor_unmarkable=anchor_unmarkable,
@@ -1431,8 +1535,8 @@ def reconstruct_wallet(args: tuple) -> dict:
     if anchor is None:
         return {"wallet": wallet, "error": "no_anchor"}
 
-    # 1) Weekly anchor truth: WHOLE-ACCOUNT allTime (perp + spot) -- 2026-06-08 spot-inclusion fix.
-    avh = get_portfolio_all(wallet)
+    # 1) Weekly anchor truth: all included perp dexes, excluding spot.
+    avh = get_portfolio_perp(wallet)
     n_sentinel_zeros = sum(1 for _, v in avh if v == 0.0)
     valid_anchors = [(t, v) for t, v in avh if v > 0.01]
     if not valid_anchors:
@@ -1535,6 +1639,7 @@ def reconstruct_wallet(args: tuple) -> dict:
                 "equity_usd": wr.equity,
                 "cash": wr.cash,
                 "position_value_usd": wr.position_value,
+                "gross_position_notional_usd": wr.gross_position_notional,
                 "n_positions": len(wr.positions),
                 "ext_flow_cum": ext_flow_cum_total,
                 "segment_ext_flow": wr.ext_flow_cum,
@@ -1554,11 +1659,16 @@ def reconstruct_wallet(args: tuple) -> dict:
 
     df_out = pd.DataFrame(rows)
 
-    # 4) Accuracy diagnostics. These are audit-only and intentionally preserve
-    # the reconcile-to-the-cent ex-post seed path; they are not selection inputs.
-    inter = inter_anchor_drift(stream, fills, anchor, wallet_lc, window_anchors)
+    # 4) Accuracy diagnostics MUST validate the exact seed mode used by the
+    # emitted series.  Quarantine consumes inter-anchor drift, so using a later
+    # snapshot-backed ex-post seed here while emitting causal rows would make
+    # the acceptance test look better/different than its actual input artifact.
+    inter = inter_anchor_drift(
+        stream, fills, anchor, wallet_lc, window_anchors, causal_seed=causal_seed
+    )
     recon = segment_reconcile(
-        stream, fills, anchor, wallet_lc, window_anchors, fills
+        stream, fills, anchor, wallet_lc, window_anchors, fills,
+        causal_seed=causal_seed,
     )
 
     audit = {
@@ -1609,8 +1719,12 @@ def reconstruct_wallet(args: tuple) -> dict:
         had_unknown_any
         or audit["unknown_ledger_types"]
         or drift_fail
+        or audit["n_inter_anchor_checks"] < MIN_INTER_ANCHOR_CHECKS
         or (audit["frac_incomplete_rows"] == audit["frac_incomplete_rows"]
             and audit["frac_incomplete_rows"] > 0.10)
+    )
+    audit["equity_validation_sufficient"] = bool(
+        audit["n_inter_anchor_checks"] >= MIN_INTER_ANCHOR_CHECKS
     )
 
     if validation_only:
@@ -1641,7 +1755,8 @@ def reconstruct_wallet(args: tuple) -> dict:
 
 
 def inter_anchor_drift(
-    stream, fills, anchor: AnchorState, wallet_lc, window_anchors
+    stream, fills, anchor: AnchorState, wallet_lc, window_anchors,
+    causal_seed: bool = True,
 ) -> dict:
     """Accuracy #1: for each weekly anchor (except the first), reconstruct equity
     AT the current anchor's timestamp by walking forward from the PREVIOUS
@@ -1658,7 +1773,10 @@ def inter_anchor_drift(
         cur_t, cur_v = window_anchors[i]
         if cur_t <= prev_t:
             continue  # anchors at/within the same instant; nothing to test
-        wr = compute_eq_at(stream, fills, anchor, wallet_lc, cur_t, prev_t, prev_v)
+        wr = compute_eq_at(
+            stream, fills, anchor, wallet_lc, cur_t, prev_t, prev_v,
+            causal_seed=causal_seed,
+        )
         # compute_eq_at includes events at ts == cur_t (ts > anchor_ms AND
         # ts <= t_ms), matching HL's accountValue snapshot which is post-event.
         if wr.recon_incomplete:
@@ -1676,16 +1794,21 @@ def inter_anchor_drift(
 
 
 def segment_reconcile(
-    stream, fills, anchor: AnchorState, wallet_lc, window_anchors, all_fills
+    stream, fills, anchor: AnchorState, wallet_lc, window_anchors, all_fills,
+    causal_seed: bool = True,
 ) -> dict:
     """Accuracy #2: realized-PnL reconciliation per inter-anchor segment.
 
-    Identity (cross-check ONLY; the equity walk does not use closedPnl):
+    Self-financing identity (cross-check ONLY):
         (eq_{a+1} - eq_a) - ext_flow_segment
-            ~= sum(closedPnl) - sum(fees) + sum(funding) + delta_unrealized
-    We compute the LHS from anchor values + the walk's ext_flow, and the RHS
-    from fills/funding within the segment plus the change in unrealized PnL
-    (mark - entry implied via mark deltas), and report abs error in USD.
+            ~= -sum(fees) + sum(funding)
+                + delta(marked_position_value) - sum(signed_size * fill_price)
+
+    ``delta(position value) - net traded`` is TOTAL trading PnL, including
+    realized PnL. Adding ``closedPnl`` again double-counts every close (a
+    buy-100/sell-110 round trip became $20 instead of $10 in the old audit).
+    ``closedPnl`` remains source data but is not part of this independent cash+
+    marked-book identity.
     """
     errs: list[float] = []
     for i in range(1, len(window_anchors)):
@@ -1694,27 +1817,31 @@ def segment_reconcile(
 
         # ext_flow over the segment from the walk.
         ext = 0.0
-        seg_closed = 0.0
         seg_fees = 0.0
         seg_funding = 0.0
         for ts, typ, ev in stream:
             if ts <= a_t or ts > b_t:
                 continue
             if typ == "fill":
-                seg_closed += ev["closedPnl"]
-                seg_fees += ev["fee"] + ev["builderFee"] + ev["deployerFee"]
+                # ``fee`` is the API total; builder/deployer fields are its
+                # component breakdown and are not additional wallet charges.
+                seg_fees += ev["fee"]
             elif typ == "funding":
                 seg_funding += funding_cash_delta(ev)
             elif typ == "ledger":
                 ext += ledger_cash_delta(ev, wallet_lc).ext_flow
 
-        # delta_unrealized: marked position value change minus the value put on
-        # / taken off by trading. Simplest robust proxy: reconstruct equity at
-        # both anchors via the walk (which is independent of closedPnl) and use
-        # the mark-derived position values. delta_unrealized = (posval_b -
-        # posval_a) - net_traded_notional.
-        wr_a = compute_eq_at(stream, fills, anchor, wallet_lc, a_t, a_t, a_v)
-        wr_b = compute_eq_at(stream, fills, anchor, wallet_lc, b_t, a_t, a_v)
+        # Total trading PnL: marked position value change minus the value put on
+        # / taken off by fills. This already includes both realized and
+        # unrealized PnL and is independent of the source closedPnl field.
+        wr_a = compute_eq_at(
+            stream, fills, anchor, wallet_lc, a_t, a_t, a_v,
+            causal_seed=causal_seed,
+        )
+        wr_b = compute_eq_at(
+            stream, fills, anchor, wallet_lc, b_t, a_t, a_v,
+            causal_seed=causal_seed,
+        )
         # net cash paid into positions over the segment (sign: buying costs cash)
         net_traded = 0.0
         for ts, typ, ev in stream:
@@ -1722,10 +1849,10 @@ def segment_reconcile(
                 continue
             if typ == "fill":
                 net_traded += ev["signed_sz"] * ev["price"]
-        delta_unreal = (wr_b.position_value - wr_a.position_value) - net_traded
+        trading_pnl = (wr_b.position_value - wr_a.position_value) - net_traded
 
         lhs = (b_v - a_v) - ext
-        rhs = seg_closed - seg_fees + seg_funding + delta_unreal
+        rhs = -seg_fees + seg_funding + trading_pnl
         errs.append(abs(lhs - rhs))
 
     if not errs:
@@ -1873,7 +2000,7 @@ def position_validation(
 #   event_order key = (ts_ms, type_rank, source_seq)
 #     type_rank: ledger=0, fill=1, funding=2   (ledger settles, then trade,
 #                then funding accrues on the post-trade position)
-#     source_seq: HL tid for fills; stable per-type append index otherwise.
+#     source_seq: stable causal fill sequence; per-type append index otherwise.
 #
 # For each event k we re-anchor to the last weekly anchor with anchor_ts
 # STRICTLY < ts(k) (codex r3: an anchor sharing the action's ms is NOT a valid
@@ -1911,36 +2038,20 @@ def build_event_stream(
 
     Returns a list of event dicts each carrying:
         ts, type ('fill'|'funding'|'ledger'), type_rank, source_seq, ev (payload)
-    sorted by (ts, type_rank, source_seq). source_seq = tid for fills (HL
-    sequence), else a stable per-type append index so the order is deterministic
+    sorted by (ts, type_rank, source_seq). source_seq is the causal per-wallet
+    fill sequence, else a stable per-type append index so the order is deterministic
     and reproducible across M01 (equity) and M02 (actions).
 
-    SAME-MS FILL IDENTITY (codex r4 BUG 2): the S3 by-wallet partition carries no
-    `tid`, so every same-ms fill would otherwise get source_seq=0 — colliding.
-    M02 rematched events->fills by (ts, source_seq) and silently overwrote the
-    duplicates (wrong action_type/position_after). FIX: give each fill a STABLE
-    UNIQUE per-wallet sequence. When tid is present/nonzero we keep it (HL order).
-    When tid is absent/0 we assign a stable index = the fill's position in the
-    deterministic (time, tid, original-load-order) sort, OFFSET past the tid space
-    so it can never alias a real tid. The same number is used as source_seq AND the
-    fill payload is carried on the event (`ev`) so M02 reads the fill DIRECTLY off
-    the ordered stream — no (ts, tid) rematch, no overwrite. M01's equity walk is
-    unaffected (it applies fills positionally; a same-ms reorder of position deltas
-    on the SAME book is commutative for cash + net position).
+    SAME-MS FILL ORDER: tid is identity, not sequence. Partial fills are ordered
+    by chaining startPosition -> startPosition+signed_size. The fill payload is
+    carried directly so M2 never rematches on a lossy key.
     """
     out: list[dict] = []
-    # Stable per-fill sequence. Deterministic key: (time, tid-or-0, load-order).
-    # Index in this order is a stable unique id; when a fill lacks a real tid we
-    # use NO_TID_BASE + index so it cannot collide with a genuine tid.
-    NO_TID_BASE = 1 << 60
-    order_key = sorted(
-        range(len(fills)),
-        key=lambda i: (int(fills[i]["time"]), int(fills[i].get("tid", 0) or 0), i),
-    )
-    stable_idx = {orig: rank for rank, orig in enumerate(order_key)}
-    for i, f in enumerate(fills):
-        tid = int(f.get("tid", 0) or 0)
-        seq = tid if tid != 0 else (NO_TID_BASE + stable_idx[i])
+    ordered_fills = order_wallet_fills_causally(list(fills))
+    for i, f in enumerate(ordered_fills):
+        if not coin_is_allowed_perp(f["coin"]):
+            continue
+        seq = int(f.get("fill_seq", i))
         out.append(
             {
                 "ts": int(f["time"]),
@@ -2352,8 +2463,8 @@ def main() -> None:
         action="store_true",
         help=(
             "Use legacy ex-post position seeding for the emitted EOD selection series "
-            "(for reconcile/validate studies). Default is causal seeding; audit "
-            "diagnostics keep ex-post seeding."
+            "(diagnostic studies only; not deployable). Default is causal seeding. "
+            "Audit diagnostics always use the same mode as the emitted series."
         ),
     )
     ap.add_argument("--headroom-gb", type=float, default=6.0,

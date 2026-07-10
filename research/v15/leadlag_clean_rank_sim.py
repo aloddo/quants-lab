@@ -68,6 +68,7 @@ HL_API = "https://api.hyperliquid.xyz/info"
 _DATA = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15"
 ASSETCTX_DIR = _DATA / "assetctx_marks"
 HOUR_MS = 3_600_000
+MARK_MAX_AGE_MS = 15 * 60_000
 
 # CANONICAL execution model is the SINGLE source of truth for slippage / fees / latency (Alberto
 # 2026-06-10: no sim may hardcode its own). See research/v15/execution_model.py + the spec in brain
@@ -105,6 +106,8 @@ def mark_at(coin: str, ts_ms: int):
     ts, px = m
     i = bisect_right(ts, ts_ms) - 1
     if i < 0:
+        return None
+    if ts_ms - int(ts[i]) > MARK_MAX_AGE_MS:
         return None
     return float(px[i])
 
@@ -290,6 +293,49 @@ def load_events_from_m02(wallet_set: set[str], start_ms: int, end_ms: int,
     return out
 
 
+S3_FILLS_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "hl_s3_fills_v2_by_wallet"
+
+
+def load_events_from_s3(wallet_set: set[str], start_ms: int, end_ms: int) -> dict[str, WalletEvents]:
+    """ADD-INCLUSIVE (fill-level) open/close events from raw HL s3 fills (ground truth, LOCAL parquets).
+    Uses HL's own 'dir' label exactly as the API loader does: Open* -> is_open, Close* -> close;
+    is_long = 'Long' in dir; flips (Long>Short) skipped (matches load_wallet_opens_closes). This is the
+    FILL-LEVEL copy model (EVERY open fill incl adds = a lot) -- the opposite extreme from m02's
+    position-initiation ENTRY/EXIT. Purpose: re-run WHO on ground-truth events to test whether the
+    m02-based WHO-kill reproduces (data-fidelity check, 2026-07-06)."""
+    import pyarrow.parquet as pq
+    from array import array
+    out: dict[str, WalletEvents] = {}
+    for w in wallet_set:
+        fp = S3_FILLS_DIR / f"{w}.parquet"
+        if not fp.exists():
+            continue
+        try:
+            d = pq.read_table(str(fp), columns=["coin", "dir", "time"]).to_pydict()
+        except Exception:
+            continue
+        coins, dirs, times = d["coin"], d["dir"], d["time"]
+        a_ts, a_c, a_o, a_l = array('q'), array('h'), array('b'), array('b')
+        for i in range(len(times)):
+            tt = times[i]
+            if tt < start_ms or tt > end_ms:
+                continue
+            dd = str(dirs[i])
+            if not (dd.startswith("Open") or dd.startswith("Close")):
+                continue
+            a_ts.append(int(tt)); a_c.append(_coin_id(coins[i]))
+            a_o.append(1 if dd.startswith("Open") else 0); a_l.append(1 if ("Long" in dd) else 0)
+        if not len(a_ts):
+            continue
+        ts_a = np.frombuffer(a_ts, dtype=np.int64).copy()
+        cid = np.frombuffer(a_c, dtype=np.int16).copy()
+        op = np.frombuffer(a_o, dtype=np.int8).astype(np.bool_)
+        lg = np.frombuffer(a_l, dtype=np.int8).astype(np.bool_)
+        order = np.argsort(ts_a, kind="stable")
+        out[w] = WalletEvents(ts_a[order], cid[order], op[order], lg[order])
+    return out
+
+
 # ----- compact per-wallet event store (memory + speed for the full 18k universe) ------------- #
 # Storing ~30M events as list-of-dicts needs ~30GB. Compact numpy arrays per wallet need ~12B/event
 # (~0.4GB total). Each decision then bisect-slices the [win_lo, win_hi] range (O(log n)) and
@@ -467,7 +513,8 @@ def beta_edge_for_lots(lots: list[dict], t0: int, t1: int,
 # ----- main sim ----------------------------------------------------------------------------- #
 def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, hold_min: int, exit_mode: str = "mirror",
         latency_s: int, adverse_bps: float, top_frac: float, null_mult: int, seed: int,
-        out_path: str, source: str = "m02", step_hours: int = 1, maker: bool = False) -> str:
+        out_path: str, source: str = "m02", step_hours: int = 1, maker: bool = False,
+        select_mode: str = "trailing", rank_metric: str = "edge", min_rank_lots: int = 20) -> str:
     trail_ms, hold_ms, lat_ms = trail_min * 60_000, hold_min * 60_000, latency_s * 1000
     rng = np.random.default_rng(seed)
     load_lo, load_hi = start_ms - trail_ms, end_ms + hold_ms
@@ -477,6 +524,12 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
         log.info(f"loading m02 events for {len(candidates)} wallets from {M02_ACTIONS.name} ...")
         wf = load_events_from_m02(set(candidates), load_lo, load_hi)
         log.info(f"{len(wf)} wallets with events (of {len(candidates)} candidates)")
+    elif source == "s3":
+        # GROUND-TRUTH add-inclusive (fill-level) events from local raw HL s3 fills. Data-fidelity
+        # re-run of WHO vs the m02 position-initiation events (2026-07-06 check).
+        log.info(f"loading s3 fill events for {len(candidates)} wallets from {S3_FILLS_DIR.name} ...")
+        wf = load_events_from_s3(set(candidates), load_lo, load_hi)
+        log.info(f"{len(wf)} wallets with s3 events (of {len(candidates)} candidates)")
     else:
         # legacy API path (per-wallet; slow, rate-limited). codex #7: failures DROP the wallet.
         log.info(f"loading fills via HL API for {len(candidates)} wallets ...")
@@ -509,14 +562,52 @@ def run(candidates: list[str], start_ms: int, end_ms: int, *, trail_min: int, ho
     while t + hold_ms <= end_ms:
         # 1) CLEAN trailing rank (causal: copy_edge only sees fills <= t). Track edge AND trailing lot
         #    count per wallet for a CAUSAL activity-matched null (codex #4/#5).
-        trailing, trail_n = {}, {}
+        trailing, trail_n, rank_score = {}, {}, {}
         for w in wallets:
             edge, lots = copy_edge(wf[w].slice_dicts(t - trail_ms, t), t - trail_ms, t, lat_ms, adverse_bps)
             if edge is not None and lots:
                 trailing[w] = edge
                 trail_n[w] = len(lots)
+                # QUALITY selection metrics (Alberto durable thesis): rank by CONSISTENCY, not raw PnL.
+                # All computed CAUSALLY over the trailing window's per-lot nets.
+                if rank_metric == "sharpe":
+                    nets = np.array([l["net"] for l in lots], dtype=np.float64)
+                    rank_score[w] = (float(nets.mean() / nets.std())
+                                     if (len(nets) >= min_rank_lots and nets.std() > 0) else -np.inf)
+                elif rank_metric == "consistency":
+                    nets = np.array([l["net"] for l in lots], dtype=np.float64)
+                    rank_score[w] = float((nets > 0).mean()) if len(nets) >= min_rank_lots else -np.inf
+                elif rank_metric == "holddur":
+                    # NON-performance structural feature: median hold duration (patient/informed capital
+                    # hypothesis). Longer hold = higher rank. Uses causal trailing lots' realized holds.
+                    holds = np.array([l["exit_ts"] - l["entry_ts"] for l in lots], dtype=np.float64)
+                    rank_score[w] = float(np.median(holds)) if len(holds) >= min_rank_lots else -np.inf
+                else:
+                    rank_score[w] = edge
         if len(trailing) >= 10:
-            ranked = sorted(trailing, key=lambda w: trailing[w], reverse=True)
+            if select_mode == "oracle":
+                # ORACLE CEILING (who-vs-how): rank eligible wallets by their FORWARD (t, t+hold]
+                # edge under REAL execution = perfect-hindsight selection. This is the mathematical
+                # ceiling of any copy strategy: if the oracle-picked top net < cost, no selection
+                # can save it. NOT causal, NOT tradeable -- an upper bound only. Null + beta below
+                # stay CAUSAL (trailing-activity bucket), so top(oracle)-null isolates foresight value.
+                fwd_rank = {}
+                for w in trailing:
+                    _, flots = copy_edge(wf[w].slice_dicts(t, t + hold_ms), t, t + hold_ms, lat_ms,
+                                         adverse_bps, fee_rt=fee, exit_mode=exit_mode, maker=maker)
+                    if flots:
+                        fwd_rank[w] = float(np.mean([l["net"] for l in flots]))
+                if len(fwd_rank) < 10:
+                    t += step_ms
+                    continue
+                ranked = sorted(fwd_rank, key=lambda w: fwd_rank[w], reverse=True)
+            else:
+                # rank by chosen causal metric; drop below-min-lots wallets (score -inf) from selection.
+                ranked = sorted([w for w in rank_score if rank_score[w] > -np.inf],
+                                key=lambda w: rank_score[w], reverse=True)
+                if len(ranked) < 10:
+                    t += step_ms
+                    continue
             k = max(1, int(len(ranked) * top_frac))
             top = ranked[:k]
             top_set = set(top)
@@ -612,14 +703,15 @@ def pick_candidates(max_wallets: int, start_ms: int, end_ms: int) -> list[str]:
 
 def main():
     ap = argparse.ArgumentParser(description="Lead-lag clean-rank salvage sim (memory-safe)")
-    ap.add_argument("--source", choices=["m02", "api"], default="m02",
-                    help="m02 = full-universe open/close from m02_actions.parquet (no API, default); "
-                         "api = legacy per-wallet HL API (slow, small scope only).")
+    ap.add_argument("--source", choices=["m02", "api", "s3"], default="m02",
+                    help="m02 = full-universe position-ENTRY/EXIT from m02_actions.parquet (no API, default); "
+                         "api = legacy per-wallet HL API (slow); "
+                         "s3 = ground-truth ADD-INCLUSIVE fill-level events from local raw HL s3 fills.")
     ap.add_argument("--start", default="2025-12-01", help="default Dec 1 (full m02 history).")
     ap.add_argument("--end", default="2026-05-23")
     ap.add_argument("--max-wallets", type=int, default=0,
                     help="candidate cap (0 = ALL wallets in the universe file; >0 caps, mainly for api).")
-    ap.add_argument("--universe-file", default="app/data/v15/m01_nonerroring_wallets.txt",
+    ap.add_argument("--universe-file", default="app/data/v15/m01_universe_20k_wallets.txt",
                     help="full-universe wallet list for --source m02 (one address/line).")
     ap.add_argument("--candidates-file", default=None, help="override universe; one wallet/line.")
     ap.add_argument("--trail-min", type=int, default=60)
@@ -641,6 +733,15 @@ def main():
                     help="mirror=follow wallet exits; oracle=best ex-post exit (#2 ceiling, not tradeable); "
                          "trail=realizable trailing-stop (#9).")
     ap.add_argument("--trail-frac", type=float, default=0.01, help="trailing-stop retracement for --exit-mode trail.")
+    ap.add_argument("--select-mode", choices=["trailing", "oracle"], default="trailing",
+                    help="trailing=causal rank by trailing edge (default, tradeable). "
+                         "oracle=rank by FORWARD edge (perfect-hindsight WHO ceiling, upper bound, NOT tradeable).")
+    ap.add_argument("--rank-metric", choices=["edge", "sharpe", "consistency", "holddur"], default="edge",
+                    help="causal ranking metric (select-mode=trailing only): edge=raw trailing mean net; "
+                         "sharpe=mean/std of trailing lot nets (consistency); consistency=frac positive lots; "
+                         "holddur=median trailing hold duration (non-performance structural feature).")
+    ap.add_argument("--min-rank-lots", type=int, default=20,
+                    help="min trailing lots for a wallet to be rankable under sharpe/consistency.")
     ap.add_argument("--maker", action="store_true", help="MAKER execution: 2.88bps RT fee, no spread-crossing (V11 maker_ws proved +25.8bps vs taker -5.7). Optimistic: assumes 100%% fill.")
     ap.add_argument("--out", default="app/data/v15/leadlag_clean_rank.parquet")
     args = ap.parse_args()
@@ -676,7 +777,8 @@ def main():
     run(cands, start_ms, end_ms, trail_min=args.trail_min, hold_min=args.hold_min, exit_mode=args.exit_mode,
         latency_s=args.latency_s, adverse_bps=args.adverse_bps, top_frac=args.top_frac,
         null_mult=args.null_mult, seed=args.seed, out_path=args.out,
-        source=args.source, step_hours=args.decision_step_hours, maker=args.maker)
+        source=args.source, step_hours=args.decision_step_hours, maker=args.maker,
+        select_mode=args.select_mode, rank_metric=args.rank_metric, min_rank_lots=args.min_rank_lots)
 
 
 if __name__ == "__main__":

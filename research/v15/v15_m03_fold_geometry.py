@@ -232,10 +232,16 @@ def build_activity(
         return pd.to_datetime(s, unit="ms", utc=True) if pd.api.types.is_numeric_dtype(s) else pd.to_datetime(s, utc=True)
 
     a = actions.copy()
+    if "stream_replay_valid" in a.columns:
+        a = a[a["stream_replay_valid"].fillna(False).astype(bool)].copy()
     a["ts"] = _to_dt(a["ts"])
     use_journeys = basis == "journey"
     if use_journeys:
         j = journeys.copy()
+        if "lifecycle_valid" in j.columns:
+            j = j[j["lifecycle_valid"].fillna(False).astype(bool)].copy()
+        if "stream_replay_valid" in j.columns:
+            j = j[j["stream_replay_valid"].fillna(False).astype(bool)].copy()
         # journey OPEN timestamp = entry_ts (ms). Open/unclosed journeys still have entry_ts.
         j["open_ts"] = _to_dt(j["entry_ts"])
     else:
@@ -372,8 +378,16 @@ def main() -> None:
     # Memory-safe (CLAUDE.md Key Rule 8): read ONLY the columns the activity pass needs. The full
     # m02_actions is 86M rows x 25 cols (~4.6GB on disk); loading all of it would strain RAM. M3
     # needs only wallet+ts (actions) and wallet+entry_ts (journeys).
-    actions = pd.read_parquet(args.actions, columns=["wallet", "ts"])
-    journeys = pd.read_parquet(args.journeys, columns=["wallet", "entry_ts"])
+    # Fail closed: activity/persistence must count only source state that a raw
+    # live trade stream can replay.  Reading these columns explicitly also makes
+    # stale pre-validity M2 artifacts fail loudly instead of contaminating M3.
+    actions = pd.read_parquet(
+        args.actions, columns=["wallet", "ts", "stream_replay_valid"]
+    )
+    journeys = pd.read_parquet(
+        args.journeys,
+        columns=["wallet", "entry_ts", "lifecycle_valid", "stream_replay_valid"],
+    )
     # MEMORY (2026-06-06): the 86M-row object-string `wallet` column was ~4GB and peaked M3 at 10.2GB
     # (OOM-killed by mem_safe_run alongside the 5.4GB standing pipeline). wallet has ~18k uniques ->
     # category dtype cuts it to ~350MB. Groupbys here are SINGLE-key (.groupby('wallet')) so the

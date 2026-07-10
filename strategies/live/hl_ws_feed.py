@@ -46,21 +46,36 @@ class HLWSFeed:
                           (a reconnect happened), it must re-establish freshness before trading.
     """
 
-    def __init__(self, users: list[str]):
+    def __init__(self, users: list[str], mark_dexes: list[str] | None = None):
         self.users = [u.lower() for u in users]
+        # builder dexes whose marks we ALSO need (copy_a copies xyz coins whose marks are NOT in the
+        # main allMids). Each gets its OWN dedicated WS connection subscribing allMids?dex=<name> --
+        # per-dex demux on ONE socket is broken (unlabeled allMids messages), so one socket per dex.
+        self.mark_dexes = [d for d in (mark_dexes if mark_dexes is not None else ["xyz"]) if d]
         self._lock = threading.Lock()
         self._user_state: dict[str, dict] = {}
         self._mids: dict[str, tuple[float, float]] = {}
+        # builder-dex marks live in a SEPARATE cache so they never collide with same-ticker main coins.
+        # get_mid falls back to this only if the coin is absent from the main mids.
+        self._dex_mids: dict[str, tuple[float, float]] = {}
         self._generation = 0
         self._connected = False
         self._last_msg_ts = 0.0
         self._stop = False
         self._thread: threading.Thread | None = None
+        self._mark_threads: list[threading.Thread] = []
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self):
         self._thread = threading.Thread(target=self._run_forever, name="hl-ws-feed", daemon=True)
         self._thread.start()
+        # one dedicated mark connection per builder dex (xyz) -- keeps xyz marks fresh for the disaster
+        # stop + order crossing without a REST-poll 429 storm (HARD SAFETY requirement 5).
+        for dex in self.mark_dexes:
+            t = threading.Thread(target=self._run_mark_dex, args=(dex,),
+                                 name=f"hl-ws-mark-{dex}", daemon=True)
+            t.start()
+            self._mark_threads.append(t)
 
     def stop(self):
         self._stop = True
@@ -72,6 +87,58 @@ class HLWSFeed:
             logger.error(f"WS feed thread died: {e}")
             with self._lock:
                 self._connected = False
+
+    def _run_mark_dex(self, dex: str):
+        try:
+            asyncio.run(self._loop_mark_dex(dex))
+        except Exception as e:  # thread died -> per-entry freshness on _dex_mids fails closed (marks age out)
+            logger.error(f"WS mark feed thread for dex={dex} died: {e}")
+
+    async def _loop_mark_dex(self, dex: str):
+        """Dedicated connection for ONE builder dex's allMids. Its messages are unambiguously this dex
+        (own socket), so we store them in _dex_mids keyed by coin. On any disconnect we drop THIS dex's
+        marks so a stale builder mark can never be served (get_mid then returns None -> fail-closed)."""
+        backoff = 1.0
+        while not self._stop:
+            try:
+                async with websockets.connect(HL_WS, ping_interval=20, ping_timeout=10,
+                                               close_timeout=5, max_queue=512) as ws:
+                    await ws.send(json.dumps({"method": "subscribe",
+                                              "subscription": {"type": "allMids", "dex": dex}}))
+                    logger.info(f"WS mark feed connected for dex={dex}")
+                    backoff = 1.0
+                    while not self._stop:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            continue
+                        try:
+                            msg = json.loads(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if msg.get("channel") != "allMids":
+                            continue
+                        data = msg.get("data") or {}
+                        mids = data.get("mids") if isinstance(data, dict) else None
+                        if not isinstance(mids, dict):
+                            continue
+                        now = time.time()
+                        with self._lock:
+                            for coin, px in mids.items():
+                                try:
+                                    self._dex_mids[coin] = (float(px), now)
+                                except (TypeError, ValueError):
+                                    continue
+            except Exception as e:
+                logger.warning(f"WS mark feed error dex={dex}: {e}; reconnecting in {backoff:.0f}s")
+            # drop THIS dex's marks on disconnect (best-effort: coins are namespaced by builder dex, so a
+            # main-dex coin of the same ticker is unaffected in _mids).
+            with self._lock:
+                self._dex_mids = {}
+            if self._stop:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     async def _loop(self):
         backoff = 1.0
@@ -188,7 +255,9 @@ class HLWSFeed:
         return out
 
     # ── read API (thread-safe) ───────────────────────────────────────────────
-    def user_aggregate(self, addr: str, max_age_s: float, strict: bool = True) -> tuple[dict | None, int, bool]:
+    def user_aggregate(self, addr: str, max_age_s: float, strict: bool = True,
+                       exclude_dexes: frozenset = frozenset(),
+                       include_dexes: frozenset | None = None) -> tuple[dict | None, int, bool]:
         """Return (agg, generation, connected) for a user, aggregated across ALL dexes (matches REST
         _clearinghouse). agg = {"av","mu","upnl","pos":{coin:szi}} or None if missing/stale/disconnected.
         Fail-closed: caller treats None as 'do not trade this cycle'.
@@ -211,10 +280,19 @@ class HLWSFeed:
                 return None, gen, connected
             av = mu = upnl = 0.0
             pos: dict[str, float] = {}
-            for s in v["states"].values():
+            # dex scoping for POSITIONS only (equity av/mu/upnl stays ACCOUNT-WIDE across all dexes):
+            #   include_dexes (if not None): copy positions ONLY from these dexes (copy_a passes {"","xyz"}
+            #     = main + xyz; every other dex, e.g. flx, is excluded).
+            #   exclude_dexes (legacy): omit these dexes.
+            # A copy_a builder-dex position on an unlisted dex thus never perturbs the before/after diff.
+            for dex, s in v["states"].items():
                 av += s["av"]
                 mu += s["mu"]
                 upnl += s["upnl"]
+                if include_dexes is not None and dex not in include_dexes:
+                    continue
+                if dex in exclude_dexes:
+                    continue
                 for coin, szi in s["pos"].items():
                     pos[coin] = pos.get(coin, 0.0) + szi
             return {"av": av, "mu": mu, "upnl": upnl, "pos": pos}, gen, connected
@@ -255,14 +333,21 @@ class HLWSFeed:
             return result, gen, connected
 
     def get_mid(self, coin: str, max_age_s: float) -> float | None:
+        """Fresh mid for a coin. MAIN allMids first (gated on the main socket being alive -- a mid from a
+        dead socket is not tradeable, codex #5). If the coin is absent from the main mids (a builder-dex
+        coin, e.g. xyz), fall back to the dedicated builder-dex mark cache. Each source is freshness-gated
+        by its own per-entry timestamp; a stale/absent mark returns None -> the runner fails closed."""
+        now = time.time()
         with self._lock:
-            if not self._connected:        # a mid from a dead socket is not tradeable (codex #5)
-                return None
-            v = self._mids.get(coin)
+            v = self._mids.get(coin) if self._connected else None
+            if v is None:
+                # builder-dex coin: served from its own socket's cache (cleared on that socket's disconnect,
+                # so a present entry is from a live builder connection). Independent of the main socket.
+                v = self._dex_mids.get(coin)
         if not v:
             return None
         px, ts = v
-        return px if (time.time() - ts) <= max_age_s and px > 0 else None
+        return px if (now - ts) <= max_age_s and px > 0 else None
 
     def health(self) -> dict:
         with self._lock:

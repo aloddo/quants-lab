@@ -236,6 +236,17 @@ def _blocks_activity(fills_path, m02_journeys_path: Path, m04_auth: pd.DataFrame
     try:
         jdf = _read_parquet_maybe_parts(Path(m02_journeys_path)) if not isinstance(
             m02_journeys_path, pd.DataFrame) else m02_journeys_path
+        validity = {"lifecycle_valid", "stream_replay_valid"}
+        if not validity.issubset(jdf.columns):
+            if not isinstance(m02_journeys_path, pd.DataFrame):
+                raise ValueError(
+                    "M02 journeys lack lifecycle/stream replay validity; rebuild M2"
+                )
+        else:
+            jdf = jdf[
+                jdf["lifecycle_valid"].fillna(False).astype(bool)
+                & jdf["stream_replay_valid"].fillna(False).astype(bool)
+            ].copy()
         jdf = jdf[["wallet", "entry_ts"]].copy()
         for fid, t0, t1 in fold_win:
             mapper = w2e_by_fold.get(int(fid), pd.DataFrame(columns=["wallet", "entity_id"])) \
@@ -788,6 +799,10 @@ def main():
     ap.add_argument("--m07-dir", default=str(DATA_DIR / "m07_pretest"),
                     help="M7 PRETEST-window run dir (m07_summary/fills/[equity].parquet)")
     ap.add_argument("--out", default=str(DATA_DIR))
+    ap.add_argument(
+        "--data-dir", default=str(DATA_DIR),
+        help="Directory containing this lane's M2-M6a artifacts.",
+    )
     ap.add_argument("--m04-dir", default=None,
                     help="directory with m04_authenticity_f{fold_id}.parquet and m04_entities_f{fold_id}.parquet")
     ap.add_argument("--fee-schedule-version", default=None)
@@ -795,7 +810,10 @@ def main():
     args = ap.parse_args()
     m = M6bManifest(fee_schedule_version=args.fee_schedule_version,
                     slippage_calibration_version=args.slippage_calibration_version)
-    inputs = load_inputs(Path(args.m07_dir), m04_dir=Path(args.m04_dir) if args.m04_dir else None)
+    inputs = load_inputs(
+        Path(args.m07_dir), data_dir=Path(args.data_dir),
+        m04_dir=Path(args.m04_dir) if args.m04_dir else None,
+    )
     out, manifest = build_ranking(inputs, m)
     res = write_outputs(out, manifest, Path(args.out))
     logger.info("M6b done: %s", res)

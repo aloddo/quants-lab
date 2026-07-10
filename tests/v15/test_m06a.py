@@ -164,6 +164,21 @@ def test_eligible_nan_metric_hardfails():
         m6a.run(elig, _pool(eids), _folds(), _entities(eids), _actions(eids), _manifest())
 
 
+def test_activity_only_shortlist_does_not_require_equity_metrics():
+    eids = [1]
+    elig = pd.DataFrame([_elig_row(1, 1, roe=np.nan, dd=np.nan)])
+    manifest = _manifest()
+    manifest["score_basis"] = "activity_only"
+    sl, _, wf = m6a.run(
+        elig, _pool(eids), _folds(), _entities(eids), _actions(eids), manifest
+    )
+    row = sl.iloc[0]
+    assert row["rankable"]
+    assert row["score_basis"] == "activity_only"
+    assert row["source_score_pretest"] > 0
+    assert wf["score_basis"] == "activity_only"
+
+
 # ---------------------------------------------------------------- recency gate drops stale
 def test_recency_gate_drops_stale_holder():
     eids = [1, 2]

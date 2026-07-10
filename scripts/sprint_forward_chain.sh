@@ -25,7 +25,7 @@ $P $R/research/v15/v15_m02_journey_trace.py \
   --start 2025-12-01 --end 2026-06-12 \
   --actions-out $R/app/data/v16/m02_cohort_slice.parquet \
   --journeys-out $R/app/data/v16/m02_cohort_journeys.parquet \
-  --procs 6 --skip-marks-cache
+  --procs 6 --skip-marks-cache --equity-enrichment
 
 echo "=== 3.5/4 merge sprint marks (assetctx + tape bridge) ==="
 $P $R/scripts/sprint_merge_marks.py

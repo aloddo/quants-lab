@@ -20,7 +20,8 @@ g5_pool_candidate_pass, ENFORCED at pool assembly (M6/M9) — never suppresses p
 
 CLI:
     python v15_m05_eligibility.py --folds m03_folds.parquet --journeys m02_journeys.parquet \
-        --equity m01_universe_20k_series.parquet --m04 m04_authenticity.parquet \
+        --equity m01_universe_20k_series.parquet --m01-audit m01_universe_20k_series.audit.parquet \
+        --m04 m04_authenticity.parquet \
         --outdir app/data/v15 [--accessible-coins accessible.json]
 """
 from __future__ import annotations
@@ -88,6 +89,11 @@ def flow_adjusted_twr(eq: pd.DataFrame) -> dict:
     collapse to ~0 from a real base.
     """
     d = eq.sort_values("date").reset_index(drop=True)
+    n_incomplete_excluded = 0
+    if "recon_incomplete" in d.columns:
+        bad = d["recon_incomplete"].fillna(True).astype(bool)
+        n_incomplete_excluded = int(bad.sum())
+        d = d.loc[~bad].reset_index(drop=True)
     # median_equity (codex finding b): computed from RAW NON-NULL equity values -- NOT the 0.0-filled
     # series used for TWR. A data gap (missing equity_usd day) filled with 0.0 would drag the median
     # down and falsely fail the $2k floor. Median of an all-null/empty series is 0.0 (fails, correct).
@@ -96,14 +102,20 @@ def flow_adjusted_twr(eq: pd.DataFrame) -> dict:
     if len(d) < 2:
         return {"roe": 0.0, "max_dd": 0.0, "n_days": len(d), "structural_ruin": True,
                 "median_equity": med_eq, "frac_days_green": 0.0, "n_active_days": 0,
-                "median_leverage": 0.0}
+                "median_leverage": 0.0, "n_incomplete_excluded": n_incomplete_excluded}
     e = d["equity_usd"].astype(float).fillna(0.0)
     flow = d["ext_flow_cum"].astype(float).ffill().fillna(0.0).diff().fillna(0.0)
     e_prev = e.shift(1)
     denom = e_prev.where(e_prev > RUIN_EQUITY_FLOOR, np.nan)   # need >$1 base to define a return
     r = ((e - e_prev - flow) / denom).replace([np.inf, -np.inf], np.nan).dropna()
     # LEVERAGE (Alberto spec): median daily gross notional / equity over days with a real (>$1) base.
-    if "position_value_usd" in d.columns:
+    if "gross_position_notional_usd" in d.columns:
+        pv = d["gross_position_notional_usd"].astype(float)
+        lev = (pv / e.where(e > RUIN_EQUITY_FLOOR, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+        median_leverage = float(lev.median()) if len(lev) else 0.0
+    elif "position_value_usd" in d.columns:
+        # Compatibility for unit fixtures only. Production CLI rejects an M1
+        # artifact without the gross field below.
         pv = d["position_value_usd"].astype(float).abs()
         lev = (pv / e.where(e > RUIN_EQUITY_FLOOR, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
         median_leverage = float(lev.median()) if len(lev) else 0.0
@@ -112,7 +124,7 @@ def flow_adjusted_twr(eq: pd.DataFrame) -> dict:
     if len(r) == 0:
         return {"roe": 0.0, "max_dd": 0.0, "n_days": len(d), "structural_ruin": True,
                 "median_equity": med_eq, "frac_days_green": 0.0, "n_active_days": 0,
-                "median_leverage": median_leverage}
+                "median_leverage": median_leverage, "n_incomplete_excluded": n_incomplete_excluded}
     # CONSISTENCY (Alberto spec): share of ACTIVE days (a real flow-adjusted return defined) that are green.
     # "active" excludes flat/no-base days (r is already dropna'd to days with a >$1 prior base).
     active = r[r != 0.0]
@@ -128,7 +140,7 @@ def flow_adjusted_twr(eq: pd.DataFrame) -> dict:
     ruin = (start_eq <= RUIN_EQUITY_FLOOR) or (float(e.iloc[-1]) <= RUIN_EQUITY_FLOOR and start_eq > 100)
     return {"roe": roe, "max_dd": max_dd, "n_days": len(d), "structural_ruin": bool(ruin),
             "median_equity": med_eq, "frac_days_green": frac_green, "n_active_days": n_active,
-            "median_leverage": median_leverage}
+            "median_leverage": median_leverage, "n_incomplete_excluded": n_incomplete_excluded}
 
 
 def journey_metrics(jr: pd.DataFrame, lo_ms: int, hi_ms: int, accessible: set | None) -> dict:
@@ -141,6 +153,12 @@ def journey_metrics(jr: pd.DataFrame, lo_ms: int, hi_ms: int, accessible: set | 
     surfaced as censored_max_hold_s so a multi-day/week hold straddling the boundary is rejected."""
     if jr is None or len(jr) == 0:
         return _empty_jm()
+    if "lifecycle_valid" in jr.columns:
+        jr = jr[jr["lifecycle_valid"].fillna(False)].copy()
+    if "stream_replay_valid" in jr.columns:
+        jr = jr[jr["stream_replay_valid"].fillna(False)].copy()
+        if len(jr) == 0:
+            return _empty_jm()
     # censored open-at-test_start holds: opened in pretest, not closed inside pretest (still open at
     # hi_ms). Censored hold = hi_ms - entry_ts (info only up to hi_ms). Used ONLY for the upper hold
     # (week-holder) gate; never enters PnL/count/median.
@@ -196,7 +214,9 @@ COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
 _PERF_FAIL_PREFIXES = ("net_pnl<=0", "roe<=0", "days_green<")
 
 
-def apply_floors(eqm: dict, jm: dict) -> tuple[bool, list[str]]:
+def apply_floors(
+    eqm: dict, jm: dict, *, equity_required: bool = True,
+) -> tuple[bool, list[str]]:
     """Per-fold pretest floors. Returns (eligible, fail_reasons).
 
     In COPYABILITY_ONLY mode, performance fails (net_pnl/roe/days_green) are recorded in fail_reasons but do
@@ -205,16 +225,17 @@ def apply_floors(eqm: dict, jm: dict) -> tuple[bool, list[str]]:
     f = []
     if jm["net_pnl"] <= 0:
         f.append(f"net_pnl<=0 ({jm['net_pnl']:.1f})")
-    if eqm["structural_ruin"]:
-        f.append("structural_ruin")
-    elif eqm["roe"] <= 0:
-        f.append(f"roe<=0 ({eqm['roe']:.2%})")
-    # absolute pretest equity floor: drop tiny degen accounts that merely survived (fold-pure)
-    me = eqm.get("median_equity", 0.0)
-    if me < MIN_EQUITY_USD:
-        f.append(f"equity_too_small (${me:.0f}<{MIN_EQUITY_USD:.0f})")
-    if eqm["max_dd"] > MAXDD_CAP:
-        f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
+    if equity_required:
+        if eqm["structural_ruin"]:
+            f.append("structural_ruin")
+        elif eqm["roe"] <= 0:
+            f.append(f"roe<=0 ({eqm['roe']:.2%})")
+        # absolute pretest equity floor: drop tiny degen accounts that merely survived (fold-pure)
+        me = eqm.get("median_equity", 0.0)
+        if me < MIN_EQUITY_USD:
+            f.append(f"equity_too_small (${me:.0f}<{MIN_EQUITY_USD:.0f})")
+        if eqm["max_dd"] > MAXDD_CAP:
+            f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
     if jm["n_journeys"] < MIN_JOURNEYS_PRETEST:
         f.append(f"n_journeys<{MIN_JOURNEYS_PRETEST} ({jm['n_journeys']})")
     if jm["median_hold_s"] <= HOLD_FLOOR_S:
@@ -232,18 +253,24 @@ def apply_floors(eqm: dict, jm: dict) -> tuple[bool, list[str]]:
         f.append(f"share_below_latency>{SHARE_BELOW_LATENCY_CAP:.0%} ({jm['share_below_latency']:.0%})")
     # LEVERAGE gate (Alberto spec): copy high but not ultra-high; reject median daily leverage > 10x.
     mlev = eqm.get("median_leverage", 0.0)
-    if mlev > LEVERAGE_CAP:
+    if equity_required and mlev > LEVERAGE_CAP:
         f.append(f"leverage>{LEVERAGE_CAP:.0f}x ({mlev:.1f}x)")
     # CONSISTENCY gate (Alberto spec): >=80% of active days green, enforced only when enough active days
     # exist to judge it (short fold windows can't prove consistency; thin history caught by other gates).
     nad = int(eqm.get("n_active_days", 0))
     fdg = eqm.get("frac_days_green", 0.0)
-    if nad >= MIN_ACTIVE_DAYS_GREEN and fdg < DAYS_GREEN_MIN:
+    if equity_required and nad >= MIN_ACTIVE_DAYS_GREEN and fdg < DAYS_GREEN_MIN:
         f.append(f"days_green<{DAYS_GREEN_MIN:.0%} ({fdg:.0%} over {nad}d)")
     # accessibility: unknown (NaN) does NOT fire (loose); only fail when known and < min
     af = jm["accessible_frac_notional"]
     if af == af and af < ACCESSIBLE_FRAC_MIN:
         f.append(f"accessible_frac<{ACCESSIBLE_FRAC_MIN:.0%} ({af:.0%})")
+    if not equity_required:
+        # Fixed-notional/direction-only lane: M1-derived equity, DD, leverage,
+        # and consistency are intentionally absent. Source net PnL is recorded
+        # but final performance judgment belongs to after-cost M7/M6b.
+        blocking = [x for x in f if not x.startswith("net_pnl<=0")]
+        return (len(blocking) == 0, f)
     if COPYABILITY_ONLY:
         # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
         blocking = [x for x in f if not x.startswith(_PERF_FAIL_PREFIXES)]
@@ -254,7 +281,15 @@ def apply_floors(eqm: dict, jm: dict) -> tuple[bool, list[str]]:
 def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: pd.DataFrame | None,
         accessible_by_fold: dict | None = None,
         active_test_folds_by_wallet: dict | None = None,
-        m04_by_fold: dict[int, pd.DataFrame] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+        m04_by_fold: dict[int, pd.DataFrame] | None = None,
+        quarantined_wallets: set[str] | None = None,
+        equity_required: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    quarantined_wallets = {w.lower() for w in (quarantined_wallets or set())}
+    if len(journeys) and {"lifecycle_valid", "stream_replay_valid"}.issubset(journeys.columns):
+        journeys = journeys[
+            journeys["lifecycle_valid"].fillna(False).astype(bool)
+            & journeys["stream_replay_valid"].fillna(False).astype(bool)
+        ].copy()
     # entities to evaluate: M4 copyable primaries — defensive filter on all three (codex code-r1 #2).
     if m04_by_fold is None:
         if m04 is None:
@@ -299,7 +334,11 @@ def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: 
                        "median_equity": 0.0, "frac_days_green": 0.0, "n_active_days": 0,
                        "median_leverage": 0.0}
             jm = journey_metrics(jr_by.get(w), lo_ms, hi_ms, acc)
-            elig, fails = apply_floors(eqm, jm)
+            elig, fails = apply_floors(eqm, jm, equity_required=equity_required)
+            recon_quarantined = equity_required and w.lower() in quarantined_wallets
+            if recon_quarantined:
+                elig = False
+                fails.append("reconstruction_quarantined")
             n_eval += 1; n_elig += int(elig)
             rows.append({
                 "entity_id": int(p["entity_id"]), "primary_wallet": w, "fold_id": fid,
@@ -308,6 +347,8 @@ def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: 
                 "median_equity_pretest": eqm.get("median_equity", 0.0),  # codex finding c: auditability
                 "max_dd_pretest": eqm["max_dd"], "structural_ruin_flag": eqm["structural_ruin"],
                 "median_leverage_pretest": eqm.get("median_leverage", 0.0),
+                "n_incomplete_equity_days_excluded": eqm.get("n_incomplete_excluded", 0),
+                "reconstruction_quarantined": recon_quarantined,
                 "frac_days_green_pretest": eqm.get("frac_days_green", 0.0),
                 "n_active_days_pretest": eqm.get("n_active_days", 0),
                 "n_journeys_pretest": jm["n_journeys"], "median_hold_s_pretest": jm["median_hold_s"],
@@ -318,6 +359,7 @@ def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: 
                 "accessible_set_as_of_ms": acc_as_of,
                 "m4_tier": p["tier"], "q_codes": ",".join(c for c in str(p["reason_codes"]).split(",") if c.startswith("q:")),
                 "as_of_ms": hi_ms,
+                "selection_lane": "equity" if equity_required else "copyability",
             })
         waterfall["folds"][fid] = {"evaluated": n_eval, "eligible": n_elig}
         logger.info(f"  fold {fid}: {n_eval} evaluated -> {n_elig} eligible")
@@ -337,14 +379,18 @@ def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: 
         active_tf = atf.get(w, np.nan)
         active_tf_known = bool(pd.notna(active_tf))   # codex code-r2: PER-WALLET, not global
         # codex code-r1 #1: G5 candidate REQUIRES active_test_folds>=3 too (from M3).
-        g5 = bool(active_tf_known and active_tf >= 3 and total_nj >= 5 and full_roe >= ROE_FULL_FLOOR_G5)
+        recon_quarantined = w.lower() in quarantined_wallets
+        g5 = bool(equity_required and not recon_quarantined and active_tf_known and active_tf >= 3
+                  and total_nj >= 5 and full_roe >= ROE_FULL_FLOOR_G5)
         pool_rows.append({
             "entity_id": eid, "primary_wallet": w,
             "eligible_folds": elig_folds_by_eid.get(eid, 0),
             "active_test_folds": active_tf, "total_n_journeys": total_nj,
             "source_6m_roe_full": full_roe,
             "g5_pool_candidate_pass": g5,
-            "g5_incomplete": not active_tf_known,   # this wallet's M3 active_test_folds missing -> undecidable
+            "g5_incomplete": (not equity_required) or not active_tf_known,
+            "selection_lane": "equity" if equity_required else "copyability",
+            "reconstruction_quarantined": recon_quarantined,
         })
     pool_df = pd.DataFrame(pool_rows)
     return elig_df, pool_df, waterfall
@@ -352,9 +398,12 @@ def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("equity", "copyability"), default="equity")
     ap.add_argument("--folds", required=True)
     ap.add_argument("--journeys", required=True)
-    ap.add_argument("--equity", required=True)
+    ap.add_argument("--equity")
+    ap.add_argument("--m01-audit",
+                    help="M1 audit parquet; wallets with quarantined=true fail closed")
     ap.add_argument("--m04", default=None, help="single m04_authenticity.parquet (compatibility mode)")
     ap.add_argument("--m04-dir", default=None,
                     help="directory with m04_authenticity_f{fold_id}.parquet for fold-pure M4")
@@ -366,7 +415,27 @@ def main():
 
     folds = pd.read_parquet(args.folds)
     journeys = pd.read_parquet(args.journeys)
-    equity = pd.read_parquet(args.equity)
+    if not {"lifecycle_valid", "stream_replay_valid"}.issubset(journeys.columns):
+        raise ValueError(
+            "M2 journeys lack lifecycle/stream replay validity; rebuild M2"
+        )
+    equity_required = args.mode == "equity"
+    if equity_required:
+        if not args.equity or not args.m01_audit:
+            raise ValueError("--mode equity requires --equity and --m01-audit")
+        equity = pd.read_parquet(args.equity)
+        if "gross_position_notional_usd" not in equity.columns:
+            raise ValueError(
+                "M1 equity artifact lacks gross_position_notional_usd; rebuild M1 before M5 "
+                "(signed position_value_usd can net hedged legs and understate leverage)"
+            )
+        m01_audit = pd.read_parquet(args.m01_audit, columns=["wallet", "quarantined"])
+        quarantined_wallets = set(
+            m01_audit.loc[m01_audit["quarantined"].fillna(True), "wallet"].astype(str).str.lower()
+        )
+    else:
+        equity = pd.DataFrame()
+        quarantined_wallets = set()
     if args.m04_dir:
         m04_by_fold = _load_m04_by_fold(Path(args.m04_dir), folds)
         m04 = None
@@ -386,7 +455,10 @@ def main():
     m04_rows = sum(len(v) for v in m04_by_fold.values()) if m04_by_fold is not None else len(m04)
     logger.info(f"folds={len(folds)} journeys={len(journeys):,} equity_rows={len(equity):,} m04_rows={m04_rows}")
 
-    elig_df, pool_df, waterfall = run(folds, journeys, equity, m04, acc, atf, m04_by_fold=m04_by_fold)
+    elig_df, pool_df, waterfall = run(
+        folds, journeys, equity, m04, acc, atf, m04_by_fold=m04_by_fold,
+        quarantined_wallets=quarantined_wallets, equity_required=equity_required,
+    )
 
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     elig_df.to_parquet(outdir / "m05_eligibility.parquet", index=False)

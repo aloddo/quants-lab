@@ -47,14 +47,16 @@ HL_API = "https://api.hyperliquid.xyz/info"
 DEXES = [None, "xyz", "flx"]  # main + builder dexes for position COUNT only
 
 
-def _retry(fn, n=3, sleep=1.0):
+def _retry(fn, n=5, sleep=1.0):
+    # n 3->5 + backoff (2026-07-09): HL API intermittently blips past 3 consecutive fails, NaN-ing the
+    # snapshot (recurred twice this session, resolved on manual re-run). More retries eat transient blips.
     last = None
     for attempt in range(n):
         try:
             return fn()
         except Exception as e:
             last = e
-            time.sleep(sleep)
+            time.sleep(sleep * (1 + attempt))  # 1,2,3,4,5s backoff
     raise last if last else RuntimeError("retry failed")
 
 

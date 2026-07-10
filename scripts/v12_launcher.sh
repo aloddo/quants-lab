@@ -40,8 +40,26 @@ PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
 # seed retry, restart kill-state reload, NEW/OLD reject tagging). Alberto GO (msg 9351 "only
 # positive full set") + codex GO (session 019e2d30, re-review). Guards inert if the expansion block
 # is absent. To revert to the baseline 10-coin V17: ARGS="--config config/copy_trader_wallets_v17.json".
+# 2026-06-28 (Alberto DIRECT VOICE GO "just go alive" TG voice 10244/10255 + "Go" 10258, no 2-4wk shadow gate;
+# quant): REPOINTED to the corrected V18 all-coin+xyz K=20 SETCOVER selection, LIVE small-size. This is the
+# fixed selection (the old v17_expansion cohort was halted 06-24 for "selection wrong"). K=20 sits below the
+# validated 30-wallet floor, authorized LIVE explicitly via global.live_below_floor_authorized=true. ENFORCED
+# hard kill = global_stop_pct 0.05 (~-$23 on $468; flattens all) -- max_daily_loss is config-only/not enforced
+# (codex go-live finding). Codex chain: approach-gate B PASS + go-live diff review PASS (2 rounds; caught the
+# unenforced daily-kill, fixed via global stop). NOTE for CoS: plist UNCHANGED; only this repo launcher
+# repointed (established pattern). To revert to old expansion: ARGS="--config config/copy_trader_wallets_v17_expansion.json".
 SCRIPT="strategies/live/hl_copy_trader_v17.py"
-ARGS="--config config/copy_trader_wallets_v17_expansion.json"
+# 2026-07-01 (quant): V24 LIVE PROBE -- beta-neutral taker cohort (12 active OOS-validated two-sided wallets,
+# BTC/ETH/HYPE/SOL/SUI). $50/order, NO margin cap (Alberto), 5% global stop floor. Alberto GO TG10410.
+# Codex re-review deferred to tomorrow (unavailable); self-reviewed pre-flight. Revert: restore v18 config below.
+# ARGS="--config config/copy_trader_wallets_v18_allcoin_xyz_live.json"
+# 2026-07-01 (quant): V24 LIVE PROBE. Halted Jul 2 (halt flags). Revert: ARGS="--config config/copy_trader_wallets_v24_LIVE.json"
+# 2026-07-06 (quant, GATE-1 go-live): repointed to gate1_v4 -- 10 OOS-validated wallets (Fable clean holdout
+# +94.5bps/trip n120), order_size $150, max_leverage_cap 5, global_stop_pct 0.15, expansion ON (xyz stripped).
+# Alberto capital GO TG10911/10913/10914/10916/10917 (150/order, waive codex, 5x lev, fail-fast). Ledger:
+# brain projects/quant/copy/2026-07-06-gate1-golive-validation-ledger. NOTE for CoS: plist UNCHANGED; only
+# this launcher repointed (established pattern). Supervised takeover needs halt flags removed + daemon loaded.
+ARGS="--config config/copy_trader_wallets_gate1_v4.json"
 
 cd "$WORKDIR"
 

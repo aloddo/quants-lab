@@ -1,0 +1,28 @@
+{
+  "run_id": "phase1_m01_rebuild_20260701_1723",
+  "status": "invalidated_stopped",
+  "stopped_at": "2026-07-01T18:02:46+03:00",
+  "stopped_after_wallet": 1748,
+  "started_at": "2026-07-01T17:23:00+03:00",
+  "git_head": "03009b784558bb8f272e7a56e49491487bb798a7",
+  "m01_and_streaming_io_diff_sha256": "da277141dfca6ed1339c7b32751074ffe7ab0f8e8d6418803169127e57209b73",
+  "wallet_file": {
+    "path": "app/data/v15/m01_universe_20k_wallets.txt",
+    "rows": 20378,
+    "sha256": "5e2d53780470b51d9d92e9f07a9f1f1e7a328451f85ebc0c1718f4f2909794a7"
+  },
+  "anchor_file": {
+    "path": "app/data/v13/wallet_anchor_state.parquet",
+    "sha256": "e46ab0d4a382b523ff9a2e09d78788697053762da99d19c50072ad50e11b35f4"
+  },
+  "window": {
+    "start": "2025-12-01",
+    "end_inclusive": "2026-05-23"
+  },
+  "headroom_gb": 1.0,
+  "output": "app/data/v15/phase1_rebuild_20260701_1723/m01_universe_series.parquet",
+  "audit_output": "app/data/v15/phase1_rebuild_20260701_1723/m01_universe_series.audit.parquet",
+  "validation_output": "app/data/v15/phase1_rebuild_20260701_1723/m01_validation.json",
+  "log": "/tmp/phase1_m01_rebuild_20260701_1723.log"
+  ,"code_note": "INVALID: M1 process loaded the recorded diff before the 2026-07-01 causal-audit fix. Emitted daily rows used causal seeding, but inter-anchor drift/quarantine used the later snapshot-backed ex-post seed. The acceptance audit therefore did not validate the emitted artifact. Do not use this output or launch M2 from it."
+}

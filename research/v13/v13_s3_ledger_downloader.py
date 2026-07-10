@@ -200,6 +200,10 @@ def main():
     ap.add_argument('--ledger-only', action='store_true',
                     help='Skip funding parse/persist. Alberto path A 2026-05-27: funding stays in REST cache; '
                          'avoids ~49GB funding disk on the ledger-only S3 path.')
+    ap.add_argument(
+        '--manifest-out',
+        help='Coverage manifest JSON. Defaults under app/data/v15/manifests/.',
+    )
     args = ap.parse_args()
 
     start_d = datetime.strptime(args.start, '%Y-%m-%d').replace(tzinfo=timezone.utc)
@@ -207,7 +211,10 @@ def main():
     start_ms_window = int(start_d.timestamp() * 1000)
     end_ms_window = int((end_d + timedelta(days=1)).timestamp() * 1000) - 1
 
-    # Cache file suffix encodes the window (matches v4 cache reader's keying).
+    # Full requested window is manifest metadata only. Data is persisted as
+    # immutable PER-DAY shards below so an interrupted run never leaves a file
+    # whose name falsely claims full-window coverage, and daily flushing stays
+    # O(total data) instead of rereading/rewriting a growing wallet file.
     suffix_window = f'_{start_ms_window}_{end_ms_window}'
 
     # Load wallet universe.
@@ -231,6 +238,8 @@ def main():
     n_ledger_total = 0
     n_funding_total = 0
     bytes_dl = 0
+    successful_hours: list[str] = []
+    failed_hours: list[dict] = []
     t_start = time.time()
 
     for day_idx, day in enumerate(days, 1):
@@ -238,7 +247,13 @@ def main():
         with ThreadPoolExecutor(max_workers=args.n_workers) as ex:
             futures = {ex.submit(_fetch_and_parse_hour, s3, day, h, wallets_lc, start_ms_window, end_ms_window, args.ledger_only): h for h in range(24)}
             for fut in as_completed(futures):
-                ledger_entries, funding_entries, dl_bytes = fut.result()
+                hour = futures[fut]
+                ledger_entries, funding_entries, dl_bytes, ok, error = fut.result()
+                hour_key = f'{day}/{hour:02d}'
+                if ok:
+                    successful_hours.append(hour_key)
+                else:
+                    failed_hours.append({'hour': hour_key, 'error': error})
                 for u, e in ledger_entries:
                     ledger_buckets[u].append(e)
                     n_ledger_total += 1
@@ -248,10 +263,13 @@ def main():
                         n_funding_total += 1
                 bytes_dl += dl_bytes
         if args.flush_every_day:
-            nL, eL = flush_per_wallet(ledger_buckets, LEDGER_OUT_DIR, suffix_window)
+            day_start = int(datetime.strptime(day, '%Y%m%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
+            day_end = day_start + 86_400_000 - 1
+            day_suffix = f'_{day_start}_{day_end}'
+            nL, eL = flush_per_wallet(ledger_buckets, LEDGER_OUT_DIR, day_suffix)
             ledger_buckets.clear()
             if not args.ledger_only:
-                nF, eF = flush_per_wallet(funding_buckets, FUNDING_OUT_DIR, suffix_window)
+                nF, eF = flush_per_wallet(funding_buckets, FUNDING_OUT_DIR, day_suffix)
                 funding_buckets.clear()
             else:
                 nF, eF = 0, 0
@@ -270,15 +288,47 @@ def main():
         flush_per_wallet(funding_buckets, FUNDING_OUT_DIR, suffix_window)
 
     total = time.time() - t_start
+    manifest_path = Path(args.manifest_out) if args.manifest_out else (
+        Path('/Users/hermes/quants-lab/app/data/v15/manifests')
+        / f'raw_misc_events_{start_d:%Y%m%d}_{end_d:%Y%m%d}.json'
+    )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        'source': f's3://{BUCKET}/{PREFIX}',
+        'start': start_d.strftime('%Y-%m-%d'),
+        'end': end_d.strftime('%Y-%m-%d'),
+        'start_ms': start_ms_window,
+        'end_ms': end_ms_window,
+        'wallet_count': len(wallets_lc),
+        'requested_hour_count': len(days) * 24,
+        'successful_hour_count': len(successful_hours),
+        'failed_hour_count': len(failed_hours),
+        'failed_hours': sorted(failed_hours, key=lambda x: x['hour']),
+        'ledger_only': bool(args.ledger_only),
+        'ledger_entries': n_ledger_total,
+        'funding_entries': n_funding_total,
+        'bytes_downloaded': bytes_dl,
+        'wall_seconds': total,
+        'complete': len(failed_hours) == 0 and len(successful_hours) == len(days) * 24,
+    }
+    tmp_manifest = manifest_path.with_suffix('.json.tmp')
+    with open(tmp_manifest, 'w') as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    tmp_manifest.replace(manifest_path)
     logger.info(
         f'\nDONE. Days: {len(days)}. Total ledger entries: {n_ledger_total:,}. '
         f'Total funding entries: {n_funding_total:,}. '
-        f'Bytes downloaded: {bytes_dl/1e9:.1f}GB. Wall: {total/60:.1f}min.'
+        f'Bytes downloaded: {bytes_dl/1e9:.1f}GB. Wall: {total/60:.1f}min. '
+        f'Hours: {len(successful_hours):,} ok / {len(failed_hours):,} failed. '
+        f'Manifest: {manifest_path}'
     )
+    if failed_hours:
+        logger.error(f'INCOMPLETE archive coverage; first failures: {failed_hours[:10]}')
+        raise SystemExit(2)
 
 
 def _fetch_and_parse_hour(s3, day, hour, wallets_lc, start_ms, end_ms, ledger_only=False):
-    """Worker: fetch + parse one hour file. Returns (ledger_list, funding_list, bytes)."""
+    """Worker: return entries, bytes, and explicit archive-object status."""
     ledger = []
     funding = []
     dl_bytes = 0
@@ -287,12 +337,12 @@ def _fetch_and_parse_hour(s3, day, hour, wallets_lc, start_ms, end_ms, ledger_on
         resp = s3.get_object(Bucket=BUCKET, Key=key, RequestPayer='requester')
         raw = resp['Body'].read()
         dl_bytes = len(raw)
-    except ClientError as e:
-        return ledger, funding, 0
+    except Exception as e:  # noqa: BLE001 - failure is persisted in the coverage manifest
+        return ledger, funding, 0, False, f'fetch:{type(e).__name__}:{e}'
     try:
         data = lz4.frame.decompress(raw)
     except Exception as e:
-        return ledger, funding, dl_bytes
+        return ledger, funding, dl_bytes, False, f'decompress:{type(e).__name__}:{e}'
     for line in data.split(b'\n'):
         if not line:
             continue
@@ -347,7 +397,7 @@ def _fetch_and_parse_hour(s3, day, hour, wallets_lc, start_ms, end_ms, ledger_on
                                     'nSamples': d.get('n_samples', 1),
                                 },
                             }))
-    return ledger, funding, dl_bytes
+    return ledger, funding, dl_bytes, True, None
 
 
 if __name__ == '__main__':
