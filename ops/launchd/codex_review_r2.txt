@@ -1,0 +1,1860 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4b0e-1fb7-7c10-9f06-a40aa0506400
+--------
+user
+# Round-2 review — Phase 1 fixes applied + the promoted heartbeat watchdog
+
+You reviewed Phase 1 (kill_switch, mark-collector supervisor, watchdog resolution) and returned FAIL with
+specific fixes. I applied them. Re-review: (A) confirm each fix is correct, (B) do a FRESH full review of the
+heartbeat watchdog now promoted to the single sanctioned killer. Be adversarial; live capital. Read the files.
+
+## Fixes applied (verify each)
+- `scripts/kill_switch.sh`: (1) P0 mode validation — a `case` rejects unknown modes with exit 2 BEFORE touching
+  halt flags (smoke-tested: `--bogus` → exit 2, no flag set). (2) P1 engine pattern now `bin/python
+  strategies/live/hl_copy_trader_v17.py` (requires the interpreter prefix so the script/editors don't self-match).
+  (3) P1 warns if >1 match. (4) P1 after SIGKILL it re-checks `engine_pids` and ABORTS (exit 3) before flatten
+  if any engine remains.
+- `data_pipeline/hl_live_mark_collector.py::load_day`: now RAISES on an unreadable existing day file instead of
+  returning [] (was: silently overwrite the day with partial buffer).
+- `ops/launchd/README.md`: mark-collector handover now `pkill -TERM` + WAIT-until-exit loop + SIGKILL fallback
+  BEFORE loading the KeepAlive agent; dropped the "loses no marks" claim.
+- Watchdog decision FLIPPED per your Q5: keep the STATS-heartbeat `scripts/v12_heartbeat_watchdog.sh`
+  (com.quantslab.v12-watchdog, already loaded) as the SINGLE sanctioned killer; retire the log-mtime
+  `~/.claude/scripts/v17-copy-engine-stall-watchdog.sh`. Runbook unloads the mtime one.
+
+## Files to read
+- `scripts/kill_switch.sh` (fixed)
+- `data_pipeline/hl_live_mark_collector.py` (load_day fixed)
+- `ops/launchd/README.md` (handover fixed)
+- `scripts/v12_heartbeat_watchdog.sh` (NOW THE SANCTIONED KILLER — full review; it self-describes its guards)
+- `scripts/v12_launcher.sh` (the supervised slot it kills into; KeepAlive restart semantics)
+- `strategies/live/hl_copy_trader_v17.py` STATS/_log_stats emission (does the heartbeat line only appear AFTER
+  the protected checks — exits/stops — actually run? that's the whole premise)
+
+## Questions
+- R1: Are the 4 kill_switch fixes correct and complete? Any remaining path to a false success or a wrong kill?
+- R2: Is the load_day raise correct, or does it introduce a crash-loop risk that loses MORE than it saves
+  (e.g., a transient read during atomic replace)? Given flush uses atomic `.tmp`→replace, can load_day ever
+  see a torn file?
+- R3: Is the mark-collector handover now race-free?
+- R4 (MAIN): Full adversarial review of `v12_heartbeat_watchdog.sh` as the sole sanctioned killer. Does its
+  STATS-content + generation-correlation logic actually kill on a real trading-loop freeze while NEVER
+  false-killing a healthy or mid-restart engine? Verify against the engine's `_log_stats`/STATS emission point:
+  is STATS emitted ONLY after `_check_exits`/stops run (so a frozen-but-logging reconnect loop is still caught)?
+  Any P0/P1 in the watchdog (PID resolution, escalation, throttle, log-file assumptions)?
+- R5: With the mtime watchdog retired, is there ANY freeze mode the heartbeat watchdog misses that the mtime
+  one would have caught (i.e., are we losing coverage by dropping it)? If yes, name it.
+
+## Output
+Per question: verdict + evidence (file:line). End OVERALL: is Phase 1 now correct + safe to hand CoS for
+activation, or what still must change. Consensus target: a clean, single-sanctioned-killer live stack.
+codex
+I’ll reread the touched files and inspect the heartbeat path end to end before giving a verdict. I’m going to treat this as a code review: findings first, with file/line evidence and the specific failure modes they imply.
+exec
+/bin/zsh -lc 'nl -ba scripts/kill_switch.sh' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	#!/bin/bash
+     2	# kill_switch.sh — EMERGENCY STOP for the LIVE HL copy engine (V17).
+     3	#
+     4	# 2026-07-10 (Phase-1 cleanup): rewritten. The prior kill_switch targeted the RETIRED Hummingbot/API stack
+     5	# (localhost:8000/8001, tmux ql-pipeline/ql-api) and did NOT stop the live V17 engine. This one acts on the
+     6	# real live stack: the halt flags the launcher respects (/tmp/v12_pause + $WORKDIR/.HALT_COPY), the running
+     7	# V17 engine PID, and the canonical exchange-truth flatten (tools/flatten_all_offline.py).
+     8	#
+     9	# MODES:
+    10	#   (default, no args)  PANIC FLATTEN — set halt flags, kill the running V17 engine, then market-close ALL
+    11	#                       open HL positions (main+xyz+flx) via flatten_all_offline --execute, and verify flat.
+    12	#                       This is the correct emergency: killing the engine stops its in-process trailing stops,
+    13	#                       so leaving positions open would be UNMANAGED risk — the safe emergency is to get FLAT.
+    14	#   --halt-only         Set halt flags + kill the engine PID, but DO NOT flatten. Positions remain OPEN and
+    15	#                       UNMANAGED — only use for maintenance where you will manage exposure by hand.
+    16	#   --pause             Softest: set halt flags only. The already-running engine keeps managing its positions;
+    17	#                       launchd KeepAlive will NOT relaunch it once it exits. No kill, no flatten.
+    18	#
+    19	# RESUME after any mode: rm -f /tmp/v12_pause "$WORKDIR/.HALT_COPY"   (launchd KeepAlive relaunches the engine)
+    20	set -uo pipefail
+    21	
+    22	WORKDIR="/Users/hermes/quants-lab"
+    23	PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
+    24	# Match the LIVE engine only: require the python-interpreter prefix so this very script (which contains the
+    25	# string "hl_copy_trader_v17.py" in this pattern) and editors/greps do NOT self-match (codex Q3).
+    26	ENGINE_PAT="bin/python strategies/live/hl_copy_trader_v17.py"
+    27	MODE="${1:-flatten}"
+    28	ts() { date '+%F %T %Z'; }
+    29	
+    30	# codex P0: validate mode BEFORE touching flags/flatten. An unknown arg (e.g. "--halt" typo) must NOT fall
+    31	# through to the default flatten.
+    32	case "$MODE" in
+    33	  flatten|--halt-only|--pause) ;;
+    34	  *)
+    35	    echo "kill_switch: unknown mode '$MODE'" >&2
+    36	    echo "usage: kill_switch.sh [--pause | --halt-only | (no arg = PANIC FLATTEN)]" >&2
+    37	    exit 2
+    38	    ;;
+    39	esac
+    40	
+    41	engine_pids() { pgrep -f "$ENGINE_PAT" || true; }
+    42	
+    43	echo "[$(ts)] kill_switch: mode=$MODE — setting halt flags (/tmp/v12_pause + .HALT_COPY)"
+    44	touch /tmp/v12_pause "$WORKDIR/.HALT_COPY"
+    45	
+    46	if [ "$MODE" = "--pause" ]; then
+    47	  echo "[$(ts)] kill_switch: PAUSE set. Launcher will not relaunch; running engine left as-is."
+    48	  echo "[$(ts)] kill_switch: resume with: rm -f /tmp/v12_pause \"$WORKDIR/.HALT_COPY\""
+    49	  exit 0
+    50	fi
+    51	
+    52	# Stop the running engine so it takes no further action.
+    53	PIDS=$(engine_pids)
+    54	if [ -n "$PIDS" ]; then
+    55	  N=$(echo "$PIDS" | wc -w | tr -d ' ')
+    56	  [ "$N" -gt 1 ] && echo "[$(ts)] kill_switch: WARNING $N engine matches (expected 1): $PIDS — killing all"
+    57	  echo "[$(ts)] kill_switch: stopping V17 engine PID(s): $PIDS"
+    58	  # shellcheck disable=SC2086
+    59	  kill $PIDS 2>/dev/null || true
+    60	  sleep 3
+    61	  PIDS=$(engine_pids)
+    62	  if [ -n "$PIDS" ]; then
+    63	    echo "[$(ts)] kill_switch: engine still up, SIGKILL: $PIDS"
+    64	    # shellcheck disable=SC2086
+    65	    kill -9 $PIDS 2>/dev/null || true
+    66	    sleep 2
+    67	  fi
+    68	else
+    69	  echo "[$(ts)] kill_switch: no running V17 engine found"
+    70	fi
+    71	
+    72	# codex P1: after kill, PROVE the engine is gone before flattening/reporting success. A surviving engine
+    73	# would race the flatten (re-open/re-manage). Abort loudly if any match remains.
+    74	PIDS=$(engine_pids)
+    75	if [ -n "$PIDS" ]; then
+    76	  echo "[$(ts)] kill_switch: !!! engine STILL RUNNING after SIGKILL (PID $PIDS). Aborting before flatten — investigate manually (halt flags ARE set)." >&2
+    77	  exit 3
+    78	fi
+    79	
+    80	if [ "$MODE" = "--halt-only" ]; then
+    81	  echo "[$(ts)] kill_switch: HALT-ONLY done. Engine stopped; positions LEFT OPEN and UNMANAGED."
+    82	  echo "[$(ts)] kill_switch: to flatten now, run: bash scripts/kill_switch.sh"
+    83	  exit 0
+    84	fi
+    85	
+    86	# Default: FLATTEN everything. flatten_all_offline aborts unless BOTH halt markers are present (set above),
+    87	# is idempotent, and verifies flatness on-exchange (Rule 8).
+    88	echo "[$(ts)] kill_switch: FLATTEN — market-closing ALL HL positions (main+xyz+flx) via flatten_all_offline"
+    89	cd "$WORKDIR"
+    90	if [ -f .env ]; then
+    91	  set -a
+    92	  # shellcheck source=/dev/null
+    93	  source .env
+    94	  set +a
+    95	fi
+    96	"$PYTHON" tools/flatten_all_offline.py --execute
+    97	rc=$?
+    98	if [ "$rc" -ne 0 ]; then
+    99	  echo "[$(ts)] kill_switch: !!! FLATTEN returned $rc — engine is halted but positions may NOT be flat. Check manually: python tools/flatten_all_offline.py (dry-run) and the HL UI."
+   100	  exit "$rc"
+   101	fi
+   102	echo "[$(ts)] kill_switch: DONE. Engine halted + flat. Resume with: rm -f /tmp/v12_pause \"$WORKDIR/.HALT_COPY\""
+
+exec
+/bin/zsh -lc 'nl -ba data_pipeline/hl_live_mark_collector.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	#!/usr/bin/env python3
+     2	"""Real-time HL MARK collector (Alberto GO 2026-07-09): poll metaAndAssetCtxs every ~60s, timestamp it,
+     3	store per-coin markPx (+oraclePx, midPx). From now on we have continuous 1-min marks -> the OOS is never
+     4	blocked by the ~10-day asset_ctxs archive lag again.
+     5	
+     6	Source: https://api.hyperliquid.xyz/info {"type":"metaAndAssetCtxs"} -- ONE low-weight call/min (231 main-dex
+     7	coins), zero 429 risk to the copy trader. (xyz/HIP-3 dexes need per-dex polls -> fast-follow, not here.)
+     8	
+     9	Output: app/data/hl_mark_1m_hot/{YYYYMMDD}.parquet  cols: coin,timestamp_utc(ms),markPx,oraclePx,midPx,source
+    10	Resident loop; resumes the current UTC day on restart; flushes atomically every N polls + on day rollover +
+    11	on SIGTERM/SIGINT. Read-only w.r.t. everything else. Companion loader: research/v15/live_marks.live_mark_at.
+    12	"""
+    13	from __future__ import annotations
+    14	import argparse, logging, signal, sys, time
+    15	from datetime import datetime, timezone
+    16	from pathlib import Path
+    17	from typing import Any
+    18	
+    19	import pandas as pd
+    20	import requests
+    21	
+    22	REPO = Path(__file__).resolve().parent.parent
+    23	OUT_DIR = REPO / "app" / "data" / "hl_mark_1m_hot"
+    24	HL_API = "https://api.hyperliquid.xyz/info"
+    25	# timestamp_utc is MINUTE-FLOORED (join key -> aligns with 1m candles/fills timestamp_utc, which are also
+    26	# minute-floored). poll_ts_utc keeps the exact wall-clock poll instant for audit. (Alberto 2026-07-09:
+    27	# "properly to the minute mark so it's joinable with the S3 backfill".)
+    28	COLS = ["coin", "timestamp_utc", "poll_ts_utc", "markPx", "oraclePx", "midPx", "source"]
+    29	LOG = logging.getLogger("hl_live_mark")
+    30	
+    31	_stop = False
+    32	
+    33	
+    34	def _sig(*_a):
+    35	    global _stop
+    36	    _stop = True
+    37	
+    38	
+    39	def day_id(ts_ms: int) -> str:
+    40	    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y%m%d")
+    41	
+    42	
+    43	def poll_once(session: requests.Session, ts_ms: int) -> list[dict[str, Any]]:
+    44	    r = session.post(HL_API, json={"type": "metaAndAssetCtxs"}, timeout=15).json()
+    45	    if not (isinstance(r, list) and len(r) == 2):
+    46	        raise RuntimeError("metaAndAssetCtxs: unexpected response shape")
+    47	    meta, ctxs = r[0], r[1]
+    48	    uni = meta.get("universe", [])
+    49	    minute_ms = (ts_ms // 60_000) * 60_000     # minute-floored join key (aligns with 1m candle grid)
+    50	    rows = []
+    51	    for u, c in zip(uni, ctxs):
+    52	        coin = u.get("name")
+    53	        if not coin or not isinstance(c, dict):
+    54	            continue
+    55	        mk = c.get("markPx")
+    56	        if mk is None:
+    57	            continue
+    58	        rows.append({"coin": coin, "timestamp_utc": minute_ms, "poll_ts_utc": ts_ms, "markPx": str(mk),
+    59	                     "oraclePx": str(c.get("oraclePx", "")), "midPx": str(c.get("midPx", "")),
+    60	                     "source": "hl_api_metaAndAssetCtxs_1m"})
+    61	    return rows
+    62	
+    63	
+    64	def load_day(day: str) -> list[dict[str, Any]]:
+    65	    fp = OUT_DIR / f"{day}.parquet"
+    66	    if not fp.exists():
+    67	        return []
+    68	    try:
+    69	        return pd.read_parquet(fp).to_dict("records")
+    70	    except Exception as e:
+    71	        # codex P1 (2026-07-10): do NOT swallow a read error and return [] — the next flush would then
+    72	        # overwrite an existing day's marks with only the new (partial) buffer, silently truncating live
+    73	        # history. Fail LOUD so KeepAlive surfaces it and an operator fixes/moves the bad file.
+    74	        raise RuntimeError(
+    75	            f"hl_live_mark_collector: existing day file {fp} is unreadable ({e!r}). Refusing to start empty "
+    76	            f"and overwrite it. Move/repair the file, then let KeepAlive relaunch."
+    77	        ) from e
+    78	
+    79	
+    80	def flush_day(day: str, buf: list[dict[str, Any]]) -> None:
+    81	    if not buf:
+    82	        return
+    83	    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    84	    df = pd.DataFrame(buf, columns=COLS).sort_values(["coin", "timestamp_utc"], kind="mergesort")
+    85	    # dedup exact (coin, ts) in case of a restart-overlap poll
+    86	    df = df.drop_duplicates(subset=["coin", "timestamp_utc"], keep="last")
+    87	    fp = OUT_DIR / f"{day}.parquet"
+    88	    tmp = fp.with_suffix(".parquet.tmp")
+    89	    df.to_parquet(tmp, index=False, compression="snappy")
+    90	    tmp.replace(fp)
+    91	
+    92	
+    93	def main() -> int:
+    94	    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    95	                        stream=sys.stdout, force=True)
+    96	    ap = argparse.ArgumentParser()
+    97	    ap.add_argument("--interval", type=int, default=60, help="seconds between polls")
+    98	    ap.add_argument("--flush-every", type=int, default=5, help="flush the day parquet every N polls")
+    99	    ap.add_argument("--once", action="store_true", help="single poll then exit (testing)")
+   100	    args = ap.parse_args()
+   101	    signal.signal(signal.SIGTERM, _sig)
+   102	    signal.signal(signal.SIGINT, _sig)
+   103	    session = requests.Session()
+   104	
+   105	    now_ms = int(time.time() * 1000)
+   106	    cur_day = day_id(now_ms)
+   107	    buf = load_day(cur_day)
+   108	    LOG.info("start: interval=%ss flush_every=%s resumed_day=%s rows=%d", args.interval, args.flush_every, cur_day, len(buf))
+   109	
+   110	    if args.once:
+   111	        buf.extend(poll_once(session, now_ms)); flush_day(cur_day, buf)
+   112	        LOG.info("once: wrote %d rows to %s", len(buf), OUT_DIR / f"{cur_day}.parquet")
+   113	        return 0
+   114	
+   115	    n = 0
+   116	    while not _stop:
+   117	        t0 = time.time()
+   118	        ts_ms = int(t0 * 1000)
+   119	        day = day_id(ts_ms)
+   120	        if day != cur_day:                       # UTC day rollover -> flush + start fresh
+   121	            flush_day(cur_day, buf)
+   122	            cur_day = day
+   123	            buf = load_day(cur_day)
+   124	            LOG.info("day rollover -> %s", cur_day)
+   125	        try:
+   126	            rows = poll_once(session, ts_ms)
+   127	            buf.extend(rows)
+   128	            n += 1
+   129	            if n % args.flush_every == 0:
+   130	                flush_day(cur_day, buf)
+   131	            if n % 30 == 0:
+   132	                LOG.info("polled %d times; day=%s buf_rows=%d last_coins=%d", n, cur_day, len(buf), len(rows))
+   133	        except Exception as exc:
+   134	            LOG.warning("poll failed (continuing): %s", exc)
+   135	        # sleep the remainder of the interval, but wake often to honor _stop
+   136	        elapsed = time.time() - t0
+   137	        remaining = max(0.0, args.interval - elapsed)
+   138	        while remaining > 0 and not _stop:
+   139	            step = min(2.0, remaining)
+   140	            time.sleep(step)
+   141	            remaining -= step
+   142	
+   143	    flush_day(cur_day, buf)
+   144	    LOG.info("stopped: flushed day=%s rows=%d", cur_day, len(buf))
+   145	    return 0
+   146	
+   147	
+   148	if __name__ == "__main__":
+   149	    raise SystemExit(main())
+
+exec
+/bin/zsh -lc 'nl -ba ops/launchd/README.md' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	# ops/launchd — launchd service templates (infra-as-code)
+     2	
+     3	Canonical, version-controlled copies of the launchd services for the LIVE HL copy-trading stack. macOS
+     4	loads plists from `/Library/LaunchDaemons` (system) or `~/Library/LaunchAgents` (user); those installed
+     5	copies should match the templates here. **CoS owns installing/loading/unloading** (needs the right session
+     6	+ sometimes sudo). This dir is the source of truth for what SHOULD be loaded.
+     7	
+     8	## The KEEP set (live stack — must stay loaded)
+     9	| Service | Kind | Supervises |
+    10	|---|---|---|
+    11	| `com.quantslab.v12-copy-trader` | system daemon | the V17 engine via `scripts/v12_launcher.sh` (KeepAlive) |
+    12	| `com.quantslab.hl-s3-fills-daily` | user agent | 06:20 S3 data refresh (`scripts/hl_s3_fills_daily_refresh.sh`) |
+    13	| `com.quantslab.v12-watchdog` | user agent | engine stall watchdog (`scripts/v12_heartbeat_watchdog.sh`, STATS-heartbeat content) — the ONE sanctioned killer (promoted 2026-07-10) |
+    14	| `com.quantslab.pnl-tracker` | system daemon | live PnL → Telegram (`tools/pnl_tracker.py`) |
+    15	| `com.quantslab.hl-mark-collector` | user agent | **NEW (this dir)** — supervises the live 1m mark collector |
+    16	
+    17	## Phase-1 activation runbook (CoS to execute; codex-reviewed 2026-07-10)
+    18	Live V17 engine must stay untouched. Do these three; verify after each.
+    19	
+    20	### 1. Supervise the mark collector (fixes the unsupervised SPOF)
+    21	```bash
+    22	# 1a. Stop the old unsupervised nohup collector GRACEFULLY and WAIT for it to exit (codex Q4: a lingering
+    23	#     old process + the new one share the same {day}.parquet.tmp path -> race / lost final rows).
+    24	pkill -TERM -f 'data_pipeline/hl_live_mark_collector.py' || true
+    25	for i in $(seq 1 20); do pgrep -f 'data_pipeline/hl_live_mark_collector.py' >/dev/null || break; sleep 1; done
+    26	pgrep -f 'data_pipeline/hl_live_mark_collector.py' && { echo "old collector still up — SIGKILL"; pkill -9 -f 'data_pipeline/hl_live_mark_collector.py'; sleep 2; } || echo "old collector exited"
+    27	# 1b. Only now install + load the KeepAlive agent (RunAtLoad starts a fresh one).
+    28	cp /Users/hermes/quants-lab/ops/launchd/com.quantslab.hl-mark-collector.plist ~/Library/LaunchAgents/
+    29	launchctl load ~/Library/LaunchAgents/com.quantslab.hl-mark-collector.plist
+    30	# 1c. verify: exactly one fresh collector, supervised, writing marks.
+    31	launchctl list | grep hl-mark-collector
+    32	pgrep -fl 'hl_live_mark_collector'   # expect exactly ONE
+    33	tail -f /tmp/ql-hl-mark-collector.launchd.log
+    34	```
+    35	Handover: the collector writes `app/data/hl_mark_1m_hot/{day}.parquet` atomically and resumes the current UTC
+    36	day on start. Marks are safe ONLY if the old process has fully exited (step 1a) before the new one loads — the
+    37	brief gap (seconds) is at most one 60s poll, and SIGTERM flushes the buffer on the way out.
+    38	
+    39	### 2. Resolve the two-killers problem (retire the log-mtime watchdog, keep the STATS one)
+    40	Codex (2026-07-10): log-mtime staleness is NOT loop health — a reconnect/error loop can keep the log fresh
+    41	while the trading loop never runs its protected checks, bypassing the mtime watchdog. The heartbeat watchdog
+    42	(`scripts/v12_heartbeat_watchdog.sh`, com.quantslab.v12-watchdog, ALREADY loaded) keys on the STATS heartbeat
+    43	CONTENT and is strictly more targeted. Keep it; retire the mtime one.
+    44	```bash
+    45	# retire the log-mtime watchdog
+    46	launchctl unload ~/Library/LaunchAgents/com.quantslab.v17-stall-watchdog.plist
+    47	launchctl list | grep -c v17-stall-watchdog   # expect 0
+    48	# confirm the sanctioned heartbeat killer stays up
+    49	launchctl list | grep v12-watchdog            # expect it present (PID)
+    50	```
+    51	(The `~/.claude/scripts/v17-copy-engine-stall-watchdog.sh` script + its plist are archived after unload.)
+    52	
+    53	### 3. kill_switch.sh (no daemon action — repo script)
+    54	`scripts/kill_switch.sh` was rewritten to actually stop V17 (halt flags + kill engine PID + flatten via
+    55	`tools/flatten_all_offline.py`). No launchd change; just verify it runs (`bash scripts/kill_switch.sh --pause`
+    56	is the safe no-op-ish smoke: sets flags only; then `rm -f /tmp/v12_pause .HALT_COPY` to resume).
+    57	
+    58	## Secrets note (Phase-2)
+    59	The retired `/Library/LaunchDaemons/com.quantslab.{api,pipeline}.plist` contain plaintext Bybit/Telegram
+    60	secrets. The KEEP-set plists above are clean (only `MONGO_URI`/`HOME`/`PATH` env; the stall watchdog reads
+    61	the TG token from `.env`). Removing the retired plists in Phase 2 removes the plaintext secrets.
+
+codex
+I have the first three files. Next I’m tracing the watchdog against the launcher and the engine’s STATS emission point, because the key question is whether the heartbeat is a true “protected loop completed” signal or just another log freshness proxy.
+exec
+/bin/zsh -lc 'nl -ba scripts/v12_heartbeat_watchdog.sh' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	#!/bin/bash
+     2	# v12_heartbeat_watchdog.sh -- SANCTIONED engine stall watchdog (promoted 2026-07-10, Phase-1 cleanup).
+     3	# RESOLUTION of the two-killers problem: codex (2026-07-10) showed the OTHER watchdog
+     4	# (~/.claude/scripts/v17-copy-engine-stall-watchdog.sh, log-MTIME staleness) is NOT loop-health -- a
+     5	# reconnect/error loop can keep the log fresh while the trading loop never reaches _check_exits/_log_stats,
+     6	# bypassing an mtime check. THIS watchdog keys on the STATS heartbeat CONTENT (the line emitted only after
+     7	# the protected checks run) with generation-correlation guards, so it is strictly more targeted. Decision:
+     8	# THIS is the single sanctioned killer; the log-mtime watchdog is retired (CoS unloads
+     9	# com.quantslab.v17-stall-watchdog). Codex round-2 PASS of this script is required before it is final.
+    10	# --- original draft header (guards documented below) ---
+    11	# v12_heartbeat_watchdog.sh -- DRAFT v2 (superseded by the promotion note above)
+    12	#
+    13	# PURPOSE: bound the unprotected window after a main-event-loop FREEZE of the live V18 copy trader.
+    14	# On 2026-06-29 05:52:03 -> 06:27:30 the bot's whole loop (STATS heartbeat 60s + WS feed + fill-sync)
+    15	# stalled for 34.6 min while the process stayed ALIVE (host-level freeze: net blackout or macOS App Nap).
+    16	# The enforced 5% global stop + exit polling run INSIDE that loop, so an open position was unprotected the
+    17	# entire time. v12_launcher.sh has no staleness detection. This watchdog detects a stale STATS heartbeat
+    18	# and kills the frozen bot; launchd (KeepAlive=true, ThrottleInterval=30) restarts the supervised slot,
+    19	# which re-syncs positions/fills from exchange truth on boot.
+    20	#
+    21	# SAFETY MODEL (codex round-1 FAIL fixes; guards live capital -- a false kill mid-restart is worse than no WD):
+    22	#   1. STALENESS IS LOOP-RELATIVE, NOT CLOCK-PARSED. We count consecutive checks where the newest STATS line
+    23	#      is byte-identical. stale after STALE_CHECKS consecutive unchanged checks. Immune to wall-clock jumps,
+    24	#      timezone, and date-parse failures (codex P1 clock/parse findings).
+    25	#   2. PID-GENERATION CORRELATION. We resolve EXACTLY ONE supervised PID by its full absolute command line
+    26	#      AND capture its start time (lstart) as a generation id. If the PID or its start time changes (cold
+    27	#      restart), we RESET the unchanged-counter -> a freshly restarted bot is never judged by the old
+    28	#      generation's heartbeat (codex P0 cold-restart false-kill + P0 fresh-restart SIGKILL).
+    29	#   3. SAME-PID-ONLY ESCALATION. We capture pid+start BEFORE signaling; after SIGTERM we only SIGKILL if the
+    30	#      SAME pid with the SAME start time is still alive. We NEVER re-resolve/re-pgrep for the kill phase
+    31	#      (codex P0: launchd may have already restarted -> would kill the new healthy instance).
+    32	#   4. EXACT SINGLE-MATCH TARGETING. Match the full "python <abs-script>" command, require EXACTLY ONE. >1
+    33	#      live instance = P0 operational incident -> log LOUD, do NOT kill (a shared log heartbeat cannot judge
+    34	#      multiple processes) (codex P0 multi-instance + fuzzy-pgrep findings).
+    35	#   5. PAUSE RE-CHECK before EACH signal (codex P1 pause race). Respects /tmp/v12_pause + .HALT_COPY.
+    36	#   6. GRACE for a young process with no current-generation STATS yet (cold boot loads ~146 closes, first
+    37	#      STATS ~1-2 min): do not act until the process is older than GRACE_SEC; after grace, a process that has
+    38	#      NEVER emitted STATS is treated as frozen (codex P1 truncation/never-heartbeat false-negative).
+    39	#   7. Bounded, generation-correlated log read via byte-offset tail -c (codex round-2 P0 + P2).
+    40	#   8. ARMED gate (codex round-3 P0): a freeze-kill is permitted only after the CURRENT generation has shown
+    41	#      >=2 distinct post-offset STATS lines (proving it is really heartbeating), OR SEEN>=GRACE_CHECKS. This
+    42	#      stops a single LATE old-generation STATS line (flushed just after the offset mark) from bypassing the
+    43	#      cold-start grace and killing a young healthy bot at ~180s.
+    44	#
+    45	# OPERATIONAL CONSTRAINT (codex round-3 P1): do NOT externally rotate $LOG while the slot is supervised.
+    46	# launchd owns this file and reopens it only on (re)start. External logrotate of the active inode would make
+    47	# the bot keep writing to the rotated-away fd while the watchdog sees a silent new file -> false kill.
+    48	#
+    49	# DEPLOYMENT (Alberto decision; CoS owns plists): run as its own launchd KeepAlive job. This script self-loops.
+    50	
+    51	set -uo pipefail
+    52	
+    53	WORKDIR="/Users/hermes/quants-lab"
+    54	LOG="/tmp/ql-v12-copy-trader-launchd.log"
+    55	# Full, exact command of the supervised live bot (interpreter + absolute-relative script). Specific enough
+    56	# that it cannot match an editor, a grep, or this watchdog.
+    57	CMD_MATCH="miniforge3/envs/quants-lab/bin/python strategies/live/hl_copy_trader_v17.py"
+    58	
+    59	CHECK_SEC=30                 # poll cadence
+    60	STALE_CHECKS=6               # 6 * 30s = 180s of an unchanged STATS line -> frozen (3 missed 60s beats)
+    61	GRACE_SEC=240                # young process w/ no current-gen STATS is not judged until older than this
+    62	COOLDOWN_SEC=240             # after a kill, pause arming so a cold restart is never re-killed
+    63	
+    64	# Resolve the single supervised bot. Echoes "PID<TAB>START" or nothing. START is ps lstart string
+    65	# (stable per process generation; compared as an opaque id, never arithmetic). ps -axww => no command
+    66	# truncation (codex P1). Substring match is fail-SAFE: >1 match => DO NOT kill (handled by caller).
+    67	resolve_bot() {
+    68	  local lines n
+    69	  lines=$(ps -axww -o pid=,lstart=,command= 2>/dev/null | grep -F "$CMD_MATCH" | grep -v "grep" || true)
+    70	  n=$(printf '%s' "$lines" | grep -c . || true)
+    71	  if [ "$n" -eq 0 ]; then return 1; fi
+    72	  if [ "$n" -gt 1 ]; then
+    73	    echo "MULTI"   # caller treats as P0 incident
+    74	    return 2
+    75	  fi
+    76	  # one line: "PID  Www Mmm DD HH:MM:SS YYYY  /path/python script ..."
+    77	  local pid start
+    78	  pid=$(printf '%s' "$lines" | awk '{print $1}')
+    79	  start=$(printf '%s' "$lines" | awk '{print $2,$3,$4,$5,$6}')   # lstart 5 fields = generation id
+    80	  printf '%s\t%s\n' "$pid" "$start"
+    81	}
+    82	
+    83	# is pid alive AND still the same generation (start string match)?
+    84	same_gen() {
+    85	  local pid="$1" want="$2" cur
+    86	  cur=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/  */ /g; s/^ //; s/ $//')
+    87	  [ -n "$cur" ] && [ "$cur" = "$want" ]
+    88	}
+    89	
+    90	# newest STATS line emitted AFTER byte-offset $1 (current generation only). Reading only post-mark bytes
+    91	# correlates the heartbeat to the generation: a cold-starting bot that has not yet emitted STATS yields an
+    92	# EMPTY result here (the OLD generation's lines are before the mark) -> the no-STATS grace branch applies
+    93	# instead of inheriting the prior generation's last line (codex round-2 P0). Each STATS line leads with a
+    94	# millisecond wall-clock stamp, so consecutive heartbeats are ALWAYS byte-distinct; a frozen loop appends
+    95	# nothing, so the post-mark newest line stays identical -> UNCHANGED climbs (codex round-2 P0 "changing field").
+    96	newest_stats() { tail -c "+$(( ${1:-0} + 1 ))" "$LOG" 2>/dev/null | grep -F "INFO: STATS:" | tail -1; }
+    97	
+    98	log_size()  { wc -c < "$LOG" 2>/dev/null | tr -d ' '; }
+    99	log_inode() { stat -f %i "$LOG" 2>/dev/null; }
+   100	
+   101	paused() { [ -f /tmp/v12_pause ] || [ -f "$WORKDIR/.HALT_COPY" ]; }
+   102	
+   103	echo "[$(date '+%F %T %Z')] watchdog v2: start stale=$((STALE_CHECKS*CHECK_SEC))s check=${CHECK_SEC}s match='$CMD_MATCH'"
+   104	
+   105	PREV_PID=""
+   106	PREV_START=""
+   107	PREV_LINE=""
+   108	UNCHANGED=0
+   109	SEEN=0          # checks observed for the CURRENT generation (loop-relative proc age; no ps clock dep)
+   110	GEN_OFFSET=0    # log byte-offset captured at generation start; only STATS after it count
+   111	GEN_INODE=""    # log inode at generation start; change => rotation
+   112	DISTINCT=0      # count of distinct post-offset STATS lines seen this generation
+   113	ARMED=0         # 1 once the generation has proven it heartbeats (>=2 distinct lines) or grace elapsed
+   114	GRACE_CHECKS=$(( GRACE_SEC / CHECK_SEC ))
+   115	
+   116	reset_gen() { PREV_PID=""; PREV_START=""; PREV_LINE=""; UNCHANGED=0; SEEN=0; GEN_OFFSET=0; GEN_INODE=""; DISTINCT=0; ARMED=0; }
+   117	
+   118	while true; do
+   119	  sleep "$CHECK_SEC"
+   120	
+   121	  if paused; then reset_gen; continue; fi
+   122	
+   123	  res=$(resolve_bot); rc=$?
+   124	  if [ "$rc" -eq 2 ]; then
+   125	    echo "[$(date '+%F %T %Z')] watchdog: P0 MULTIPLE bot instances match '$CMD_MATCH' -- NOT killing (operational incident, investigate)"
+   126	    reset_gen
+   127	    continue
+   128	  fi
+   129	  if [ "$rc" -ne 0 ] || [ -z "$res" ]; then
+   130	    reset_gen   # not running; launchd will restart.
+   131	    continue
+   132	  fi
+   133	
+   134	  pid=$(printf '%s' "$res" | cut -f1)
+   135	  start=$(printf '%s' "$res" | cut -f2)
+   136	  cur_inode=$(log_inode)
+   137	
+   138	  # generation change (cold restart) OR log rotation/truncation -> mark a fresh offset baseline.
+   139	  cur_size=$(log_size); cur_size=${cur_size:-0}
+   140	  if [ "$pid" != "$PREV_PID" ] || [ "$start" != "$PREV_START" ]; then
+   141	    # cold restart (new generation) -> full staleness reset incl DISTINCT/ARMED so the new gen must
+   142	    # re-prove it heartbeats; never inherit the prior generation's armed state (codex round-4 P0).
+   143	    PREV_PID="$pid"; PREV_START="$start"; PREV_LINE=""; UNCHANGED=0; SEEN=0; DISTINCT=0; ARMED=0
+   144	    GEN_OFFSET="$cur_size"; GEN_INODE="$cur_inode"
+   145	  elif [ "$cur_inode" != "$GEN_INODE" ] || [ "$cur_size" -lt "$GEN_OFFSET" ]; then
+   146	    # log rotated (new inode) or truncated (shrunk below mark) -> rebaseline + fresh grace, keep generation
+   147	    PREV_LINE=""; UNCHANGED=0; SEEN=0; GEN_OFFSET="$cur_size"; GEN_INODE="$cur_inode"; DISTINCT=0; ARMED=0
+   148	  fi
+   149	  SEEN=$(( SEEN + 1 ))   # one more check observed for this generation
+   150	
+   151	  line=$(newest_stats "$GEN_OFFSET")
+   152	
+   153	  if [ -z "$line" ]; then
+   154	    # no STATS in the tail window. If generation is young, grace. If old, it never heartbeats -> frozen.
+   155	    if [ "$SEEN" -lt "$GRACE_CHECKS" ]; then
+   156	      continue
+   157	    fi
+   158	    UNCHANGED=$(( UNCHANGED + 1 ))
+   159	  elif [ "$line" = "$PREV_LINE" ]; then
+   160	    UNCHANGED=$(( UNCHANGED + 1 ))
+   161	  else
+   162	    PREV_LINE="$line"; UNCHANGED=0
+   163	    DISTINCT=$(( DISTINCT + 1 ))
+   164	    [ "$DISTINCT" -ge 2 ] && ARMED=1
+   165	    continue
+   166	  fi
+   167	
+   168	  # arm once the generation has proven it heartbeats, or grace has fully elapsed (covers frozen-before-first-STATS)
+   169	  if [ "$DISTINCT" -ge 2 ] || [ "$SEEN" -ge "$GRACE_CHECKS" ]; then ARMED=1; fi
+   170	
+   171	  if [ "$ARMED" -eq 1 ] && [ "$UNCHANGED" -ge "$STALE_CHECKS" ]; then
+   172	    # never signal unless the bot is unpaused AND still the exact same pid+generation (codex round-2 P1)
+   173	    if paused || ! same_gen "$pid" "$start"; then continue; fi
+   174	    echo "[$(date '+%F %T %Z')] watchdog: FREEZE -- STATS unchanged ${UNCHANGED} checks (~$((UNCHANGED*CHECK_SEC))s) pid=$pid gen-checks=${SEEN}; SIGTERM"
+   175	    kill -TERM "$pid" 2>/dev/null
+   176	    sleep 5
+   177	    if ! paused && same_gen "$pid" "$start"; then
+   178	      echo "[$(date '+%F %T %Z')] watchdog: pid=$pid (same gen) still alive after TERM; SIGKILL"
+   179	      kill -KILL "$pid" 2>/dev/null
+   180	    fi
+   181	    echo "[$(date '+%F %T %Z')] watchdog: kill issued; launchd KeepAlive restarts slot; cooldown ${COOLDOWN_SEC}s"
+   182	    reset_gen
+   183	    sleep "$COOLDOWN_SEC"
+   184	  fi
+   185	done
+
+exec
+/bin/zsh -lc 'nl -ba scripts/v12_launcher.sh' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	#!/bin/bash
+     2	# v12_launcher.sh — wrapper for the live HL copy trader under launchd.
+     3	#
+     4	# 2026-06-02 (Alberto go-live): REPURPOSED from hl_copy_trader_v11.py (fixed-size) to the V15 proportional
+     5	# copy engine hl_prop_copy.py (codex-SHIP'd, dry-run-validated). V11 was flattened first (clean slate).
+     6	# Same supervised slot (com.quantslab.v12-copy-trader.plist, KeepAlive). NOTE for CoS: the plist is
+     7	# unchanged; only this repo launcher script was re-pointed. To revert to V11, restore SCRIPT/CONFIG below.
+     8	# Used by /Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist.
+     9	# Note: no flock; launchd KeepAlive guarantees one supervised instance.
+    10	# Pause: touch /tmp/v12_pause to make the launcher exit cleanly; remove to resume.
+    11	
+    12	set -euo pipefail
+    13	
+    14	WORKDIR="/Users/hermes/quants-lab"
+    15	PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
+    16	# 2026-06-08 (Alberto "Build"+"Don't wait"): repointed to the codex-SHIPPED (7 rounds) EXIT-COPY bot --
+    17	# commitment entry + follow-leader-exit + overlay (disaster/trailing-TP/funding/24h), liquid builder perps
+    18	# (xyz:CL/xyz:SILVER), venue-native basket, DUST $10-50. Live-small validation of entry concession vs the
+    19	# leader commitment fill. Same supervised slot. To revert: SCRIPT="strategies/live/hl_copy_measure.py";
+    20	# ARGS="--wallets config/copy_live_realpnl_5.json config/copy_live_backtest_5.json --live".
+    21	# 2026-06-09 (Alberto go-live): live-tiny PROBE copying 0x3ea004bb (passed shadow gate +3-5% net, 2% DD).
+    22	# Proportional copy via the codex-SHIP'd hl_prop_copy engine. Tight gates: -8% account stop, $700 gross cap,
+    23	# 5x max lev, per-position 12% trail, per-leader -35% breaker, per-coin 35%. Kill: touch /tmp/v12_pause.
+    24	# 2026-06-11 (Alberto V16 go-live, Fable build): repointed to V16 -- top-decile faithful copy on liquid
+    25	# majors (codex SHIP-validated strategy; 100-wallet cohort, $50 fixed/trade, 10x cap, book-level risk).
+    26	# Engine = hl_copy_trader_v16.py (V15 engine subclass + liquid whitelist hard guard + fail-fast asserts).
+    27	# GATED: do NOT remove halt flags until the V16 codex gate passes AND Alberto gives the launch word.
+    28	# To revert: SCRIPT="strategies/live/hl_prop_copy.py"; ARGS="--config config/copy_live_basket.json".
+    29	# 2026-06-11 ~12:40 (Alberto V17 go-live msg 9254, Fable sprint): repointed to V17 -- GATED HERD
+    30	# COPY. V16 + knet>=0 net-consensus entry gate + $50 + stop -25% latched + util 0.40 + backstop 5x
+    31	# + netx 2.5x + coin-side 2.0x caps + seed audit (>=98/100 configured, top-30 hard block) +
+    32	# stale-tracker kill. Codex chain: strategy SHIP-WITH-CHANGES (rounds 1-4) + CODE review GO
+    33	# (rounds 1-2; 4 P1s fixed + verified). Replay (real marks) +$260/+$60 vs V16 +$165/+$32; forward
+    34	# gate spread +140bps. Rollback gates: 18d forward fail -> revert V16; live DD 18% pre-forward ->
+    35	# revert V16. To revert to V16: SCRIPT="strategies/live/hl_copy_trader_v16.py";
+    36	# ARGS="--config config/copy_trader_wallets_v16.json".
+    37	# 2026-06-12 (quant): UNIVERSE EXPANSION deploy. Same V17 engine + cohort; config adds the
+    38	# global.expansion block (29 net-positive new coins: 7 crypto-main + 22 xyz builder-dex) + the
+    39	# codex-required guards (per-coin kill -$25/n20-fee-net-mean<0, expansion-wide kill -$50, builder
+    40	# seed retry, restart kill-state reload, NEW/OLD reject tagging). Alberto GO (msg 9351 "only
+    41	# positive full set") + codex GO (session 019e2d30, re-review). Guards inert if the expansion block
+    42	# is absent. To revert to the baseline 10-coin V17: ARGS="--config config/copy_trader_wallets_v17.json".
+    43	# 2026-06-28 (Alberto DIRECT VOICE GO "just go alive" TG voice 10244/10255 + "Go" 10258, no 2-4wk shadow gate;
+    44	# quant): REPOINTED to the corrected V18 all-coin+xyz K=20 SETCOVER selection, LIVE small-size. This is the
+    45	# fixed selection (the old v17_expansion cohort was halted 06-24 for "selection wrong"). K=20 sits below the
+    46	# validated 30-wallet floor, authorized LIVE explicitly via global.live_below_floor_authorized=true. ENFORCED
+    47	# hard kill = global_stop_pct 0.05 (~-$23 on $468; flattens all) -- max_daily_loss is config-only/not enforced
+    48	# (codex go-live finding). Codex chain: approach-gate B PASS + go-live diff review PASS (2 rounds; caught the
+    49	# unenforced daily-kill, fixed via global stop). NOTE for CoS: plist UNCHANGED; only this repo launcher
+    50	# repointed (established pattern). To revert to old expansion: ARGS="--config config/copy_trader_wallets_v17_expansion.json".
+    51	SCRIPT="strategies/live/hl_copy_trader_v17.py"
+    52	# 2026-07-01 (quant): V24 LIVE PROBE -- beta-neutral taker cohort (12 active OOS-validated two-sided wallets,
+    53	# BTC/ETH/HYPE/SOL/SUI). $50/order, NO margin cap (Alberto), 5% global stop floor. Alberto GO TG10410.
+    54	# Codex re-review deferred to tomorrow (unavailable); self-reviewed pre-flight. Revert: restore v18 config below.
+    55	# ARGS="--config config/copy_trader_wallets_v18_allcoin_xyz_live.json"
+    56	# 2026-07-01 (quant): V24 LIVE PROBE. Halted Jul 2 (halt flags). Revert: ARGS="--config config/copy_trader_wallets_v24_LIVE.json"
+    57	# 2026-07-06 (quant, GATE-1 go-live): repointed to gate1_v4 -- 10 OOS-validated wallets (Fable clean holdout
+    58	# +94.5bps/trip n120), order_size $150, max_leverage_cap 5, global_stop_pct 0.15, expansion ON (xyz stripped).
+    59	# Alberto capital GO TG10911/10913/10914/10916/10917 (150/order, waive codex, 5x lev, fail-fast). Ledger:
+    60	# brain projects/quant/copy/2026-07-06-gate1-golive-validation-ledger. NOTE for CoS: plist UNCHANGED; only
+    61	# this launcher repointed (established pattern). Supervised takeover needs halt flags removed + daemon loaded.
+    62	ARGS="--config config/copy_trader_wallets_gate1_v4.json"
+    63	
+    64	cd "$WORKDIR"
+    65	
+    66	# 2026-05-22: pause flag for ops maintenance (drift heal, schema changes, etc).
+    67	# Touch /tmp/v12_pause to make launcher exit 0 cleanly; remove to resume.
+    68	# 2026-06-10 (quant): /tmp is volatile (cleared by macOS periodic / wipe). After the reboot-OOM
+    69	# incident where launchd KeepAlive auto-re-armed an unapproved basket on machine-wake, added a
+    70	# PERSISTENT halt file in the repo. Either flag pauses the launcher. Remove BOTH to resume.
+    71	# Resume requires: rm -f /tmp/v12_pause "$WORKDIR/.HALT_COPY"
+    72	if [ -f /tmp/v12_pause ] || [ -f "$WORKDIR/.HALT_COPY" ]; then
+    73	  echo "[$(date '+%F %T %Z')] v12_launcher: pause flag present (/tmp/v12_pause or .HALT_COPY), exiting (paused)"
+    74	  sleep 5
+    75	  exit 0
+    76	fi
+    77	
+    78	# Source .env safely (auto-export, then disable)
+    79	if [ -f .env ]; then
+    80	  set -a
+    81	  # shellcheck source=/dev/null
+    82	  source .env
+    83	  set +a
+    84	fi
+    85	
+    86	echo "[$(date '+%F %T %Z')] v12_launcher: starting $SCRIPT $ARGS"
+    87	exec "$PYTHON" "$SCRIPT" $ARGS
+
+exec
+/bin/zsh -lc 'rg -n "STATS|_log_stats|check_exits|_check_exits|stop|HALT_COPY|v12_pause|CopyTrader|while|sleep" strategies/live/hl_copy_trader_v17.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+8:    CopyTrader (the engine: entry/exit/sizing/margin/WS/tilt/webData2/persistence)
+9:      <- V16CopyTrader  (liquid-whitelist hard guard)
+10:      <- V17CopyTrader  (entry gate + expansion/knet/seed; the instantiated class).
+111:class CopyTrader:
+150:        # capped at ALLOCATION + the global -15% stop + the exchange's own max_margin_util, not an
+160:        # #3 global stop as a PERCENT of equity (flatten-all on trigger), not a $ amount.
+161:        self.global_stop_pct = float(self.global_config.get("global_stop_pct", 0.15))  # 0.15 = -15%
+164:        # #4 runaway backstop: flatten-all if total gross notional exceeds this x equity (NOT a mirror
+166:        self.gross_backstop_x = float(self.global_config.get("gross_backstop_x", float("inf")))
+171:        # (our stop/trail/maxhold, NOT leader reverse-flow). All additive + guarded by cluster_mode.
+185:        self._baseline_equity = None      # session-start equity for the % global stop
+186:        self._flatten_requested = False   # set by the % loss stops -> _check_exits flattens all
+187:        self._trim_requested = False      # set by the gross backstop -> _check_exits TRIMS to target (self-heal)
+232:                # hard-stop loop with no retry. On timeout it raises -> except logs -> idempotent
+242:                time.sleep(wait)
+348:        # reconciliation -> stale (shadow-era) PnL in STATS + phantom open positions. Moved up here;
+397:                time.sleep(0.15)   # gentle pacing to avoid a rate-limit burst
+466:                time.sleep(0.3)
+531:        stale data). Per-slice -> no artificial gross cap needed; margin-util + the global stop backstop."""
+567:        # row and never closes. Also carry the attempt counter so restarts don't reset the give-up backstop.
+675:                    # 2026-06-18 (codex review): preserve the give-up backstop counter across restarts
+1259:        # FREE USDC (hold zeroed) while the engine's equity = GROSS spot USDC per
+1392:          made us FALSE-LOG "CROSS" while the position stayed ISOLATED 20x. For these we instead set
+1402:        # "protected" while it's still isolated). 60s failure-backoff so a persistent reject doesn't
+1424:            # (idempotent on the exchange), rather than being falsely marked done while still isolated.
+1474:        # (notional/equity) at a PREDICTABLE level, leaving a clean buffer to the 5x flatten backstop. This is
+1505:        # + the global -15% stop, NOT an artificial per-coin notional clamp). So they apply in FIXED mode
+1666:        # codex 2026-06-15 #2: explicitly block NEW entries while the gross-backstop TRIM is in progress
+1669:            logger.info(f"Entry blocked (gross-backstop TRIM in progress): {coin}")
+1910:                        await asyncio.sleep(0.4 * (_attempt + 1))
+2004:        """DEDICATED hard-stop flatten (codex r3 #1/#2/#3). Reads EXCHANGE TRUTH (clearinghouseState, all
+2028:                        # close_exchange bound to PARENT so user_state finds the position (hard-stop fix 2026-06-30).
+2038:        """Gross-backstop TRIM (Alberto 2026-06-15): close WORST-uPnL positions first (market_close,
+2040:        spiked us over the backstop while KEEPING winners. Returns True if already at/under target (done).
+2044:        n_dex = 0      # read must NOT zero cur_gross and falsely self-heal while still over the backstop)
+2067:                         f"trim latch (could be a partial read over the backstop); retry next poll.")
+2079:                # close_exchange bound to PARENT so user_state finds the position (hard-stop fix 2026-06-30).
+2088:    def _evaluate_global_stop_fast(self):
+2089:        """codex r3 #5: evaluate the -15% stop on the FAST exit-poll cadence (not only the 60s _log_stats),
+2099:            stop_usd = -self.global_stop_pct * self._baseline_equity
+2100:            if net_pnl <= stop_usd:
+2101:                logger.error(f"GLOBAL STOP (fast): net ${net_pnl:.2f} <= ${stop_usd:.2f} -- FLATTEN")
+2102:                _tg(f"GLOBAL STOP -{self.global_stop_pct:.0%} (fast): net ${net_pnl:.2f} -- FLATTENING all")
+2103:                self._kill_reasons["global_stop"] = True
+2106:            logger.warning(f"fast global-stop eval failed: {e}")
+2108:    async def _check_exits(self):
+2114:        # codex r3 #5: fast -15% stop check (every poll, not just the 60s stats loop).
+2115:        self._evaluate_global_stop_fast()
+2117:        # codex r3 #1/#2/#3: GLOBAL STOP / backstop -> use the DEDICATED exchange-truth emergency flatten
+2127:        # Gross-backstop TRIM (Alberto 2026-06-15): self-healing -- close worst-first to the target, then
+2128:        # CLEAR the flag and resume normal trading (NOT a permanent kill, unlike the loss stops above).
+2185:            # Track peak PnL for trailing stop
+2199:            # EXIT LAYER 1: Hard stop-loss (per-wallet)
+2220:            # EXIT LAYER 2: Trailing stop (per-wallet)
+2389:                # Not filled. Do NOT release while the entry order is still in flight (codex r1 #3):
+2565:            # Try maker exit first -- BUT skip maker for URGENT exits (global-stop flatten / force-exit):
+2566:            # a hard stop must go straight to IOC, not wait up to 60s for a maker fill (codex r2 #1).
+3430:        broader rule (2026-05-23): never remove tracking while the target is still
+3971:    def _log_stats(self):
+3995:        # equity. Trigger when net_pnl <= -global_stop_pct x baseline. No auto-lift (a hit stop stays
+3996:        # latched; manual re-arm only -- you do not want a 15% stop oscillating back into the trade).
+3999:        # SESSION realized baseline once, so the -15% stop measures THIS session's loss only (prior P&L
+4000:        # cannot mask current losses or trip the stop on startup).
+4007:            logger.info(f"V15 baseline equity for global stop: ${self._baseline_equity:.2f} "
+4008:                        f"(stop at -{self.global_stop_pct:.0%} = ${-self.global_stop_pct*self._baseline_equity:.2f})")
+4009:        stop_usd = -self.global_stop_pct * (self._baseline_equity or 0.0)
+4010:        if self._baseline_equity and net_pnl <= stop_usd:
+4011:            if not self._kill_reasons.get("global_stop"):
+4012:                logger.error(f"GLOBAL STOP HIT: net ${net_pnl:.2f} <= -{self.global_stop_pct:.0%} "
+4013:                             f"(${stop_usd:.2f} of ${self._baseline_equity:.2f}). FLATTEN + entries off.")
+4014:                _tg(f"GLOBAL STOP -{self.global_stop_pct:.0%}: net ${net_pnl:.2f} -- FLATTENING all + entries off")
+4015:            self._kill_reasons["global_stop"] = True
+4016:            self._flatten_requested = True   # _check_exits flattens all open positions
+4018:        # #4 runaway backstop: if total gross notional exceeds gross_backstop_x x equity, TRIM the book back
+4019:        # to gross_backstop_trim_target_x (default = the gross entry gate) by closing WORST-uPnL positions
+4022:        # The loss-based hard stops (-15% global, -25% daily) still flatten-all; this is leverage-only.
+4023:        if self._baseline_equity and self.gross_backstop_x != float("inf"):
+4026:            if self._equity_cache and gross > self.gross_backstop_x * self._equity_cache:
+4028:                    "gross_backstop_trim_target_x", self.global_config.get("gross_entry_gate_x", 3.5)))
+4031:                    logger.error(f"GROSS BACKSTOP: gross ${gross:.0f} > {self.gross_backstop_x}x "
+4033:                    _tg(f"GROSS BACKSTOP {self.gross_backstop_x}x: gross ${gross:.0f} -- TRIMMING to {trim_target_x}x")
+4057:            f"STATS: acct=${ep['account_net']:+.4f}({ep['account_closes']}) "
+4363:        while self.running:
+4389:                        # Batch subscriptions: don't sleep on every one
+4391:                            await asyncio.sleep(0.5)
+4434:                    while self.running:
+4471:                            await self._check_exits()
+4473:                            self._log_stats()
+4482:                await asyncio.sleep(5)
+4516:class V16CopyTrader(CopyTrader):
+4590:        _req(0 < float(g.get("global_stop_pct", 0)) <= 0.15,
+4591:             "global_stop_pct must be set (latched flatten-all) and <= 15%")
+4592:        _req(float(g.get("gross_backstop_x", 1e9)) <= 8.0, "gross_backstop_x must be <= 8.0")
+4593:        # gross-leverage entry gate (2026-06-15): if set, must sit BELOW the flatten backstop with a buffer
+4594:        # (>=0.5x) so entries stop before the catastrophe failsafe; and not absurdly low.
+4597:            _req(1.0 <= _gross_gate <= float(g.get("gross_backstop_x", 5.0)) - 0.5,
+4598:                 f"gross_entry_gate_x must be in [1.0, gross_backstop_x-0.5]; got {_gross_gate}")
+4700:            f"margin_util<={g['max_margin_util']}, stop={g['global_stop_pct']:.0%} latched, "
+4701:            f"gross_backstop={g['gross_backstop_x']}x, trail={d['trail_activate_bps']}/{d['trail_bps']}bps, "
+4782:                # OPEN (leader ~flat) or REVERSE-while-we-hold: update tracker, hand to the base
+4824:            await asyncio.sleep(self._backfill_warmup_s)
+4880:        # _equity_cache is HL spot-only USDC (Hard Rule 16); STATS reports the same value as `eq`.
+4899:                logger.warning("BACKFILL: engine stopping -- pass halted")
+4904:            # re-check just-before-open (state can change during throttle sleeps / concurrent fills)
+4926:                await asyncio.sleep(self._backfill_throttle_ms / 1000.0)
+4950:            await asyncio.sleep(self._backfill_throttle_ms / 1000.0)
+4975:class V17CopyTrader(V16CopyTrader):
+4978:    # V16 hard-asserts global_stop_pct <= 0.15; V17's validated budget is 0.25. Same for the V16
+4981:    # for the fill sync), and temporarily satisfy the V16 stop assert by validating the V17 bound
+4985:    # on self.global_config -- we pass it a config FILE whose stop is 0.15-compliant? NO: the
+4986:    # engine must RUN with 0.25. Resolution: V16's assert line reads global_stop_pct from config;
+4988:    # resolution implemented: temporarily present stop=0.15 to the V16 asserts via a shimmed json
+4990:    # but BEFORE the engine arms the stop. The base engine reads global_stop_pct lazily from
+4991:    # self.global_config at stop-check time (verified: _check_global_stop reads
+4992:    # self.global_config['global_stop_pct'] each pass), so: feed V16 a 0.15 value through
+4999:        self._v17_stop_pct = float(g.get("global_stop_pct", 0.25))
+5000:        if not (0 < self._v17_stop_pct <= 0.30):
+5001:            raise ValueError(f"V17: global_stop_pct {self._v17_stop_pct} outside (0, 0.30]")
+5013:        # shim: satisfy V16's <=0.15 stop assert during super().__init__, restore after.
+5015:        if self._v17_stop_pct > 0.15:
+5019:            shim["global"]["global_stop_pct"] = 0.15
+5049:        # restore the REAL stop on BOTH the cached attr (the one the stop checks read --
+5051:        # review r1 confirmed fast + stats stops read the attr) and the config dict. Re-assert.
+5053:        self.global_stop_pct = self._v17_stop_pct
+5054:        self.global_config["global_stop_pct"] = self._v17_stop_pct
+5055:        if not (0 < float(self.global_stop_pct) <= 0.30):
+5056:            raise ValueError("V17: stop restore failed")
+5057:        logger.info(f"V17: global stop set to {self.global_stop_pct:.0%} (latched flatten-all; "
+5076:            time.sleep(5)
+5110:                        time.sleep(0.2)
+5163:        # stop-shim used during super().__init__ shallow-copied global so the expansion key survives.
+5178:                    f"coin-side<={self._v17_coin_side_cap_x}x, stop={self._v17_stop_pct:.0%}, "
+5224:        self._v17_rej_new = {"netx": 0, "coinside": 0, "margin_util": 0, "gross_backstop": 0}
+5225:        self._v17_rej_old = {"netx": 0, "coinside": 0, "margin_util": 0, "gross_backstop": 0}
+5382:            # WS entries are reachable. DRAIN fully (loop while a full 2000-doc batch comes back) so a
+5430:        # _v17_latched_disabled lets a real kill latch even while the blanket is up (and a
+5564:        threshold. Then re-eval to catch any kill the poll newly trips. Extracted from _log_stats so it
+5577:    def _log_stats(self):
+5578:        # the base _log_stats self-throttles to 60s; run the (cheap, bounded) close-poll on the SAME
+5587:            # gross-backstop attribution (codex req #4): the base backstop is a global FLATTEN, not a
+5590:            if self._kill_reasons.get("gross_backstop") and not getattr(self, "_v17_gb_attributed", False):
+5596:                self._v17_rej_new["gross_backstop"] += len(open_new)
+5597:                self._v17_rej_old["gross_backstop"] += len(open_old)
+5600:        return super()._log_stats()
+5609:        {netx, coinside, margin_util, gross_backstop}. Pure counter update; safe when flag off
+5677:        # switch, gross-backstop TRIM, per-coin expansion kill, netx cap, coin-side cap, and (via
+5688:        # metrics/stamps are consumed during a gross-backstop trim (base also blocks; this is for clean attribution).
+5690:            logger.info(f"V17 ENTRY BLOCKED (gross-backstop TRIM in progress): {coin}")
+5695:        # _check_exits/_exit_position runs independently and closes them normally. No-op when the
+5717:        while q:
+5890:    trader = V17CopyTrader(config_path, order_size_override=args.size, shadow=args.shadow)
+
+exec
+/bin/zsh -lc "nl -ba strategies/live/hl_copy_trader_v17.py | sed -n '2080,2145p'" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "nl -ba strategies/live/hl_copy_trader_v17.py | sed -n '3960,4070p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+  2080	                await asyncio.to_thread(self.close_exchange.market_close, coin)
+  2081	                cur_gross -= notional
+  2082	                logger.error(f"GROSS TRIM: market_close {coin} (notional ${notional:.0f} uPnL ${upnl:.2f}); "
+  2083	                             f"gross -> ~${cur_gross:.0f} / target ${target_notional:.0f}")
+  2084	            except Exception as e:
+  2085	                logger.error(f"GROSS TRIM failed {coin}: {e}")
+  2086	        return False
+  2087	
+  2088	    def _evaluate_global_stop_fast(self):
+  2089	        """codex r3 #5: evaluate the -15% stop on the FAST exit-poll cadence (not only the 60s _log_stats),
+  2090	        so the flatten latch fires within ~exit_poll_s, not up to 60s late. Sets _flatten_requested."""
+  2091	        if self._flatten_requested or self._baseline_equity is None:
+  2092	            return
+  2093	        try:
+  2094	            base = getattr(self, "_session_realized_base", None)
+  2095	            if base is None:
+  2096	                return
+  2097	            realized = self._exch_pnl["account_net"] - base
+  2098	            net_pnl = realized + self._compute_unrealized_pnl()
+  2099	            stop_usd = -self.global_stop_pct * self._baseline_equity
+  2100	            if net_pnl <= stop_usd:
+  2101	                logger.error(f"GLOBAL STOP (fast): net ${net_pnl:.2f} <= ${stop_usd:.2f} -- FLATTEN")
+  2102	                _tg(f"GLOBAL STOP -{self.global_stop_pct:.0%} (fast): net ${net_pnl:.2f} -- FLATTENING all")
+  2103	                self._kill_reasons["global_stop"] = True
+  2104	                self._flatten_requested = True
+  2105	        except Exception as e:
+  2106	            logger.warning(f"fast global-stop eval failed: {e}")
+  2107	
+  2108	    async def _check_exits(self):
+  2109	        """Exit when TARGET exits, not on fixed timer."""
+  2110	        now = time.time()
+  2111	        still_open = []
+  2112	        exited_ids = set()
+  2113	
+  2114	        # codex r3 #5: fast -15% stop check (every poll, not just the 60s stats loop).
+  2115	        self._evaluate_global_stop_fast()
+  2116	
+  2117	        # codex r3 #1/#2/#3: GLOBAL STOP / backstop -> use the DEDICATED exchange-truth emergency flatten
+  2118	        # (market_close every real position; no V17 exit-machinery give-up / partial-IOC / book deps).
+  2119	        # Reconcile then syncs the tracker to the flat exchange. Entries stay off (kill latched).
+  2120	        if self._flatten_requested:
+  2121	            n_remaining = await self._emergency_flatten()
+  2122	            self._reconcile_positions()
+  2123	            if n_remaining == 0:
+  2124	                logger.info("GLOBAL STOP: exchange flat. Halted (manual re-arm to resume).")
+  2125	            return
+  2126	
+  2127	        # Gross-backstop TRIM (Alberto 2026-06-15): self-healing -- close worst-first to the target, then
+  2128	        # CLEAR the flag and resume normal trading (NOT a permanent kill, unlike the loss stops above).
+  2129	        if self._trim_requested:
+  2130	            done = await self._emergency_trim(self._trim_target_notional)
+  2131	            self._reconcile_positions()
+  2132	            if done:
+  2133	                self._trim_requested = False   # self-healed -> entries resume (gated by the gross gate)
+  2134	                logger.info("GROSS TRIM complete -> resuming normal trading.")
+  2135	            return
+  2136	
+  2137	        for pos in self.positions:
+  2138	            if not pos['filled']:
+  2139	                still_open.append(pos)
+  2140	                continue
+  2141	
+  2142	            # WS handler marked this position as exited; just skip it
+  2143	            if pos.get('_ws_exited'):
+  2144	                exited_ids.add(id(pos))
+  2145	                continue
+
+ succeeded in 0ms:
+  3960	                    f"| liquidations={liq_count} (${liq_pnl:+.4f}) "
+  3961	                    f"| unattributed=${unattributed_pnl:+.4f}"
+  3962	                )
+  3963	
+  3964	            total_stored = self.db[DB_EXCHANGE_FILLS].count_documents({})
+  3965	            if new_fills > 0:
+  3966	                logger.debug(f"FILL SYNC: {total_stored} fills stored ({len(v17_oids)} V17 oids)")
+  3967	
+  3968	        except Exception as e:
+  3969	            logger.warning(f"Exchange fill sync failed: {e}")
+  3970	
+  3971	    def _log_stats(self):
+  3972	        now = time.time()
+  3973	        if now - self._last_stats < 60:
+  3974	            return
+  3975	        self._last_stats = now
+  3976	
+  3977	        # Sync exchange fills FIRST so PnL is fresh
+  3978	        self._sync_exchange_fills()
+  3979	        self._reconcile_positions()
+  3980	
+  3981	        # Kill switch with separate reason tracking (no shared flag confusion)
+  3982	        # Reason 1: Staleness
+  3983	        sync_age = now - self._last_successful_sync
+  3984	        if sync_age > 180 and self._last_successful_sync > 0:
+  3985	            if not self._kill_reasons.get("stale"):
+  3986	                logger.error(f"SYNC STALE: last successful sync {sync_age:.0f}s ago. Blocking entries.")
+  3987	                _tg(f"SYNC STALE: exchange data {sync_age:.0f}s old. Entries blocked.")
+  3988	            self._kill_reasons["stale"] = True
+  3989	        elif self._kill_reasons.get("stale"):
+  3990	            self._kill_reasons.pop("stale")
+  3991	            logger.info("SYNC RESTORED: exchange data fresh again")
+  3992	
+  3993	        # Reason 2: GLOBAL STOP -- codex #3 fix: PERCENT of equity (not a $ amount) and FLATTEN on trigger
+  3994	        # (not just block entries). net_pnl = realized + uPnL since session start; baseline = session-start
+  3995	        # equity. Trigger when net_pnl <= -global_stop_pct x baseline. No auto-lift (a hit stop stays
+  3996	        # latched; manual re-arm only -- you do not want a 15% stop oscillating back into the trade).
+  3997	        total_upnl = self._compute_unrealized_pnl()
+  3998	        # codex r2 #4: account_net is cumulative since the V17/v9 epoch, NOT this session. Snapshot a
+  3999	        # SESSION realized baseline once, so the -15% stop measures THIS session's loss only (prior P&L
+  4000	        # cannot mask current losses or trip the stop on startup).
+  4001	        if not hasattr(self, "_session_realized_base") or self._session_realized_base is None:
+  4002	            self._session_realized_base = float(self._exch_pnl["account_net"])
+  4003	        realized = self._exch_pnl["account_net"] - self._session_realized_base
+  4004	        net_pnl = realized + total_upnl
+  4005	        if self._baseline_equity is None and self._equity_cache and self._equity_cache > 0:
+  4006	            self._baseline_equity = float(self._equity_cache)
+  4007	            logger.info(f"V15 baseline equity for global stop: ${self._baseline_equity:.2f} "
+  4008	                        f"(stop at -{self.global_stop_pct:.0%} = ${-self.global_stop_pct*self._baseline_equity:.2f})")
+  4009	        stop_usd = -self.global_stop_pct * (self._baseline_equity or 0.0)
+  4010	        if self._baseline_equity and net_pnl <= stop_usd:
+  4011	            if not self._kill_reasons.get("global_stop"):
+  4012	                logger.error(f"GLOBAL STOP HIT: net ${net_pnl:.2f} <= -{self.global_stop_pct:.0%} "
+  4013	                             f"(${stop_usd:.2f} of ${self._baseline_equity:.2f}). FLATTEN + entries off.")
+  4014	                _tg(f"GLOBAL STOP -{self.global_stop_pct:.0%}: net ${net_pnl:.2f} -- FLATTENING all + entries off")
+  4015	            self._kill_reasons["global_stop"] = True
+  4016	            self._flatten_requested = True   # _check_exits flattens all open positions
+  4017	
+  4018	        # #4 runaway backstop: if total gross notional exceeds gross_backstop_x x equity, TRIM the book back
+  4019	        # to gross_backstop_trim_target_x (default = the gross entry gate) by closing WORST-uPnL positions
+  4020	        # first -- shedding the risk that spiked us over without dumping winners (Alberto 2026-06-15). This is
+  4021	        # SELF-HEALING (not a permanent kill latch): once gross is back under target, normal trading resumes.
+  4022	        # The loss-based hard stops (-15% global, -25% daily) still flatten-all; this is leverage-only.
+  4023	        if self._baseline_equity and self.gross_backstop_x != float("inf"):
+  4024	            gross = sum(abs(p.get('size', 0) * self.mid_prices.get(p['coin'], 0))
+  4025	                        for p in self.positions if p.get('filled'))
+  4026	            if self._equity_cache and gross > self.gross_backstop_x * self._equity_cache:
+  4027	                trim_target_x = float(self.global_config.get(
+  4028	                    "gross_backstop_trim_target_x", self.global_config.get("gross_entry_gate_x", 3.5)))
+  4029	                self._trim_target_notional = trim_target_x * self._equity_cache
+  4030	                if not self._trim_requested:
+  4031	                    logger.error(f"GROSS BACKSTOP: gross ${gross:.0f} > {self.gross_backstop_x}x "
+  4032	                                 f"eq ${self._equity_cache:.0f}. TRIM to {trim_target_x}x (worst-first), keep winners.")
+  4033	                    _tg(f"GROSS BACKSTOP {self.gross_backstop_x}x: gross ${gross:.0f} -- TRIMMING to {trim_target_x}x")
+  4034	                self._trim_requested = True
+  4035	
+  4036	        # Unified kill switch: active if ANY reason is present
+  4037	        self._kill_switch_active = bool(self._kill_reasons)
+  4038	
+  4039	        open_pos = [p for p in self.positions if p['filled']]
+  4040	        open_coins = " ".join(f"{p['coin']}" for p in open_pos) if open_pos else "none"
+  4041	        equity = self._equity_cache or 0
+  4042	        margin_used = getattr(self, '_exch_margin_used', 0)
+  4043	        margin_pct = (margin_used / equity * 100) if equity > 0 else 0
+  4044	        ep = self._exch_pnl
+  4045	        sync_age = int(now - ep["last_sync"]) if ep["last_sync"] > 0 else 999
+  4046	        tilt_str = ""
+  4047	        if getattr(self, "_tilt_enabled", False) or getattr(self, "_tilt_log", None):
+  4048	            n = len(self._tilt_log)
+  4049	            adv = ""
+  4050	            if n >= 1:
+  4051	                a = self._tilt_advantage(self._tilt_log[-100:])
+  4052	                if a is not None:
+  4053	                    adv = f" adv={a:+.0f}bp"
+  4054	            eqf = "+eq" if getattr(self, "_tilt_equity_enabled", False) and self._equity_band else ""
+  4055	            tilt_str = f" tilt={'ON' if self._tilt_enabled else 'OFF'}{eqf}(n={n}{adv})"
+  4056	        logger.info(
+  4057	            f"STATS: acct=${ep['account_net']:+.4f}({ep['account_closes']}) "
+  4058	            f"v17=${ep['v17_net']:+.4f}({ep['v17_closes']}) "
+  4059	            f"fees=${ep['fees']:.2f} uPnL=${total_upnl:+.4f} "
+  4060	            f"liq={ep.get('liquidations', 0)}(${ep.get('liquidation_pnl', 0.0):+.2f}) "
+  4061	            f"open={len(open_pos)}[{open_coins}] margin={margin_pct:.0f}% eq=${equity or 0:.2f} "
+  4062	            f"sync={sync_age}s{tilt_str}"
+  4063	        )
+  4064	
+  4065	        # V17 internal TG report DISABLED -- replaced by exchange-truth pnl_tracker.py
+  4066	        # The old _send_performance_report used internal collections (not exchange truth)
+  4067	        # and produced numbers that conflicted with the pnl_tracker. All TG reporting
+  4068	        # now goes through scripts/pnl_tracker.py (15-min loop in tmux pnl-tracker).
+  4069	
+  4070	    def _send_performance_report(self):
+
+exec
+/bin/zsh -lc "nl -ba strategies/live/hl_copy_trader_v17.py | sed -n '4350,4490p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+  4350	    # ── Main loop ────────────────────────────────────────────────────────────
+  4351	
+  4352	    async def run(self):
+  4353	        logger.info(
+  4354	            f"Copy trader V17 starting: {len(self.target_set)} wallets, "
+  4355	            f"size=${self.order_size}, shadow={self.shadow_mode}"
+  4356	        )
+  4357	
+  4358	        def shutdown(sig, frame):
+  4359	            self.running = False
+  4360	        signal.signal(signal.SIGINT, shutdown)
+  4361	        signal.signal(signal.SIGTERM, shutdown)
+  4362	
+  4363	        while self.running:
+  4364	            try:
+  4365	                async with websockets.connect(HL_WS, ping_interval=20) as ws:
+  4366	                    # Clear stale entry TWAP buffers on reconnect
+  4367	                    # NOTE: preserve _exit_twap_buffer across reconnects -- if target
+  4368	                    # already closed their position before reconnect, no further trades
+  4369	                    # will arrive to refill the buffer, leaving our position stranded
+  4370	                    # until max_hold_s expires. Entry buffer is safe to clear.
+  4371	                    self._twap_buffer.clear()
+  4372	                    self._l2_subscribed.clear()
+  4373	                    # Fix #9: clear stale mid prices and book data on reconnect
+  4374	                    self.mid_prices.clear()
+  4375	                    self._mid_price_ts.clear()
+  4376	                    self._book_depth.clear()
+  4377	
+  4378	                    # Subscribe to trades for ALL coins: perps + builder dexes
+  4379	                    all_coins = self.all_perp_coins + self.all_builder_coins
+  4380	                    logger.info(
+  4381	                        f"Subscribing to trades for {len(self.all_perp_coins)} perp + "
+  4382	                        f"{len(self.all_builder_coins)} builder coins..."
+  4383	                    )
+  4384	                    for i, coin in enumerate(all_coins):
+  4385	                        await ws.send(json.dumps({
+  4386	                            "method": "subscribe",
+  4387	                            "subscription": {"type": "trades", "coin": coin}
+  4388	                        }))
+  4389	                        # Batch subscriptions: don't sleep on every one
+  4390	                        if (i + 1) % 50 == 0:
+  4391	                            await asyncio.sleep(0.5)
+  4392	                    logger.info(f"Trade subscriptions complete ({len(all_coins)} coins)")
+  4393	
+  4394	                    # Subscribe to l2Book for needed coins (held + target coins)
+  4395	                    await self._sync_l2_subscriptions(ws)
+  4396	
+  4397	                    # Subscribe to our order updates
+  4398	                    await ws.send(json.dumps({
+  4399	                        "method": "subscribe",
+  4400	                        "subscription": {"type": "orderUpdates", "user": self.parent_address}
+  4401	                    }))
+  4402	
+  4403	                    # Subscribe to webData2: push-based main-dex account state
+  4404	                    # (margin/positions) -> serves _refresh_exchange_state without the main
+  4405	                    # clearinghouse REST poll. Builder dexes + spot stay on (guarded) REST.
+  4406	                    await ws.send(json.dumps({
+  4407	                        "method": "subscribe",
+  4408	                        "subscription": {"type": "webData2", "user": self.parent_address}
+  4409	                    }))
+  4410	
+  4411	                    logger.info("WS subscribed")
+  4412	
+  4413	                    # BACKFILL: spawn the one-shot startup pass after marks warm up (OFF unless
+  4414	                    # global.backfill.enabled). Guarded by _backfill_task_spawned + _backfill_done so
+  4415	                    # WS reconnects never spawn a duplicate. getattr-default keeps a bare base instance
+  4416	                    # byte-identical when the flag/block is absent.
+  4417	                    if getattr(self, "_backfill_enabled", False) \
+  4418	                            and not getattr(self, "_backfill_task_spawned", False) \
+  4419	                            and not getattr(self, "_backfill_done", False):
+  4420	                        self._backfill_task_spawned = True
+  4421	                        asyncio.create_task(self._backfill_after_warmup())
+  4422	
+  4423	                    if not hasattr(self, '_ws_ever_connected'):
+  4424	                        self._ws_ever_connected = True
+  4425	                        _tg(
+  4426	                            f"{getattr(self, 'label', 'V17')} STARTED: {len(self.target_set)} wallets, "
+  4427	                            f"{len(self.all_perp_coins)}+{len(self.all_builder_coins)} coins "
+  4428	                            f"(perp+builder), size=${self.order_size}"
+  4429	                            f"{' [SHADOW]' if self.shadow_mode else ''}"
+  4430	                        )
+  4431	                    else:
+  4432	                        logger.info("WS reconnected (no TG notification)")
+  4433	
+  4434	                    while self.running:
+  4435	                        try:
+  4436	                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+  4437	                            data = json.loads(msg)
+  4438	                            channel = data.get("channel")
+  4439	
+  4440	                            if channel == "l2Book":
+  4441	                                coin_data = data.get("data", {})
+  4442	                                coin = coin_data.get("coin", "")
+  4443	                                levels = coin_data.get("levels", [])
+  4444	                                if len(levels) >= 2 and levels[0] and levels[1]:
+  4445	                                    self.mid_prices[coin] = (
+  4446	                                        float(levels[0][0]["px"]) + float(levels[1][0]["px"])
+  4447	                                    ) / 2
+  4448	                                    self._mid_price_ts[coin] = time.time()
+  4449	                                    self._update_book_depth_from_ws(coin, levels)
+  4450	
+  4451	                            elif channel == "trades":
+  4452	                                trades_data = data.get("data", [])
+  4453	                                if isinstance(trades_data, list):
+  4454	                                    for t in trades_data:
+  4455	                                        self._on_hl_trade(t)
+  4456	
+  4457	                            elif channel == "orderUpdates":
+  4458	                                self._on_order_update(data.get("data", []))
+  4459	
+  4460	                            elif channel == "webData2":
+  4461	                                self._ingest_webdata2(data.get("data", {}))
+  4462	
+  4463	                        except asyncio.TimeoutError:
+  4464	                            pass
+  4465	
+  4466	                        # Throttle expensive checks to max 1/sec
+  4467	                        now_check = time.time()
+  4468	                        if not hasattr(self, '_last_check') or now_check - self._last_check >= 1.0:
+  4469	                            self._last_check = now_check
+  4470	                            await self._check_twap_windows()
+  4471	                            await self._check_exits()
+  4472	                            self._eval_tilt_counterfactual()   # codex guard: auto-disable bad tilt
+  4473	                            self._log_stats()
+  4474	
+  4475	                        # Sync l2Book subscriptions every 30s
+  4476	                        if not hasattr(self, '_last_l2_sync') or now_check - self._last_l2_sync >= 30:
+  4477	                            self._last_l2_sync = now_check
+  4478	                            await self._sync_l2_subscriptions(ws)
+  4479	
+  4480	            except Exception as e:
+  4481	                logger.error(f"WS error: {e}, reconnecting in 5s...")
+  4482	                await asyncio.sleep(5)
+  4483	
+  4484	        # Shutdown: preserve positions
+  4485	        logger.info(f"Shutting down -- preserving {len([p for p in self.positions if p['filled']])} positions for recovery")
+  4486	        for pos in self.positions:
+  4487	            if not pos['filled']:
+  4488	                try:
+  4489	                    self.exchange.cancel(pos['coin'], int(pos['oid']))
+  4490	                    logger.info(f"Cancelled pending order: {pos['coin']}")
+
+exec
+/bin/zsh -lc "nl -ba strategies/live/hl_copy_trader_v17.py | sed -n '5560,5610p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+  5560	        known -- lift ONLY the precautionary blanket. Restore the base disabled set from the LATCHED
+  5561	        snapshot (_v17_latched_disabled = persisted kills + any kill that fired this session, including
+  5562	        during the blanket because _v17_eval_kills gates on the latched set), NOT from set(): a latched
+  5563	        kill is never auto-lifted, even if the coin's later exits moved its cum/mean back above the
+  5564	        threshold. Then re-eval to catch any kill the poll newly trips. Extracted from _log_stats so it
+  5565	        is independently unit-testable without the base stats super() chain."""
+  5566	        if self._v17_precautionary_disabled and got is not None:
+  5567	            self._v17_precautionary_disabled = False
+  5568	            self._v17_disabled_coins = set(self._v17_new_coins) if self._v17_expansion_killed \
+  5569	                else set(self._v17_latched_disabled)
+  5570	            for c in self._v17_new_coins:
+  5571	                self._v17_eval_kills(c)    # re-applies $/n kills from restored state
+  5572	            logger.info(f"V17 EXPANSION: state re-established after fail-closed boot; "
+  5573	                        f"disabled now {sorted(self._v17_disabled_coins) or 'none'} "
+  5574	                        f"(latched {sorted(self._v17_latched_disabled) or 'none'}).")
+  5575	
+  5576	    # ── stats cadence hook: poll new-coin closes -> evaluate kills, then defer to the base stats ──
+  5577	    def _log_stats(self):
+  5578	        # the base _log_stats self-throttles to 60s; run the (cheap, bounded) close-poll on the SAME
+  5579	        # cadence by gating on the same clock the base uses, BEFORE super so a kill that disables a
+  5580	        # coin takes effect on this very cycle. No-op when the flag is off.
+  5581	        if self._v17_expansion_on:
+  5582	            now = time.time()
+  5583	            if now - getattr(self, "_v17_last_exp_poll", 0) >= 30:
+  5584	                self._v17_last_exp_poll = now
+  5585	                got = self._v17_poll_new_coin_closes()
+  5586	                self._v17_lift_precautionary_if_known(got)
+  5587	            # gross-backstop attribution (codex req #4): the base backstop is a global FLATTEN, not a
+  5588	            # per-entry reject, so we record (once, on the cycle it trips) which NEW vs OLD coins were
+  5589	            # open at the time -- the audit signal is "did new coins drive the gross that tripped it".
+  5590	            if self._kill_reasons.get("gross_backstop") and not getattr(self, "_v17_gb_attributed", False):
+  5591	                self._v17_gb_attributed = True
+  5592	                open_new = sorted({p["coin"] for p in self.positions
+  5593	                                   if p.get("filled") and self._v17_is_new(p["coin"])})
+  5594	                open_old = sorted({p["coin"] for p in self.positions
+  5595	                                   if p.get("filled") and not self._v17_is_new(p["coin"])})
+  5596	                self._v17_rej_new["gross_backstop"] += len(open_new)
+  5597	                self._v17_rej_old["gross_backstop"] += len(open_old)
+  5598	                logger.error(f"V17 GROSS-BACKSTOP attribution: open NEW coins={open_new} "
+  5599	                             f"open OLD coins={open_old} at trip time.")
+  5600	        return super()._log_stats()
+  5601	
+  5602	    # ── reject tagging helpers (codex req #4) ──────────────────────────────────────────────────────
+  5603	    def _v17_coin_tag(self, coin: str) -> str:
+  5604	        """'[NEW]' / '[OLD]' label for log lines (no-op-cheap; '[OLD]' when expansion flag off)."""
+  5605	        return "[NEW]" if self._v17_is_new(coin) else "[OLD]"
+  5606	
+  5607	    def _v17_tag_reject(self, kind: str, coin: str):
+  5608	        """Bump the NEW-coin or OLD-coin reject counter for `kind` in
+  5609	        {netx, coinside, margin_util, gross_backstop}. Pure counter update; safe when flag off
+  5610	        (everything tags as OLD then, and the counters are simply never surfaced/used)."""
+
+codex
+The engine does emit the base `STATS:` after `_check_exits()` in the live loop, so the core heartbeat premise is partially supported. I’m checking the operational edges now: process matching, launchd log wiring, and whether any restart/log state can turn the watchdog into a false killer or a no-op.
+exec
+/bin/zsh -lc 'rg -n "logging.basicConfig|logger =|getLogger|INFO|StreamHandler|FileHandler" strategies/live/hl_copy_trader_v17.py | head -80' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+39:logging.basicConfig(
+40:    level=logging.INFO,
+43:logger = logging.getLogger("hl_copy_v17")   # live tag (was "hl_copy_v17"; renamed 2026-06-12)
+5770:                # Log EVERY knet reject at INFO (de-throttled; the %20 + restart-resetting counter hid most
+
+exec
+/bin/zsh -lc 'rg -n "v12-watchdog|v12-copy-trader|StandardOutPath|StandardErrorPath|ThrottleInterval|KeepAlive|ProgramArguments|v12_heartbeat" ops/launchd /Library/LaunchDaemons ~/Library/LaunchAgents 2>/dev/null' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+/Library/LaunchDaemons/com.claude.oikon.plist:12:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.claude.oikon.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.claude.oikon.plist:25:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.claude.oikon.plist:27:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.claude.oikon.plist:29:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.curator.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.curator.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.curator.plist:24:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.dream-cycle.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.dream-cycle.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.dream-cycle.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.kernel.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.kernel.plist:24:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.kernel.plist:26:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.check-update-surface.plist.disabled-p1:7:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.check-update-surface.plist.disabled-p1:26:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.check-update-surface.plist.disabled-p1:28:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v17-stall-watchdog.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v17-stall-watchdog.plist:23:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v17-stall-watchdog.plist:25:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.kernel.plist:18:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.kernel.plist:26:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.kernel.plist:28:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.weekly.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.weekly.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.weekly.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.openai-key-setenv.plist:9:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-wallet-collector.plist:16:	<key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-wallet-collector.plist:22:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-wallet-collector.plist:29:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-wallet-collector.plist:31:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-wallet-collector.plist:33:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.disk-monitor.plist:7:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.disk-monitor.plist:15:  <key>StandardErrorPath</key><string>/Users/hermes/.gbrain/audit/launchd/com.hermes.cron.disk-monitor.err.log</string>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.disk-monitor.plist:16:  <key>StandardOutPath</key><string>/Users/hermes/.gbrain/audit/launchd/com.hermes.cron.disk-monitor.out.log</string>
+ops/launchd/com.quantslab.hl-wallet-collector.plist:13:  <key>ProgramArguments</key>
+ops/launchd/com.quantslab.hl-wallet-collector.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.hl-wallet-collector.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.hl-wallet-collector.plist:35:  <key>StandardOutPath</key>
+ops/launchd/com.quantslab.hl-wallet-collector.plist:37:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.compounding-scorecard.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.compounding-scorecard.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.compounding-scorecard.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.google.GoogleUpdater.wake.plist:15:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.morning-brief-trigger.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.morning-brief-trigger.plist:22:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.morning-brief-trigger.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.scoreboard.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.scoreboard.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.scoreboard.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.weekly.plist:18:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.weekly.plist:24:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.weekly.plist:26:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.pipeline.plist:34:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.pipeline.plist:40:	<key>ProgramArguments</key>
+ops/launchd/com.quantslab.pipeline.plist:50:	<key>StandardErrorPath</key>
+ops/launchd/com.quantslab.pipeline.plist:52:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.pipeline.plist:54:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.run-eval-weekly.plist:9:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.run-eval-weekly.plist:28:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.run-eval-weekly.plist:30:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-score-log.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-score-log.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-score-log.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.dream-cycle.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.dream-cycle.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.dream-cycle.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.calendar-to-brain.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.calendar-to-brain.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.calendar-to-brain.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.listing-monitor.plist:16:	<key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.listing-monitor.plist:22:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.listing-monitor.plist:29:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.listing-monitor.plist:31:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.listing-monitor.plist:33:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.storage-cleanup.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.storage-cleanup.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.storage-cleanup.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.x-content-scan.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.x-content-scan.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.x-content-scan.plist:24:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-backup.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-backup.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-backup.plist:22:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.arb-collector.plist:13:  <key>ProgramArguments</key>
+ops/launchd/com.quantslab.arb-collector.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.arb-collector.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.arb-collector.plist:35:  <key>StandardOutPath</key>
+ops/launchd/com.quantslab.arb-collector.plist:37:  <key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.compliance-audit.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.compliance-audit.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.compliance-audit.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.calendar-to-brain.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.calendar-to-brain.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.calendar-to-brain.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.api.plist:34:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.quantslab.api.plist:40:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.quantslab.api.plist:52:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.quantslab.api.plist:54:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.api.plist:56:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-chief-of-staff.plist.disabled-p1:7:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-chief-of-staff.plist.disabled-p1:24:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-chief-of-staff.plist.disabled-p1:26:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.check-updates.plist.disabled-p1:7:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.check-updates.plist.disabled-p1:26:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.check-updates.plist.disabled-p1:28:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.arb-collector.plist:16:	<key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.arb-collector.plist:22:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.arb-collector.plist:29:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.arb-collector.plist:31:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.arb-collector.plist:33:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/homebrew.mxcl.mongodb-community.plist:7:    <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/homebrew.mxcl.mongodb-community.plist:15:    <key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/homebrew.mxcl.mongodb-community.plist:19:    <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/homebrew.mxcl.mongodb-community.plist:21:    <key>StandardOutPath</key>
+ops/launchd/README.md:11:| `com.quantslab.v12-copy-trader` | system daemon | the V17 engine via `scripts/v12_launcher.sh` (KeepAlive) |
+ops/launchd/README.md:13:| `com.quantslab.v12-watchdog` | user agent | engine stall watchdog (`scripts/v12_heartbeat_watchdog.sh`, STATS-heartbeat content) — the ONE sanctioned killer (promoted 2026-07-10) |
+ops/launchd/README.md:27:# 1b. Only now install + load the KeepAlive agent (RunAtLoad starts a fresh one).
+ops/launchd/README.md:42:(`scripts/v12_heartbeat_watchdog.sh`, com.quantslab.v12-watchdog, ALREADY loaded) keys on the STATS heartbeat
+ops/launchd/README.md:49:launchctl list | grep v12-watchdog            # expect it present (PID)
+/Library/LaunchDaemons/com.quantslab.pipeline.plist:34:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.quantslab.pipeline.plist:40:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.quantslab.pipeline.plist:50:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.quantslab.pipeline.plist:52:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.pipeline.plist:54:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.email-to-brain.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.email-to-brain.plist:24:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.email-to-brain.plist:26:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.dream-cycle-catchup.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.dream-cycle-catchup.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.dream-cycle-catchup.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.mongo-log-rotate.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.mongo-log-rotate.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.mongo-log-rotate.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.restore-drill.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.restore-drill.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.restore-drill.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.pnl-tracker.plist.disabled-2026-06-24:16:	<key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.pnl-tracker.plist.disabled-2026-06-24:22:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.pnl-tracker.plist.disabled-2026-06-24:29:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.pnl-tracker.plist.disabled-2026-06-24:31:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.pnl-tracker.plist.disabled-2026-06-24:33:	<key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:6:  <string>com.quantslab.v12-copy-trader</string>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:13:  <key>ProgramArguments</key>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:31:  <key>KeepAlive</key>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:33:  <key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:35:  <key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:36:  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:37:  <key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.quantslab.v12-copy-trader.plist:38:  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-job-hunter.plist.disabled-p4:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-job-hunter.plist.disabled-p4:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-job-hunter.plist.disabled-p4:24:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.listing-monitor.plist:13:  <key>ProgramArguments</key>
+ops/launchd/com.quantslab.listing-monitor.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.listing-monitor.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.listing-monitor.plist:35:  <key>StandardOutPath</key>
+ops/launchd/com.quantslab.listing-monitor.plist:37:  <key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.claude.quant-engineer.plist:12:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.claude.quant-engineer.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.claude.quant-engineer.plist:25:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.claude.quant-engineer.plist:27:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.claude.quant-engineer.plist:29:	<key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.hermes.cron.email-to-brain.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.email-to-brain.plist:22:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.email-to-brain.plist:24:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.storage-cleanup.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.storage-cleanup.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.storage-cleanup.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-firstcut-dev.plist.disabled-p4:7:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-firstcut-dev.plist.disabled-p4:24:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-firstcut-dev.plist.disabled-p4:26:  <key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.kb-lint.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.kb-lint.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.kb-lint.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.docker.vmnetd.plist:3:<plist version="1.0"><dict><key>Label</key><string>com.docker.vmnetd</string><key>Program</key><string>/Library/PrivilegedHelperTools/com.docker.vmnetd</string><key>ProgramArguments</key><array><string>/Library/PrivilegedHelperTools/com.docker.vmnetd</string></array><key>RunAtLoad</key><true/><key>Sockets</key><dict><key>Listener</key><dict><key>SockPathMode</key><integer>438</integer><key>SockPathName</key><string>/var/run/com.docker.vmnetd.sock</string></dict></dict><key>Version</key><string>77</string></dict></plist>
+/Library/LaunchDaemons/com.hermes.cron.fleet-watchdog.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.fleet-watchdog.plist:24:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.fleet-watchdog.plist:26:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.docker-stack.plist:9:	<key>ProgramArguments</key>
+ops/launchd/com.quantslab.docker-stack.plist:16:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.docker-stack.plist:18:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.docker-stack.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.scoreboard.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.scoreboard.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.scoreboard.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.probes.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.probes.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.probes.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.fleet-watchdog.plist:9:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.fleet-watchdog.plist:28:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.fleet-watchdog.plist:30:  <key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.cos-self-watchdog.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.cos-self-watchdog.plist:24:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.cos-self-watchdog.plist:26:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.integration-freshness.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.integration-freshness.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.integration-freshness.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.oikon-supply-refresh.plist:18:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.oikon-supply-refresh.plist:28:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.oikon-supply-refresh.plist:30:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.multi-agent-smoke.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.multi-agent-smoke.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.multi-agent-smoke.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.claude.job-hunter.plist:12:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.claude.job-hunter.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.claude.job-hunter.plist:25:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.claude.job-hunter.plist:27:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.claude.job-hunter.plist:29:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cloakbrowser.plist:7:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cloakbrowser.plist:14:  <key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cloakbrowser.plist:16:  <key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cloakbrowser.plist:18:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cloakbrowser.plist:20:  <key>StandardErrorPath</key>
+ops/launchd/com.quantslab.api.plist:34:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.api.plist:40:	<key>ProgramArguments</key>
+ops/launchd/com.quantslab.api.plist:52:	<key>StandardErrorPath</key>
+ops/launchd/com.quantslab.api.plist:54:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.api.plist:56:	<key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.quantslab.docker-stack.plist:9:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.quantslab.docker-stack.plist:16:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.quantslab.docker-stack.plist:18:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.docker-stack.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.doctor-monitor.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.doctor-monitor.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.doctor-monitor.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.plan-shipped-refresh.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.plan-shipped-refresh.plist:24:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.plan-shipped-refresh.plist:26:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.telegram-mcp-watchdog.plist:12:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.hermes.cron.telegram-mcp-watchdog.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.telegram-mcp-watchdog.plist:24:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.telegram-mcp-watchdog.plist:26:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.telegram-mcp-watchdog.plist:28:	<key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.daily-copy-report.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.daily-copy-report.plist:23:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.daily-copy-report.plist:25:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.gbrain.mcp-server.plist:7:    <key>ProgramArguments</key>
+/Library/LaunchDaemons/com.gbrain.mcp-server.plist:15:    <key>KeepAlive</key>
+/Library/LaunchDaemons/com.gbrain.mcp-server.plist:17:    <key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.gbrain.mcp-server.plist:19:    <key>StandardOutPath</key>
+/Library/LaunchDaemons/com.gbrain.mcp-server.plist:21:    <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.autopilot-watchdog.plist:14:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.autopilot-watchdog.plist:20:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.autopilot-watchdog.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.agent-restart.plist:18:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.agent-restart.plist:25:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.agent-restart.plist:27:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-normalize.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-normalize.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-normalize.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-export.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-export.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-export.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.pnl-tracker.plist:13:  <key>ProgramArguments</key>
+/Library/LaunchDaemons/com.quantslab.pnl-tracker.plist:31:  <key>KeepAlive</key>
+/Library/LaunchDaemons/com.quantslab.pnl-tracker.plist:33:  <key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.quantslab.pnl-tracker.plist:35:  <key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.pnl-tracker.plist:37:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.mem-monitor.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.mem-monitor.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.mem-monitor.plist:24:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.colima.plist:9:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.quantslab.colima.plist:20:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.quantslab.colima.plist:25:	<key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.quantslab.colima.plist:27:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.quantslab.colima.plist:29:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.multi-agent-smoke.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.multi-agent-smoke.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.multi-agent-smoke.plist:24:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.restore-drill.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.restore-drill.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.restore-drill.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-backup.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-backup.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-backup.plist:24:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.docker.socket.plist:3:<plist version="1.0"><dict><key>KeepAlive</key><false/><key>Label</key><string>com.docker.socket</string><key>ProcessType</key><string>Background</string><key>Program</key><string>/Library/PrivilegedHelperTools/com.docker.socket</string><key>ProgramArguments</key><array><string>/Library/PrivilegedHelperTools/com.docker.socket</string><string>albertoloddo</string></array><key>RunAtLoad</key><true/><key>Version</key><string>0</string></dict></plist>
+/Library/LaunchDaemons/com.hermes.cron.daily-plan.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.daily-plan.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.daily-plan.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-score-log.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-score-log.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.brain-score-log.plist:22:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:6:  <string>com.quantslab.v12-copy-trader</string>
+ops/launchd/com.quantslab.v12-copy-trader.plist:13:  <key>ProgramArguments</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:35:  <key>StandardOutPath</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:36:  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+ops/launchd/com.quantslab.v12-copy-trader.plist:37:  <key>StandardErrorPath</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:38:  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+/Library/LaunchDaemons/com.claude.cos-supervisor.plist:12:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.claude.cos-supervisor.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.claude.cos-supervisor.plist:25:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.claude.cos-supervisor.plist:27:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.claude.cos-supervisor.plist:29:	<key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.claude.firstcut-dev.plist:12:	<key>KeepAlive</key>
+/Library/LaunchDaemons/com.claude.firstcut-dev.plist:16:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.claude.firstcut-dev.plist:25:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.claude.firstcut-dev.plist:27:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.claude.firstcut-dev.plist:29:	<key>ThrottleInterval</key>
+/Library/LaunchDaemons/com.hermes.cron.meeting-to-brain.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.meeting-to-brain.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.meeting-to-brain.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-quant-engineer.plist.disabled-p4:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-quant-engineer.plist.disabled-p4:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.heartbeat-quant-engineer.plist.disabled-p4:24:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.mongo-log-rotate.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.mongo-log-rotate.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.mongo-log-rotate.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.autopilot-watchdog.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.autopilot-watchdog.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.autopilot-watchdog.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.compounding-scorecard.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.compounding-scorecard.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.compounding-scorecard.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/homebrew.mxcl.mongodb-community.plist:7:    <key>ProgramArguments</key>
+/Library/LaunchDaemons/homebrew.mxcl.mongodb-community.plist:15:    <key>KeepAlive</key>
+/Library/LaunchDaemons/homebrew.mxcl.mongodb-community.plist:19:    <key>StandardErrorPath</key>
+/Library/LaunchDaemons/homebrew.mxcl.mongodb-community.plist:21:    <key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.oikon-supply-refresh.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.oikon-supply-refresh.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.oikon-supply-refresh.plist:22:	<key>StandardOutPath</key>
+/Library/LaunchDaemons/com.hermes.cron.mem-monitor.plist:14:	<key>ProgramArguments</key>
+/Library/LaunchDaemons/com.hermes.cron.mem-monitor.plist:20:	<key>StandardErrorPath</key>
+/Library/LaunchDaemons/com.hermes.cron.mem-monitor.plist:22:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-normalize.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-normalize.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-normalize.plist:24:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.colima.plist:9:	<key>ProgramArguments</key>
+ops/launchd/com.quantslab.colima.plist:20:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.colima.plist:25:	<key>ThrottleInterval</key>
+ops/launchd/com.quantslab.colima.plist:27:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.colima.plist:29:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.integration-freshness.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.integration-freshness.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.integration-freshness.plist:24:	<key>StandardOutPath</key>
+ops/launchd/com.quantslab.hl-mark-collector.plist:4:  com.quantslab.hl-mark-collector — supervises the live HL 1m mark collector (KeepAlive).
+ops/launchd/com.quantslab.hl-mark-collector.plist:18:  <key>ProgramArguments</key>
+ops/launchd/com.quantslab.hl-mark-collector.plist:32:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.hl-mark-collector.plist:34:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.hl-mark-collector.plist:36:  <key>StandardOutPath</key>
+ops/launchd/com.quantslab.hl-mark-collector.plist:38:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.probes.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.probes.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.probes.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.email-to-brain.plist.bak-2026-05-23:7:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.email-to-brain.plist.bak-2026-05-23:59:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.email-to-brain.plist.bak-2026-05-23:61:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:6:  <string>com.quantslab.v12-watchdog</string>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:15:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:18:    <string>/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh</string>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:29:  <key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:31:  <key>ThrottleInterval</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:33:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:34:  <string>/tmp/ql-v12-watchdog.log</string>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:35:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist:36:  <string>/tmp/ql-v12-watchdog.log</string>
+/Users/hermes/Library/LaunchAgents/com.gbrain.autopilot.plist:5:	<key>KeepAlive</key>
+/Users/hermes/Library/LaunchAgents/com.gbrain.autopilot.plist:11:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.gbrain.autopilot.plist:17:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.gbrain.autopilot.plist:19:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-s3-fills-daily.plist:13:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-s3-fills-daily.plist:34:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.quantslab.hl-s3-fills-daily.plist:36:  <key>StandardErrorPath</key>
+ops/launchd/com.quantslab.hl-s3-fills-daily.plist:13:  <key>ProgramArguments</key>
+ops/launchd/com.quantslab.hl-s3-fills-daily.plist:34:  <key>StandardOutPath</key>
+ops/launchd/com.quantslab.hl-s3-fills-daily.plist:36:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.compliance-audit.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.compliance-audit.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.compliance-audit.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-export.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-export.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.brain-export.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.daily-plan.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.daily-plan.plist:24:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.daily-plan.plist:26:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.doctor-monitor.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.doctor-monitor.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.doctor-monitor.plist:24:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.cos-self-watchdog.plist:18:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.cos-self-watchdog.plist:26:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.cos-self-watchdog.plist:28:	<key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.plan-shipped-refresh.plist:9:  <key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.plan-shipped-refresh.plist:28:  <key>StandardOutPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.plan-shipped-refresh.plist:30:  <key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.kb-lint.plist:16:	<key>ProgramArguments</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.kb-lint.plist:22:	<key>StandardErrorPath</key>
+/Users/hermes/Library/LaunchAgents/com.hermes.cron.kb-lint.plist:24:	<key>StandardOutPath</key>
+
+exec
+/bin/zsh -lc 'ls -l ops/launchd && rg -n "v12_heartbeat|v12_launcher|ql-v12-copy-trader-launchd|KeepAlive|ThrottleInterval" ops/launchd' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+total 112
+-rw-r--r--  1 hermes  staff  4369 Jul 10 11:03 README.md
+-rw-r--r--  1 hermes  staff  1873 Apr 10 08:34 com.quantslab.api.plist
+-rw-r--r--  1 hermes  staff  1258 May 22 16:36 com.quantslab.arb-collector.plist
+-rw-r--r--  1 hermes  staff   997 Apr 15 16:11 com.quantslab.colima.plist
+-rw-r--r--  1 hermes  staff   941 Apr 17 10:42 com.quantslab.docker-stack.plist
+-rw-r--r--  1 hermes  staff  1440 Jul 10 10:55 com.quantslab.hl-mark-collector.plist
+-rw-r--r--  1 hermes  staff  1189 Jul  9 09:44 com.quantslab.hl-s3-fills-daily.plist
+-rw-r--r--  1 hermes  staff  1282 May 22 16:36 com.quantslab.hl-wallet-collector.plist
+-rw-r--r--  1 hermes  staff  1266 May 22 16:36 com.quantslab.listing-monitor.plist
+-rw-r--r--  1 hermes  staff  1842 Apr 10 08:34 com.quantslab.pipeline.plist
+-rw-r--r--  1 hermes  staff  1254 May 22 16:21 com.quantslab.v12-copy-trader.plist
+-rwxr-xr-x  1 hermes  staff  1845 Apr  9 13:07 install.sh
+-rwxr-xr-x  1 hermes  staff   428 Apr  9 13:07 uninstall.sh
+ops/launchd/com.quantslab.hl-wallet-collector.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.hl-wallet-collector.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.pipeline.plist:34:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.pipeline.plist:54:	<key>ThrottleInterval</key>
+ops/launchd/com.quantslab.arb-collector.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.arb-collector.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/README.md:11:| `com.quantslab.v12-copy-trader` | system daemon | the V17 engine via `scripts/v12_launcher.sh` (KeepAlive) |
+ops/launchd/README.md:13:| `com.quantslab.v12-watchdog` | user agent | engine stall watchdog (`scripts/v12_heartbeat_watchdog.sh`, STATS-heartbeat content) — the ONE sanctioned killer (promoted 2026-07-10) |
+ops/launchd/README.md:27:# 1b. Only now install + load the KeepAlive agent (RunAtLoad starts a fresh one).
+ops/launchd/README.md:42:(`scripts/v12_heartbeat_watchdog.sh`, com.quantslab.v12-watchdog, ALREADY loaded) keys on the STATS heartbeat
+ops/launchd/com.quantslab.listing-monitor.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.listing-monitor.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.docker-stack.plist:16:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.api.plist:34:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.api.plist:56:	<key>ThrottleInterval</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:16:    <string>/Users/hermes/quants-lab/scripts/v12_launcher.sh</string>
+ops/launchd/com.quantslab.v12-copy-trader.plist:31:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:33:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.v12-copy-trader.plist:36:  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+ops/launchd/com.quantslab.v12-copy-trader.plist:38:  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+ops/launchd/com.quantslab.hl-mark-collector.plist:4:  com.quantslab.hl-mark-collector — supervises the live HL 1m mark collector (KeepAlive).
+ops/launchd/com.quantslab.hl-mark-collector.plist:32:  <key>KeepAlive</key>
+ops/launchd/com.quantslab.hl-mark-collector.plist:34:  <key>ThrottleInterval</key>
+ops/launchd/com.quantslab.colima.plist:20:	<key>KeepAlive</key>
+ops/launchd/com.quantslab.colima.plist:25:	<key>ThrottleInterval</key>
+
+exec
+/bin/zsh -lc 'nl -ba ops/launchd/com.quantslab.v12-copy-trader.plist' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	<?xml version="1.0" encoding="UTF-8"?>
+     2	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+     3	<plist version="1.0">
+     4	<dict>
+     5	  <key>Label</key>
+     6	  <string>com.quantslab.v12-copy-trader</string>
+     7	  <key>UserName</key>
+     8	  <string>hermes</string>
+     9	  <key>GroupName</key>
+    10	  <string>staff</string>
+    11	  <key>WorkingDirectory</key>
+    12	  <string>/Users/hermes/quants-lab</string>
+    13	  <key>ProgramArguments</key>
+    14	  <array>
+    15	    <string>/bin/bash</string>
+    16	    <string>/Users/hermes/quants-lab/scripts/v12_launcher.sh</string>
+    17	  </array>
+    18	  <key>EnvironmentVariables</key>
+    19	  <dict>
+    20	    <key>PATH</key>
+    21	    <string>/Users/hermes/miniforge3/envs/quants-lab/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    22	    <key>HOME</key>
+    23	    <string>/Users/hermes</string>
+    24	    <key>MONGO_URI</key>
+    25	    <string>mongodb://localhost:27017/quants_lab</string>
+    26	    <key>MONGO_DATABASE</key>
+    27	    <string>quants_lab</string>
+    28	  </dict>
+    29	  <key>RunAtLoad</key>
+    30	  <true/>
+    31	  <key>KeepAlive</key>
+    32	  <true/>
+    33	  <key>ThrottleInterval</key>
+    34	  <integer>30</integer>
+    35	  <key>StandardOutPath</key>
+    36	  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+    37	  <key>StandardErrorPath</key>
+    38	  <string>/tmp/ql-v12-copy-trader-launchd.log</string>
+    39	</dict>
+    40	</plist>
+
+exec
+/bin/zsh -lc "nl -ba strategies/live/hl_copy_trader_v17.py | sed -n '30,48p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    30	import websockets
+    31	from hyperliquid.exchange import Exchange
+    32	from hyperliquid.info import Info
+    33	from pymongo import MongoClient
+    34	
+    35	# Repo root for repo-relative artifact paths (parquet tilt artifacts, calib JSON, etc.).
+    36	# strategies/live/hl_copy_trader_v17.py -> parent.parent.parent == repo root.
+    37	_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+    38	
+    39	logging.basicConfig(
+    40	    level=logging.INFO,
+    41	    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    42	)
+    43	logger = logging.getLogger("hl_copy_v17")   # live tag (was "hl_copy_v17"; renamed 2026-06-12)
+    44	
+    45	HL_API = "https://api.hyperliquid.xyz"
+    46	HL_WS = "wss://api.hyperliquid.xyz/ws"
+    47	TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003576397888")
+    48	TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+exec
+/bin/zsh -lc 'nl -ba /Users/hermes/Library/LaunchAgents/com.quantslab.v17-stall-watchdog.plist 2>/dev/null || true' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	<?xml version="1.0" encoding="UTF-8"?>
+     2	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+     3	<plist version="1.0">
+     4	<dict>
+     5		<key>EnvironmentVariables</key>
+     6		<dict>
+     7			<key>HOME</key>
+     8			<string>/Users/hermes</string>
+     9			<key>PATH</key>
+    10			<string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    11		</dict>
+    12		<key>Label</key>
+    13		<string>com.quantslab.v17-stall-watchdog</string>
+    14		<key>LimitLoadToSessionType</key>
+    15		<string>Background</string>
+    16		<key>ProgramArguments</key>
+    17		<array>
+    18			<string>/bin/bash</string>
+    19			<string>/Users/hermes/.claude/scripts/v17-copy-engine-stall-watchdog.sh</string>
+    20		</array>
+    21		<key>RunAtLoad</key>
+    22		<true/>
+    23		<key>StandardErrorPath</key>
+    24		<string>/tmp/v17-stall-watchdog.log</string>
+    25		<key>StandardOutPath</key>
+    26		<string>/tmp/v17-stall-watchdog.log</string>
+    27		<key>StartInterval</key>
+    28		<integer>120</integer>
+    29	</dict>
+    30	</plist>
+
+exec
+/bin/zsh -lc 'nl -ba /Users/hermes/Library/LaunchAgents/com.quantslab.v12-watchdog.plist' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	<?xml version="1.0" encoding="UTF-8"?>
+     2	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+     3	<plist version="1.0">
+     4	<dict>
+     5	  <key>Label</key>
+     6	  <string>com.quantslab.v12-watchdog</string>
+     7	  <key>LimitLoadToSessionType</key>
+     8	  <string>Background</string>
+     9	  <key>UserName</key>
+    10	  <string>hermes</string>
+    11	  <key>GroupName</key>
+    12	  <string>staff</string>
+    13	  <key>WorkingDirectory</key>
+    14	  <string>/Users/hermes/quants-lab</string>
+    15	  <key>ProgramArguments</key>
+    16	  <array>
+    17	    <string>/bin/bash</string>
+    18	    <string>/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh</string>
+    19	  </array>
+    20	  <key>EnvironmentVariables</key>
+    21	  <dict>
+    22	    <key>PATH</key>
+    23	    <string>/Users/hermes/miniforge3/envs/quants-lab/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    24	    <key>HOME</key>
+    25	    <string>/Users/hermes</string>
+    26	  </dict>
+    27	  <key>RunAtLoad</key>
+    28	  <true/>
+    29	  <key>KeepAlive</key>
+    30	  <true/>
+    31	  <key>ThrottleInterval</key>
+    32	  <integer>30</integer>
+    33	  <key>StandardOutPath</key>
+    34	  <string>/tmp/ql-v12-watchdog.log</string>
+    35	  <key>StandardErrorPath</key>
+    36	  <string>/tmp/ql-v12-watchdog.log</string>
+    37	</dict>
+    38	</plist>
+
+exec
+/bin/zsh -lc 'ps -axww -o pid=,lstart=,command= | grep -F "miniforge3/envs/quants-lab/bin/python strategies/live/hl_copy_trader_v17.py" | grep -v grep || true' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+zsh:1: operation not permitted: ps
+
+exec
+/bin/zsh -lc 'launchctl list 2>/dev/null | rg "v12-watchdog|v17-stall-watchdog|v12-copy-trader" || true' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+exec
+/bin/zsh -lc 'rg -n "ql-v12-copy-trader-launchd|v12-copy-trader-launchd|logrotate|newsyslog|ql-v12" /Users/hermes/quants-lab /Users/hermes/Library/LaunchAgents /Library/LaunchDaemons 2>/dev/null' in /Users/hermes/quants-lab
+ succeeded in 278ms:
+codex
+**R1 Verdict: mostly fixed, not perfect.**  
+The four stated `kill_switch` fixes are present: mode validation happens before flags ([scripts/kill_switch.sh:32](/Users/hermes/quants-lab/scripts/kill_switch.sh:32)), engine match requires `bin/python ...hl_copy_trader_v17.py` ([line 26](/Users/hermes/quants-lab/scripts/kill_switch.sh:26)), multi-match warns ([line 56](/Users/hermes/quants-lab/scripts/kill_switch.sh:56)), and it rechecks after SIGKILL before flattening ([lines 74-78](/Users/hermes/quants-lab/scripts/kill_switch.sh:74)).
+
+Remaining risks: extra args are ignored, so `--pause --bogus` still succeeds; and the PID pattern matches any single V17 script invocation, not specifically the live config/launcher. That is not a P0 for emergency use, but it is still a wrong-kill path for a manual smoke/dev V17 process.
+
+**R2 Verdict: correct.**  
+`load_day()` now refuses to restart empty over an unreadable existing parquet ([data_pipeline/hl_live_mark_collector.py:64](/Users/hermes/quants-lab/data_pipeline/hl_live_mark_collector.py:64), [lines 70-77](/Users/hermes/quants-lab/data_pipeline/hl_live_mark_collector.py:70)). Given `flush_day()` writes `*.parquet.tmp` then `replace()`s the final file ([lines 87-90](/Users/hermes/quants-lab/data_pipeline/hl_live_mark_collector.py:87)), `load_day()` should see either old complete parquet or new complete parquet, not a torn target file. The crash-loop risk is acceptable: it may miss fresh marks until operator repair, but it prevents silent truncation of the day.
+
+**R3 Verdict: improved, not strictly race-free.**  
+The handover now terminates and waits before loading the KeepAlive agent ([ops/launchd/README.md:24](/Users/hermes/quants-lab/ops/launchd/README.md:24), [lines 25-29](/Users/hermes/quants-lab/ops/launchd/README.md:25)). That fixes the main concurrent-writer race. Remaining gap: after SIGKILL fallback, the runbook sleeps but does not prove `pgrep` is empty before loading the new agent ([line 26](/Users/hermes/quants-lab/ops/launchd/README.md:26)). Add a final `pgrep ... && abort` after the SIGKILL path.
+
+**R4 Verdict: heartbeat watchdog design is substantially right; one operational false-kill invariant must be enforced.**  
+The core premise checks out. The engine main loop runs `_check_exits()` before `_log_stats()` ([strategies/live/hl_copy_trader_v17.py:4466](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:4466), [lines 4470-4473](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:4470)). `_check_exits()` runs the fast global stop and emergency flatten/trim path before normal exits ([lines 2114-2135](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:2114)). The base `STATS:` line is emitted only after fill sync, reconcile, global stop/backstop evaluation, and kill-switch state update ([lines 3971-4063](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:3971)). So a reconnect/error loop that logs but never reaches the protected loop will not emit new `STATS:`; the heartbeat watchdog catches that.
+
+The restart guards are good: exact-one match gating ([scripts/v12_heartbeat_watchdog.sh:67](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:67)), generation reset on PID/start change ([lines 140-148](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:140)), post-offset STATS correlation ([line 151](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:151)), pause rechecks before signals ([lines 171-179](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:171)), and same-generation SIGKILL escalation ([lines 177-180](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:177)).
+
+Main weakness: it is only safe if `/tmp/ql-v12-copy-trader-launchd.log` is never externally rotated/replaced while the process is alive. The script documents that constraint ([lines 45-47](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:45)), but the activation runbook does not enforce it. If the active log path is replaced while the engine keeps writing its old fd, the watchdog sees no post-offset `STATS:` and can false-kill a healthy engine. That is a P1 operational invariant, not a code-path P0.
+
+Also note detection after watchdog start/restart is conservative: it rebaselines at current log size, so a bot already frozen before watchdog startup is killed only after grace plus stale checks, roughly 7 minutes, not immediately.
+
+**R5 Verdict: no meaningful trading-loop coverage lost, except stale-before-watchdog-start latency.**  
+I do not see a freeze mode where log-mtime catches a protected-loop failure that the STATS watchdog misses. The opposite is the important case: reconnect/error logging can keep mtime fresh while no protected checks run, and STATS catches that. The only coverage regression is startup latency if the heartbeat watchdog starts after the engine is already stale; an mtime watchdog could kill immediately from old mtime, while this one rebaselines and waits.
+
+**OVERALL: not quite clean for CoS activation yet.**  
+Phase 1 is close, and the promoted STATS watchdog is the right single sanctioned killer. Before handoff, I would require: final post-SIGKILL `pgrep` abort in the mark-collector handover, explicit runbook/preflight enforcement that the copy-trader log is not externally rotated/replaced while live, and preferably reject extra `kill_switch` args plus narrow its engine pattern to the live config. No current P0 in the watchdog’s generation/kill logic, but the log-inode invariant needs to be operationally locked before live activation.
+tokens used
+54.178
+**R1 Verdict: mostly fixed, not perfect.**  
+The four stated `kill_switch` fixes are present: mode validation happens before flags ([scripts/kill_switch.sh:32](/Users/hermes/quants-lab/scripts/kill_switch.sh:32)), engine match requires `bin/python ...hl_copy_trader_v17.py` ([line 26](/Users/hermes/quants-lab/scripts/kill_switch.sh:26)), multi-match warns ([line 56](/Users/hermes/quants-lab/scripts/kill_switch.sh:56)), and it rechecks after SIGKILL before flattening ([lines 74-78](/Users/hermes/quants-lab/scripts/kill_switch.sh:74)).
+
+Remaining risks: extra args are ignored, so `--pause --bogus` still succeeds; and the PID pattern matches any single V17 script invocation, not specifically the live config/launcher. That is not a P0 for emergency use, but it is still a wrong-kill path for a manual smoke/dev V17 process.
+
+**R2 Verdict: correct.**  
+`load_day()` now refuses to restart empty over an unreadable existing parquet ([data_pipeline/hl_live_mark_collector.py:64](/Users/hermes/quants-lab/data_pipeline/hl_live_mark_collector.py:64), [lines 70-77](/Users/hermes/quants-lab/data_pipeline/hl_live_mark_collector.py:70)). Given `flush_day()` writes `*.parquet.tmp` then `replace()`s the final file ([lines 87-90](/Users/hermes/quants-lab/data_pipeline/hl_live_mark_collector.py:87)), `load_day()` should see either old complete parquet or new complete parquet, not a torn target file. The crash-loop risk is acceptable: it may miss fresh marks until operator repair, but it prevents silent truncation of the day.
+
+**R3 Verdict: improved, not strictly race-free.**  
+The handover now terminates and waits before loading the KeepAlive agent ([ops/launchd/README.md:24](/Users/hermes/quants-lab/ops/launchd/README.md:24), [lines 25-29](/Users/hermes/quants-lab/ops/launchd/README.md:25)). That fixes the main concurrent-writer race. Remaining gap: after SIGKILL fallback, the runbook sleeps but does not prove `pgrep` is empty before loading the new agent ([line 26](/Users/hermes/quants-lab/ops/launchd/README.md:26)). Add a final `pgrep ... && abort` after the SIGKILL path.
+
+**R4 Verdict: heartbeat watchdog design is substantially right; one operational false-kill invariant must be enforced.**  
+The core premise checks out. The engine main loop runs `_check_exits()` before `_log_stats()` ([strategies/live/hl_copy_trader_v17.py:4466](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:4466), [lines 4470-4473](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:4470)). `_check_exits()` runs the fast global stop and emergency flatten/trim path before normal exits ([lines 2114-2135](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:2114)). The base `STATS:` line is emitted only after fill sync, reconcile, global stop/backstop evaluation, and kill-switch state update ([lines 3971-4063](/Users/hermes/quants-lab/strategies/live/hl_copy_trader_v17.py:3971)). So a reconnect/error loop that logs but never reaches the protected loop will not emit new `STATS:`; the heartbeat watchdog catches that.
+
+The restart guards are good: exact-one match gating ([scripts/v12_heartbeat_watchdog.sh:67](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:67)), generation reset on PID/start change ([lines 140-148](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:140)), post-offset STATS correlation ([line 151](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:151)), pause rechecks before signals ([lines 171-179](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:171)), and same-generation SIGKILL escalation ([lines 177-180](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:177)).
+
+Main weakness: it is only safe if `/tmp/ql-v12-copy-trader-launchd.log` is never externally rotated/replaced while the process is alive. The script documents that constraint ([lines 45-47](/Users/hermes/quants-lab/scripts/v12_heartbeat_watchdog.sh:45)), but the activation runbook does not enforce it. If the active log path is replaced while the engine keeps writing its old fd, the watchdog sees no post-offset `STATS:` and can false-kill a healthy engine. That is a P1 operational invariant, not a code-path P0.
+
+Also note detection after watchdog start/restart is conservative: it rebaselines at current log size, so a bot already frozen before watchdog startup is killed only after grace plus stale checks, roughly 7 minutes, not immediately.
+
+**R5 Verdict: no meaningful trading-loop coverage lost, except stale-before-watchdog-start latency.**  
+I do not see a freeze mode where log-mtime catches a protected-loop failure that the STATS watchdog misses. The opposite is the important case: reconnect/error logging can keep mtime fresh while no protected checks run, and STATS catches that. The only coverage regression is startup latency if the heartbeat watchdog starts after the engine is already stale; an mtime watchdog could kill immediately from old mtime, while this one rebaselines and waits.
+
+**OVERALL: not quite clean for CoS activation yet.**  
+Phase 1 is close, and the promoted STATS watchdog is the right single sanctioned killer. Before handoff, I would require: final post-SIGKILL `pgrep` abort in the mark-collector handover, explicit runbook/preflight enforcement that the copy-trader log is not externally rotated/replaced while live, and preferably reject extra `kill_switch` args plus narrow its engine pattern to the live config. No current P0 in the watchdog’s generation/kill logic, but the log-inode invariant needs to be operationally locked before live activation.

@@ -67,8 +67,14 @@ def load_day(day: str) -> list[dict[str, Any]]:
         return []
     try:
         return pd.read_parquet(fp).to_dict("records")
-    except Exception:
-        return []
+    except Exception as e:
+        # codex P1 (2026-07-10): do NOT swallow a read error and return [] — the next flush would then
+        # overwrite an existing day's marks with only the new (partial) buffer, silently truncating live
+        # history. Fail LOUD so KeepAlive surfaces it and an operator fixes/moves the bad file.
+        raise RuntimeError(
+            f"hl_live_mark_collector: existing day file {fp} is unreadable ({e!r}). Refusing to start empty "
+            f"and overwrite it. Move/repair the file, then let KeepAlive relaunch."
+        ) from e
 
 
 def flush_day(day: str, buf: list[dict[str, Any]]) -> None:

@@ -1,0 +1,246 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4b11-7eda-7b43-8081-c6ea5735baad
+--------
+user
+# Round-3 consensus check — Phase 1 final residuals
+
+You returned (round 2, NO P0) three requirements before CoS activation. I applied exactly these:
+1. kill_switch rejects EXTRA args now: `if [ "$#" -gt 1 ]` -> exit 2 BEFORE touching flags (smoke-tested:
+   `--pause --bogus` -> exit 2, no flag set). See scripts/kill_switch.sh top.
+2. Mark-collector handover: added a FINAL `pgrep ... && { echo ABORT; exit 1 }` after the SIGKILL fallback,
+   before loading the KeepAlive agent. See ops/launchd/README.md section 1 (1a-final).
+3. Log-inode invariant: added an explicit "INVARIANT" section to ops/launchd/README.md enforcing that
+   /tmp/ql-v12-copy-trader-launchd.log must not be rotated/replaced while V17 is live (with the safe rotate
+   procedure + preflight `ls -li`).
+I kept the kill_switch engine pattern as `bin/python strategies/live/hl_copy_trader_v17.py` (you rated
+narrowing-to-config "preferable, not P0"; an emergency should flatten any live V17, and tying to the config
+name is brittle).
+
+Read scripts/kill_switch.sh + ops/launchd/README.md. Confirm: are these three fixes correct and complete,
+and is Phase 1 now CLEAN to hand CoS for activation? If yes, say so explicitly (consensus). If any real
+issue remains, name it with file:line — do not invent new nice-to-haves.
+codex
+I’ll do a targeted read of the two files and verify only the three claimed residuals plus any directly blocking issue for activation.
+exec
+/bin/zsh -lc 'nl -ba ops/launchd/README.md' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc 'nl -ba scripts/kill_switch.sh' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	# ops/launchd — launchd service templates (infra-as-code)
+     2	
+     3	Canonical, version-controlled copies of the launchd services for the LIVE HL copy-trading stack. macOS
+     4	loads plists from `/Library/LaunchDaemons` (system) or `~/Library/LaunchAgents` (user); those installed
+     5	copies should match the templates here. **CoS owns installing/loading/unloading** (needs the right session
+     6	+ sometimes sudo). This dir is the source of truth for what SHOULD be loaded.
+     7	
+     8	## The KEEP set (live stack — must stay loaded)
+     9	| Service | Kind | Supervises |
+    10	|---|---|---|
+    11	| `com.quantslab.v12-copy-trader` | system daemon | the V17 engine via `scripts/v12_launcher.sh` (KeepAlive) |
+    12	| `com.quantslab.hl-s3-fills-daily` | user agent | 06:20 S3 data refresh (`scripts/hl_s3_fills_daily_refresh.sh`) |
+    13	| `com.quantslab.v12-watchdog` | user agent | engine stall watchdog (`scripts/v12_heartbeat_watchdog.sh`, STATS-heartbeat content) — the ONE sanctioned killer (promoted 2026-07-10) |
+    14	| `com.quantslab.pnl-tracker` | system daemon | live PnL → Telegram (`tools/pnl_tracker.py`) |
+    15	| `com.quantslab.hl-mark-collector` | user agent | **NEW (this dir)** — supervises the live 1m mark collector |
+    16	
+    17	## Phase-1 activation runbook (CoS to execute; codex-reviewed 2026-07-10)
+    18	Live V17 engine must stay untouched. Do these three; verify after each.
+    19	
+    20	### 1. Supervise the mark collector (fixes the unsupervised SPOF)
+    21	```bash
+    22	# 1a. Stop the old unsupervised nohup collector GRACEFULLY and WAIT for it to exit (codex Q4: a lingering
+    23	#     old process + the new one share the same {day}.parquet.tmp path -> race / lost final rows).
+    24	pkill -TERM -f 'data_pipeline/hl_live_mark_collector.py' || true
+    25	for i in $(seq 1 20); do pgrep -f 'data_pipeline/hl_live_mark_collector.py' >/dev/null || break; sleep 1; done
+    26	pgrep -f 'data_pipeline/hl_live_mark_collector.py' && { echo "old collector still up — SIGKILL"; pkill -9 -f 'data_pipeline/hl_live_mark_collector.py'; sleep 2; } || echo "old collector exited"
+    27	# 1a-final: PROVE it is gone before loading the new agent (codex R3) — do NOT load if any old collector remains.
+    28	pgrep -f 'data_pipeline/hl_live_mark_collector.py' && { echo "ABORT: old collector still present, do not load"; exit 1; } || echo "confirmed no old collector"
+    29	# 1b. Only now install + load the KeepAlive agent (RunAtLoad starts a fresh one).
+    30	cp /Users/hermes/quants-lab/ops/launchd/com.quantslab.hl-mark-collector.plist ~/Library/LaunchAgents/
+    31	launchctl load ~/Library/LaunchAgents/com.quantslab.hl-mark-collector.plist
+    32	# 1c. verify: exactly one fresh collector, supervised, writing marks.
+    33	launchctl list | grep hl-mark-collector
+    34	pgrep -fl 'hl_live_mark_collector'   # expect exactly ONE
+    35	tail -f /tmp/ql-hl-mark-collector.launchd.log
+    36	```
+    37	Handover: the collector writes `app/data/hl_mark_1m_hot/{day}.parquet` atomically and resumes the current UTC
+    38	day on start. Marks are safe ONLY if the old process has fully exited (step 1a) before the new one loads — the
+    39	brief gap (seconds) is at most one 60s poll, and SIGTERM flushes the buffer on the way out.
+    40	
+    41	### 2. Resolve the two-killers problem (retire the log-mtime watchdog, keep the STATS one)
+    42	Codex (2026-07-10): log-mtime staleness is NOT loop health — a reconnect/error loop can keep the log fresh
+    43	while the trading loop never runs its protected checks, bypassing the mtime watchdog. The heartbeat watchdog
+    44	(`scripts/v12_heartbeat_watchdog.sh`, com.quantslab.v12-watchdog, ALREADY loaded) keys on the STATS heartbeat
+    45	CONTENT and is strictly more targeted. Keep it; retire the mtime one.
+    46	```bash
+    47	# retire the log-mtime watchdog
+    48	launchctl unload ~/Library/LaunchAgents/com.quantslab.v17-stall-watchdog.plist
+    49	launchctl list | grep -c v17-stall-watchdog   # expect 0
+    50	# confirm the sanctioned heartbeat killer stays up
+    51	launchctl list | grep v12-watchdog            # expect it present (PID)
+    52	```
+    53	(The `~/.claude/scripts/v17-copy-engine-stall-watchdog.sh` script + its plist are archived after unload.)
+    54	
+    55	### 3. kill_switch.sh (no daemon action — repo script)
+    56	`scripts/kill_switch.sh` was rewritten to actually stop V17 (halt flags + kill engine PID + flatten via
+    57	`tools/flatten_all_offline.py`). No launchd change; just verify it runs (`bash scripts/kill_switch.sh --pause`
+    58	is the safe no-op-ish smoke: sets flags only; then `rm -f /tmp/v12_pause .HALT_COPY` to resume).
+    59	
+    60	## INVARIANT (must hold before + during activation) — log-inode stability
+    61	The sanctioned heartbeat watchdog reads the engine's STATS line from `/tmp/ql-v12-copy-trader-launchd.log`.
+    62	If that file is externally ROTATED/REPLACED (new inode) while the engine keeps writing its old fd, the
+    63	watchdog sees no new post-offset `STATS:` and can FALSE-KILL a healthy engine (codex R4). Enforce:
+    64	- Do NOT `mv`/rotate/truncate `/tmp/ql-v12-copy-trader-launchd.log` while V17 is live.
+    65	- If the log must be rotated, do it as: kill_switch --pause → confirm engine exited → rotate → remove halt
+    66	  flags (engine + watchdog both re-baseline on the fresh log). Preflight check before activation:
+    67	  `ls -li /tmp/ql-v12-copy-trader-launchd.log` and confirm no logrotate/tmpwatch touches it.
+    68	Note: after a watchdog (re)start it rebaselines at current log size, so a bot already frozen BEFORE the
+    69	watchdog starts is killed after grace + stale checks (~7 min), not instantly — acceptable, documented.
+    70	
+    71	## Secrets note (Phase-2)
+    72	The retired `/Library/LaunchDaemons/com.quantslab.{api,pipeline}.plist` contain plaintext Bybit/Telegram
+    73	secrets. The KEEP-set plists above are clean (only `MONGO_URI`/`HOME`/`PATH` env; the stall watchdog reads
+    74	the TG token from `.env`). Removing the retired plists in Phase 2 removes the plaintext secrets.
+
+ succeeded in 0ms:
+     1	#!/bin/bash
+     2	# kill_switch.sh — EMERGENCY STOP for the LIVE HL copy engine (V17).
+     3	#
+     4	# 2026-07-10 (Phase-1 cleanup): rewritten. The prior kill_switch targeted the RETIRED Hummingbot/API stack
+     5	# (localhost:8000/8001, tmux ql-pipeline/ql-api) and did NOT stop the live V17 engine. This one acts on the
+     6	# real live stack: the halt flags the launcher respects (/tmp/v12_pause + $WORKDIR/.HALT_COPY), the running
+     7	# V17 engine PID, and the canonical exchange-truth flatten (tools/flatten_all_offline.py).
+     8	#
+     9	# MODES:
+    10	#   (default, no args)  PANIC FLATTEN — set halt flags, kill the running V17 engine, then market-close ALL
+    11	#                       open HL positions (main+xyz+flx) via flatten_all_offline --execute, and verify flat.
+    12	#                       This is the correct emergency: killing the engine stops its in-process trailing stops,
+    13	#                       so leaving positions open would be UNMANAGED risk — the safe emergency is to get FLAT.
+    14	#   --halt-only         Set halt flags + kill the engine PID, but DO NOT flatten. Positions remain OPEN and
+    15	#                       UNMANAGED — only use for maintenance where you will manage exposure by hand.
+    16	#   --pause             Softest: set halt flags only. The already-running engine keeps managing its positions;
+    17	#                       launchd KeepAlive will NOT relaunch it once it exits. No kill, no flatten.
+    18	#
+    19	# RESUME after any mode: rm -f /tmp/v12_pause "$WORKDIR/.HALT_COPY"   (launchd KeepAlive relaunches the engine)
+    20	set -uo pipefail
+    21	
+    22	WORKDIR="/Users/hermes/quants-lab"
+    23	PYTHON="/Users/hermes/miniforge3/envs/quants-lab/bin/python"
+    24	# Match the LIVE engine only: require the python-interpreter prefix so this very script (which contains the
+    25	# string "hl_copy_trader_v17.py" in this pattern) and editors/greps do NOT self-match (codex Q3).
+    26	ENGINE_PAT="bin/python strategies/live/hl_copy_trader_v17.py"
+    27	MODE="${1:-flatten}"
+    28	ts() { date '+%F %T %Z'; }
+    29	
+    30	# codex: reject extra args (e.g. `--pause --bogus`) so a typo can't ride along with a valid mode.
+    31	if [ "$#" -gt 1 ]; then
+    32	  echo "kill_switch: too many args ($#). Pass at most one mode." >&2
+    33	  echo "usage: kill_switch.sh [--pause | --halt-only | (no arg = PANIC FLATTEN)]" >&2
+    34	  exit 2
+    35	fi
+    36	# codex P0: validate mode BEFORE touching flags/flatten. An unknown arg (e.g. "--halt" typo) must NOT fall
+    37	# through to the default flatten.
+    38	case "$MODE" in
+    39	  flatten|--halt-only|--pause) ;;
+    40	  *)
+    41	    echo "kill_switch: unknown mode '$MODE'" >&2
+    42	    echo "usage: kill_switch.sh [--pause | --halt-only | (no arg = PANIC FLATTEN)]" >&2
+    43	    exit 2
+    44	    ;;
+    45	esac
+    46	
+    47	engine_pids() { pgrep -f "$ENGINE_PAT" || true; }
+    48	
+    49	echo "[$(ts)] kill_switch: mode=$MODE — setting halt flags (/tmp/v12_pause + .HALT_COPY)"
+    50	touch /tmp/v12_pause "$WORKDIR/.HALT_COPY"
+    51	
+    52	if [ "$MODE" = "--pause" ]; then
+    53	  echo "[$(ts)] kill_switch: PAUSE set. Launcher will not relaunch; running engine left as-is."
+    54	  echo "[$(ts)] kill_switch: resume with: rm -f /tmp/v12_pause \"$WORKDIR/.HALT_COPY\""
+    55	  exit 0
+    56	fi
+    57	
+    58	# Stop the running engine so it takes no further action.
+    59	PIDS=$(engine_pids)
+    60	if [ -n "$PIDS" ]; then
+    61	  N=$(echo "$PIDS" | wc -w | tr -d ' ')
+    62	  [ "$N" -gt 1 ] && echo "[$(ts)] kill_switch: WARNING $N engine matches (expected 1): $PIDS — killing all"
+    63	  echo "[$(ts)] kill_switch: stopping V17 engine PID(s): $PIDS"
+    64	  # shellcheck disable=SC2086
+    65	  kill $PIDS 2>/dev/null || true
+    66	  sleep 3
+    67	  PIDS=$(engine_pids)
+    68	  if [ -n "$PIDS" ]; then
+    69	    echo "[$(ts)] kill_switch: engine still up, SIGKILL: $PIDS"
+    70	    # shellcheck disable=SC2086
+    71	    kill -9 $PIDS 2>/dev/null || true
+    72	    sleep 2
+    73	  fi
+    74	else
+    75	  echo "[$(ts)] kill_switch: no running V17 engine found"
+    76	fi
+    77	
+    78	# codex P1: after kill, PROVE the engine is gone before flattening/reporting success. A surviving engine
+    79	# would race the flatten (re-open/re-manage). Abort loudly if any match remains.
+    80	PIDS=$(engine_pids)
+    81	if [ -n "$PIDS" ]; then
+    82	  echo "[$(ts)] kill_switch: !!! engine STILL RUNNING after SIGKILL (PID $PIDS). Aborting before flatten — investigate manually (halt flags ARE set)." >&2
+    83	  exit 3
+    84	fi
+    85	
+    86	if [ "$MODE" = "--halt-only" ]; then
+    87	  echo "[$(ts)] kill_switch: HALT-ONLY done. Engine stopped; positions LEFT OPEN and UNMANAGED."
+    88	  echo "[$(ts)] kill_switch: to flatten now, run: bash scripts/kill_switch.sh"
+    89	  exit 0
+    90	fi
+    91	
+    92	# Default: FLATTEN everything. flatten_all_offline aborts unless BOTH halt markers are present (set above),
+    93	# is idempotent, and verifies flatness on-exchange (Rule 8).
+    94	echo "[$(ts)] kill_switch: FLATTEN — market-closing ALL HL positions (main+xyz+flx) via flatten_all_offline"
+    95	cd "$WORKDIR"
+    96	if [ -f .env ]; then
+    97	  set -a
+    98	  # shellcheck source=/dev/null
+    99	  source .env
+   100	  set +a
+   101	fi
+   102	"$PYTHON" tools/flatten_all_offline.py --execute
+   103	rc=$?
+   104	if [ "$rc" -ne 0 ]; then
+   105	  echo "[$(ts)] kill_switch: !!! FLATTEN returned $rc — engine is halted but positions may NOT be flat. Check manually: python tools/flatten_all_offline.py (dry-run) and the HL UI."
+   106	  exit "$rc"
+   107	fi
+   108	echo "[$(ts)] kill_switch: DONE. Engine halted + flat. Resume with: rm -f /tmp/v12_pause \"$WORKDIR/.HALT_COPY\""
+
+exec
+/bin/zsh -lc 'git diff -- scripts/kill_switch.sh ops/launchd/README.md' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+codex
+Consensus: **Phase 1 is CLEAN to hand to CoS for activation.**
+
+The three round-2 residuals are correctly and completely addressed:
+
+- [scripts/kill_switch.sh](/Users/hermes/quants-lab/scripts/kill_switch.sh:30): extra args are rejected before any halt flags are touched; flags are only set later at line 49.
+- [ops/launchd/README.md](/Users/hermes/quants-lab/ops/launchd/README.md:27): mark-collector handover now has the final post-SIGKILL proof gate before loading the KeepAlive agent.
+- [ops/launchd/README.md](/Users/hermes/quants-lab/ops/launchd/README.md:60): log-inode stability is now an explicit activation/runtime invariant with a safe rotation procedure and preflight check.
+
+I do not see any remaining real Phase-1 blocker in these two files.
+tokens used
+7.679
+Consensus: **Phase 1 is CLEAN to hand to CoS for activation.**
+
+The three round-2 residuals are correctly and completely addressed:
+
+- [scripts/kill_switch.sh](/Users/hermes/quants-lab/scripts/kill_switch.sh:30): extra args are rejected before any halt flags are touched; flags are only set later at line 49.
+- [ops/launchd/README.md](/Users/hermes/quants-lab/ops/launchd/README.md:27): mark-collector handover now has the final post-SIGKILL proof gate before loading the KeepAlive agent.
+- [ops/launchd/README.md](/Users/hermes/quants-lab/ops/launchd/README.md:60): log-inode stability is now an explicit activation/runtime invariant with a safe rotation procedure and preflight check.
+
+I do not see any remaining real Phase-1 blocker in these two files.

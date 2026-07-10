@@ -1,5 +1,14 @@
 #!/bin/bash
-# v12_heartbeat_watchdog.sh -- DRAFT v2 (await Alberto GO + codex PASS; NOT deployed)
+# v12_heartbeat_watchdog.sh -- SANCTIONED engine stall watchdog (promoted 2026-07-10, Phase-1 cleanup).
+# RESOLUTION of the two-killers problem: codex (2026-07-10) showed the OTHER watchdog
+# (~/.claude/scripts/v17-copy-engine-stall-watchdog.sh, log-MTIME staleness) is NOT loop-health -- a
+# reconnect/error loop can keep the log fresh while the trading loop never reaches _check_exits/_log_stats,
+# bypassing an mtime check. THIS watchdog keys on the STATS heartbeat CONTENT (the line emitted only after
+# the protected checks run) with generation-correlation guards, so it is strictly more targeted. Decision:
+# THIS is the single sanctioned killer; the log-mtime watchdog is retired (CoS unloads
+# com.quantslab.v17-stall-watchdog). Codex round-2 PASS of this script is required before it is final.
+# --- original draft header (guards documented below) ---
+# v12_heartbeat_watchdog.sh -- DRAFT v2 (superseded by the promotion note above)
 #
 # PURPOSE: bound the unprotected window after a main-event-loop FREEZE of the live V18 copy trader.
 # On 2026-06-29 05:52:03 -> 06:27:30 the bot's whole loop (STATS heartbeat 60s + WS feed + fill-sync)

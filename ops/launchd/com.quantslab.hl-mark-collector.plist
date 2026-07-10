@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.quantslab.hl-mark-collector — supervises the live HL 1m mark collector (KeepAlive).
+  2026-07-10 Phase-1: replaces the unsupervised nohup process (silent SPOF). Infra-as-code: this template
+  lives in the repo; CoS installs it to ~/Library/LaunchAgents and loads it. See ops/launchd/README.md.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.quantslab.hl-mark-collector</string>
+  <key>UserName</key>
+  <string>hermes</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/hermes/quants-lab</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/hermes/quants-lab/scripts/hl_mark_collector_launcher.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/hermes/miniforge3/envs/quants-lab/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/hermes</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/ql-hl-mark-collector.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/ql-hl-mark-collector.launchd.log</string>
+</dict>
+</plist>

@@ -16,14 +16,14 @@ V11-V28) is retired and being archived (never deleted). Last verified: 2026-07-1
 | Engine | `strategies/live/hl_copy_trader_v17.py` — PID 85806 (launchd, PPID 1) |
 | Live config | `config/copy_trader_wallets_gate1_v4.json` (10 wallets; `global`/`defaults`/`wallets`) — THE live config |
 | Supervisor | LaunchDaemon `com.quantslab.v12-copy-trader` (KeepAlive) → `scripts/v12_launcher.sh` |
-| Stall watchdog | `com.quantslab.v17-stall-watchdog` → `~/.claude/scripts/v17-copy-engine-stall-watchdog.sh` (120s; kills on log-mtime freeze) — SANCTIONED |
+| Stall watchdog | `com.quantslab.v12-watchdog` → `scripts/v12_heartbeat_watchdog.sh` (STATS-heartbeat content freeze) — SANCTIONED (promoted 2026-07-10; the log-mtime `v17-stall-watchdog` is retired: mtime != loop health, codex) |
 | Kill (working today) | `touch /tmp/v12_pause` + `~/quants-lab/.HALT_COPY` (launcher-level halt) |
 | Exposure | HL ~$457 (spot-only, Rule 16) + Bybit ~$465 (parked until HL eq >= $550) |
 | Wallet addrs | parent `0x11ca20aeb7cd014cf8406560ae405b12601994b4` (funds) / agent `0xdf67eda0bc0223060891d49dde9a780a4538c2e3` (signs) |
 
 Known live-stack RISKS (Phase 1 of the cleanup fixes these — do NOT rely on them until fixed):
 - `data_pipeline/hl_live_mark_collector.py` (PID 1595) runs UNSUPERVISED (no plist) → silent single point of failure.
-- `scripts/v12_heartbeat_watchdog.sh` self-labels "DRAFT / NOT deployed" yet is LIVE (`com.quantslab.v12-watchdog`, PID 40377), overlapping the sanctioned stall watchdog = two killers on one engine.
+- [RESOLVED 2026-07-10] two-killers problem: kept the STATS-heartbeat `v12-watchdog` (strictly better than log-mtime per codex), retiring `v17-stall-watchdog`. Pending CoS unload of the mtime one + codex round-2 PASS of the heartbeat script.
 - `scripts/kill_switch.sh` targets the RETIRED HB/API stack (localhost:8001), NOT V17 — it does not stop the live engine.
 
 ## B. RESEARCH (offline) — the canonical funnel
