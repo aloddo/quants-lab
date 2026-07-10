@@ -90,6 +90,8 @@ def build_folds(start: date = DEFAULT_START, n_folds: int = N_FOLDS) -> list[Fol
         test  = [s_i+56d,        s_i+70d)
     Half-open intervals (end exclusive).
     """
+    if n_folds < 1:  # FIX (audit 2026-07-10, codex P2): reject invalid n_folds before writing a partial artifact.
+        raise ValueError(f"n_folds must be >= 1, got {n_folds}")
     folds: list[Fold] = []
     for i in range(n_folds):
         s = start + timedelta(days=i * STEP_DAYS)
@@ -180,10 +182,14 @@ def tag_fold_regime(fold: Fold, market_data_fn: Optional[Callable[[date], dict]]
     return {"btc_trend_bucket": btc_trend, "hl_trend_bucket": hl_trend, "dvol_bucket": dvol_bucket}
 
 
-def folds_to_frame(folds: list[Fold], market_data_fn: Optional[Callable] = None) -> pd.DataFrame:
+def folds_to_frame(folds: list[Fold], market_data_fn: Optional[Callable] = None,
+                   archive_end_excl: date = DEFAULT_END_EXCL) -> pd.DataFrame:
     rows = []
     for f in folds:
         tags = tag_fold_regime(f, market_data_fn)
+        # FIX (audit 2026-07-10, codex P1): a fold whose test window runs past the available archive is NOT a
+        # full test fold; marking it True let downstream validate on a truncated/empty tail. Honest flag now.
+        is_full = f.test_end_excl <= archive_end_excl
         rows.append(
             {
                 "fold_id": f.fold_id,
@@ -199,7 +205,7 @@ def folds_to_frame(folds: list[Fold], market_data_fn: Optional[Callable] = None)
                 "val_days": VAL_DAYS,
                 "test_days": TEST_DAYS,
                 "step_days": STEP_DAYS,
-                "is_full_test_fold": True,
+                "is_full_test_fold": bool(is_full),
                 "oos_chain_order": f.fold_id,
                 **tags,
             }
@@ -229,7 +235,20 @@ def build_activity(
 
     def _to_dt(s):
         # codex code-r1 #5: pd.api.types, not np.issubdtype (handles extension/tz/nullable dtypes).
-        return pd.to_datetime(s, unit="ms", utc=True) if pd.api.types.is_numeric_dtype(s) else pd.to_datetime(s, utc=True)
+        if pd.api.types.is_numeric_dtype(s):
+            # FIX (audit 2026-07-10, codex P1): guard the ms assumption. A seconds-epoch column (~1.7e9) parsed
+            # as ms lands in 1970 -> every fold membership wrong. Real HL ms ts are ~1.7e12. Fail LOUD on a
+            # magnitude that looks like seconds (or micros) rather than silently mis-bucketing every wallet.
+            nn = pd.to_numeric(s, errors="coerce").dropna()
+            if len(nn):
+                med = float(nn.median())
+                if not (1e11 <= med <= 1e14):
+                    raise ValueError(
+                        f"v15_m03: numeric timestamp median {med:.3g} is not epoch-ms (~1e12). Refusing to "
+                        f"parse as ms and silently mis-bucket folds (seconds? micros?). Fix the upstream schema."
+                    )
+            return pd.to_datetime(s, unit="ms", utc=True)
+        return pd.to_datetime(s, utc=True)
 
     a = actions.copy()
     if "stream_replay_valid" in a.columns:
@@ -346,8 +365,10 @@ def _summarize(
     for w in WINDOWS:
         summary[f"active_{w}_folds"] = summary["key"].map(g[f"active_{w}"].sum()).fillna(0).astype(int)
     summary["active_any_folds"] = summary["key"].map(g["active_any"].sum()).fillna(0).astype(int)
-    # G5: active in >=3 TEST windows.
-    summary["active_folds_for_g5"] = summary["active_test_folds"]
+    # AUDIT 2026-07-10 (codex ruling b): DROPPED the old `active_folds_for_g5` field. Its name implied it drove
+    # the G5 gate, but it held active_TEST_folds (post-test_start = look-ahead) — a footgun. The ENFORCED G5 lives
+    # in m06b on active_pretest_folds (look-ahead-safe). `active_test_folds` (diagnostic) and `active_pretest_folds`
+    # (look-ahead-safe) are both still emitted above; no misleading "for_g5" alias remains.
     # codex code-r1 #9: raw archive-wide totals (NOT fold-summed — overlapping train/val
     # windows would double-count the same source row).
     summary["total_actions"] = summary["key"].map(total_actions_raw.to_dict()).fillna(0).astype(int)
@@ -399,9 +420,10 @@ def main() -> None:
     wide.to_parquet(outdir / "m03_wallet_fold_activity.parquet", index=False)
     summary.to_parquet(outdir / "m03_wallet_activity_summary.parquet", index=False)
     logger.info(f"activity -> {len(wide):,} (key,fold) rows; {len(summary):,} keys")
-    hist = summary["active_folds_for_g5"].value_counts().sort_index()
+    hist = summary["active_test_folds"].value_counts().sort_index()
     logger.info(f"active_test_folds histogram:\n{hist}")
-    logger.info(f"keys with >=3 active test folds (G5): {(summary['active_folds_for_g5']>=3).sum():,}")
+    logger.info(f"keys with >=3 active test folds (diagnostic; NOT the G5 gate, which m06b enforces on "
+                f"active_pretest_folds): {(summary['active_test_folds']>=3).sum():,}")
 
 
 if __name__ == "__main__":

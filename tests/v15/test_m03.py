@@ -104,16 +104,20 @@ def test_activity_g5_counts_open_journeys():
     a = summary.set_index("key")
     # 0xa: active in test of F1 and F3 (the open journey in F3 still counts) -> 2
     assert a.loc["0xa", "active_test_folds"] == 2
-    assert a.loc["0xa", "active_folds_for_g5"] == 2
     # 0xb: only active in F1 train -> 0 test folds
     assert a.loc["0xb", "active_test_folds"] == 0
     assert a.loc["0xb", "active_train_folds"] >= 1
 
 
-def test_i5_g5_equals_test_folds():
+def test_i5_g5_alias_dropped():
+    # AUDIT 2026-07-10 (codex ruling b): the misleading `active_folds_for_g5` alias (held look-ahead
+    # active_test_folds) was DROPPED. The look-ahead-safe count is active_pretest_folds (m06b enforces G5 there);
+    # active_test_folds remains as a diagnostic.
     folds, actions, journeys = _synthetic()
     _, summary = m03.build_activity(folds, actions, journeys)
-    assert (summary["active_folds_for_g5"] == summary["active_test_folds"]).all()
+    assert "active_folds_for_g5" not in summary.columns
+    assert "active_test_folds" in summary.columns
+    assert "active_pretest_folds" in summary.columns
 
 
 def test_i4_half_open_no_boundary_leak():
