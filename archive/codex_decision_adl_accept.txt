@@ -1,0 +1,2028 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c58-ce2b-7ae1-ae2e-1edb10194dd0
+--------
+user
+# DECISION request: implement ADL de-leverage stress in m07, or accept the stress model without it?
+
+Context: m07 is the counterfactual execution/PnL engine (now trust-audited). m08 runs it with adl_stress=True to
+decide the SURVIVAL tier (kill / suspicious / uncertain / full_weight = the size multiplier on a copied leader).
+Audit finding P0#7: adl_stress was accepted but NEVER applied (n_adl_stress always 0) -> now flagged loudly
+(adl_stress_applied=False), not silently favorable. Alberto delegated the call to codex: implement real ADL, or
+accept the model as-is?
+
+What the stress model ALREADY applies at the stress slice (read research/v15/v15_m07_engine.py):
+- high slippage band on every fill, adverse latency-drift haircut,
+- adverse breach marks (low for longs / high for shorts) in _scan_breach,
+- full liquidation state machine (isolated + cross), >100k 20%-then-full ladder, forced-liq slippage,
+- backstop transfer at 2/3*maintenance = total wipe -> ruin,
+- funding + MTM to fold end, causal carry-in.
+
+ADL (auto-deleverage) on HL = when the liquidation engine can't fill, profitable counterparties are force-closed;
+for a COPIER's subaccount it would mean an extra adverse forced-exit/haircut on positions near maintenance during
+extreme moves.
+
+## Question
+For the SURVIVAL-TIER purpose (is this leader DANGEROUS to copy at size), is a real ADL model MATERIAL beyond what
+the high-slippage + adverse-mark + liquidation + backstop model already captures? Options:
+(a) ACCEPT the model without ADL — the existing liquidation/backstop already conservatively wipes near-maintenance
+    accounts, so ADL is largely redundant for a pass/fail survival tier; keep the adl_stress_applied=False flag +
+    document that "survives stress" excludes ADL (a known, bounded understatement of danger).
+(b) IMPLEMENT ADL — it materially changes survival verdicts (name the concrete scenario where the current model
+    says survive but ADL would kill), and sketch the minimal correct implementation.
+
+Recommend (a) or (b) with reasoning. If (b), how big is the implementation and what's the minimal version?
+2026-07-10T14:05:21.156638Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+codex
+I’ll inspect the m07 engine and related m08 usage before recommending, because the answer hinges on exactly where stress exits and ruin are already modeled.
+exec
+/bin/zsh -lc "sed -n '1,260p' research/v15/v15_m07_engine.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""V15 M7 — Execution-Reality Engine.
+
+Design: brain projects/quant/v15/modules/m07 (codex DESIGN loop r1->r5 SHIP, 2026-05-31).
+Greenlit by Alberto 2026-05-31 ("Go build"). Codex CODE loop r1 NO-SHIP (12 findings) -> this
+revision addresses all 12 (final-horizon risk, isolated margin+liq, 3-valued breach, causal
+prior-minute marks, HL liquidation ladder, no in-engine stress-mult, runner pre-shard, versioned
+fee, start_policy, purity, determinism).
+
+WHAT THIS IS
+  A deterministic, PURE-per-step LIBRARY that steps ONE Hyperliquid subaccount (one source entity)
+  through its fold-frozen M2 action stream under OUR costs, with zero look-ahead, and emits our
+  replica's fills, typed state-transition events, a bounded-cadence equity path, the full ending
+  account state (for M9 chaining), and a counterfactual-survival verdict. Consumed by M6b / M8 / M9.
+
+BOUNDARY (design §0/D8): M7 copies RAW source exposure on a CALLER-SET slice (start_equity). NO
+  allocation / tier / portfolio-cap / stress-sizing math lives here (that is M9; M8 stress = a bigger
+  caller slice). The ONLY size adjustment M7 makes is the EXECUTION-reality capacity cap (depth
+  limit, recorded as unfilled tracking error), which is a fill constraint, not an allocation choice.
+
+MANDATORY (CLAUDE.md Key Rule 8): streaming sharded output, memory guard, NO per-row DB in the inner
+  loop (market/funding/liquidity/tier precomputed once into shared in-memory asof indices; the runner
+  pre-shards actions by wallet so no per-seat full-file scan). Pre-run smoke with /usr/bin/time -l.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import logging
+import os
+import urllib.parse as _ulib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger("m07_engine")
+
+# --------------------------------------------------------------------------- #
+# Paths / constants
+# --------------------------------------------------------------------------- #
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15"
+OHLC_CACHE_DIR = DATA_DIR / "ohlc_cache"
+HL_META_DIR = DATA_DIR / "hl_meta"
+FEE_SCHEDULE_PATH = DATA_DIR / "hl_fee_schedule.json"
+
+MS_MIN = 60_000
+MS_HOUR = 3_600_000
+
+# Fee fallback (design §1.7/D11/D20). Versioned schedule (FEE_SCHEDULE_PATH) overrides; absent ->
+# conservative fallback + summary flag fee_unversioned=True. ONE-WAY taker. Build-time re-confirm.
+DEFAULT_TAKER_FEE_ONEWAY = 0.00045          # 4.5 bps base perps taker
+HIP3_FEE_MULT_FALLBACK = 2.0                # conservative HIP-3 per-market modifier until read live
+
+# Liquidation (HL liquidations doc; design §3.3/D12/D15)
+PARTIAL_LIQ_NOTIONAL = 100_000.0            # >100k -> first liq order is 20%, then 30s cooldown
+PARTIAL_LIQ_FRACTION = 0.20
+LIQ_COOLDOWN_MS = 30_000
+BACKSTOP_MAINT_FRACTION = 2.0 / 3.0         # below 2/3 maintenance -> backstop transfer to vault
+FORCED_LIQ_SLIP_BPS = 30.0                  # forced market-liq order execution penalty (legit, not a fee)
+
+MIN_ORDER_NOTIONAL = 10.0                   # HL ~$10 min order
+
+# Slippage (design §4; D1/D13). Calibrated artifact overrides per bucket; absent -> conservative prior
+# + summary flag slippage_uncalibrated=True.
+SLIP_BANDS = {"low": 0.5, "base": 1.0, "high": 2.0}
+DEFAULT_IMPACT_K_BPS = 8.0
+DEFAULT_IMPACT_ALPHA = 0.5
+BLOCK_MS = 14 * 86_400_000        # CHANGE 1: 14d consistency sub-split block (M6b D4 anchor cadence)
+DEFAULT_HALF_SPREAD_BPS = 1.0
+CAPACITY_PARTICIPATION_CAP = 0.05           # execution-reality depth cap (NOT allocation)
+MARK_MAX_AGE_MS = 15 * MS_MIN               # reject stale/delisted 1m execution marks
+
+# CHANGE B: latency adverse-drift haircut tunable (latency_model="bar_drift_v1"). Multiplies the
+# fraction-of-a-1m-bar our copy latency spans by the bar's |directional move|, applied ALWAYS-adverse
+# to a late taker (a BUY in an up-bar / a SELL in a down-bar fills worse). 1m-RESOLUTION APPROXIMATION
+# pending real sub-minute (HL trades / L2 book) data -- see _apply_order.
+LAT_DRIFT_K = 1.0
+
+ISOLATED_ONLY_DEXES = {"xyz", "flx", "vntl", "hyna", "km", "abcd", "cash", "para"}
+
+
+# --------------------------------------------------------------------------- #
+# Coin / dex helpers
+# --------------------------------------------------------------------------- #
+def coin_dex(coin: str) -> str:
+    """Margin-sharing SCOPE key (design D19): the DEX. main perps share cross within main; each HIP-3
+    dex is its own scope."""
+    return coin.split(":", 1)[0] if ":" in coin else "main"
+
+
+def coin_is_spot(coin: str) -> bool:
+    # ``#`` assets are HIP-4 outcome markets with settlement semantics, not
+    # perpetuals. The historical engine is perp-only.
+    return coin.startswith(("@", "#")) or "/" in coin or coin == "USDC"
+
+
+def default_margin_mode(coin: str) -> str:
+    """Design D3: main -> cross; HIP-3 (onlyIsolated) dexes -> isolated."""
+    return "isolated" if coin_dex(coin) in ISOLATED_ONLY_DEXES else "cross"
+
+
+def _f(x) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def build_ohlc_cache(coins: list[str], out_dir: Path = OHLC_CACHE_DIR,
+                     mongo_uri: str = "mongodb://localhost:27017", force: bool = False) -> int:
+    """Precompute per-coin 1m (minute, open, high, low, close, volume) arrays to .npy (page-cached, shared,
+    read with mmap) so the engine inner loop reads marks/extremes with NO per-row Mongo (CLAUDE.md
+    Key Rule 8). Legacy 5-row OHLC caches are rebuilt automatically because
+    capacity requires dollar volume. Returns #coins written."""
+    import pymongo
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    db = pymongo.MongoClient(mongo_uri)["quants_lab"]
+    n = 0
+    for coin in coins:
+        p = out_dir / f"{_ulib.quote(coin, safe='')}.npy"
+        if p.exists() and not force:
+            try:
+                if np.load(p, mmap_mode="r").shape[0] >= 6:
+                    continue
+            except Exception:
+                pass
+        cur = db.hyperliquid_candles.find(
+            {"coin": coin, "interval": "1m"},
+            projection={"timestamp_utc": 1, "open": 1, "high": 1, "low": 1, "close": 1,
+                        "volume": 1, "_id": 0},
+        ).sort("timestamp_utc", 1)
+        mins, o, h, lo, c, volume = [], [], [], [], [], []
+        for d in cur:
+            t = d.get("timestamp_utc")
+            if t is None:
+                continue
+            mins.append(int(t)); o.append(_f(d.get("open"))); h.append(_f(d.get("high")))
+            lo.append(_f(d.get("low"))); c.append(_f(d.get("close")))
+            volume.append(_f(d.get("volume")))
+        arr = np.vstack([np.asarray(mins, "float64"), np.asarray(o, "float64"), np.asarray(h, "float64"),
+                         np.asarray(lo, "float64"), np.asarray(c, "float64"),
+                         np.asarray(volume, "float64")]) if mins else np.empty((6, 0), "float64")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        with open(tmp, "wb") as fh:
+            np.save(fh, arr)
+        tmp.replace(p)
+        n += 1
+    logger.info("build_ohlc_cache: wrote %d coin OHLC series to %s", n, out_dir)
+    return n
+
+
+# --------------------------------------------------------------------------- #
+# HL metadata (margin tiers) — design §1.6/§3.2
+# --------------------------------------------------------------------------- #
+class HLMeta:
+    """Per-coin maxLeverage + margin-tier table from cached HL `meta`. HL maintenance margin = HALF
+    the initial margin at the tier's max leverage; the tier is the largest lowerBound <= notional
+    (flat per-tier lookup, NOT marginal/incremental). maint_rate = 1/(2*tier_maxLev). Build-time
+    constraint (codex DESIGN r5 #3): re-confirm vs HL margin-tiers doc; add a deduction term if HL
+    publishes one."""
+
+    def __init__(self, meta_dir: Path = HL_META_DIR):
+        self.coin_maxlev: dict[str, float] = {}
+        self.coin_szdec: dict[str, int] = {}
+        self.coin_tiers: dict[str, list[tuple[float, float]]] = {}
+        self._loaded = False
+        self.meta_dir = Path(meta_dir)
+
+    def load(self) -> "HLMeta":
+        if self._loaded:
+            return self
+        for f in sorted(self.meta_dir.glob("meta_*.json")):
+            m = json.loads(f.read_text())
+            tables: dict[int, list[tuple[float, float]]] = {}
+            for entry in m.get("marginTables", []):
+                tid, body = entry[0], entry[1]
+                tiers = sorted((float(t["lowerBound"]), float(t["maxLeverage"]))
+                               for t in body.get("marginTiers", []))
+                tables[int(tid)] = tiers
+            for u in m.get("universe", []):
+                name = u["name"]
+                ml = float(u.get("maxLeverage", 3))
+                self.coin_maxlev[name] = ml
+                self.coin_szdec[name] = int(u.get("szDecimals", 2))
+                tid = u.get("marginTableId")
+                self.coin_tiers[name] = tables.get(int(tid), [(0.0, ml)]) if tid is not None else [(0.0, ml)]
+        if not self.coin_maxlev:
+            logger.warning("HLMeta: no cached meta in %s; conservative fallback tiers in use", self.meta_dir)
+        self._loaded = True
+        return self
+
+    def tier_maxlev(self, coin: str, notional: float) -> float:
+        tiers = self.coin_tiers.get(coin)
+        if not tiers:
+            return 3.0
+        lev = tiers[0][1]
+        for lb, ml in tiers:
+            if notional >= lb:
+                lev = ml
+            else:
+                break
+        return lev
+
+    def maint_rate(self, coin: str, notional: float) -> float:
+        return 1.0 / (2.0 * self.tier_maxlev(coin, abs(notional)))
+
+    def init_margin_rate(self, coin: str, notional: float) -> float:
+        return 1.0 / self.tier_maxlev(coin, abs(notional))
+
+    def max_leverage(self, coin: str) -> float:
+        return self.coin_maxlev.get(coin, 3.0)
+
+    def szdec(self, coin: str) -> int:
+        return self.coin_szdec.get(coin, 4)
+
+    def has(self, coin: str) -> bool:
+        return coin in self.coin_maxlev
+
+
+# --------------------------------------------------------------------------- #
+# Fee schedule (versioned — design §1.7/D11/D20)
+# --------------------------------------------------------------------------- #
+class FeeSchedule:
+    """Versioned one-way taker + per-market HIP-3 modifier. Loads FEE_SCHEDULE_PATH if present, else
+    conservative fallback (flagged). Build-time: populate from the master account's userFees tier +
+    HIP-3 per-market fee args."""
+
+    def __init__(self, path: Path = FEE_SCHEDULE_PATH):
+        self.versioned = False
+        self.base_taker = DEFAULT_TAKER_FEE_ONEWAY
+        self.hip3_mult = HIP3_FEE_MULT_FALLBACK
+        self.per_market: dict[str, float] = {}
+        if Path(path).exists():
+            d = json.loads(Path(path).read_text())
+            self.versioned = True
+            self.base_taker = float(
+                d.get(
+                    "effective_subaccount_taker_oneway",
+                    d.get("base_taker_oneway", DEFAULT_TAKER_FEE_ONEWAY),
+                )
+            )
+            self.hip3_mult = float(d.get("hip3_mult", HIP3_FEE_MULT_FALLBACK))
+            self.per_market = {k: float(v) for k, v in d.get("per_market", {}).items()}
+
+    def taker(self, coin: str) -> float:
+        if coin in self.per_market:
+            return self.per_market[coin]
+        if coin_dex(coin) != "main":
+            return self.base_taker * self.hip3_mult
+        return self.base_taker
+
+
+# --------------------------------------------------------------------------- #
+# Market data indices (precomputed, shared, in-memory asof) — design §1.3-§1.5/§8
+# --------------------------------------------------------------------------- #
+class MarketData:
+
+exec
+/bin/zsh -lc "rg -n \"adl_stress|n_adl|backstop|liquid|maintenance|_scan_breach|stress\" research/v15/v15_m07_engine.py research/v15 -g '*.py'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_m07_engine.py:7:prior-minute marks, HL liquidation ladder, no in-engine stress-mult, runner pre-shard, versioned
+research/v15/v15_m07_engine.py:11:  A deterministic, PURE-per-step LIBRARY that steps ONE Hyperliquid subaccount (one source entity)
+research/v15/v15_m07_engine.py:17:  allocation / tier / portfolio-cap / stress-sizing math lives here (that is M9; M8 stress = a bigger
+research/v15/v15_m07_engine.py:22:  loop (market/funding/liquidity/tier precomputed once into shared in-memory asof indices; the runner
+research/v15/v15_m07_engine.py:58:# Liquidation (HL liquidations doc; design §3.3/D12/D15)
+research/v15/v15_m07_engine.py:62:BACKSTOP_MAINT_FRACTION = 2.0 / 3.0         # below 2/3 maintenance -> backstop transfer to vault
+research/v15/v15_m07_engine.py:131:        cur = db.hyperliquid_candles.find(
+research/v15/v15_m07_engine.py:160:    """Per-coin maxLeverage + margin-tier table from cached HL `meta`. HL maintenance margin = HALF
+research/v15/v15_m07_engine.py:306:        cur = self._mongo().hyperliquid_candles.find(
+research/v15/v15_m07_engine.py:364:            cur = self._mongo().hyperliquid_funding_rates.find(
+research/v15/v15_m07_engine.py:387:    def liquidity(self, coin: str, ts_ms: int) -> dict:
+research/v15/v15_m07_engine.py:388:        """Strictly-trailing liquidity as of ts (only COMPLETED bars, i.e. bar_open <= ts-60s).
+research/v15/v15_m07_engine.py:477:# Engine params (caller-set; design §1.8-§1.9) — NO stress-mult (boundary; M8 stress = bigger slice)
+research/v15/v15_m07_engine.py:483:    adl_stress: bool = False
+research/v15/v15_m07_engine.py:516:    start_state positions accrue funding/MTM/liquidation even when there are no actions (M9 chaining).
+research/v15/v15_m07_engine.py:533:    summary["_fills_ref"] = fills    # internal: lets the liquidation path append market_liq_order fills
+research/v15/v15_m07_engine.py:634:    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+research/v15/v15_m07_engine.py:635:    # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+research/v15/v15_m07_engine.py:637:    # until ADL is implemented or the stress model is accepted without it (Alberto decision).
+research/v15/v15_m07_engine.py:638:    summary["adl_stress_requested"] = bool(params.adl_stress)
+research/v15/v15_m07_engine.py:639:    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+research/v15/v15_m07_engine.py:640:    if params.adl_stress:
+research/v15/v15_m07_engine.py:641:        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+research/v15/v15_m07_engine.py:642:                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+research/v15/v15_m07_engine.py:655:    # liquidation on the carried position (seeding at the first-action price skipped it = wrong max_dd/roe/ruin).
+research/v15/v15_m07_engine.py:688:        # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
+research/v15/v15_m07_engine.py:689:        # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
+research/v15/v15_m07_engine.py:760:    # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
+research/v15/v15_m07_engine.py:761:    # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
+research/v15/v15_m07_engine.py:770:        # fold, a single-action fold, or a post-last-action drawdown via funding/MTM/liquidation that the
+research/v15/v15_m07_engine.py:822:        "n_market_liq_orders": 0, "n_backstop_transfer": 0, "n_adl_stress": 0,
+research/v15/v15_m07_engine.py:919:    # action's latency-adjusted time -- otherwise the start->first-action drawdown/liquidation is invisible.
+research/v15/v15_m07_engine.py:943:                # isolated position with 0 margin (would liquidate instantly). Reject if main can't fund.
+research/v15/v15_m07_engine.py:976:    liq = md.liquidity(coin, our_ts)
+research/v15/v15_m07_engine.py:1137:    (>=0) is any additional penalty/fee the forced close eats (e.g. liquidation slippage already in
+research/v15/v15_m07_engine.py:1268:    settlements with repeated maintenance-breach scans + liquidations, in time order. A position
+research/v15/v15_m07_engine.py:1269:    liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
+research/v15/v15_m07_engine.py:1286:        if guard > 200_000:                 # backstop against any pathological non-advance
+research/v15/v15_m07_engine.py:1292:        breach = _scan_breach(st, md, cursor, seg_end, summary)
+research/v15/v15_m07_engine.py:1294:            _run_liquidation(st, md, breach["ts"], params, events, summary)
+research/v15/v15_m07_engine.py:1296:            # rescanned and the cooldown elapses before the next (full) liquidation step.
+research/v15/v15_m07_engine.py:1314:                # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
+research/v15/v15_m07_engine.py:1319:    # FOLD-BOUNDARY solvency: final point-in-time maintenance check at t1 (codex code-r4 #1). The
+research/v15/v15_m07_engine.py:1320:    # cooldown guard makes this safe even if a post-funding liquidation just fired within 30s of t1.
+research/v15/v15_m07_engine.py:1327:def _scan_breach(st: AccountState, md: MarketData, t0_ms: int, t1_ms: int, summary: dict):
+research/v15/v15_m07_engine.py:1329:    position, test maintenance under BOTH the adverse (low-for-long/high-for-short) and favorable
+research/v15/v15_m07_engine.py:1411:    """Point-in-time maintenance solvency check at the CAUSAL CLOSE mark at ts (codex code-r4 #1):
+research/v15/v15_m07_engine.py:1413:    wick) can drop a scope/isolated bucket below maintenance. If breached, run liquidation (which
+research/v15/v15_m07_engine.py:1437:        _run_liquidation(st, md, ts_ms, params, events, summary)
+research/v15/v15_m07_engine.py:1443:    with _scan_breach), so a detected breach actually fires, and the forced fill is conservatively
+research/v15/v15_m07_engine.py:1444:    pessimistic (codex code-r1 #3 — scan and liquidation must agree)."""
+research/v15/v15_m07_engine.py:1461:def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, events, summary):
+research/v15/v15_m07_engine.py:1462:    """Cross/isolated liquidation state machine (design §3.3/§3.4/D12/D15; codex code-r1 #2/#3/#5).
+research/v15/v15_m07_engine.py:1465:    Uses ADVERSE breach marks (consistent with _scan_breach) so detected breaches actually execute."""
+research/v15/v15_m07_engine.py:1476:            events.append(_evt(summary, ts_ms, "backstop_transfer", coin, coin_dex(coin)))
+research/v15/v15_m07_engine.py:1477:            summary["n_backstop_transfer"] += 1
+research/v15/v15_m07_engine.py:1478:            summary["outcome_states"].add("backstop")
+research/v15/v15_m07_engine.py:1481:            _rt_close(summary, coin)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+research/v15/v15_m07_engine.py:1485:    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
+research/v15/v15_m07_engine.py:1486:    # (isolated-only account wiped), it is RUIN too -> finalize via _ruin (was leaving backstop w/o account_ruin/
+research/v15/v15_m07_engine.py:1502:                events.append(_evt(summary, ts_ms, "backstop_transfer", c, scope))
+research/v15/v15_m07_engine.py:1506:                _rt_close(summary, c)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+research/v15/v15_m07_engine.py:1508:            summary["n_backstop_transfer"] += 1
+research/v15/v15_m07_engine.py:1509:            summary["outcome_states"].add("backstop")
+research/v15/v15_m07_engine.py:1510:            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
+research/v15/v15_m07_engine.py:1513:            # whose OTHER scopes still hold collateral is NOT ruined by a single-scope backstop (n_backstop_transfer
+research/v15/v15_m07_engine.py:1514:            # still flags it; m08 counts any backstop as wiped).
+research/v15/v15_m07_engine.py:1518:            _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks)
+research/v15/v15_m07_engine.py:1521:def _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks):
+research/v15/v15_m07_engine.py:1522:    """ONE HL market-liquidation STEP for the breached cross scope (codex code-r2 #5): close the
+research/v15/v15_m07_engine.py:1527:    # SINGLE-POINT COOLDOWN ENFORCEMENT (codex code-r5/r6/r7): never issue a liquidation order while
+research/v15/v15_m07_engine.py:1540:    # HL ladder: the FIRST liquidation order on the account is 20% (if >100k) and sets the 30s
+research/v15/v15_m07_engine.py:1542:    # "no prior liquidation pending" (reset once the account is healthy for a full segment).
+research/v15/v15_m07_engine.py:1555:    Hyperliquid sends these orders to the book and charges no clearance fee.
+research/v15/v15_m07_engine.py:1567:    liq = md.liquidity(coin, ts_ms)
+research/v15/v15_m07_engine.py:1594:    summary["outcome_states"].add("position_liquidated")
+research/v15/v15_m07_engine.py:1678:        "position_after", "target_exposure_pct", "is_liquidation",
+research/v15/v15_m07_engine.py:1738:            "target_exposure_pct", "is_liquidation", "carry_in_status",
+research/v15/v15_m07_engine.py:1815:                    help="copy entry lag in ms (2000=typical, 15000=P95 tail stress)")
+research/v15/v15_slippage_calib.py:38:CALIB_VERSION = "v11-fills-v2"   # v2: liquidity-CLASS comps for uncovered coins (Alberto 2026-06-01)
+research/v15/v15_slippage_calib.py:66:        cur = db.hyperliquid_candles.aggregate([
+research/v15/v15_slippage_calib.py:134:    """Per-liquidity-class comp = median of the OWN-covered empirical bases in that class; global =
+research/v15/v15_slippage_calib.py:153:    bucket {major/midcap/microcap/hip3} (Alberto 2026-06-01). Slippage is a structural liquidity
+research/v15/v15_slippage_calib.py:175:    # full-window own bases -> the class comps (structural liquidity cost).
+research/v15/v15_slippage_calib.py:196:                "liquidity_class": cls, "n_fills": o["n_fills"],
+research/v15/v15_slippage_calib.py:215:        "liquidity_classes": {"proxy": "dollar_adv_14d", "major_usd": ADV_MAJOR_USD,
+research/v15/v15_slippage_calib.py:218:        "boundary_note": "v2: every coin calibrated via own-empirical / liquidity-class comp / global "
+research/v15/v15_slippage_calib.py:237:                         "fills -- the engine calls liquidity for rejected orders too) to assign comps to")
+research/v15/v15_slippage_calib.py:262:        cls_counts[v["liquidity_class"]] = cls_counts.get(v["liquidity_class"], 0) + 1
+research/v15/v15_slippage_calib.py:263:    logger.info("liquidity classes: %s | class comps: %s", cls_counts,
+research/v15/v15_slippage_calib.py:264:                {k: round(v, 2) for k, v in calib["liquidity_classes"]["class_comps_full_window"].items()})
+research/v15/execution_model.py:16:   Uncalibrated tail: a single liquidity-class default (DEFAULT_SLIP_BPS, tune via set_slip_default_bps).
+research/v15/execution_model.py:17:   LIMITATION: per-coin liquidity-class mapping for the tail is not yet wired (l2_calib covers 10
+research/v15/copy_edge_2026_07_01/maker_taker.py:4:cols=["wallet","signed_size","price","mark","is_liquidation"]
+research/v15/copy_edge_2026_07_01/maker_taker.py:12:        if w not in W or d["is_liquidation"][i]: continue
+research/v15/v15_m09_sim.py:398:                "is_liquidation": False, "carry_in_status": "SEEDED",
+research/v15/copy_edge_2026_07_01/oos_holdout.py:14:cols=["wallet","coin","ts","signed_size","action_type","journey_id","is_liquidation"]
+research/v15/copy_edge_2026_07_01/oos_holdout.py:21:        if w not in uni or d["is_liquidation"][i]: continue
+research/v15/fidelity_oos.py:21:LIQUID = set(_json.load(open(S._DATA / "l2_calib_10coin.json")).keys())   # liquid coins (no microcap artifacts)
+research/v15/fidelity_oos.py:28:        if not (lo <= ets < hi) or c not in LIQUID:   # liquid-only (kills microcap mark artifacts)
+research/v15/copy_edge_2026_07_01/latency_pass.py:12:cols=["wallet","coin","ts","signed_size","action_type","journey_id","is_liquidation"]
+research/v15/copy_edge_2026_07_01/latency_pass.py:19:        if w not in W or d["is_liquidation"][i]: continue
+research/v15/copy_edge_2026_07_01/journey_score2.py:14:cols=["wallet","coin","ts","signed_size","mark","action_type","journey_id","is_liquidation"]
+research/v15/copy_edge_2026_07_01/journey_score2.py:22:        if w not in wallets or d["is_liquidation"][i]: continue
+research/v15/v15_m06a_shortlist.py:29:wallets AND multi-week sitters (Alberto 2026-05-31: "I want to realize returns fast, not be stressed
+research/v15/v15_forward_select.py:31:        ["entity_id", "fold_id", "roe_engine", "max_dd", "n_backstop_transfer"]].rename(columns={"roe_engine": "oos"})
+research/v15/copy_edge_2026_07_01/oos_holdout_loose.py:14:cols=["wallet","coin","ts","signed_size","action_type","journey_id","is_liquidation"]
+research/v15/copy_edge_2026_07_01/oos_holdout_loose.py:21:        if w not in uni or d["is_liquidation"][i]: continue
+research/v15/revalidate_api_execmodel.py:5:per-trade cap -> TRUE OOS split (train<split, test>=split). No hardcoded fees, no illiquid artifacts.
+research/v15/revalidate_api_execmodel.py:25:                r=requests.post('https://api.hyperliquid.xyz/info',
+research/v15/revalidate_api_execmodel.py:54:    # ALL coins (Alberto: do NOT exclude illiquid/microcap - the edge lives there). Price REAL per-coin
+research/v15/revalidate_api_execmodel.py:82:                         "illiquid (thousands of real fills prove it); default 0.5 not the old 4.7.")
+research/v15/copy_edge_2026_07_01/journey_universe_2wk.py:14:cols=["wallet","coin","ts","signed_size","mark","action_type","journey_id","is_liquidation"]
+research/v15/copy_edge_2026_07_01/journey_universe_2wk.py:21:    d=b.to_pydict(); W=d["wallet"];CO=d["coin"];TS=d["ts"];SS=d["signed_size"];MK=d["mark"];AT=d["action_type"];JID=d["journey_id"];LQ=d["is_liquidation"]
+research/v15/v15_m06b_ranking.py:561:    df["survivability_penalty"] = ((df["n_backstop_transfer"] + 2 * df["account_ruin"]) / nj).clip(0, 1)
+research/v15/v15_m06b_ranking.py:583:        # derive from capacity_capped_frac / n_backstop_transfer / account_ruin; a NaN there makes m6b_score NaN,
+research/v15/v15_m06b_ranking.py:824:    "n_backstop_transfer", "account_ruin", "m4_tier", "entity_alloc_weight",
+research/v15/leadlag_clean_rank_sim.py:67:HL_API = "https://api.hyperliquid.xyz/info"
+research/v15/leadlag_clean_rank_sim.py:254:    cols = ["wallet", "coin", "ts", "action_type", "signed_size", "is_liquidation"]
+research/v15/leadlag_clean_rank_sim.py:266:                                   d["signed_size"], d["is_liquidation"])
+research/v15/leadlag_clean_rank_sim.py:422:            # maker = post liquidity, do NOT cross the spread (slip 0; optimistic = 100% fill assumed)
+research/v15/copy_edge_2026_07_01/beta_neutral.py:12:cols=["wallet","coin","ts","signed_size","mark","action_type","journey_id","is_liquidation"]
+research/v15/copy_edge_2026_07_01/beta_neutral.py:16:    d=b.to_pydict();Wc=d["wallet"];Cc=d["coin"];Tc=d["ts"];Sc=d["signed_size"];Mc=d["mark"];Ac=d["action_type"];Jc=d["journey_id"];Lc=d["is_liquidation"]
+research/v15/v15_m07_engine.py:7:prior-minute marks, HL liquidation ladder, no in-engine stress-mult, runner pre-shard, versioned
+research/v15/v15_m07_engine.py:11:  A deterministic, PURE-per-step LIBRARY that steps ONE Hyperliquid subaccount (one source entity)
+research/v15/v15_m07_engine.py:17:  allocation / tier / portfolio-cap / stress-sizing math lives here (that is M9; M8 stress = a bigger
+research/v15/v15_m07_engine.py:22:  loop (market/funding/liquidity/tier precomputed once into shared in-memory asof indices; the runner
+research/v15/v15_m07_engine.py:58:# Liquidation (HL liquidations doc; design §3.3/D12/D15)
+research/v15/v15_m07_engine.py:62:BACKSTOP_MAINT_FRACTION = 2.0 / 3.0         # below 2/3 maintenance -> backstop transfer to vault
+research/v15/v15_m07_engine.py:131:        cur = db.hyperliquid_candles.find(
+research/v15/v15_m07_engine.py:160:    """Per-coin maxLeverage + margin-tier table from cached HL `meta`. HL maintenance margin = HALF
+research/v15/v15_m07_engine.py:306:        cur = self._mongo().hyperliquid_candles.find(
+research/v15/v15_m07_engine.py:364:            cur = self._mongo().hyperliquid_funding_rates.find(
+research/v15/v15_m07_engine.py:387:    def liquidity(self, coin: str, ts_ms: int) -> dict:
+research/v15/v15_m07_engine.py:388:        """Strictly-trailing liquidity as of ts (only COMPLETED bars, i.e. bar_open <= ts-60s).
+research/v15/v15_m07_engine.py:477:# Engine params (caller-set; design §1.8-§1.9) — NO stress-mult (boundary; M8 stress = bigger slice)
+research/v15/v15_m07_engine.py:483:    adl_stress: bool = False
+research/v15/v15_m07_engine.py:516:    start_state positions accrue funding/MTM/liquidation even when there are no actions (M9 chaining).
+research/v15/v15_m07_engine.py:533:    summary["_fills_ref"] = fills    # internal: lets the liquidation path append market_liq_order fills
+research/v15/v15_m07_engine.py:634:    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+research/v15/v15_m07_engine.py:635:    # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+research/v15/v15_m07_engine.py:637:    # until ADL is implemented or the stress model is accepted without it (Alberto decision).
+research/v15/v15_m07_engine.py:638:    summary["adl_stress_requested"] = bool(params.adl_stress)
+research/v15/v15_m07_engine.py:639:    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+research/v15/v15_m07_engine.py:640:    if params.adl_stress:
+research/v15/v15_m07_engine.py:641:        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+research/v15/v15_m07_engine.py:642:                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+research/v15/v15_m07_engine.py:655:    # liquidation on the carried position (seeding at the first-action price skipped it = wrong max_dd/roe/ruin).
+research/v15/v15_m07_engine.py:688:        # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
+research/v15/v15_m07_engine.py:689:        # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
+research/v15/v15_m07_engine.py:760:    # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
+research/v15/v15_m07_engine.py:761:    # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
+research/v15/v15_m07_engine.py:770:        # fold, a single-action fold, or a post-last-action drawdown via funding/MTM/liquidation that the
+research/v15/v15_m07_engine.py:822:        "n_market_liq_orders": 0, "n_backstop_transfer": 0, "n_adl_stress": 0,
+research/v15/v15_m07_engine.py:919:    # action's latency-adjusted time -- otherwise the start->first-action drawdown/liquidation is invisible.
+research/v15/v15_m07_engine.py:943:                # isolated position with 0 margin (would liquidate instantly). Reject if main can't fund.
+research/v15/v15_m07_engine.py:976:    liq = md.liquidity(coin, our_ts)
+research/v15/v15_m07_engine.py:1137:    (>=0) is any additional penalty/fee the forced close eats (e.g. liquidation slippage already in
+research/v15/v15_m07_engine.py:1268:    settlements with repeated maintenance-breach scans + liquidations, in time order. A position
+research/v15/v15_m07_engine.py:1269:    liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
+research/v15/v15_m07_engine.py:1286:        if guard > 200_000:                 # backstop against any pathological non-advance
+research/v15/v15_m07_engine.py:1292:        breach = _scan_breach(st, md, cursor, seg_end, summary)
+research/v15/v15_m07_engine.py:1294:            _run_liquidation(st, md, breach["ts"], params, events, summary)
+research/v15/v15_m07_engine.py:1296:            # rescanned and the cooldown elapses before the next (full) liquidation step.
+research/v15/v15_m07_engine.py:1314:                # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
+research/v15/v15_m07_engine.py:1319:    # FOLD-BOUNDARY solvency: final point-in-time maintenance check at t1 (codex code-r4 #1). The
+research/v15/v15_m07_engine.py:1320:    # cooldown guard makes this safe even if a post-funding liquidation just fired within 30s of t1.
+research/v15/v15_m07_engine.py:1327:def _scan_breach(st: AccountState, md: MarketData, t0_ms: int, t1_ms: int, summary: dict):
+research/v15/v15_m07_engine.py:1329:    position, test maintenance under BOTH the adverse (low-for-long/high-for-short) and favorable
+research/v15/v15_m07_engine.py:1411:    """Point-in-time maintenance solvency check at the CAUSAL CLOSE mark at ts (codex code-r4 #1):
+research/v15/v15_m07_engine.py:1413:    wick) can drop a scope/isolated bucket below maintenance. If breached, run liquidation (which
+research/v15/v15_m07_engine.py:1437:        _run_liquidation(st, md, ts_ms, params, events, summary)
+research/v15/v15_m07_engine.py:1443:    with _scan_breach), so a detected breach actually fires, and the forced fill is conservatively
+research/v15/v15_m07_engine.py:1444:    pessimistic (codex code-r1 #3 — scan and liquidation must agree)."""
+research/v15/v15_m07_engine.py:1461:def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, events, summary):
+research/v15/v15_m07_engine.py:1462:    """Cross/isolated liquidation state machine (design §3.3/§3.4/D12/D15; codex code-r1 #2/#3/#5).
+research/v15/v15_m07_engine.py:1465:    Uses ADVERSE breach marks (consistent with _scan_breach) so detected breaches actually execute."""
+research/v15/v15_m07_engine.py:1476:            events.append(_evt(summary, ts_ms, "backstop_transfer", coin, coin_dex(coin)))
+research/v15/v15_m07_engine.py:1477:            summary["n_backstop_transfer"] += 1
+research/v15/v15_m07_engine.py:1478:            summary["outcome_states"].add("backstop")
+research/v15/v15_m07_engine.py:1481:            _rt_close(summary, coin)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+research/v15/v15_m07_engine.py:1485:    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
+research/v15/v15_m07_engine.py:1486:    # (isolated-only account wiped), it is RUIN too -> finalize via _ruin (was leaving backstop w/o account_ruin/
+research/v15/v15_m07_engine.py:1502:                events.append(_evt(summary, ts_ms, "backstop_transfer", c, scope))
+research/v15/v15_m07_engine.py:1506:                _rt_close(summary, c)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+research/v15/v15_m07_engine.py:1508:            summary["n_backstop_transfer"] += 1
+research/v15/v15_m07_engine.py:1509:            summary["outcome_states"].add("backstop")
+research/v15/v15_m07_engine.py:1510:            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
+research/v15/v15_m07_engine.py:1513:            # whose OTHER scopes still hold collateral is NOT ruined by a single-scope backstop (n_backstop_transfer
+research/v15/v15_m07_engine.py:1514:            # still flags it; m08 counts any backstop as wiped).
+research/v15/v15_m07_engine.py:1518:            _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks)
+research/v15/v15_m07_engine.py:1521:def _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks):
+research/v15/v15_m07_engine.py:1522:    """ONE HL market-liquidation STEP for the breached cross scope (codex code-r2 #5): close the
+research/v15/v15_m07_engine.py:1527:    # SINGLE-POINT COOLDOWN ENFORCEMENT (codex code-r5/r6/r7): never issue a liquidation order while
+research/v15/v15_m07_engine.py:1540:    # HL ladder: the FIRST liquidation order on the account is 20% (if >100k) and sets the 30s
+research/v15/v15_m07_engine.py:1542:    # "no prior liquidation pending" (reset once the account is healthy for a full segment).
+research/v15/v15_m07_engine.py:1555:    Hyperliquid sends these orders to the book and charges no clearance fee.
+research/v15/v15_m07_engine.py:1567:    liq = md.liquidity(coin, ts_ms)
+research/v15/v15_m07_engine.py:1594:    summary["outcome_states"].add("position_liquidated")
+research/v15/v15_m07_engine.py:1678:        "position_after", "target_exposure_pct", "is_liquidation",
+research/v15/v15_m07_engine.py:1738:            "target_exposure_pct", "is_liquidation", "carry_in_status",
+research/v15/v15_m07_engine.py:1815:                    help="copy entry lag in ms (2000=typical, 15000=P95 tail stress)")
+research/v15/v15_two_regime_test.py:33:HL_URL = "https://api.hyperliquid.xyz/info"
+research/v15/v15_m04_authenticity.py:14:latency, liquidity, accessible mechanics), NOT survival (-> M8). (M3 = fold geometry, separate.)
+research/v15/v15_m02_journey_trace.py:4:Converts each source wallet's Hyperliquid PERP fills into:
+research/v15/v15_m02_journey_trace.py:201:    """Return the signed total wallet fee reported by Hyperliquid.
+research/v15/v15_m02_journey_trace.py:358:        is_liq = bool(f.get("is_liquidation"))
+research/v15/v15_m02_journey_trace.py:562:            "is_liquidation": is_liq,
+research/v15/our_drawdown_scorer.py:196:        r = urllib.request.Request("https://api.hyperliquid.xyz/info", data=json.dumps(b).encode(),
+research/v15/balanced_step4_netted_sim.py:7:  Simulate ONE netted Hyperliquid account that copies N leader wallets at a FIXED $150 budget each,
+research/v15/balanced_step4_netted_sim.py:26:    new_tgt_frac = 0 if (is_liquidation or position_after==0 or action_type is an exit) else target_exposure_pct
+research/v15/balanced_step4_netted_sim.py:84:_EXIT_TYPES = {"close", "exit", "reduce_close", "flatten", "liquidation"}
+research/v15/balanced_step4_netted_sim.py:103:                     "position_after", "mark", "target_exposure_pct", "is_liquidation"])
+research/v15/balanced_step4_netted_sim.py:110:            "position_after", "mark", "target_exposure_pct", "is_liquidation"]
+research/v15/balanced_step4_netted_sim.py:119:def is_exit_action(action_type, position_after, is_liquidation):
+research/v15/balanced_step4_netted_sim.py:120:    if bool(is_liquidation):
+research/v15/balanced_step4_netted_sim.py:227:        is_exit = is_exit_action(row.action_type, row.position_after, row.is_liquidation)
+research/v15/v15_m08_survival.py:11:sizing chain (M9 composes). Runs on the M6b INVESTABLE POOL only (small set -> M7 stress sims cheap).
+research/v15/v15_m08_survival.py:46:    # stress run params (design §3)
+research/v15/v15_m08_survival.py:47:    stress_slippage_band: str = "high"
+research/v15/v15_m08_survival.py:48:    stress_adl: bool = True
+research/v15/v15_m08_survival.py:52:    nominal_capital: float = 10_000.0          # reference bankroll for the absolute stress slice
+research/v15/v15_m08_survival.py:72:def _run_stress(actions: pd.DataFrame, md: E.MarketData, start_equity: float, t0: int, t1: int,
+research/v15/v15_m08_survival.py:77:        slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
+research/v15/v15_m08_survival.py:84:    wiped = bool(s["ruin"]) or s["n_backstop_transfer"] > 0 or s["final_equity"] <= 0
+research/v15/v15_m08_survival.py:86:        "wiped": wiped, "ruin": bool(s["ruin"]), "backstop": s["n_backstop_transfer"] > 0,
+research/v15/v15_m08_survival.py:98:    - wiped at pre_m8_max BUT survives at the MINIMUM tradable size -> copyability_fail_at_stress: a
+research/v15/v15_m08_survival.py:106:    # BEFORE any stress (old actions would otherwise "survive" on unchanged equity). Empty stream is handled by
+research/v15/v15_m08_survival.py:108:    _none_base = {"indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+research/v15/v15_m08_survival.py:114:                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **_none_base}
+research/v15/v15_m08_survival.py:118:                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+research/v15/v15_m08_survival.py:121:    big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
+research/v15/v15_m08_survival.py:122:    base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
+research/v15/v15_m08_survival.py:123:            "stress_max_dd": big["max_dd"]}
+research/v15/v15_m08_survival.py:130:                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+research/v15/v15_m08_survival.py:134:                "copyability_fail_at_stress": False, "max_survivable_slice": pre_m8_max_capital, **base}
+research/v15/v15_m08_survival.py:137:    mn = _run_stress(actions, md, m.min_slice_capital, t0, t1, m)
+research/v15/v15_m08_survival.py:143:                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+research/v15/v15_m08_survival.py:150:        small = _run_stress(actions, md, smaller, t0, t1, m)
+research/v15/v15_m08_survival.py:154:            "survival_outcome": "copyability_fail_at_stress",
+research/v15/v15_m08_survival.py:155:            "copyability_fail_at_stress": True, "max_survivable_slice": surv_slice, **base}
+research/v15/v15_m08_survival.py:270:    primitive (M7 stress) + inferential scorers (phase-2 stub) -> tier; emit m08_tiers + attribution."""
+research/v15/v15_m08_survival.py:352:        # AUDIT 2026-07-10 fail-closed guards BEFORE the survival stress:
+research/v15/v15_m08_survival.py:355:        #       stress could still emit uncertain/full_weight (0.25/1.0 multiplier). Force kill here.
+research/v15/v15_m08_survival.py:356:        # P1#6: a non-finite quality_weight (NaN) would make pre_max_raw NaN -> NaN stress equity -> `final<=0`
+research/v15/v15_m08_survival.py:364:                  "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+research/v15/v15_m08_survival.py:365:                  "indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+research/v15/v15_m08_survival.py:370:            # gets a meaningful stress test; the RAW value is persisted unchanged.
+research/v15/v15_m08_survival.py:381:            "copyability_fail_at_stress": sv["copyability_fail_at_stress"],
+research/v15/v15_m08_survival.py:383:            "stress_roe": sv["stress_roe"], "stress_max_dd": sv["stress_max_dd"],
+research/v15/v15_m08_survival.py:424:                    help="bankroll scale for absolute survival stress slices (default: 10000.0)")
+research/v15/fidelity_replay.py:63:    ap.add_argument("--liquid-only", action="store_true", help="restrict to l2_calib liquid coins (kills microcap mark artifacts).")
+research/v15/fidelity_replay.py:83:    # liquid coins (l2_calib) to kill microcap mark-reconstruction artifacts
+research/v15/fidelity_replay.py:85:    liquid = set(json.load(open(S._DATA / "l2_calib_10coin.json")).keys()) if args.liquid_only else None
+research/v15/fidelity_replay.py:87:    print(f"{len(wf)} wallets with fills; reconstructing round-trips (liquid_only={args.liquid_only}, "
+research/v15/fidelity_replay.py:95:            if liquid is not None and c not in liquid:
+research/v15/fidelity_replay.py:114:    print(f"\n=== HIGH-FIDELITY REPLAY ({len(df)} wallets, >= {args.min_rt} rt; liquid_only={args.liquid_only}) ===")
+research/v15/candle_marks.py:4:(hyperliquid-archive, only published to ~06-29). Alberto 2026-07-09: the fills+candles were backfilled this
+research/v15/v15_m01_equity_reconstruct.py:2:"""V15 M01 — Whole-account Hyperliquid PERP equity reconstructor.
+research/v15/v15_m01_equity_reconstruct.py:54:  - Marks: Mongo hyperliquid_candles (1m, s3_reconstructed); close at-or-before
+research/v15/v15_m01_equity_reconstruct.py:62:    return_since_anchor_pct, recon_incomplete, has_liquidation_in_day,
+research/v15/v15_m01_equity_reconstruct.py:110:HL_URL = "https://api.hyperliquid.xyz/info"
+research/v15/v15_m01_equity_reconstruct.py:170:        # Informational liquidation summary. Liquidation position/cash effects
+research/v15/v15_m01_equity_reconstruct.py:172:        "liquidation",
+research/v15/v15_m01_equity_reconstruct.py:214:    PREFER the oracle mark (hyperliquid_oracle, from v13_extract_oracle_marks setOracle)
+research/v15/v15_m01_equity_reconstruct.py:284:    cur = db.hyperliquid_oracle.find(
+research/v15/v15_m01_equity_reconstruct.py:328:    cur = db.hyperliquid_oracle.find(
+research/v15/v15_m01_equity_reconstruct.py:434:    cur = db.hyperliquid_candles.find(
+research/v15/v15_m01_equity_reconstruct.py:464:    cur_coins = set(db.hyperliquid_candles.distinct("coin", {"interval": "1m"}))
+research/v15/v15_m01_equity_reconstruct.py:467:    latest = db.hyperliquid_candles.find_one({"interval": "1m"}, sort=[("timestamp_utc", -1)],
+research/v15/v15_m01_equity_reconstruct.py:470:    cur_total = int(db.hyperliquid_candles.estimated_document_count())  # O(1) metadata; catches backfills
+research/v15/v15_m01_equity_reconstruct.py:498:    coins = db.hyperliquid_candles.distinct("coin", {"interval": "1m"})
+research/v15/v15_m01_equity_reconstruct.py:516:    latest = db.hyperliquid_candles.find_one({"interval": "1m"}, sort=[("timestamp_utc", -1)],
+research/v15/v15_m01_equity_reconstruct.py:521:        "total_candles": int(db.hyperliquid_candles.estimated_document_count()),
+research/v15/v15_m01_equity_reconstruct.py:813:    and tags liquidation fills via the `dir` column.
+research/v15/v15_m01_equity_reconstruct.py:851:            d["is_liquidation"] = d["dir"] in LIQUIDATION_DIRS
+research/v15/v15_m01_equity_reconstruct.py:1049:    Hyperliquid's API defines ``fee`` as the total wallet charge (signed;
+research/v15/v15_m01_equity_reconstruct.py:1075:    Trading results (fills, funding, liquidation) are NOT in ext_flow.
+research/v15/v15_m01_equity_reconstruct.py:1512:def _liquidation_days(fills: list[dict]) -> set:
+research/v15/v15_m01_equity_reconstruct.py:1513:    """UTC dates on which a liquidation fill occurred."""
+research/v15/v15_m01_equity_reconstruct.py:1516:        if f.get("is_liquidation"):
+research/v15/v15_m01_equity_reconstruct.py:1572:    liq_days = _liquidation_days(fills)
+research/v15/v15_m01_equity_reconstruct.py:1651:                "has_liquidation_in_day": current_day in liq_days,
+research/v15/v15_m01_equity_reconstruct.py:1708:    # Inter-anchor drift gate (codex backstop for hidden no-anchor-dex exposure):
+
+exec
+/bin/zsh -lc "rg -n \"SURVIVAL|survival|adl_stress|v15_m07\" research/v15 -g '*.py'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_slippage_calib.py:230:    import v15_m07_engine as E  # for MarketData.mark (causal=True)
+research/v15/v15_m09_sim.py:11:cold-start. Sizing chain (one multiplier per module): quality(M6b) x confidence(M4) x survival(M8) ->
+research/v15/v15_m09_sim.py:53:def sizing_chain_weight(quality_weight: float, m4_confidence: float, survival_mult: float) -> float:
+research/v15/v15_m09_sim.py:54:    """Desired weight = quality(M6b) x confidence(M4) x survival(M8). One multiplier per module."""
+research/v15/v15_m09_sim.py:55:    return float(quality_weight) * float(m4_confidence) * float(survival_mult)
+research/v15/v15_m09_sim.py:60:    survival); add an entity unless its max pairwise corr with the already-selected set > rho_max
+research/v15/v15_m09_sim.py:421:        # desired weights (drop KILL) + select_priority for anti-corr (m6b quality x survival).
+research/v15/v15_m09_sim.py:429:            surv = float(tk.get("survival_multiplier", 1.0))
+research/v15/v15_m06b_ranking.py:10:  final_slice = quality_weight(M6b) x confidence(M4 alloc) x survival(M8 tier) x caps/anti-corr(M9)
+research/v15/v15_forward_select.py:22:import v15_m07_engine as E      # noqa: E402
+research/v15/v15_forward_select.py:108:    tiers = pd.DataFrame([{"entity_id": e, "fold_id": fd, "tier": "full_weight", "survival_multiplier": 1.0,
+research/v15/v15_m08_survival.py:1:"""V15 M8 -- Survival / Danger Tiering (post-engine). M8-v1 = the COUNTERFACTUAL-SURVIVAL primitive
+research/v15/v15_m08_survival.py:6:with the contract in place, so the tier is currently survival-driven (mechanical, provable).
+research/v15/v15_m08_survival.py:10:{kill 0 / suspicious <=0.10 / uncertain <=0.25 / full_weight 1.0} = the SURVIVAL multiplier in the
+research/v15/v15_m08_survival.py:14:  python research/v15/v15_m08_survival.py --m07-dir app/data/v15/m07_pretest --out app/data/v15
+research/v15/v15_m08_survival.py:32:import v15_m07_engine as E  # noqa: E402
+research/v15/v15_m08_survival.py:40:    # tier survival multipliers (frozen; decisions/2026-06-01-m9-m10-manifest-freeze)
+research/v15/v15_m08_survival.py:49:    # entity_pre_m8_max = M6b_quality x M4_confidence x 1.0(survival placeholder) x M9_static_cap.
+research/v15/v15_m08_survival.py:53:    # multi-slice survival probe (design §3): test at the pre-M8 max, a smaller slice, and the min size
+research/v15/v15_m08_survival.py:74:    """One counterfactual-survival run: M7 at the STRESS slice (high slippage + adl, causal carry-in,
+research/v15/v15_m08_survival.py:77:        slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
+research/v15/v15_m08_survival.py:95:def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dict:
+research/v15/v15_m08_survival.py:96:    """Counterfactual-survival -> mechanical tier + sizing signals (design §1/§3; codex r1#1,#2).
+research/v15/v15_m08_survival.py:99:      SIZING signal (M9 clamps the max slice); the tier stays SURVIVAL-OK = full_weight (the wallet
+research/v15/v15_m08_survival.py:113:            return {"tier": "kill", "survival_outcome": "bad_ts_data_gap",
+research/v15/v15_m08_survival.py:117:            return {"tier": "kill", "survival_outcome": "stale_inactive",
+research/v15/v15_m08_survival.py:124:    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
+research/v15/v15_m08_survival.py:129:        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
+research/v15/v15_m08_survival.py:133:        return {"tier": "uncertain" if heavy else "full_weight", "survival_outcome": "survived",
+research/v15/v15_m08_survival.py:139:    # is evidence-less "survival" -> KILL, not copyability_fail (which would leak a 0.25/1.0 multiplier).
+research/v15/v15_m08_survival.py:142:                "survival_outcome": ("ruin_at_min_size" if mn["wiped"] else "no_fills_at_min_data_gap"),
+research/v15/v15_m08_survival.py:144:    # survives at min -> copyability SIZING signal, tier stays survival-OK (codex r1#1: NOT downgraded).
+research/v15/v15_m08_survival.py:154:            "survival_outcome": "copyability_fail_at_stress",
+research/v15/v15_m08_survival.py:164:    no_flag (the inferential layer is NOT yet active -> tier is survival-driven only). The WORST tier
+research/v15/v15_m08_survival.py:171:def _worst_tier(survival_tier_name: str, scorer_out: dict) -> str:
+research/v15/v15_m08_survival.py:173:    tier = survival_tier_name
+research/v15/v15_m08_survival.py:229:    M8 survival multiplier, the suspicious cohort cap, and anti-corr). = M6b quality x M4 confidence x
+research/v15/v15_m08_survival.py:230:    1.0 (survival placeholder) x M9 static per-entity cap, as an absolute capital on nominal_capital."""
+research/v15/v15_m08_survival.py:269:    """Tier the M6b INVESTABLE POOL: per pooled (entity, fold) run the counterfactual-survival
+research/v15/v15_m08_survival.py:352:        # AUDIT 2026-07-10 fail-closed guards BEFORE the survival stress:
+research/v15/v15_m08_survival.py:353:        # P1#7: a KILL / non-canonical M4 tier (m4_conf == 0) must produce a KILL survival tier, not just a
+research/v15/v15_m08_survival.py:363:            sv = {"tier": "kill", "survival_outcome": f"fail_closed_{reason}",
+research/v15/v15_m08_survival.py:371:            sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
+research/v15/v15_m08_survival.py:378:            "tier": final_tier, "survival_multiplier": mult, "lp_label":
+research/v15/v15_m08_survival.py:380:            "survival_outcome": sv["survival_outcome"],
+research/v15/v15_m08_survival.py:424:                    help="bankroll scale for absolute survival stress slices (default: 10000.0)")
+research/v15/v15_m04_authenticity.py:5:dedup PRE-engine; M8 counterfactual-survival tiering POST-engine). Design codex-SHIP:
+research/v15/v15_m04_authenticity.py:14:latency, liquidity, accessible mechanics), NOT survival (-> M8). (M3 = fold geometry, separate.)
+research/v15/v15_m05_eligibility.py:6:A pass/fail FLOOR (NOT ranking, NOT danger, NOT survival). For each M4-non-KILL copyable entity
+research/v15/v15_m07_engine.py:14:  account state (for M9 chaining), and a counterfactual-survival verdict. Consumed by M6b / M8 / M9.
+research/v15/v15_m07_engine.py:483:    adl_stress: bool = False
+research/v15/v15_m07_engine.py:634:    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+research/v15/v15_m07_engine.py:638:    summary["adl_stress_requested"] = bool(params.adl_stress)
+research/v15/v15_m07_engine.py:639:    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+research/v15/v15_m07_engine.py:640:    if params.adl_stress:
+research/v15/v15_m07_engine.py:641:        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+research/v15/v15_m07_engine.py:642:                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+research/v15/v15_m07_engine.py:822:        "n_market_liq_orders": 0, "n_backstop_transfer": 0, "n_adl_stress": 0,
+
+codex
+I found the explicit audit guard and the m08 caller path. I’m reading the liquidation and survival decision blocks now to separate “extra PnL haircut” from “changes the tier verdict.”
+exec
+/bin/zsh -lc "sed -n '1260,1615p' research/v15/v15_m07_engine.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            p.isolated_margin += fund
+        p.cum_funding += -fund
+        summary["total_funding"] += fund
+        _rt_add(summary, coin, funding=fund)   # CHANGE A: funding is a round-trip cost (signed)
+
+
+def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None, fold_end_ms=None):
+    """CHRONOLOGICAL event loop over (t0,t1] (codex code-r2 #1/#5): interleave hourly funding
+    settlements with repeated maintenance-breach scans + liquidations, in time order. A position
+    liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
+    fold end; the >100k 20%-then-30s-cooldown ladder advances bar-by-bar (the cursor jumps past the
+    cooldown so the next scan does the full close).
+
+    `_emit(cursor_ts, st)` (CHANGE 1): a PURE-READ boundary-equity observer. Called at each cursor
+    position; it appends to a NEW equity-samples list ONLY (never touches fills/events/summary/state)
+    -> existing outputs are byte-identical. It records equity at any pending block boundary <= cursor."""
+    if t0_ms is None or t1_ms <= t0_ms:
+        if _emit is not None:
+            _emit(t0_ms if t0_ms is not None else t1_ms, st)
+        return
+    cursor = t0_ms
+    if _emit is not None:
+        _emit(cursor, st)
+    guard = 0
+    while cursor < t1_ms and st.positions and not summary["ruin"]:
+        guard += 1
+        if guard > 200_000:                 # backstop against any pathological non-advance
+            logger.error("m07 _advance_between guard tripped (entity=%s fold=%s)",
+                         summary.get("entity_id"), summary.get("fold_id"))
+            break
+        next_funding = ((cursor // MS_HOUR) + 1) * MS_HOUR
+        seg_end = min(next_funding, t1_ms)
+        breach = _scan_breach(st, md, cursor, seg_end, summary)
+        if breach is not None:
+            _run_liquidation(st, md, breach["ts"], params, events, summary)
+            # resume AFTER this breach minute (and past any liq cooldown just set) so survivors are
+            # rescanned and the cooldown elapses before the next (full) liquidation step.
+            cursor = max(breach["ts"] + MS_MIN, st.cooldown_until_ms)
+            if _emit is not None:
+                _emit(cursor, st)
+        else:
+            # no breach this segment -> account healthy. Once the cooldown has elapsed, reset it so a
+            # later, independent breach starts fresh with a 20%-first step (not an immediate full close).
+            if st.cooldown_until_ms and st.cooldown_until_ms <= cursor:
+                st.cooldown_until_ms = 0
+            cursor = seg_end
+            # AUDIT 2026-07-10 (codex P0#4 + fix): the FOLD is half-open [start, fold_end). Funding stamped
+            # exactly at the fold's exclusive end belongs to the NEXT fold -> skip it (was charging boundary/test
+            # funding into pretest ROE). But do NOT skip funding at an INTERIOR action boundary that merely
+            # coincides with an hourly stamp (t1_ms here is often an action time, not the fold end) -- only skip
+            # when seg_end IS the fold exclusive end.
+            if seg_end == next_funding and (fold_end_ms is None or seg_end != int(fold_end_ms)):
+                _apply_funding(st, md, seg_end, summary)
+                # POST-FUNDING solvency check (codex code-r4 #1): a settlement can push below
+                # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
+                # any same-ts/within-30s double-fire on every caller path -- codex code-r5/r6/r7).
+                _check_maint_at(st, md, seg_end, params, events, summary)
+            if _emit is not None:
+                _emit(cursor, st)
+    # FOLD-BOUNDARY solvency: final point-in-time maintenance check at t1 (codex code-r4 #1). The
+    # cooldown guard makes this safe even if a post-funding liquidation just fired within 30s of t1.
+    if st.positions and not summary["ruin"]:
+        _check_maint_at(st, md, t1_ms, params, events, summary)
+    if _emit is not None:
+        _emit(t1_ms, st)
+
+
+def _scan_breach(st: AccountState, md: MarketData, t0_ms: int, t1_ms: int, summary: dict):
+    """3-valued conservative breach scan (design §3.7/D7/D16; codex code-r1 #3). For each scope/iso
+    position, test maintenance under BOTH the adverse (low-for-long/high-for-short) and favorable
+    orderings over completed minutes in (t0,t1]. Returns the earliest minute that breaches under the
+    ADVERSE ordering (the conservative breach) with a `resolved` flag: resolved=True if it also
+    breaches under the favorable ordering (definite), False if only adverse breaches (INDETERMINATE,
+    counted + treated as a breach conservatively)."""
+    m0 = (t0_ms // MS_MIN) * MS_MIN
+    m1 = (t1_ms // MS_MIN) * MS_MIN - MS_MIN     # only completed bars
+    if m1 < m0:
+        return None
+    best = None
+
+    def _consider(ts, resolved):
+        nonlocal best
+        if best is None or ts < best["ts"]:
+            best = {"ts": int(ts), "resolved": bool(resolved)}
+
+    # ISOLATED positions (independent)
+    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+        p = st.positions[coin]
+        mins, _o, h, low, _c = md.ohlc(coin)
+        if mins.size == 0:
+            continue
+        lo = int(np.searchsorted(mins, m0, "left")); hi = int(np.searchsorted(mins, m1, "right"))
+        if hi <= lo:
+            continue
+        adverse = low[lo:hi] if p.szi > 0 else h[lo:hi]
+        favorable = h[lo:hi] if p.szi > 0 else low[lo:hi]
+        notion_a = np.abs(p.szi) * adverse
+        eq_a = p.isolated_margin + p.szi * (adverse - p.entry_px)
+        maint_a = notion_a * md.meta.maint_rate(coin, float(np.nanmax(notion_a)) if notion_a.size else 0.0)
+        bad_a = np.where(eq_a < maint_a)[0]
+        if bad_a.size:
+            k = lo + int(bad_a[0])
+            eq_f = p.isolated_margin + p.szi * (favorable[int(bad_a[0])] - p.entry_px)
+            resolved = eq_f < maint_a[int(bad_a[0])]
+            if not resolved:
+                summary["n_indeterminate_minutes"] += 1
+                summary["outcome_states"].add("indeterminate")
+            _consider(mins[k], resolved)
+
+    # CROSS scopes (aggregate over coins on a union minute grid)
+    scopes: dict[str, list[str]] = {}
+    for coin in sorted(c for c, p in st.positions.items() if p.mode == "cross"):
+        scopes.setdefault(coin_dex(coin), []).append(coin)
+    for scope in sorted(scopes):
+        coins = scopes[scope]
+        grid = None
+        for coin in coins:
+            mins, *_ = md.ohlc(coin)
+            if mins.size == 0:
+                continue
+            lo = int(np.searchsorted(mins, m0, "left")); hi = int(np.searchsorted(mins, m1, "right"))
+            if hi > lo:
+                grid = mins[lo:hi] if grid is None else np.union1d(grid, mins[lo:hi])
+        if grid is None or grid.size == 0:
+            continue
+        cash = st.cross_collateral.get(scope, 0.0)
+        adv_eq = np.full(grid.size, cash); fav_eq = np.full(grid.size, cash); maint = np.zeros(grid.size)
+        for coin in coins:
+            p = st.positions[coin]
+            mins, _o, h, low, _c = md.ohlc(coin)
+            if mins.size == 0:
+                continue
+            j = np.clip(np.searchsorted(mins, grid, "right") - 1, 0, mins.size - 1)
+            adverse = low[j] if p.szi > 0 else h[j]
+            favorable = h[j] if p.szi > 0 else low[j]
+            adv_eq = adv_eq + p.szi * (adverse - p.entry_px)
+            fav_eq = fav_eq + p.szi * (favorable - p.entry_px)
+            notion = np.abs(p.szi) * adverse
+            maint = maint + notion * md.meta.maint_rate(coin, float(np.nanmax(notion)) if notion.size else 0.0)
+        bad = np.where(adv_eq < maint)[0]
+        if bad.size:
+            k = int(bad[0])
+            resolved = fav_eq[k] < maint[k]
+            if not resolved:
+                summary["n_indeterminate_minutes"] += 1
+                summary["outcome_states"].add("indeterminate")
+            _consider(grid[k], resolved)
+    return best
+
+
+def _check_maint_at(st: AccountState, md: MarketData, ts_ms: int, params, events, summary):
+    """Point-in-time maintenance solvency check at the CAUSAL CLOSE mark at ts (codex code-r4 #1):
+    used after funding settlements and at the fold boundary, where a settled cash move (not a price
+    wick) can drop a scope/isolated bucket below maintenance. If breached, run liquidation (which
+    executes at the adverse mark, consistent + conservative). Detects via close; adverse <= close so
+    a close breach always also breaches under the adverse extreme."""
+    if not st.positions:
+        return
+    marks = _marks(st, md, ts_ms)
+    breached = False
+    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+        p = st.positions[coin]; m = marks.get(coin) or p.entry_px
+        notion = abs(p.szi) * m
+        if p.isolated_margin + p.szi * (m - p.entry_px) < notion * md.meta.maint_rate(coin, notion):
+            breached = True; break
+    if not breached:
+        for scope in st.cross_scopes():
+            coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+            if not coins:
+                continue
+            eq = st.cross_collateral.get(scope, 0.0) + sum(
+                st.positions[c].szi * ((marks.get(c) or st.positions[c].entry_px) - st.positions[c].entry_px) for c in coins)
+            maint = sum(abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)
+                        * md.meta.maint_rate(c, abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)) for c in coins)
+            if eq < maint:
+                breached = True; break
+    if breached:
+        _run_liquidation(st, md, ts_ms, params, events, summary)
+
+
+def _adverse_marks(st: AccountState, md: MarketData, ts_ms: int) -> dict:
+    """Per-coin ADVERSE candle extreme at the minute covering ts (low for longs, high for shorts) —
+    the realized worst price that drove the breach. Liquidation executes against THIS (consistent
+    with _scan_breach), so a detected breach actually fires, and the forced fill is conservatively
+    pessimistic (codex code-r1 #3 — scan and liquidation must agree)."""
+    out = {}
+    for coin in sorted(st.positions):
+        p = st.positions[coin]
+        mins, _o, h, low, c = md.ohlc(coin)
+        if mins.size == 0:
+            out[coin] = p.entry_px
+            continue
+        i = int(np.searchsorted(mins, (ts_ms // MS_MIN) * MS_MIN, "right")) - 1
+        if i < 0:
+            out[coin] = p.entry_px
+            continue
+        adverse = low[i] if p.szi > 0 else h[i]
+        out[coin] = float(adverse) if adverse == adverse else float(c[i])
+    return out
+
+
+def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, events, summary):
+    """Cross/isolated liquidation state machine (design §3.3/§3.4/D12/D15; codex code-r1 #2/#3/#5).
+    Backstop = position+cross-margin TRANSFER to vault (event-only, NO fee). Market-liq orders are
+    FILLS with the forced-liq slippage penalty. >100k: 20% first then (cooldown) full; <=100k full.
+    Uses ADVERSE breach marks (consistent with _scan_breach) so detected breaches actually execute."""
+    marks = _adverse_marks(st, md, ts_ms)
+
+    # ISOLATED first (each independent)
+    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+        p = st.positions[coin]
+        m = marks.get(coin) or p.entry_px
+        notion = abs(p.szi) * m
+        iso_eq = p.isolated_margin + p.szi * (m - p.entry_px)
+        maint = notion * md.meta.maint_rate(coin, notion)
+        if iso_eq < BACKSTOP_MAINT_FRACTION * maint:
+            events.append(_evt(summary, ts_ms, "backstop_transfer", coin, coin_dex(coin)))
+            summary["n_backstop_transfer"] += 1
+            summary["outcome_states"].add("backstop")
+            _rt_realize_terminal(summary, p, m)   # CHANGE A FIX #1: realize the wipe loss FIRST
+            del st.positions[coin]
+            _rt_close(summary, coin)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+        elif iso_eq < maint:
+            _liq_close(st, md, coin, m, ts_ms, summary=summary)
+
+    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
+    # (isolated-only account wiped), it is RUIN too -> finalize via _ruin (was leaving backstop w/o account_ruin/
+    # time_to_ruin). Checked after the isolated loop to avoid mutating st.positions mid-iteration.
+    if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
+        _ruin(st, md, summary, events, int(ts_ms))
+
+    # CROSS scopes
+    for scope in st.cross_scopes():
+        coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+        if not coins:
+            continue
+        cash = st.cross_collateral.get(scope, 0.0)
+        eq = cash + sum(st.positions[c].szi * ((marks.get(c) or st.positions[c].entry_px) - st.positions[c].entry_px) for c in coins)
+        maint = sum(abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)
+                    * md.meta.maint_rate(c, abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)) for c in coins)
+        if eq < BACKSTOP_MAINT_FRACTION * maint:
+            for c in sorted(coins):
+                events.append(_evt(summary, ts_ms, "backstop_transfer", c, scope))
+                _rt_realize_terminal(summary, st.positions[c],
+                                     marks.get(c) or st.positions[c].entry_px)   # CHANGE A FIX #1
+                del st.positions[c]
+                _rt_close(summary, c)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+            st.cross_collateral[scope] = 0.0
+            summary["n_backstop_transfer"] += 1
+            summary["outcome_states"].add("backstop")
+            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
+            # ALL remaining scopes+positions <= ~0), it is RUIN -> set ruin/time_to_ruin so `ruin`-based
+            # downstream filters (m06b, etc.) don't treat a wiped account as non-ruined. A multi-scope account
+            # whose OTHER scopes still hold collateral is NOT ruined by a single-scope backstop (n_backstop_transfer
+            # still flags it; m08 counts any backstop as wiped).
+            if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
+                _ruin(st, md, summary, events, int(ts_ms))   # full ruin finalization (zeros equity, no stale _core_final_eq)
+        elif eq < maint:
+            _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks)
+
+
+def _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks):
+    """ONE HL market-liquidation STEP for the breached cross scope (codex code-r2 #5): close the
+    most-marginal position by 20% if its notional > 100k and not in cooldown (then sets the 30s
+    cooldown), else full. The chronological event loop (_advance_between) re-invokes on the next bar
+    after the cooldown elapses, so the >100k 20%-then-full ladder advances bar-by-bar (interval-
+    bounded at 1m). Recorded as a market_liq_order FILL with the forced-liq slippage penalty."""
+    # SINGLE-POINT COOLDOWN ENFORCEMENT (codex code-r5/r6/r7): never issue a liquidation order while
+    # cooling down. This makes it IMPOSSIBLE for any caller path (price breach, post-funding, terminal
+    # fold-boundary, or their combinations at the same/sub-minute ts) to fire two orders within 30s.
+    # The position simply waits; the next eligible 1m bar (>=60s > 30s cooldown) issues the next order.
+    if ts_ms < st.cooldown_until_ms:
+        return
+    coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+    if not coins:
+        return
+    c = max(sorted(coins), key=lambda x: abs(st.positions[x].szi) * (marks.get(x) or st.positions[x].entry_px))
+    p = st.positions[c]
+    m = marks.get(c) or p.entry_px
+    notion = abs(p.szi) * m
+    # HL ladder: the FIRST liquidation order on the account is 20% (if >100k) and sets the 30s
+    # cooldown; SUBSEQUENT orders (after the cooldown elapses) are FULL. cooldown_until_ms==0 marks
+    # "no prior liquidation pending" (reset once the account is healthy for a full segment).
+    first_step = (st.cooldown_until_ms == 0)
+    if notion > PARTIAL_LIQ_NOTIONAL and first_step:
+        close_szi = -p.szi * PARTIAL_LIQ_FRACTION
+        st.cooldown_until_ms = ts_ms + LIQ_COOLDOWN_MS
+    else:
+        close_szi = -p.szi
+    _liq_close(st, md, c, m, ts_ms, summary=summary, close_szi=close_szi, scope=scope)
+
+
+def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
+    """Close via a forced market-liq order with uncapped full-order impact.
+
+    Hyperliquid sends these orders to the book and charges no clearance fee.
+    Thirty bps is a conservative floor, not a size-independent execution
+    price: larger orders also pay the normal half-spread + full order/ADV impact
+    curve with no participation cap.
+    """
+    p = st.positions.get(coin)
+    if p is None:
+        return
+    if close_szi is None:
+        close_szi = -p.szi
+    side = 1 if close_szi > 0 else -1
+    close_notional = abs(close_szi) * mark
+    liq = md.liquidity(coin, ts_ms)
+    adv = float(liq.get("adv", 0.0) or 0.0)
+    participation = close_notional / adv if adv > 0 else 1.0
+    half_spread_bps = float(liq.get("half_spread_bps", DEFAULT_HALF_SPREAD_BPS))
+    impact_k = float(liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS))
+    impact_alpha = float(liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA))
+    curve_slip_bps = half_spread_bps + impact_k * (participation ** impact_alpha)
+    forced_slip_bps = max(FORCED_LIQ_SLIP_BPS, curve_slip_bps)
+    fill_px = mark * (1 + side * forced_slip_bps / 1e4)
+    # realized PnL on the closed portion (forced-liq order; no fee, design D12)
+    realized = min(abs(close_szi), abs(p.szi)) * (fill_px - p.entry_px) * (1 if p.szi > 0 else -1)
+    if p.mode == "cross":
+        sc = scope or coin_dex(coin)
+        st.cross_collateral[sc] = st.cross_collateral.get(sc, 0.0) + realized
+    else:
+        p.isolated_margin += realized
+    _rt_add(summary, coin, realized=realized)   # CHANGE A: forced-liq realized (no fee on liq orders)
+    new_szi = p.szi + close_szi
+    fl = summary.get("_fills_ref")
+    if fl is not None:
+        fl.append({"entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
+                   "our_ts": ts_ms, "source_ts": ts_ms, "side": "buy" if side > 0 else "sell",
+                   "our_fill_size": float(close_szi), "our_fill_px": float(fill_px), "ref_mark": float(mark),
+                   "half_spread_bps": half_spread_bps,
+                   "impact_bps": float(forced_slip_bps - half_spread_bps), "fee": 0.0,
+                   "fill_type": "market_liq_order", "capacity_capped": False, "margin_mode": p.mode})
+    summary["n_market_liq_orders"] += 1
+    summary["outcome_states"].add("position_liquidated")
+    if abs(new_szi) < 10 ** (-md.meta.szdec(coin)):
+        if p.mode == "isolated":
+            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + max(0.0, p.isolated_margin)
+        del st.positions[coin]
+        _rt_close(summary, coin)   # CHANGE A: forced full close ends the round-trip
+    else:
+        p.szi = new_szi
+
+
+def _evt(summary, ts_ms, etype, coin, scope):
+    return {"entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "ts": ts_ms,
+            "event_type": etype, "coin": coin, "scope": scope}
+
+
+def _ruin(st: AccountState, md: "MarketData", summary: dict, events: list, ts_ms: int):
+    summary["ruin"] = True
+    summary["outcome_states"].add("account_ruin")
+    if summary["time_to_ruin_ms"] is None:
+        summary["time_to_ruin_ms"] = ts_ms
+    events.append(_evt(summary, ts_ms, "account_ruin", "", ""))
+    for c in list(st.positions):           # CHANGE A: close any still-open round-trips on ruin
+
+exec
+/bin/zsh -lc "sed -n '40,165p' research/v15/v15_m08_survival.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    # tier survival multipliers (frozen; decisions/2026-06-01-m9-m10-manifest-freeze)
+    mult_kill: float = 0.0
+    mult_suspicious: float = 0.10
+    mult_uncertain: float = 0.25
+    mult_full_weight: float = 1.0
+    suspicious_cohort_cap: float = 0.10        # <=10% of portfolio (enforced in M9)
+    # stress run params (design §3)
+    stress_slippage_band: str = "high"
+    stress_adl: bool = True
+    # entity_pre_m8_max = M6b_quality x M4_confidence x 1.0(survival placeholder) x M9_static_cap.
+    m9_static_per_entity_cap: float = 0.10     # the pre-M9 static cap (NOT the suspicious-cohort cap)
+    # Survival/ruin verdicts are bankroll-scale-dependent; production should pass the real bankroll.
+    nominal_capital: float = 10_000.0          # reference bankroll for the absolute stress slice
+    # multi-slice survival probe (design §3): test at the pre-M8 max, a smaller slice, and the min size
+    smaller_slice_frac: float = 0.25           # "survives at a smaller slice" probe
+    min_slice_capital: float = 50.0            # ~ min deployable subaccount (HL min-notional regime)
+    # STALENESS gate (audit 2026-07-10 P0#1; Alberto delegated the cutoff TG 11133): a wallet must have OPENED
+    # activity within the last N days BEFORE the fold decision (test_start) to be eligible to survive; else KILL.
+    # 14d = the fold VAL window (last 14d of pretest) AND matches the live rotation monitor's dead-leader
+    # eviction (>10d inactive). A leader that went dark before the decision is not copyable.
+    staleness_max_days: int = 14
+    inferential_layer_active: bool = False
+    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
+    fixed_target_exposure: float = 0.10
+    # outcome -> tier
+    indeterminate_heavy_frac: float = 0.25     # >this share of indeterminate minutes -> cap at UNCERTAIN
+
+
+TIER_ORDER = {"kill": 0, "suspicious": 1, "uncertain": 2, "full_weight": 3}
+TIER_MULT = None  # set per-manifest
+
+
+def _run_stress(actions: pd.DataFrame, md: E.MarketData, start_equity: float, t0: int, t1: int,
+                m: M8Manifest) -> dict:
+    """One counterfactual-survival run: M7 at the STRESS slice (high slippage + adl, causal carry-in,
+    NO source top-ups -- the replica lives on its slice + PnL). Returns the typed outcome."""
+    params = E.EngineParams(
+        slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
+        start_policy="causal_carry_in", sizing_mode=m.sizing_mode,
+        fixed_target_exposure=m.fixed_target_exposure,
+    )
+    res = E.step_subaccount(actions, md, start_equity, params, end_ts_ms=t1, start_ts_ms=t0)
+    s = res["summary"]
+    window_min = max((t1 - t0) / 60_000.0, 1.0)
+    wiped = bool(s["ruin"]) or s["n_backstop_transfer"] > 0 or s["final_equity"] <= 0
+    return {
+        "wiped": wiped, "ruin": bool(s["ruin"]), "backstop": s["n_backstop_transfer"] > 0,
+        "account_ruin": "account_ruin" in s["outcome_states"], "final_equity": s["final_equity"],
+        "roe": s["roe_engine"], "max_dd": s["max_dd"], "time_to_ruin_ms": s["time_to_ruin_ms"],
+        "n_fills": s["n_fills"],
+        # codex r1#3: indeterminate MINUTES / simulated window MINUTES (not / action count).
+        "indeterminate_frac": (s.get("n_indeterminate_minutes", 0) / window_min),
+    }
+
+
+def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dict:
+    """Counterfactual-survival -> mechanical tier + sizing signals (design §1/§3; codex r1#1,#2).
+    - survives at pre_m8_max -> full_weight (UNCERTAIN only if indeterminate-heavy).
+    - wiped at pre_m8_max BUT survives at the MINIMUM tradable size -> copyability_fail_at_stress: a
+      SIZING signal (M9 clamps the max slice); the tier stays SURVIVAL-OK = full_weight (the wallet
+      isn't dangerous, our chosen slice was too big -- NOT downgraded). max_survivable_slice refined by
+      the smaller-slice probe.
+    - wiped even at the MINIMUM size (no positive slice survives) -> KILL (mechanical).
+    Inferential SUSPICIOUS/UNCERTAIN downgrades are applied SEPARATELY (§4 scorers via _worst_tier)."""
+    # AUDIT 2026-07-10 (P0#1, Alberto-delegated cutoff): STALENESS gate. A wallet whose most recent in-window
+    # action is > staleness_max_days before the decision (t1 = test_start) went dark and is NOT copyable -> KILL,
+    # BEFORE any stress (old actions would otherwise "survive" on unchanged equity). Empty stream is handled by
+    # the n_fills gate below; here we catch the "traded early then dark" case.
+    _none_base = {"indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+    if len(actions):
+        last_ts_raw = pd.to_numeric(actions["ts"], errors="coerce").max()
+        if not pd.notna(last_ts_raw):
+            # non-empty stream but no parseable ts -> no usable activity signal -> fail closed (codex hardening).
+            return {"tier": "kill", "survival_outcome": "bad_ts_data_gap",
+                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **_none_base}
+        last_ts = int(last_ts_raw)
+        if (t1 - last_ts) > m.staleness_max_days * 86_400_000:
+            return {"tier": "kill", "survival_outcome": "stale_inactive",
+                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+                    "last_action_ts": last_ts, "staleness_days":
+                    round((t1 - last_ts) / 86_400_000.0, 1), **_none_base}
+    big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
+    base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
+            "stress_max_dd": big["max_dd"]}
+    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
+    # happens when the action stream is empty / fully filtered, OR when every action has NaN/invalid sizing so
+    # M7 skips it. Such a wallet must NOT come out "survived / full_weight" on unchanged start equity. Fail
+    # closed to KILL (data-gap) so it is excluded from the live cohort.
+    if int(big.get("n_fills", 0)) == 0:
+        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
+                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+    heavy = big["indeterminate_frac"] > m.indeterminate_heavy_frac
+    if not big["wiped"]:
+        return {"tier": "uncertain" if heavy else "full_weight", "survival_outcome": "survived",
+                "copyability_fail_at_stress": False, "max_survivable_slice": pre_m8_max_capital, **base}
+    # wiped at pre_m8_max -> the MIN-size probe decides KILL vs copyability (codex r1#2: KILL only when
+    # even the smallest positive slice fails -- min is the smallest, so min-wipe == no slice survives).
+    mn = _run_stress(actions, md, m.min_slice_capital, t0, t1, m)
+    # codex completion (2026-07-10): the min probe must also have EVIDENCE. `wiped=False` on a zero-fill min run
+    # is evidence-less "survival" -> KILL, not copyability_fail (which would leak a 0.25/1.0 multiplier).
+    if mn["wiped"] or int(mn.get("n_fills", 0)) == 0:
+        return {"tier": "kill",
+                "survival_outcome": ("ruin_at_min_size" if mn["wiped"] else "no_fills_at_min_data_gap"),
+                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+    # survives at min -> copyability SIZING signal, tier stays survival-OK (codex r1#1: NOT downgraded).
+    # refine max_survivable with a smaller-slice probe ONLY if it sits ABOVE min (codex r2#1: never
+    # probe below the min slice -- min already survived, so the floor is min_slice_capital).
+    smaller = pre_m8_max_capital * m.smaller_slice_frac
+    surv_slice = m.min_slice_capital
+    if smaller > m.min_slice_capital:
+        small = _run_stress(actions, md, smaller, t0, t1, m)
+        if not small["wiped"] and int(small.get("n_fills", 0)) > 0:  # codex: only raise the slice on real evidence
+            surv_slice = smaller
+    return {"tier": "uncertain" if heavy else "full_weight",
+            "survival_outcome": "copyability_fail_at_stress",
+            "copyability_fail_at_stress": True, "max_survivable_slice": surv_slice, **base}
+
+
+# --------------------------------------------------------------------------- #
+# INFERENTIAL SCORERS -- PHASE 2 (deterministic contract; open data questions Q3/Q4). Stubbed no_flag.
+# --------------------------------------------------------------------------- #
+def inferential_scorers(entity_id, fold_id) -> dict:
+    """Each scorer returns one of {no_flag, uncertain, suspicious} + reason + source_module=M8_new.
+    PHASE 2: off-platform-hedge-smell, funder-provenance, carry-timing, behavioral-linkage. Stubbed to
+    no_flag (the inferential layer is NOT yet active -> tier is survival-driven only). The WORST tier
+    any scorer assigns wins; never auto-KILL (inferential -> at most SUSPICIOUS)."""
+
+exec
+/bin/zsh -lc "sed -n '470,850p' research/v15/v15_m07_engine.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            m = marks.get(coin)
+            upnl = (p.szi * (m - p.entry_px)) if (m is not None and m == m) else 0.0
+            eq += (p.isolated_margin + upnl) if p.mode == "isolated" else upnl
+        return eq
+
+
+# --------------------------------------------------------------------------- #
+# Engine params (caller-set; design §1.8-§1.9) — NO stress-mult (boundary; M8 stress = bigger slice)
+# --------------------------------------------------------------------------- #
+@dataclass
+class EngineParams:
+    copy_latency_ms: int = 2_000
+    slippage_band: str = "base"
+    adl_stress: bool = False
+    start_policy: str = "future_delta_only"   # future_delta_only | causal_carry_in (design D9)
+    follower_trail: Optional[float] = None     # FOLLOWER trailing exit ("exit before them"): if our copy
+    sizing_mode: str = "leader_equity"         # leader_equity | fixed_position
+    fixed_target_exposure: float = 0.10         # signed direction gets this absolute follower exposure
+    # equity draws down >= follower_trail from its running peak, FLATTEN all positions and sit out the rest
+    # of the fold (independent of source). None = disabled (copy source exposure verbatim). Checked at
+    # every action boundary + fold-end using REAL engine equity (fills/fees/funding/liq priced in).
+
+
+def _action_target_pct(action: dict, params: EngineParams) -> float:
+    """Return the declared source target under the selected sizing policy."""
+    if params.sizing_mode == "leader_equity":
+        return _f(action.get("target_exposure_pct"))
+    if params.sizing_mode == "fixed_position":
+        pa = _f(action.get("position_after"))
+        if pa != pa:
+            return float("nan")
+        if abs(pa) <= 1e-12:
+            return 0.0
+        return float(np.sign(pa) * abs(params.fixed_target_exposure))
+    raise ValueError(f"unknown sizing_mode {params.sizing_mode!r}")
+
+
+# --------------------------------------------------------------------------- #
+# The engine core — step_subaccount (pure function; design §0/§3-§7)
+# --------------------------------------------------------------------------- #
+def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, params: EngineParams,
+                    end_ts_ms: int, start_ts_ms: Optional[int] = None,
+                    start_state: Optional[AccountState] = None,
+                    entity_id=None, fold_id=None) -> dict:
+    """Step ONE subaccount through its fold-frozen action stream to end_ts_ms. PURE: never mutates the
+    caller's start_state (deep-copied). `start_ts_ms` anchors the risk cursor (fold start) so carried
+    start_state positions accrue funding/MTM/liquidation even when there are no actions (M9 chaining).
+    Returns fills/events/equity/ending_account_state/summary."""
+    # Defensive contract for every caller, including M8/M9 direct calls that do
+    # not pass through run_shortlist's parquet predicate.
+    if not actions.empty and "stream_replay_valid" in actions.columns:
+        actions = actions[actions["stream_replay_valid"].fillna(False).astype(bool)].copy()
+    if not actions.empty and "lifecycle_valid" in actions.columns:
+        actions = actions[actions["lifecycle_valid"].fillna(False).astype(bool)].copy()
+
+    st = copy.deepcopy(start_state) if start_state is not None else AccountState(cross_collateral={"main": float(start_equity)})
+    if not st.cross_collateral:
+        st.cross_collateral = {"main": float(start_equity)}
+
+    fills: list[dict] = []
+    events: list[dict] = []
+    equity_samples: list[dict] = []
+    summary = _new_summary(entity_id, fold_id, start_equity, len(actions), params, md)
+    summary["_fills_ref"] = fills    # internal: lets the liquidation path append market_liq_order fills
+
+    band = SLIP_BANDS.get(params.slippage_band, 1.0)
+    peak_equity = float(start_equity)
+    follower_halted = [False]   # follower trailing-exit latch (list for closure mutation)
+
+    def _flatten_all(ts):
+        """GUARANTEED close-all for the breaker (codex review bug #5). Closes EVERY open position in
+        full at ts via force_close (no min-notional / capacity skip). Pricing falls back causal mark ->
+        realized mark -> entry_px so a momentarily-uncovered coin is still closed (never silently left
+        open). Any sub-lot residual that force_close cannot book is dropped to cash at its entry value."""
+        for c in list(st.positions.keys()):
+            p = st.positions.get(c)
+            if p is None or p.szi == 0.0:
+                continue
+            m = md.mark(c, ts, causal=True)
+            if m is None or m != m or m <= 0:
+                m = md.mark(c, ts, causal=False)
+            if m is None or m != m or m <= 0:
+                m = p.entry_px      # last-resort: realize 0 PnL at entry rather than leave it open
+            if m is None or m != m or m <= 0:
+                continue            # cannot price at all (handled by residual drop below)
+            _apply_order(st, md, c, -p.szi, m, ts, {"action_type": "FOLLOWER_TRAIL_EXIT", "ts": ts},
+                         params, band, fills, events, summary, force_close=True)
+        # residual safety net: any position still open (unpriceable / sub-lot dust) -> drop to cash at
+        # entry value so NO exposure survives the halt and equity stays well-defined.
+        for c in list(st.positions.keys()):
+            p = st.positions.get(c)
+            if p is None:
+                continue
+            if p.mode == "isolated":
+                st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin
+            del st.positions[c]
+            _rt_close(summary, c)   # CHANGE A: residual flatten ends the round-trip
+
+    def _trail_fire(cur_eq, ts):
+        """FOLLOWER trailing-exit state machine. Updates the running peak from REAL equity at THIS
+        observation point (codex bug #4/#8), then if drawdown-from-peak >= params.follower_trail: flatten
+        ALL positions (guaranteed), latch halted (no un-halt this fold), record ruin if the post-flatten
+        equity is non-positive (codex bug #6). Returns post-flatten equity. No-op (and does NOT touch the
+        peak) when disabled -> the follower_trail=None path is byte-identical to pre-breaker."""
+        nonlocal peak_equity
+        if params.follower_trail is None or follower_halted[0]:
+            return cur_eq
+        if cur_eq > peak_equity:
+            peak_equity = cur_eq
+        if peak_equity <= 0 or (peak_equity - cur_eq) / peak_equity < params.follower_trail:
+            return cur_eq
+        _flatten_all(ts)
+        follower_halted[0] = True
+        post_eq = st.equity(_marks(st, md, ts))
+        events.append({"ts": ts, "event_type": "follower_trail_exit", "entity_id": entity_id,
+                       "fold_id": fold_id, "trail": params.follower_trail,
+                       "peak_equity": float(peak_equity), "trigger_equity": float(cur_eq)})
+        if post_eq <= 0 and not summary["ruin"]:
+            _ruin(st, md, summary, events, ts)
+        return post_eq
+
+    # CHANGE 1: block-boundary anchors b_k = start_ts + k*14d in [start_ts, end_ts) (fold_start = b_0;
+    # interior = block_boundary; the fold_end sample is the final anchor). `_emit` is a PURE-READ
+    # observer threaded into _advance_between: it appends boundary equity samples ONLY (never touches
+    # fills/events/summary/state) -> existing outputs byte-identical. Equity at b uses mark(b).
+    if start_ts_ms is not None:
+        _bstart = int(start_ts_ms)
+    elif not actions.empty:
+        _bstart = int(actions["ts"].min())
+    else:
+        _bstart = int(end_ts_ms)
+    boundaries_q = []
+    k = 0
+    while True:
+        b = _bstart + k * BLOCK_MS
+        if b >= end_ts_ms:
+            break
+        boundaries_q.append(b)
+        k += 1
+    _bi = [0]
+
+    def _emit(cursor_ts, state):
+        if cursor_ts is None:
+            return
+        while _bi[0] < len(boundaries_q) and boundaries_q[_bi[0]] <= cursor_ts:
+            b = boundaries_q[_bi[0]]; _bi[0] += 1
+            eqb = state.equity(_marks(state, md, b))
+            flag = "fold_start" if b == _bstart else "block_boundary"
+            equity_samples.append(_eq_sample(entity_id, fold_id, b, eqb, flag, state, summary["max_dd"]))
+
+    rows = actions.sort_values(["ts", "event_order"]).to_dict("records") if not actions.empty else []
+    # AUDIT 2026-07-10 (codex P0#1): WINDOW PURITY. Defensively drop any SOURCE action outside [win_lo, end)
+    # so a mis-scoped input can't pollute the metrics with test-window data (the runner filters, but M8/M9
+    # call step_subaccount directly). The latency-pushed our_ts >= end guard is enforced in the loop below.
+    _win_lo = int(start_ts_ms) if start_ts_ms is not None else _bstart
+    rows = [r for r in rows if _win_lo <= int(r["ts"]) < int(end_ts_ms)]
+    # AUDIT 2026-07-10 (codex P0#2): emit window provenance on the summary so a consumer (m06b) can PROVE the
+    # row was generated for its fold's window, not a stale test run. window_end is the half-open exclusive bound.
+    summary["window_start_ms"] = int(_win_lo)
+    summary["window_end_ms"] = int(end_ts_ms)
+    # count of COPYABLE (perp, non-spot) actions whose latency-pushed our_ts lands at/after the fold end
+    # (codex P0#1 minor; spot rows are skipped by the loop so they must not inflate this reject count).
+    summary["n_late_copy_skipped"] = sum(
+        1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
+    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+    # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+    # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
+    # until ADL is implemented or the stress model is accepted without it (Alberto decision).
+    summary["adl_stress_requested"] = bool(params.adl_stress)
+    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+    if params.adl_stress:
+        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+    # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
+    # zero actions (codex code-r2 #2). Falls back to the first action time, then end_ts.
+    if start_ts_ms is not None:
+        prev_ts = int(start_ts_ms)
+    elif rows:
+        prev_ts = int(rows[0]["ts"]) + params.copy_latency_ms
+    else:
+        prev_ts = end_ts_ms
+
+    # causal_carry_in: seed the opening position from the first action's pre-state (design D9).
+    # AUDIT 2026-07-10 (codex P0#3): seed at the WINDOW START mark (prev_ts), NOT the first action's mark, so
+    # the main loop's first _advance_between(start -> first action) captures any intra-window drawdown/
+    # liquidation on the carried position (seeding at the first-action price skipped it = wrong max_dd/roe/ruin).
+    if rows and params.start_policy == "causal_carry_in":
+        _seed_carry_in(st, md, rows[0], params, summary, seed_ts=prev_ts)
+
+    # FOLLOWER-TRAIL peak init (codex review bug #8): when carrying state into the fold, the breaker peak
+    # must start from the REAL marked equity at fold start, not the caller's (possibly stale) start_equity
+    # scalar -- otherwise a chained fold can fire/suppress wrongly at t0. Gated on follower_trail so the
+    # disabled path keeps the original peak (max_dd byte-identical).
+    if params.follower_trail is not None and start_state is not None:
+        _pe = st.equity(_marks(st, md, prev_ts))
+        if _pe == _pe and _pe > peak_equity:
+            peak_equity = _pe
+
+    # CHANGE 2 tracking_error state: the SOURCE signed target vector + the open interval's L1/active.
+    src_target: dict = {}
+    te_prev_ts = None
+    te_prev_l1 = 0.0
+    te_prev_active = False
+
+    def _te_accrue(to_ts):
+        """accrue the open interval [te_prev_ts, to_ts) at the held L1 (active intervals only)."""
+        nonlocal te_prev_ts
+        if te_prev_ts is not None and to_ts > te_prev_ts and te_prev_active:
+            dt = to_ts - te_prev_ts
+            summary["_te_weighted_sum"] += dt * te_prev_l1
+            summary["tracking_error_active_ms"] += dt
+
+    for a in rows:
+        coin = a["coin"]
+        if coin_is_spot(coin):
+            continue
+        our_ts = int(a["ts"]) + params.copy_latency_ms
+        # AUDIT 2026-07-10 (codex P0#1): a latency-pushed fill at our_ts >= end_ts_ms would execute on
+        # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
+        # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
+        if our_ts >= int(end_ts_ms):
+            break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
+
+        _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
+        if summary["ruin"]:
+            break
+
+        marks = _marks(st, md, our_ts, extra=coin)
+        cur_eq = st.equity(marks)
+        if cur_eq <= 0:
+            _ruin(st, md, summary, events, our_ts)
+            break
+
+        # FOLLOWER trailing exit: check on the freshly-advanced equity BEFORE copying this action. If we
+        # breach, flatten + latch; once halted we stop copying source entries for the rest of the fold.
+        cur_eq = _trail_fire(cur_eq, our_ts)
+        if summary["ruin"]:
+            break
+        if follower_halted[0]:
+            equity_samples.append(_eq_sample(entity_id, fold_id, our_ts, cur_eq, "action", st, summary["max_dd"]))
+            summary["_core_final_eq"] = cur_eq
+            prev_ts = our_ts
+            continue
+
+        mark = marks.get(coin)
+        if mark is None or mark != mark or mark <= 0:
+            summary["metadata_uncertain"] = True
+            prev_ts = our_ts
+            continue
+
+        tgt_pct = _action_target_pct(a, params)
+        if tgt_pct != tgt_pct:
+            prev_ts = our_ts
+            continue
+        target_notional = tgt_pct * cur_eq
+        target_szi = target_notional / mark
+        cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
+        exit_cond = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
+        if exit_cond:
+            target_szi = 0.0
+        delta_szi = target_szi - cur_szi
+
+        _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary)
+
+        marks = _marks(st, md, our_ts, extra=coin)
+        eq = st.equity(marks)
+        peak_equity = max(peak_equity, eq)
+        if peak_equity > 0:
+            summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
+        # FOLLOWER trailing exit POST-FILL (codex review bug #3): this action just changed exposure; the
+        # fill's fee/slippage/marking can itself breach the trail -> check again immediately so we never
+        # stay exposed past the threshold until the NEXT action.
+        eq = _trail_fire(eq, our_ts)
+        if peak_equity > 0:
+            summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
+        equity_samples.append(_eq_sample(entity_id, fold_id, our_ts, eq, "action", st, summary["max_dd"]))
+        summary["_core_final_eq"] = eq
+        # CHANGE 2: close the prior interval, fold in THIS action's source target, open a new interval.
+        _te_accrue(our_ts)
+        src_target[coin] = (0.0 if exit_cond else tgt_pct)
+        te_prev_l1, te_prev_active = _te_l1_active(st, md, src_target, our_ts)
+        te_prev_ts = our_ts
+        if eq <= 0 and not summary["ruin"]:
+            _ruin(st, md, summary, events, our_ts)
+            break
+        if summary["ruin"] or follower_halted[0]:
+            prev_ts = our_ts
+            continue
+        prev_ts = our_ts
+
+    # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
+    # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
+    if not summary["ruin"] and end_ts_ms > prev_ts:
+        _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
+        marks = _marks(st, md, end_ts_ms)
+        eq = st.equity(marks)
+        peak_equity = max(peak_equity, eq)
+        if peak_equity > 0:
+            summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
+        # FOLLOWER trailing exit at FOLD END (codex review bug #2): catches a breach from a no-action
+        # fold, a single-action fold, or a post-last-action drawdown via funding/MTM/liquidation that the
+        # per-action checks cannot see. Flattens so the carried state into the next chained fold is flat.
+        eq = _trail_fire(eq, end_ts_ms)
+        if peak_equity > 0:
+            summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
+        equity_samples.append(_eq_sample(entity_id, fold_id, end_ts_ms, eq, "fold_end", st, summary["max_dd"]))
+        summary["_core_final_eq"] = eq
+
+    # D2 post-ruin closeout: after ruin, _ruin() cleared positions + zeroed cash -> equity 0. Emit
+    # zero-equity samples at every REMAINING block boundary + a fold_end anchor so M6b block ROE has no
+    # silent gap (any block at/after ruin reads eq=0 -> -100%, counts as NON-positive, never positive).
+    if summary["ruin"]:
+        while _bi[0] < len(boundaries_q):
+            b = boundaries_q[_bi[0]]; _bi[0] += 1
+            equity_samples.append(_eq_sample(entity_id, fold_id, b, 0.0, "block_boundary", st, summary["max_dd"]))
+        equity_samples.append(_eq_sample(entity_id, fold_id, end_ts_ms, 0.0, "fold_end", st, summary["max_dd"]))
+
+    # CHANGE 2 TE finalize.
+    if not summary["ruin"]:
+        _te_accrue(end_ts_ms)                          # flush the open interval to fold end
+    else:
+        # D3: flush the pre-ruin interval to the ruin instant (our tracked exposure), then the SOURCE
+        # keeps trading while our exposure is forced 0 -> full penalty = sum|source target| accrued
+        # time-weighted to fold_end, advancing the source target vector read-only over later actions.
+        rt = int(summary.get("time_to_ruin_ms") or end_ts_ms)
+        _te_accrue(rt)
+        cur = rt
+        for a in rows:
+            ats = int(a["ts"]) + params.copy_latency_ms
+            if ats <= rt or coin_is_spot(a["coin"]):
+                continue
+            pen = sum(abs(v) for v in src_target.values() if v == v)
+            if ats > cur and pen > 0:
+                summary["_te_weighted_sum"] += (ats - cur) * pen
+                summary["tracking_error_active_ms"] += (ats - cur)
+            tp = _action_target_pct(a, params)
+            if tp == tp:
+                ex = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
+                src_target[a["coin"]] = (0.0 if ex else tp)
+            cur = ats
+        pen = sum(abs(v) for v in src_target.values() if v == v)
+        if end_ts_ms > cur and pen > 0:
+            summary["_te_weighted_sum"] += (end_ts_ms - cur) * pen
+            summary["tracking_error_active_ms"] += (end_ts_ms - cur)
+
+    return _finalize(st, fills, events, equity_samples, summary, md, start_equity)
+
+
+def _new_summary(entity_id, fold_id, start_equity, n_actions, params, md):
+    return {
+        "entity_id": entity_id, "fold_id": fold_id, "start_equity": float(start_equity),
+        "n_actions": int(n_actions), "n_fills": 0, "n_rejected": 0, "n_capacity_capped": 0,
+        "n_market_liq_orders": 0, "n_backstop_transfer": 0, "n_adl_stress": 0,
+        "total_fees": 0.0, "total_funding": 0.0, "slip_bps_notional_sum": 0.0, "notional_traded": 0.0,
+        "outcome_states": set(), "n_indeterminate_minutes": 0, "max_dd": 0.0, "time_to_ruin_ms": None,
+        "slippage_band": params.slippage_band, "start_policy": params.start_policy,
+        "sizing_mode": params.sizing_mode,
+        "fixed_target_exposure": (
+            float(params.fixed_target_exposure) if params.sizing_mode == "fixed_position" else None
+        ),
+        "slippage_uncalibrated": False, "metadata_uncertain": False, "mode_uncertain": False,
+        "adv_unavailable": False,
+        "fee_unversioned": (not md.fees.versioned), "ruin": False,
+        "slippage_calibration_version": None,
+        # CHANGE 2 tracking_error accumulators (finalized in _finalize): time-weighted L1 signed
+        # portfolio-vector error over ACTIVE intervals + the active-time denominator.
+        "_te_weighted_sum": 0.0, "tracking_error_active_ms": 0,
+        # CHANGE 1: final_equity/roe_engine come from the ORIGINAL sample sites (action + non-ruin
+        # fold_end) ONLY -> the new boundary/ruin-drain samples never change them (byte-identical).
+        "_core_final_eq": float(start_equity),
+        # CHANGE A (round-trip aggregates for M6b): realized PnL after OUR costs per CLOSED round-trip
+        # (a coin's position opening from flat and returning to ~0). `_rt` holds the per-coin open
+        # accumulator (realized + funding - fees) since the position last opened from flat; finalized
+        # into the n_round_trips/wins/realized_pnl_total totals when the position closes. Popped in
+        # _finalize. Latency cost is ALREADY priced into each fill_px (CHANGE B), so the accumulated
+        # realized PnL is genuinely after fees+funding+latency.
+        "_rt": {}, "n_round_trips": 0, "n_round_trip_wins": 0, "realized_pnl_total": 0.0,
+    }
+
+
+def _eq_sample(entity_id, fold_id, ts, eq, flag, st, dd):
+
+exec
+/bin/zsh -lc "sed -n '340,390p' research/v15/v15_m08_survival.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+        # TIER-DOMAIN FAIL-CLOSED (codex M8 confirm): a non-canonical entity_tier (e.g. a literal "nan"
+        # string or unknown label from corrupted/nonstandard M4 input) must NOT silently get the 0.25
+        # default. Canonical M4 writes only CLEAN/UNCERTAIN/SUSPICIOUS/KILL; anything else -> 0.0 (KILL-
+        # equivalent, fail-closed conservative) + loud warning, so a bad tier excludes the entity rather
+        # than fabricating mid confidence.
+        _tier = str(r.entity_tier)
+        if _tier not in conf_map:
+            logger.warning(f"M8: non-canonical entity_tier {_tier!r} for entity {int(r.entity_id)} fold "
+                           f"{fid} -> fail-closed to 0.0 confidence (expected one of {sorted(conf_map)})")
+            m4_conf = 0.0
+        else:
+            m4_conf = conf_map[_tier]
+        # AUDIT 2026-07-10 fail-closed guards BEFORE the survival stress:
+        # P1#7: a KILL / non-canonical M4 tier (m4_conf == 0) must produce a KILL survival tier, not just a
+        #       zeroed size. Previously m4_conf=0 only zeroed pre_max_raw, which got bumped to min_slice and the
+        #       stress could still emit uncertain/full_weight (0.25/1.0 multiplier). Force kill here.
+        # P1#6: a non-finite quality_weight (NaN) would make pre_max_raw NaN -> NaN stress equity -> `final<=0`
+        #       is False for NaN -> the row could "survive" with a nonsensical slice. Fail closed to kill.
+        qw = r.quality_weight
+        qw_ok = isinstance(qw, (int, float, np.integer, np.floating)) and not isinstance(qw, bool) \
+            and np.isfinite(qw) and qw > 0
+        if m4_conf <= 0.0 or not qw_ok:
+            reason = "m4_kill_or_noncanonical" if m4_conf <= 0.0 else "nonfinite_quality_weight"
+            sv = {"tier": "kill", "survival_outcome": f"fail_closed_{reason}",
+                  "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+                  "indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+            pre_max_raw = 0.0
+        else:
+            pre_max_raw = entity_pre_m8_max(qw, m4_conf, m)   # codex r1#4: store the RAW formula
+            # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
+            # gets a meaningful stress test; the RAW value is persisted unchanged.
+            sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
+        sc = inferential_scorers(int(r.entity_id), fid)
+        final_tier = _worst_tier(sv["tier"], sc)
+        mult = {"kill": m.mult_kill, "suspicious": m.mult_suspicious,
+                "uncertain": m.mult_uncertain, "full_weight": m.mult_full_weight}[final_tier]
+        rows.append({
+            "entity_id": int(r.entity_id), "fold_id": fid, "m4_tier": str(r.entity_tier),
+            "tier": final_tier, "survival_multiplier": mult, "lp_label":
+            ("NO_OBSERVED_DANGER" if final_tier == "full_weight" else final_tier),
+            "survival_outcome": sv["survival_outcome"],
+            "copyability_fail_at_stress": sv["copyability_fail_at_stress"],
+            "max_survivable_slice": sv["max_survivable_slice"], "entity_pre_m8_max": pre_max_raw,
+            "stress_roe": sv["stress_roe"], "stress_max_dd": sv["stress_max_dd"],
+            "hidden_hedge_not_observable": (final_tier != "kill"),
+            "funder_provenance_unavailable": sc["funder_provenance_unavailable"],
+            "inferential_layer_active": m.inferential_layer_active,
+            "scorers_phase": sc["scorers_phase"],
+            **{f"scorer_{k}": sc[k] for k in ("hedge_smell", "funder_provenance", "carry_timing", "behavioral_linkage")},
+        })
+    tiers = pd.DataFrame(rows)
+
+codex
+The key distinction is that m08 treats any `ruin`, any `backstop_transfer`, or non-positive final equity as wiped. That means ADL would only matter to the survival tier if it creates a wipe in a path that never trips the existing maintenance/backstop logic.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '58,66p;632,643p;1280,1325p;1327,1408p;1461,1520p;1521,1598p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    58	# Liquidation (HL liquidations doc; design §3.3/D12/D15)
+    59	PARTIAL_LIQ_NOTIONAL = 100_000.0            # >100k -> first liq order is 20%, then 30s cooldown
+    60	PARTIAL_LIQ_FRACTION = 0.20
+    61	LIQ_COOLDOWN_MS = 30_000
+    62	BACKSTOP_MAINT_FRACTION = 2.0 / 3.0         # below 2/3 maintenance -> backstop transfer to vault
+    63	FORCED_LIQ_SLIP_BPS = 30.0                  # forced market-liq order execution penalty (legit, not a fee)
+    64	
+    65	MIN_ORDER_NOTIONAL = 10.0                   # HL ~$10 min order
+    66	
+   632	    summary["n_late_copy_skipped"] = sum(
+   633	        1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
+   634	    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+   635	    # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+   636	    # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
+   637	    # until ADL is implemented or the stress model is accepted without it (Alberto decision).
+   638	    summary["adl_stress_requested"] = bool(params.adl_stress)
+   639	    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+   640	    if params.adl_stress:
+   641	        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+   642	                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+   643	    # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
+  1280	    cursor = t0_ms
+  1281	    if _emit is not None:
+  1282	        _emit(cursor, st)
+  1283	    guard = 0
+  1284	    while cursor < t1_ms and st.positions and not summary["ruin"]:
+  1285	        guard += 1
+  1286	        if guard > 200_000:                 # backstop against any pathological non-advance
+  1287	            logger.error("m07 _advance_between guard tripped (entity=%s fold=%s)",
+  1288	                         summary.get("entity_id"), summary.get("fold_id"))
+  1289	            break
+  1290	        next_funding = ((cursor // MS_HOUR) + 1) * MS_HOUR
+  1291	        seg_end = min(next_funding, t1_ms)
+  1292	        breach = _scan_breach(st, md, cursor, seg_end, summary)
+  1293	        if breach is not None:
+  1294	            _run_liquidation(st, md, breach["ts"], params, events, summary)
+  1295	            # resume AFTER this breach minute (and past any liq cooldown just set) so survivors are
+  1296	            # rescanned and the cooldown elapses before the next (full) liquidation step.
+  1297	            cursor = max(breach["ts"] + MS_MIN, st.cooldown_until_ms)
+  1298	            if _emit is not None:
+  1299	                _emit(cursor, st)
+  1300	        else:
+  1301	            # no breach this segment -> account healthy. Once the cooldown has elapsed, reset it so a
+  1302	            # later, independent breach starts fresh with a 20%-first step (not an immediate full close).
+  1303	            if st.cooldown_until_ms and st.cooldown_until_ms <= cursor:
+  1304	                st.cooldown_until_ms = 0
+  1305	            cursor = seg_end
+  1306	            # AUDIT 2026-07-10 (codex P0#4 + fix): the FOLD is half-open [start, fold_end). Funding stamped
+  1307	            # exactly at the fold's exclusive end belongs to the NEXT fold -> skip it (was charging boundary/test
+  1308	            # funding into pretest ROE). But do NOT skip funding at an INTERIOR action boundary that merely
+  1309	            # coincides with an hourly stamp (t1_ms here is often an action time, not the fold end) -- only skip
+  1310	            # when seg_end IS the fold exclusive end.
+  1311	            if seg_end == next_funding and (fold_end_ms is None or seg_end != int(fold_end_ms)):
+  1312	                _apply_funding(st, md, seg_end, summary)
+  1313	                # POST-FUNDING solvency check (codex code-r4 #1): a settlement can push below
+  1314	                # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
+  1315	                # any same-ts/within-30s double-fire on every caller path -- codex code-r5/r6/r7).
+  1316	                _check_maint_at(st, md, seg_end, params, events, summary)
+  1317	            if _emit is not None:
+  1318	                _emit(cursor, st)
+  1319	    # FOLD-BOUNDARY solvency: final point-in-time maintenance check at t1 (codex code-r4 #1). The
+  1320	    # cooldown guard makes this safe even if a post-funding liquidation just fired within 30s of t1.
+  1321	    if st.positions and not summary["ruin"]:
+  1322	        _check_maint_at(st, md, t1_ms, params, events, summary)
+  1323	    if _emit is not None:
+  1324	        _emit(t1_ms, st)
+  1325	
+  1327	def _scan_breach(st: AccountState, md: MarketData, t0_ms: int, t1_ms: int, summary: dict):
+  1328	    """3-valued conservative breach scan (design §3.7/D7/D16; codex code-r1 #3). For each scope/iso
+  1329	    position, test maintenance under BOTH the adverse (low-for-long/high-for-short) and favorable
+  1330	    orderings over completed minutes in (t0,t1]. Returns the earliest minute that breaches under the
+  1331	    ADVERSE ordering (the conservative breach) with a `resolved` flag: resolved=True if it also
+  1332	    breaches under the favorable ordering (definite), False if only adverse breaches (INDETERMINATE,
+  1333	    counted + treated as a breach conservatively)."""
+  1334	    m0 = (t0_ms // MS_MIN) * MS_MIN
+  1335	    m1 = (t1_ms // MS_MIN) * MS_MIN - MS_MIN     # only completed bars
+  1336	    if m1 < m0:
+  1337	        return None
+  1338	    best = None
+  1339	
+  1340	    def _consider(ts, resolved):
+  1341	        nonlocal best
+  1342	        if best is None or ts < best["ts"]:
+  1343	            best = {"ts": int(ts), "resolved": bool(resolved)}
+  1344	
+  1345	    # ISOLATED positions (independent)
+  1346	    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+  1347	        p = st.positions[coin]
+  1348	        mins, _o, h, low, _c = md.ohlc(coin)
+  1349	        if mins.size == 0:
+  1350	            continue
+  1351	        lo = int(np.searchsorted(mins, m0, "left")); hi = int(np.searchsorted(mins, m1, "right"))
+  1352	        if hi <= lo:
+  1353	            continue
+  1354	        adverse = low[lo:hi] if p.szi > 0 else h[lo:hi]
+  1355	        favorable = h[lo:hi] if p.szi > 0 else low[lo:hi]
+  1356	        notion_a = np.abs(p.szi) * adverse
+  1357	        eq_a = p.isolated_margin + p.szi * (adverse - p.entry_px)
+  1358	        maint_a = notion_a * md.meta.maint_rate(coin, float(np.nanmax(notion_a)) if notion_a.size else 0.0)
+  1359	        bad_a = np.where(eq_a < maint_a)[0]
+  1360	        if bad_a.size:
+  1361	            k = lo + int(bad_a[0])
+  1362	            eq_f = p.isolated_margin + p.szi * (favorable[int(bad_a[0])] - p.entry_px)
+  1363	            resolved = eq_f < maint_a[int(bad_a[0])]
+  1364	            if not resolved:
+  1365	                summary["n_indeterminate_minutes"] += 1
+  1366	                summary["outcome_states"].add("indeterminate")
+  1367	            _consider(mins[k], resolved)
+  1368	
+  1369	    # CROSS scopes (aggregate over coins on a union minute grid)
+  1370	    scopes: dict[str, list[str]] = {}
+  1371	    for coin in sorted(c for c, p in st.positions.items() if p.mode == "cross"):
+  1372	        scopes.setdefault(coin_dex(coin), []).append(coin)
+  1373	    for scope in sorted(scopes):
+  1374	        coins = scopes[scope]
+  1375	        grid = None
+  1376	        for coin in coins:
+  1377	            mins, *_ = md.ohlc(coin)
+  1378	            if mins.size == 0:
+  1379	                continue
+  1380	            lo = int(np.searchsorted(mins, m0, "left")); hi = int(np.searchsorted(mins, m1, "right"))
+  1381	            if hi > lo:
+  1382	                grid = mins[lo:hi] if grid is None else np.union1d(grid, mins[lo:hi])
+  1383	        if grid is None or grid.size == 0:
+  1384	            continue
+  1385	        cash = st.cross_collateral.get(scope, 0.0)
+  1386	        adv_eq = np.full(grid.size, cash); fav_eq = np.full(grid.size, cash); maint = np.zeros(grid.size)
+  1387	        for coin in coins:
+  1388	            p = st.positions[coin]
+  1389	            mins, _o, h, low, _c = md.ohlc(coin)
+  1390	            if mins.size == 0:
+  1391	                continue
+  1392	            j = np.clip(np.searchsorted(mins, grid, "right") - 1, 0, mins.size - 1)
+  1393	            adverse = low[j] if p.szi > 0 else h[j]
+  1394	            favorable = h[j] if p.szi > 0 else low[j]
+  1395	            adv_eq = adv_eq + p.szi * (adverse - p.entry_px)
+  1396	            fav_eq = fav_eq + p.szi * (favorable - p.entry_px)
+  1397	            notion = np.abs(p.szi) * adverse
+  1398	            maint = maint + notion * md.meta.maint_rate(coin, float(np.nanmax(notion)) if notion.size else 0.0)
+  1399	        bad = np.where(adv_eq < maint)[0]
+  1400	        if bad.size:
+  1401	            k = int(bad[0])
+  1402	            resolved = fav_eq[k] < maint[k]
+  1403	            if not resolved:
+  1404	                summary["n_indeterminate_minutes"] += 1
+  1405	                summary["outcome_states"].add("indeterminate")
+  1406	            _consider(grid[k], resolved)
+  1407	    return best
+  1408	
+  1461	def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, events, summary):
+  1462	    """Cross/isolated liquidation state machine (design §3.3/§3.4/D12/D15; codex code-r1 #2/#3/#5).
+  1463	    Backstop = position+cross-margin TRANSFER to vault (event-only, NO fee). Market-liq orders are
+  1464	    FILLS with the forced-liq slippage penalty. >100k: 20% first then (cooldown) full; <=100k full.
+  1465	    Uses ADVERSE breach marks (consistent with _scan_breach) so detected breaches actually execute."""
+  1466	    marks = _adverse_marks(st, md, ts_ms)
+  1467	
+  1468	    # ISOLATED first (each independent)
+  1469	    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+  1470	        p = st.positions[coin]
+  1471	        m = marks.get(coin) or p.entry_px
+  1472	        notion = abs(p.szi) * m
+  1473	        iso_eq = p.isolated_margin + p.szi * (m - p.entry_px)
+  1474	        maint = notion * md.meta.maint_rate(coin, notion)
+  1475	        if iso_eq < BACKSTOP_MAINT_FRACTION * maint:
+  1476	            events.append(_evt(summary, ts_ms, "backstop_transfer", coin, coin_dex(coin)))
+  1477	            summary["n_backstop_transfer"] += 1
+  1478	            summary["outcome_states"].add("backstop")
+  1479	            _rt_realize_terminal(summary, p, m)   # CHANGE A FIX #1: realize the wipe loss FIRST
+  1480	            del st.positions[coin]
+  1481	            _rt_close(summary, coin)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+  1482	        elif iso_eq < maint:
+  1483	            _liq_close(st, md, coin, m, ts_ms, summary=summary)
+  1484	
+  1485	    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
+  1486	    # (isolated-only account wiped), it is RUIN too -> finalize via _ruin (was leaving backstop w/o account_ruin/
+  1487	    # time_to_ruin). Checked after the isolated loop to avoid mutating st.positions mid-iteration.
+  1488	    if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
+  1489	        _ruin(st, md, summary, events, int(ts_ms))
+  1490	
+  1491	    # CROSS scopes
+  1492	    for scope in st.cross_scopes():
+  1493	        coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+  1494	        if not coins:
+  1495	            continue
+  1496	        cash = st.cross_collateral.get(scope, 0.0)
+  1497	        eq = cash + sum(st.positions[c].szi * ((marks.get(c) or st.positions[c].entry_px) - st.positions[c].entry_px) for c in coins)
+  1498	        maint = sum(abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)
+  1499	                    * md.meta.maint_rate(c, abs(st.positions[c].szi) * (marks.get(c) or st.positions[c].entry_px)) for c in coins)
+  1500	        if eq < BACKSTOP_MAINT_FRACTION * maint:
+  1501	            for c in sorted(coins):
+  1502	                events.append(_evt(summary, ts_ms, "backstop_transfer", c, scope))
+  1503	                _rt_realize_terminal(summary, st.positions[c],
+  1504	                                     marks.get(c) or st.positions[c].entry_px)   # CHANGE A FIX #1
+  1505	                del st.positions[c]
+  1506	                _rt_close(summary, c)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+  1507	            st.cross_collateral[scope] = 0.0
+  1508	            summary["n_backstop_transfer"] += 1
+  1509	            summary["outcome_states"].add("backstop")
+  1510	            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
+  1511	            # ALL remaining scopes+positions <= ~0), it is RUIN -> set ruin/time_to_ruin so `ruin`-based
+  1512	            # downstream filters (m06b, etc.) don't treat a wiped account as non-ruined. A multi-scope account
+  1513	            # whose OTHER scopes still hold collateral is NOT ruined by a single-scope backstop (n_backstop_transfer
+  1514	            # still flags it; m08 counts any backstop as wiped).
+  1515	            if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
+  1516	                _ruin(st, md, summary, events, int(ts_ms))   # full ruin finalization (zeros equity, no stale _core_final_eq)
+  1517	        elif eq < maint:
+  1518	            _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks)
+  1519	
+  1520	
+  1521	def _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks):
+  1522	    """ONE HL market-liquidation STEP for the breached cross scope (codex code-r2 #5): close the
+  1523	    most-marginal position by 20% if its notional > 100k and not in cooldown (then sets the 30s
+  1524	    cooldown), else full. The chronological event loop (_advance_between) re-invokes on the next bar
+  1525	    after the cooldown elapses, so the >100k 20%-then-full ladder advances bar-by-bar (interval-
+  1526	    bounded at 1m). Recorded as a market_liq_order FILL with the forced-liq slippage penalty."""
+  1527	    # SINGLE-POINT COOLDOWN ENFORCEMENT (codex code-r5/r6/r7): never issue a liquidation order while
+  1528	    # cooling down. This makes it IMPOSSIBLE for any caller path (price breach, post-funding, terminal
+  1529	    # fold-boundary, or their combinations at the same/sub-minute ts) to fire two orders within 30s.
+  1530	    # The position simply waits; the next eligible 1m bar (>=60s > 30s cooldown) issues the next order.
+  1531	    if ts_ms < st.cooldown_until_ms:
+  1532	        return
+  1533	    coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+  1534	    if not coins:
+  1535	        return
+  1536	    c = max(sorted(coins), key=lambda x: abs(st.positions[x].szi) * (marks.get(x) or st.positions[x].entry_px))
+  1537	    p = st.positions[c]
+  1538	    m = marks.get(c) or p.entry_px
+  1539	    notion = abs(p.szi) * m
+  1540	    # HL ladder: the FIRST liquidation order on the account is 20% (if >100k) and sets the 30s
+  1541	    # cooldown; SUBSEQUENT orders (after the cooldown elapses) are FULL. cooldown_until_ms==0 marks
+  1542	    # "no prior liquidation pending" (reset once the account is healthy for a full segment).
+  1543	    first_step = (st.cooldown_until_ms == 0)
+  1544	    if notion > PARTIAL_LIQ_NOTIONAL and first_step:
+  1545	        close_szi = -p.szi * PARTIAL_LIQ_FRACTION
+  1546	        st.cooldown_until_ms = ts_ms + LIQ_COOLDOWN_MS
+  1547	    else:
+  1548	        close_szi = -p.szi
+  1549	    _liq_close(st, md, c, m, ts_ms, summary=summary, close_szi=close_szi, scope=scope)
+  1550	
+  1551	
+  1552	def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
+  1553	    """Close via a forced market-liq order with uncapped full-order impact.
+  1554	
+  1555	    Hyperliquid sends these orders to the book and charges no clearance fee.
+  1556	    Thirty bps is a conservative floor, not a size-independent execution
+  1557	    price: larger orders also pay the normal half-spread + full order/ADV impact
+  1558	    curve with no participation cap.
+  1559	    """
+  1560	    p = st.positions.get(coin)
+  1561	    if p is None:
+  1562	        return
+  1563	    if close_szi is None:
+  1564	        close_szi = -p.szi
+  1565	    side = 1 if close_szi > 0 else -1
+  1566	    close_notional = abs(close_szi) * mark
+  1567	    liq = md.liquidity(coin, ts_ms)
+  1568	    adv = float(liq.get("adv", 0.0) or 0.0)
+  1569	    participation = close_notional / adv if adv > 0 else 1.0
+  1570	    half_spread_bps = float(liq.get("half_spread_bps", DEFAULT_HALF_SPREAD_BPS))
+  1571	    impact_k = float(liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS))
+  1572	    impact_alpha = float(liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA))
+  1573	    curve_slip_bps = half_spread_bps + impact_k * (participation ** impact_alpha)
+  1574	    forced_slip_bps = max(FORCED_LIQ_SLIP_BPS, curve_slip_bps)
+  1575	    fill_px = mark * (1 + side * forced_slip_bps / 1e4)
+  1576	    # realized PnL on the closed portion (forced-liq order; no fee, design D12)
+  1577	    realized = min(abs(close_szi), abs(p.szi)) * (fill_px - p.entry_px) * (1 if p.szi > 0 else -1)
+  1578	    if p.mode == "cross":
+  1579	        sc = scope or coin_dex(coin)
+  1580	        st.cross_collateral[sc] = st.cross_collateral.get(sc, 0.0) + realized
+  1581	    else:
+  1582	        p.isolated_margin += realized
+  1583	    _rt_add(summary, coin, realized=realized)   # CHANGE A: forced-liq realized (no fee on liq orders)
+  1584	    new_szi = p.szi + close_szi
+  1585	    fl = summary.get("_fills_ref")
+  1586	    if fl is not None:
+  1587	        fl.append({"entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
+  1588	                   "our_ts": ts_ms, "source_ts": ts_ms, "side": "buy" if side > 0 else "sell",
+  1589	                   "our_fill_size": float(close_szi), "our_fill_px": float(fill_px), "ref_mark": float(mark),
+  1590	                   "half_spread_bps": half_spread_bps,
+  1591	                   "impact_bps": float(forced_slip_bps - half_spread_bps), "fee": 0.0,
+  1592	                   "fill_type": "market_liq_order", "capacity_capped": False, "margin_mode": p.mode})
+  1593	    summary["n_market_liq_orders"] += 1
+  1594	    summary["outcome_states"].add("position_liquidated")
+  1595	    if abs(new_szi) < 10 ** (-md.meta.szdec(coin)):
+  1596	        if p.mode == "isolated":
+  1597	            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + max(0.0, p.isolated_margin)
+  1598	        del st.positions[coin]
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m08_survival.py | sed -n '46,88p;95,156p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    46	    # stress run params (design §3)
+    47	    stress_slippage_band: str = "high"
+    48	    stress_adl: bool = True
+    49	    # entity_pre_m8_max = M6b_quality x M4_confidence x 1.0(survival placeholder) x M9_static_cap.
+    50	    m9_static_per_entity_cap: float = 0.10     # the pre-M9 static cap (NOT the suspicious-cohort cap)
+    51	    # Survival/ruin verdicts are bankroll-scale-dependent; production should pass the real bankroll.
+    52	    nominal_capital: float = 10_000.0          # reference bankroll for the absolute stress slice
+    53	    # multi-slice survival probe (design §3): test at the pre-M8 max, a smaller slice, and the min size
+    54	    smaller_slice_frac: float = 0.25           # "survives at a smaller slice" probe
+    55	    min_slice_capital: float = 50.0            # ~ min deployable subaccount (HL min-notional regime)
+    56	    # STALENESS gate (audit 2026-07-10 P0#1; Alberto delegated the cutoff TG 11133): a wallet must have OPENED
+    57	    # activity within the last N days BEFORE the fold decision (test_start) to be eligible to survive; else KILL.
+    58	    # 14d = the fold VAL window (last 14d of pretest) AND matches the live rotation monitor's dead-leader
+    59	    # eviction (>10d inactive). A leader that went dark before the decision is not copyable.
+    60	    staleness_max_days: int = 14
+    61	    inferential_layer_active: bool = False
+    62	    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
+    63	    fixed_target_exposure: float = 0.10
+    64	    # outcome -> tier
+    65	    indeterminate_heavy_frac: float = 0.25     # >this share of indeterminate minutes -> cap at UNCERTAIN
+    66	
+    67	
+    68	TIER_ORDER = {"kill": 0, "suspicious": 1, "uncertain": 2, "full_weight": 3}
+    69	TIER_MULT = None  # set per-manifest
+    70	
+    71	
+    72	def _run_stress(actions: pd.DataFrame, md: E.MarketData, start_equity: float, t0: int, t1: int,
+    73	                m: M8Manifest) -> dict:
+    74	    """One counterfactual-survival run: M7 at the STRESS slice (high slippage + adl, causal carry-in,
+    75	    NO source top-ups -- the replica lives on its slice + PnL). Returns the typed outcome."""
+    76	    params = E.EngineParams(
+    77	        slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
+    78	        start_policy="causal_carry_in", sizing_mode=m.sizing_mode,
+    79	        fixed_target_exposure=m.fixed_target_exposure,
+    80	    )
+    81	    res = E.step_subaccount(actions, md, start_equity, params, end_ts_ms=t1, start_ts_ms=t0)
+    82	    s = res["summary"]
+    83	    window_min = max((t1 - t0) / 60_000.0, 1.0)
+    84	    wiped = bool(s["ruin"]) or s["n_backstop_transfer"] > 0 or s["final_equity"] <= 0
+    85	    return {
+    86	        "wiped": wiped, "ruin": bool(s["ruin"]), "backstop": s["n_backstop_transfer"] > 0,
+    87	        "account_ruin": "account_ruin" in s["outcome_states"], "final_equity": s["final_equity"],
+    88	        "roe": s["roe_engine"], "max_dd": s["max_dd"], "time_to_ruin_ms": s["time_to_ruin_ms"],
+    95	def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dict:
+    96	    """Counterfactual-survival -> mechanical tier + sizing signals (design §1/§3; codex r1#1,#2).
+    97	    - survives at pre_m8_max -> full_weight (UNCERTAIN only if indeterminate-heavy).
+    98	    - wiped at pre_m8_max BUT survives at the MINIMUM tradable size -> copyability_fail_at_stress: a
+    99	      SIZING signal (M9 clamps the max slice); the tier stays SURVIVAL-OK = full_weight (the wallet
+   100	      isn't dangerous, our chosen slice was too big -- NOT downgraded). max_survivable_slice refined by
+   101	      the smaller-slice probe.
+   102	    - wiped even at the MINIMUM size (no positive slice survives) -> KILL (mechanical).
+   103	    Inferential SUSPICIOUS/UNCERTAIN downgrades are applied SEPARATELY (§4 scorers via _worst_tier)."""
+   104	    # AUDIT 2026-07-10 (P0#1, Alberto-delegated cutoff): STALENESS gate. A wallet whose most recent in-window
+   105	    # action is > staleness_max_days before the decision (t1 = test_start) went dark and is NOT copyable -> KILL,
+   106	    # BEFORE any stress (old actions would otherwise "survive" on unchanged equity). Empty stream is handled by
+   107	    # the n_fills gate below; here we catch the "traded early then dark" case.
+   108	    _none_base = {"indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+   109	    if len(actions):
+   110	        last_ts_raw = pd.to_numeric(actions["ts"], errors="coerce").max()
+   111	        if not pd.notna(last_ts_raw):
+   112	            # non-empty stream but no parseable ts -> no usable activity signal -> fail closed (codex hardening).
+   113	            return {"tier": "kill", "survival_outcome": "bad_ts_data_gap",
+   114	                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **_none_base}
+   115	        last_ts = int(last_ts_raw)
+   116	        if (t1 - last_ts) > m.staleness_max_days * 86_400_000:
+   117	            return {"tier": "kill", "survival_outcome": "stale_inactive",
+   118	                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+   119	                    "last_action_ts": last_ts, "staleness_days":
+   120	                    round((t1 - last_ts) / 86_400_000.0, 1), **_none_base}
+   121	    big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
+   122	    base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
+   123	            "stress_max_dd": big["max_dd"]}
+   124	    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
+   125	    # happens when the action stream is empty / fully filtered, OR when every action has NaN/invalid sizing so
+   126	    # M7 skips it. Such a wallet must NOT come out "survived / full_weight" on unchanged start equity. Fail
+   127	    # closed to KILL (data-gap) so it is excluded from the live cohort.
+   128	    if int(big.get("n_fills", 0)) == 0:
+   129	        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
+   130	                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+   131	    heavy = big["indeterminate_frac"] > m.indeterminate_heavy_frac
+   132	    if not big["wiped"]:
+   133	        return {"tier": "uncertain" if heavy else "full_weight", "survival_outcome": "survived",
+   134	                "copyability_fail_at_stress": False, "max_survivable_slice": pre_m8_max_capital, **base}
+   135	    # wiped at pre_m8_max -> the MIN-size probe decides KILL vs copyability (codex r1#2: KILL only when
+   136	    # even the smallest positive slice fails -- min is the smallest, so min-wipe == no slice survives).
+   137	    mn = _run_stress(actions, md, m.min_slice_capital, t0, t1, m)
+   138	    # codex completion (2026-07-10): the min probe must also have EVIDENCE. `wiped=False` on a zero-fill min run
+   139	    # is evidence-less "survival" -> KILL, not copyability_fail (which would leak a 0.25/1.0 multiplier).
+   140	    if mn["wiped"] or int(mn.get("n_fills", 0)) == 0:
+   141	        return {"tier": "kill",
+   142	                "survival_outcome": ("ruin_at_min_size" if mn["wiped"] else "no_fills_at_min_data_gap"),
+   143	                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+   144	    # survives at min -> copyability SIZING signal, tier stays survival-OK (codex r1#1: NOT downgraded).
+   145	    # refine max_survivable with a smaller-slice probe ONLY if it sits ABOVE min (codex r2#1: never
+   146	    # probe below the min slice -- min already survived, so the floor is min_slice_capital).
+   147	    smaller = pre_m8_max_capital * m.smaller_slice_frac
+   148	    surv_slice = m.min_slice_capital
+   149	    if smaller > m.min_slice_capital:
+   150	        small = _run_stress(actions, md, smaller, t0, t1, m)
+   151	        if not small["wiped"] and int(small.get("n_fills", 0)) > 0:  # codex: only raise the slice on real evidence
+   152	            surv_slice = smaller
+   153	    return {"tier": "uncertain" if heavy else "full_weight",
+   154	            "survival_outcome": "copyability_fail_at_stress",
+   155	            "copyability_fail_at_stress": True, "max_survivable_slice": surv_slice, **base}
+   156	
+
+codex
+Recommend **(a) ACCEPT the model without ADL** for SURVIVAL-tier.
+
+Reason: in this engine, survival is already decided on hard wipe signals: `ruin`, any `n_backstop_transfer`, or `final_equity <= 0` in [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:84). m07 already scans adverse candle extremes, treats indeterminate wick breaches as breaches, runs liquidation, applies forced-liq slippage, and wipes via backstop below `2/3 * maintenance` in [v15_m07_engine.py](/Users/hermes/quants-lab/research/v15/v15_m07_engine.py:1327) and [v15_m07_engine.py](/Users/hermes/quants-lab/research/v15/v15_m07_engine.py:1461).
+
+For pass/fail danger, real ADL is probably **not material beyond that** unless you can name a path where:
+
+1. the copier does **not** breach maintenance/backstop under adverse marks,
+2. an exchange-wide liquidation shortfall triggers ADL,
+3. the copier is selected in the ADL queue,
+4. the ADL forced close/haircut is large enough to push the copier from survive to wipe.
+
+That fourth case can exist in theory, but m07 does not have the required observables: exchange-wide liquidation shortfall, insurance/backstop state, ADL queue priority, bankruptcy prices, and counterparty-side selection. Without those, “real ADL” would be a synthetic extra haircut, not a faithful HL ADL model.
+
+So I would keep the current fail-loud behavior: `adl_stress_requested=True`, `adl_stress_applied=False`, `n_adl_stress=0`, and document the exact contract: **“survives stress” means survives high slippage, adverse latency drift, adverse breach marks, liquidation ladder, forced-liq slippage, funding/MTM, and backstop wipe; it excludes ADL/socialized deleveraging.**
+
+If you later choose (b), the minimal version is not “real ADL”; it is a conservative heuristic: during `adl_stress`, detect extreme adverse/low-liquidity minutes, force-close profitable exposed positions at an adverse ADL price/haircut, increment `n_adl_stress`, emit an event, then immediately rerun maintenance/backstop checks. That is probably a medium change with tests around cross/isolated accounting and tier flips. I would not block SURVIVAL-tier on it.
+tokens used
+47.739
+Recommend **(a) ACCEPT the model without ADL** for SURVIVAL-tier.
+
+Reason: in this engine, survival is already decided on hard wipe signals: `ruin`, any `n_backstop_transfer`, or `final_equity <= 0` in [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:84). m07 already scans adverse candle extremes, treats indeterminate wick breaches as breaches, runs liquidation, applies forced-liq slippage, and wipes via backstop below `2/3 * maintenance` in [v15_m07_engine.py](/Users/hermes/quants-lab/research/v15/v15_m07_engine.py:1327) and [v15_m07_engine.py](/Users/hermes/quants-lab/research/v15/v15_m07_engine.py:1461).
+
+For pass/fail danger, real ADL is probably **not material beyond that** unless you can name a path where:
+
+1. the copier does **not** breach maintenance/backstop under adverse marks,
+2. an exchange-wide liquidation shortfall triggers ADL,
+3. the copier is selected in the ADL queue,
+4. the ADL forced close/haircut is large enough to push the copier from survive to wipe.
+
+That fourth case can exist in theory, but m07 does not have the required observables: exchange-wide liquidation shortfall, insurance/backstop state, ADL queue priority, bankruptcy prices, and counterparty-side selection. Without those, “real ADL” would be a synthetic extra haircut, not a faithful HL ADL model.
+
+So I would keep the current fail-loud behavior: `adl_stress_requested=True`, `adl_stress_applied=False`, `n_adl_stress=0`, and document the exact contract: **“survives stress” means survives high slippage, adverse latency drift, adverse breach marks, liquidation ladder, forced-liq slippage, funding/MTM, and backstop wipe; it excludes ADL/socialized deleveraging.**
+
+If you later choose (b), the minimal version is not “real ADL”; it is a conservative heuristic: during `adl_stress`, detect extreme adverse/low-liquidity minutes, force-close profitable exposed positions at an adverse ADL price/haircut, increment `n_adl_stress`, emit an event, then immediately rerun maintenance/backstop checks. That is probably a medium change with tests around cross/isolated accounting and tier flips. I would not block SURVIVAL-tier on it.

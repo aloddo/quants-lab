@@ -637,9 +637,16 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     # until ADL is implemented or the stress model is accepted without it (Alberto decision).
     summary["adl_stress_requested"] = bool(params.adl_stress)
     summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+    # DECISION 2026-07-10 (Alberto delegated -> codex ACCEPT): real ADL is NOT material beyond the existing wipe
+    # signals for a pass/fail survival tier, and a faithful HL ADL needs observables m07 lacks (exchange-wide
+    # liquidation shortfall, insurance/backstop state, ADL queue priority, bankruptcy prices). CONTRACT: "survives
+    # stress" = survives high slippage + adverse latency drift + adverse breach marks + liquidation ladder +
+    # forced-liq slippage + funding/MTM + backstop wipe; it EXCLUDES ADL/socialized deleveraging (a known, bounded
+    # understatement of danger). If ever needed, implement a heuristic ADL haircut (medium change) later; do NOT
+    # block the survival tier on it. Record: projects/quant/decisions/2026-07-10-m07-adl-accept.
     if params.adl_stress:
-        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
-                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+        logger.warning("m07: adl_stress=True but ADL NOT modeled (accepted 2026-07-10). Stress excludes ADL; "
+                       "flagged adl_stress_applied=False. See decisions/2026-07-10-m07-adl-accept.")
     # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
     # zero actions (codex code-r2 #2). Falls back to the first action time, then end_ts.
     if start_ts_ms is not None:
