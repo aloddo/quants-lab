@@ -88,6 +88,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import math
+
 import numpy as np
 import pandas as pd
 import pymongo
@@ -112,8 +114,33 @@ S3_FILLS_DIR = Path("/Users/hermes/quants-lab/app/data/hl_s3_fills_v2")
 S3_BY_WALLET_DIR = Path("/Users/hermes/quants-lab/app/data/hl_s3_fills_v2_by_wallet")
 FUNDING_DIR = Path("/Users/hermes/quants-lab/app/data/v13/raw_funding_cache_20k")
 LEDGER_DIR = Path("/Users/hermes/quants-lab/app/data/v13/raw_ledger_cache_20k")
+# Self-healing parquet fallback sources (2026-07-10 fix): the JSON per-wallet caches above are written
+# by v13_s3_ledger_downloader but were EMPTY, so m01 silently reconstructed with zero funding/ledger.
+# When a wallet has no JSON cache we read the raw parquet directly (per-wallet funding_cache + the
+# monolithic ledger table) and reshape to the SAME record contract the JSON loaders emit. This makes
+# m01 self-sufficient: a dead JSON cache can never again silently zero the funding/ledger input.
+FUNDING_PARQUET_DIR = Path("/Users/hermes/quants-lab/app/data/v13/funding_cache")
+LEDGER_PARQUET = Path("/Users/hermes/quants-lab/app/data/raw/ledger/ledger_20k.parquet")
+# Delta fields ledger_cash_delta() reads; the parquet 'coin' column carries the token (mapped to delta['token']).
+_LEDGER_DELTA_FIELDS = (
+    "usdc", "usdcValue", "amount", "fee", "user", "destination",
+    "sourceDex", "destinationDex", "toPerp", "netWithdrawnUsd", "operation",
+    "dex",  # ledger_cash_delta reads delta['dex'] for activateDexAbstraction (codex m01fix)
+)
+_LEDGER_PARQUET_CACHE = {"df": None}  # lazy single load of the 200MB monolith, filtered per wallet
 ANCHOR_PARQUET = Path("/Users/hermes/quants-lab/app/data/v13/wallet_anchor_state.parquet")
 MONGO_URI = "mongodb://localhost:27017/"
+
+
+def _num(v, default: float = 0.0) -> float:
+    """NaN-safe numeric coercion. The idiom float(x or 0) does NOT sanitize parquet nulls: np.nan is
+    truthy so `nan or 0` -> nan -> float(nan)=nan, silently poisoning equity/PnL sums. Returns default
+    for None/NaN/inf/unparseable; otherwise the finite float. (2026-07-10 fail-closed fix.)"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
 
 # ALL perp dexes are in scope (Alberto 2026-05-30). Any coin with a "<dex>:" prefix
 # (or unprefixed main) is reconstructed; flx and km are INCLUDED. Marks come from a
@@ -788,7 +815,27 @@ def _order_fill_burst(group: list[dict]) -> tuple[list[dict], bool]:
 
 
 def order_wallet_fills_causally(fills: list[dict]) -> list[dict]:
-    """Causally order fills and attach a stable per-wallet ``fill_seq``."""
+    """Causally order fills and attach a stable per-wallet ``fill_seq``.
+
+    DEDUP (2026-07-10 fix): funding/ledger loaders dedup but fills did not, so a duplicated fill row in
+    an overlapping S3 partition double-counted size + closedPnl + fee into equity. Drop exact duplicates:
+    prefer the trade id (tid) when present (unique per HL fill); else the full identifying tuple. This is
+    order-independent and only removes rows that are byte-identical on their accounting fields."""
+    seen: set[tuple] = set()
+    deduped: list[dict] = []
+    for f in fills:
+        tid = int(f.get("tid", 0) or 0)
+        if tid:
+            key = ("tid", tid)
+        else:
+            key = ("row", int(f["time"]), str(f["coin"]), str(f.get("side", "")),
+                   float(f.get("size", 0.0)), float(f.get("price", 0.0)),
+                   float(f.get("startPosition", 0.0)), float(f.get("closedPnl", 0.0)))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    fills = deduped
     groups: dict[tuple[int, str], list[dict]] = {}
     for f in fills:
         groups.setdefault((int(f["time"]), str(f["coin"])), []).append(f)
@@ -828,7 +875,12 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
             coin = str(rec["coin"])
             if not coin_is_allowed_perp(coin):
                 continue
-            size = float(rec["size"])
+            size = _num(rec["size"], default=float("nan"))
+            price = _num(rec["price"], default=float("nan"))
+            # Fail CLOSED on a malformed fill: a NaN price/size cannot be booked (0 would be worse than
+            # dropping). Skip it so a corrupt row never poisons position/cash. (2026-07-10 fix.)
+            if not (math.isfinite(size) and math.isfinite(price)):
+                continue
             try:
                 tid = int(rec.get("tid", 0) or 0)
             except (TypeError, ValueError):
@@ -837,15 +889,16 @@ def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
                 "coin": coin,
                 "side": rec["side"],
                 "size": size,
-                "price": float(rec["price"]),
+                "price": price,
                 "time": int(rec["time"]),
                 "tid": tid,
                 "dir": str(rec.get("dir", "") or ""),
-                "closedPnl": float(rec.get("closedPnl", 0) or 0),
-                "startPosition": float(rec.get("startPosition", 0) or 0),
-                "fee": float(rec.get("fee", 0) or 0),
-                "builderFee": float(rec.get("builderFee", 0) or 0),
-                "deployerFee": float(rec.get("deployerFee", 0) or 0),
+                # NaN-safe: parquet nulls survive `float(x or 0)` as NaN and poison equity/PnL sums.
+                "closedPnl": _num(rec.get("closedPnl", 0)),
+                "startPosition": _num(rec.get("startPosition", 0)),
+                "fee": _num(rec.get("fee", 0)),
+                "builderFee": _num(rec.get("builderFee", 0)),
+                "deployerFee": _num(rec.get("deployerFee", 0)),
             }
             d["signed_sz"] = size if rec["side"] == "B" else -size
             d["is_liquidation"] = d["dir"] in LIQUIDATION_DIRS
@@ -902,7 +955,8 @@ def load_wallet_funding(wallet: str, t0: int, t1: int) -> list[dict]:
     wallet_lc = wallet.lower()
     seen: set[tuple[int, str]] = set()
     out: list[dict] = []
-    for fp in sorted(glob.glob(str(FUNDING_DIR / f"{wallet_lc}_*.json"))):
+    json_files = sorted(glob.glob(str(FUNDING_DIR / f"{wallet_lc}_*.json")))
+    for fp in json_files:
         try:
             with open(fp) as f:
                 data = json.load(f)
@@ -921,6 +975,26 @@ def load_wallet_funding(wallet: str, t0: int, t1: int) -> list[dict]:
                 continue
             seen.add(key)
             out.append(rec)
+    # Self-healing fallback: JSON path produced NO records (dir missing, OR a dead/empty JSON file
+    # exists) -> read the raw parquet funding cache and reshape to the SAME {time,hash,delta} contract.
+    # Gated on `not out` (not `not json_files`) so an empty JSON file can't skip the heal. (2026-07-10.)
+    if not out:
+        for pf in sorted(FUNDING_PARQUET_DIR.glob(f"{wallet_lc}_*.parquet")):
+            try:
+                fd = pd.read_parquet(pf)
+            except Exception:
+                continue
+            for r in fd.itertuples(index=False):
+                t = int(r.time_ms)
+                if t < t0 or t > t1:
+                    continue
+                coin = str(r.coin)
+                key = (t, coin)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"time": t, "hash": "",
+                            "delta": {"type": "funding", "coin": coin, "usdc": str(r.usdc_signed)}})
     out.sort(key=lambda x: int(x["time"]))
     return out
 
@@ -936,7 +1010,8 @@ def load_wallet_ledger(wallet: str, t0: int, t1: int) -> list[dict]:
     wallet_lc = wallet.lower()
     seen: set[tuple] = set()
     out: list[dict] = []
-    for lf in sorted(glob.glob(str(LEDGER_DIR / f"{wallet_lc}_*.json"))):
+    json_files = sorted(glob.glob(str(LEDGER_DIR / f"{wallet_lc}_*.json")))
+    for lf in json_files:
         try:
             with open(lf) as f:
                 data = json.load(f)
@@ -958,6 +1033,38 @@ def load_wallet_ledger(wallet: str, t0: int, t1: int) -> list[dict]:
                 continue
             seen.add(key)
             out.append(e)
+    # Self-healing fallback: JSON path produced NO records (dir missing OR dead/empty JSON) -> reshape
+    # rows from the monolithic ledger parquet into the SAME {time, hash, delta:{...}} contract. The
+    # parquet 'coin' column carries the token, mapped to delta['token'] (ledger_cash_delta branches on
+    # delta['token']). Gated on `not out` so an empty JSON file can't skip the heal. (2026-07-10 fix.)
+    if not out:
+        lg = _LEDGER_PARQUET_CACHE["df"]
+        if lg is None and LEDGER_PARQUET.exists():
+            lg = pd.read_parquet(LEDGER_PARQUET)
+            _LEDGER_PARQUET_CACHE["df"] = lg
+        if lg is not None:
+            sub = lg[lg["wallet"].astype(str).str.lower() == wallet_lc]
+            for r in sub.itertuples(index=False):
+                t = int(r.time)
+                if t < t0 or t > t1:
+                    continue
+                delta = {"type": str(r.type)}
+                coin = getattr(r, "coin", None)
+                if coin is not None and not (isinstance(coin, float) and math.isnan(coin)) and str(coin) != "":
+                    delta["token"] = str(coin)
+                for fld in _LEDGER_DELTA_FIELDS:
+                    v = getattr(r, fld, None)
+                    if v is None or (isinstance(v, float) and math.isnan(v)):
+                        continue
+                    delta[fld] = v
+                h = getattr(r, "hash", "")
+                h = "" if (h is None or (isinstance(h, float) and math.isnan(h))) else str(h)
+                e = {"time": t, "hash": h, "delta": delta}
+                key = (t, h, json.dumps(delta, sort_keys=True, default=str))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(e)
     out.sort(key=lambda x: int(x["time"]))
     return out
 
@@ -1116,16 +1223,24 @@ def ledger_cash_delta(e: dict, wallet_lc: str) -> LedgerDelta:
         elif d.get("token") == "USDC":
             amt = _f("amount")
         else:
-            # A non-USDC perp transfer without a USD valuation cannot be
-            # reconstructed safely. Quarantine rather than treating token
-            # quantity as dollars.
+            # A non-USDC perp transfer without a USD valuation cannot be reconstructed safely.
+            # Quarantine rather than treating token quantity as dollars. NOTE the asymmetry vs the
+            # cash path above is INTENTIONAL and both directions are fail-closed: the cash path uses
+            # _perp_leg (empty dex -> DON'T move cash, avoid fabricating a move); this quarantine path
+            # keeps dex_in_scope (empty/unknown dex -> COULD be perp -> quarantine, avoid trusting a
+            # move we cannot value). Empty dex is treated as maybe-perp here on purpose. (codex m01fix.)
             touches_perp = dex_in_scope(src_dex) or dex_in_scope(dst_dex)
             return LedgerDelta(0.0, 0.0, unknown=touches_perp)
         fee = _f("fee")
+        # 2026-07-10 fix: an EMPTY/unknown dex is not PROVABLY an in-scope perp dex. dex_in_scope("")
+        # returned True (only "spot"/"@" are out), so an empty-sourceDex USDC send wrongly moved perp
+        # cash. Require a non-empty, in-scope dex before adjusting the reconstructed perp cash.
+        def _perp_leg(dex: str) -> bool:
+            return bool(dex) and dex_in_scope(dex)
         c = 0.0
-        if user == wallet_lc and dex_in_scope(src_dex):
+        if user == wallet_lc and _perp_leg(src_dex):
             c -= amt + fee
-        if dest == wallet_lc and dex_in_scope(dst_dex):
+        if dest == wallet_lc and _perp_leg(dst_dex):
             c += amt
         return LedgerDelta(c, c)
     if k == "spotTransfer":
@@ -1470,6 +1585,12 @@ def compute_eq_at(
         pos_value += sz * mark
         gross_position_notional += abs(sz * mark)
     equity = cash + pos_value
+    # 2026-07-10 fix (daily path non-finite guard): the per-EVENT path fails closed on non-finite
+    # cash/equity, but this daily path did not -> a NaN/inf ledger/funding delta (e.g. usdc="NaN") could
+    # flow a NaN equity into the emitted EOD parquet with recon_incomplete=False. Force the day INCOMPLETE
+    # (via anchor_unmarkable, which drives recon_incomplete) so it is flagged, never trusted.
+    if not (np.isfinite(cash) and np.isfinite(equity)):
+        anchor_unmarkable = max(anchor_unmarkable, 1)
     return WalkResult(
         cash=cash,
         positions=positions,
@@ -1743,10 +1864,11 @@ def reconstruct_wallet(args: tuple) -> dict:
         )
         ext_stream.sort(key=lambda x: x[0])
         cc = today_crosscheck(
-            wallet, ext_stream, ext_fills, anchor, wallet_lc, window_anchors, df_out
+            wallet, ext_stream, ext_fills, anchor, wallet_lc, window_anchors, df_out,
+            causal_seed=causal_seed,
         )
         pv = position_validation(
-            ext_stream, ext_fills, anchor, wallet_lc, window_anchors
+            ext_stream, ext_fills, anchor, wallet_lc, window_anchors, causal_seed=causal_seed
         )
         audit.update(cc)
         audit.update(pv)
@@ -1865,7 +1987,8 @@ def segment_reconcile(
 
 
 def today_crosscheck(
-    wallet, ext_stream, ext_fills, anchor: AnchorState, wallet_lc, window_anchors, df_out
+    wallet, ext_stream, ext_fills, anchor: AnchorState, wallet_lc, window_anchors, df_out,
+    causal_seed: bool = True,
 ) -> dict:
     """Accuracy #3: cross-check the reconstruction against authoritative snapshots.
 
@@ -1893,7 +2016,8 @@ def today_crosscheck(
     if window_anchors:
         a_t, a_v = window_anchors[-1]
         wr = compute_eq_at(
-            ext_stream, ext_fills, anchor, wallet_lc, anchor.fetched_ms, a_t, a_v
+            ext_stream, ext_fills, anchor, wallet_lc, anchor.fetched_ms, a_t, a_v,
+            causal_seed=causal_seed,
         )
         recon_at_fetch = wr.equity
     out["recon_equity_at_fetch_usd"] = recon_at_fetch
@@ -1931,7 +2055,7 @@ def today_crosscheck(
 
 
 def position_validation(
-    stream, fills, anchor: AnchorState, wallet_lc, window_anchors
+    stream, fills, anchor: AnchorState, wallet_lc, window_anchors, causal_seed: bool = True
 ) -> dict:
     """Accuracy #4: reconstructed per-coin positions AT the anchor-parquet fetch
     time vs the parquet positions_json (main+xyz). Both reference the SAME
@@ -1962,7 +2086,8 @@ def position_validation(
             "position_validation_status": f"fills_end_{gap_h:.0f}h_before_anchor",
         }
     a_t, a_v = window_anchors[-1]
-    wr = compute_eq_at(stream, fills, anchor, wallet_lc, anchor.fetched_ms, a_t, a_v)
+    wr = compute_eq_at(stream, fills, anchor, wallet_lc, anchor.fetched_ms, a_t, a_v,
+                       causal_seed=causal_seed)
     recon = wr.positions
     mismatches = 0
     checked = 0
@@ -2193,7 +2318,7 @@ def compute_event_equity(
         m = get_mark(coin, active_anchor_ts)
         if m is not None:
             cash -= sp * m  # mirror the anchor cash snap for this carried-in coin
-            last_val[coin] = sp * m
+            last_val[coin] = m  # store PRICE (frozen re-values at current size)
             last_val_ts.setdefault(coin, active_anchor_ts)
         else:
             # codex m01 P1a: carry-in coin unmarkable at the anchor -> its anchor value was NOT removed from
@@ -2248,6 +2373,10 @@ def compute_event_equity(
             active_anchor_ts = a_t
             active_anchor_eq = a_v
             anchor_snap_incomplete[0] = False   # codex m01 P1a: fresh cycle, re-assess snap completeness
+            # 2026-07-10 fix (frozen P1#4): the last-known-price map is CYCLE-SCOPED. A stale price for a
+            # coin closed in a prior cycle must NOT value a same-named position reopened in this cycle.
+            last_val.clear()
+            last_val_ts.clear()
             seeded = seed_positions(fills, anchor, a_t, causal_cutoff=True)
             anchor_pos_value = 0.0
             for c, sz in seeded.items():
@@ -2256,7 +2385,7 @@ def compute_event_equity(
                 m = get_mark(c, a_t)
                 if m is not None:
                     anchor_pos_value += sz * m
-                    last_val[c] = sz * m
+                    last_val[c] = m            # store PRICE (frozen re-values at current size)
                     last_val_ts[c] = a_t
                 else:
                     # codex m01 P1a: seeded position unmarkable at the anchor -> its value is NOT subtracted
@@ -2302,14 +2431,20 @@ def compute_event_equity(
             m = get_mark(c, ts, causal=causal_mark)
             if m is None:
                 n_unmarkable += 1
-                fv = last_val.get(c, 0.0)
-                frozen_value += fv
-                if c in last_val_ts:
-                    frozen_age = max(frozen_age, ts - last_val_ts[c])
+                # 2026-07-10 fix (frozen P0/P1): last_val stores the last known PRICE, so the frozen
+                # value re-prices at the CURRENT size. Previously it stored the full VALUE at the last
+                # markable size, so a size change during a mark gap double-counted (e.g. sell 9 of 10
+                # while unmarkable -> frozen still showed all 10). A coin never priced in this cycle has
+                # no last price -> contributes 0 to frozen (unchanged PARTIAL_MTM contract; disclosed via
+                # markable_all=False), it is NOT fabricated into equity.
+                lp = last_val.get(c)
+                if lp is not None:
+                    frozen_value += sz * lp
+                    if c in last_val_ts:
+                        frozen_age = max(frozen_age, ts - last_val_ts[c])
                 continue
-            val = sz * m
-            pos_value += val
-            last_val[c] = val
+            pos_value += sz * m
+            last_val[c] = m  # store PRICE, not value
             mk = ts // 60_000 * 60_000 - (60_000 if causal_mark else 0)
             last_val_ts[c] = mk
             mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
