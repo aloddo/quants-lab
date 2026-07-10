@@ -53,6 +53,11 @@ class M8Manifest:
     # multi-slice survival probe (design §3): test at the pre-M8 max, a smaller slice, and the min size
     smaller_slice_frac: float = 0.25           # "survives at a smaller slice" probe
     min_slice_capital: float = 50.0            # ~ min deployable subaccount (HL min-notional regime)
+    # STALENESS gate (audit 2026-07-10 P0#1; Alberto delegated the cutoff TG 11133): a wallet must have OPENED
+    # activity within the last N days BEFORE the fold decision (test_start) to be eligible to survive; else KILL.
+    # 14d = the fold VAL window (last 14d of pretest) AND matches the live rotation monitor's dead-leader
+    # eviction (>10d inactive). A leader that went dark before the decision is not copyable.
+    staleness_max_days: int = 14
     inferential_layer_active: bool = False
     sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
     fixed_target_exposure: float = 0.10
@@ -96,6 +101,23 @@ def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dic
       the smaller-slice probe.
     - wiped even at the MINIMUM size (no positive slice survives) -> KILL (mechanical).
     Inferential SUSPICIOUS/UNCERTAIN downgrades are applied SEPARATELY (§4 scorers via _worst_tier)."""
+    # AUDIT 2026-07-10 (P0#1, Alberto-delegated cutoff): STALENESS gate. A wallet whose most recent in-window
+    # action is > staleness_max_days before the decision (t1 = test_start) went dark and is NOT copyable -> KILL,
+    # BEFORE any stress (old actions would otherwise "survive" on unchanged equity). Empty stream is handled by
+    # the n_fills gate below; here we catch the "traded early then dark" case.
+    _none_base = {"indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+    if len(actions):
+        last_ts_raw = pd.to_numeric(actions["ts"], errors="coerce").max()
+        if not pd.notna(last_ts_raw):
+            # non-empty stream but no parseable ts -> no usable activity signal -> fail closed (codex hardening).
+            return {"tier": "kill", "survival_outcome": "bad_ts_data_gap",
+                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **_none_base}
+        last_ts = int(last_ts_raw)
+        if (t1 - last_ts) > m.staleness_max_days * 86_400_000:
+            return {"tier": "kill", "survival_outcome": "stale_inactive",
+                    "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+                    "last_action_ts": last_ts, "staleness_days":
+                    round((t1 - last_ts) / 86_400_000.0, 1), **_none_base}
     big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
     base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
             "stress_max_dd": big["max_dd"]}

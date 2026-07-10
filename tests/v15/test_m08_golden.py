@@ -56,6 +56,27 @@ def test_min_probe_zero_fills_fail_closed(monkeypatch):
     assert out["tier"] == "kill" and out["survival_outcome"] == "no_fills_at_min_data_gap"
 
 
+def test_p0_1_stale_wallet_killed(monkeypatch):
+    # last in-window action 20 days before the decision (t1) -> stale (>14d) -> KILL before any stress.
+    # _run_stress must NOT be called for a stale wallet.
+    called = {"n": 0}
+    monkeypatch.setattr(M8, "_run_stress", lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
+    t1 = T0 + 60 * DAY
+    acts = pd.DataFrame({"ts": [t1 - 20 * DAY]})  # dark for 20 days before decision
+    out = M8.survival_tier(acts, None, T0, t1, 1000.0, M)
+    assert out["tier"] == "kill" and out["survival_outcome"] == "stale_inactive"
+    assert called["n"] == 0  # never stressed
+
+
+def test_p0_1_recent_wallet_proceeds(monkeypatch):
+    # last action 5 days before the decision -> fresh (<14d) -> proceeds to stress (here: survives).
+    _stub(monkeypatch, [(False, 10)])
+    t1 = T0 + 60 * DAY
+    acts = pd.DataFrame({"ts": [t1 - 5 * DAY]})
+    out = M8.survival_tier(acts, None, T0, t1, 1000.0, M)
+    assert out["survival_outcome"] == "survived"
+
+
 def test_p0_3_global_m04_lookahead_fails_closed(tmp_path):
     # run_m08 must refuse the look-ahead global M4 path unless allow_global_m04=True. It reaches the guard
     # after loading the pool + folds, so provide minimal parquets; the guard should raise before M4 load.

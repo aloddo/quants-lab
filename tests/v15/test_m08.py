@@ -37,9 +37,10 @@ M = M8.M8Manifest()
 
 
 def test_survival_full_weight_on_benign_source():
-    # low-leverage source on flat price -> survives the stress slice comfortably -> full_weight.
+    # low-leverage source on flat price, RECENTLY active -> survives the stress slice comfortably -> full_weight.
+    # (action at t1-2d so it passes the 14d staleness gate; staleness is exercised separately in test_m08_golden.)
     md = T7.FakeMarketData(ohlc=_ohlc_flat("BTC"))
-    acts = pd.DataFrame([T7._action("BTC", T0 + 10 * E.MS_MIN, 0.3)])
+    acts = pd.DataFrame([T7._action("BTC", T0 + 18 * DAY, 0.3)])
     out = M8.survival_tier(acts, md, T0, T0 + 20 * DAY, 1000.0, M)
     assert out["tier"] == "full_weight"
     assert out["survival_outcome"] == "survived"
