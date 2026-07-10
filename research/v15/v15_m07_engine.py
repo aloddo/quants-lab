@@ -627,7 +627,10 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     # row was generated for its fold's window, not a stale test run. window_end is the half-open exclusive bound.
     summary["window_start_ms"] = int(_win_lo)
     summary["window_end_ms"] = int(end_ts_ms)
-    summary["n_late_copy_skipped"] = 0
+    # count of COPYABLE (perp, non-spot) actions whose latency-pushed our_ts lands at/after the fold end
+    # (codex P0#1 minor; spot rows are skipped by the loop so they must not inflate this reject count).
+    summary["n_late_copy_skipped"] = sum(
+        1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
     # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
     # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
     # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
@@ -646,9 +649,12 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     else:
         prev_ts = end_ts_ms
 
-    # causal_carry_in: seed the opening position from the first action's pre-state (design D9)
+    # causal_carry_in: seed the opening position from the first action's pre-state (design D9).
+    # AUDIT 2026-07-10 (codex P0#3): seed at the WINDOW START mark (prev_ts), NOT the first action's mark, so
+    # the main loop's first _advance_between(start -> first action) captures any intra-window drawdown/
+    # liquidation on the carried position (seeding at the first-action price skipped it = wrong max_dd/roe/ruin).
     if rows and params.start_policy == "causal_carry_in":
-        _seed_carry_in(st, md, rows[0], params, summary)
+        _seed_carry_in(st, md, rows[0], params, summary, seed_ts=prev_ts)
 
     # FOLLOWER-TRAIL peak init (codex review bug #8): when carrying state into the fold, the breaker peak
     # must start from the REAL marked equity at fold start, not the caller's (possibly stale) start_equity
@@ -682,10 +688,9 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
         # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
         if our_ts >= int(end_ts_ms):
-            summary["n_late_copy_skipped"] += 1
-            break
+            break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
 
-        _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit)
+        _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
         if summary["ruin"]:
             break
 
@@ -755,7 +760,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
     # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
     if not summary["ruin"] and end_ts_ms > prev_ts:
-        _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary, _emit=_emit)
+        _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
         marks = _marks(st, md, end_ts_ms)
         eq = st.equity(marks)
         peak_equity = max(peak_equity, eq)
@@ -899,19 +904,21 @@ def _te_l1_active(st, md, src_target: dict, ts_ms: int) -> tuple:
     return l1, bool(coins)
 
 
-def _seed_carry_in(st, md, first_row, params, summary):
+def _seed_carry_in(st, md, first_row, params, summary, seed_ts=None):
     """causal_carry_in: seed an opening position to match the source's exposure that pre-exists the
-    window. We back-fill the position to (position_after - signed_size) at the first action, sized to
-    OUR equity by the same target fraction. Conservative: only seeds if the source enters the window
-    already holding (carry_in_status present)."""
+    window. We back-fill the position to (position_after - signed_size), sized to OUR equity by the same
+    target fraction, and mark it at the WINDOW START (seed_ts) so the pre-existing position is exposed to
+    the full in-window path (codex P0#3). Conservative: only seeds if the source enters already holding."""
     status = str(first_row.get("carry_in_status", "") or "")
     if "carry" not in status.lower():
         return
     coin = first_row["coin"]
     if coin_is_spot(coin):
         return
-    our_ts = int(first_row["ts"]) + params.copy_latency_ms
-    mark = md.mark(coin, our_ts)
+    # AUDIT 2026-07-10 (codex P0#3): mark the carried position at the window START (seed_ts), not at the first
+    # action's latency-adjusted time -- otherwise the start->first-action drawdown/liquidation is invisible.
+    ref_ts = int(seed_ts) if seed_ts is not None else int(first_row["ts"]) + params.copy_latency_ms
+    mark = md.mark(coin, ref_ts, causal=True)
     if mark is None or mark != mark or mark <= 0:
         return
     post_pct = _action_target_pct(first_row, params)       # SIGNED exposure% AFTER the first action
@@ -1030,7 +1037,30 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
     cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
     new_szi = cur_szi + delta_szi
     increasing = abs(new_szi) > abs(cur_szi) + 10 ** (-szdec)
-    if increasing:
+    # AUDIT 2026-07-10 (codex P0#5 gate): a REVERSAL (flip through zero) is not "increasing" in magnitude, so it
+    # skipped the IM gate and could open a residual isolated position that drives main NEGATIVE. Gate the flip:
+    # after settling the old leg (main + old_im + realized_close - close_fee), the residual's fresh IM + open_fee
+    # + slip must fit; else REJECT the copy (stay as-is; tracking_error captures the divergence).
+    flipping = (cur_szi != 0.0 and abs(new_szi) > 10 ** (-szdec)
+                and ((cur_szi >= 0) != (new_szi >= 0)))
+    if flipping and mode == "isolated":
+        p0 = st.positions[coin]
+        realized_close = abs(cur_szi) * (fill_px - p0.entry_px) * (1.0 if cur_szi > 0 else -1.0)
+        closed_sz, opened_sz = abs(cur_szi), abs(new_szi)
+        total_sz = closed_sz + opened_sz
+        close_fee = fee * (closed_sz / total_sz) if total_sz > 0 else fee
+        open_fee = fee - close_fee
+        slip_cost = abs(delta_szi) * abs(fill_px - mark)
+        settled_main = st.cross_collateral.get("main", 0.0) + p0.isolated_margin + realized_close - close_fee
+        new_notional = opened_sz * fill_px
+        resid_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
+        if settled_main < resid_im + open_fee + slip_cost:
+            summary["n_rejected"] += 1
+            return
+    # codex r2: a CROSS flip (same-or-smaller residual, so not "increasing") must ALSO pass the cross IM
+    # admissibility gate below (else a reversal can realize loss + open a residual that leaves the scope under
+    # IM). Route cross flips into the gate; validated isolated flips (handled above) are excluded.
+    if (increasing or (flipping and mode == "cross")) and not (flipping and mode == "isolated"):
         # use the SLIPPAGE-ADJUSTED fill_px (codex code-r4 #2) so the gate matches what _book_fill
         # actually posts/debits; also charge the immediate slippage loss on the new size.
         new_notional = abs(new_szi) * fill_px
@@ -1179,22 +1209,28 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
         _rt_add(summary, coin, fee=fee)    # CHANGE A: add into open round-trip (no realized)
     elif (p.szi >= 0) != (new_szi >= 0):
-        p.entry_px = fill_px      # flipped through zero
-        if p.mode == "isolated":
-            p.isolated_margin += realized - fee
-        else:
-            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
-        # CHANGE A: flip-through-zero CLOSES the prior round-trip (the closed portion's realized + fee)
-        # and OPENS a new one for the residual that re-entered on the opposite side.
-        # FIX (codex finding #2): SPLIT the single flip-order fee by closing vs opening notional so each
-        # round-trip bears ITS OWN fee. Previously the WHOLE fee was charged to the closing RT and the
-        # new opposite-side RT opened fee-free -> the closing RT was over-penalized and the new RT was
-        # under-costed (mis-ranking both legs). delta is the flip order; |p.szi| closes, |new_szi| opens.
+        # FLIPPED THROUGH ZERO. Split the flip-order fee by closing vs opening notional so each round-trip
+        # bears its own fee (codex finding #2). |p.szi| closes, |new_szi| opens.
         closed_sz = abs(p.szi)
         opened_sz = abs(new_szi)
         total_sz = closed_sz + opened_sz
         close_fee = fee * (closed_sz / total_sz) if total_sz > 0 else fee
         open_fee = fee - close_fee
+        if p.mode == "isolated":
+            # AUDIT 2026-07-10 (codex P0#5): a reversal must CLOSE the old isolated leg (return its margin +
+            # realized - close_fee to main) and OPEN a fresh isolated leg for the RESIDUAL with its OWN new IM
+            # drawn from main. The old code did `isolated_margin += realized - fee`, leaving a live opposite
+            # position with a stale/NEGATIVE isolated margin (e.g. -40) and breaking cash/IM conservation.
+            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin + realized - close_fee
+            new_notional = opened_sz * fill_px
+            new_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
+            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - new_im - open_fee
+            p.isolated_margin = new_im
+        else:
+            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+        p.entry_px = fill_px      # residual opposite leg re-enters at the flip price
+        # CHANGE A: flip CLOSES the prior round-trip (closed portion's realized + close_fee) and OPENS a new
+        # one for the residual (open_fee).
         _rt_add(summary, coin, realized=realized, fee=close_fee)
         _rt_close(summary, coin)
         _rt_open(summary, coin)
@@ -1227,7 +1263,7 @@ def _apply_funding(st, md, h, summary):
         _rt_add(summary, coin, funding=fund)   # CHANGE A: funding is a round-trip cost (signed)
 
 
-def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None):
+def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None, fold_end_ms=None):
     """CHRONOLOGICAL event loop over (t0,t1] (codex code-r2 #1/#5): interleave hourly funding
     settlements with repeated maintenance-breach scans + liquidations, in time order. A position
     liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
@@ -1267,10 +1303,12 @@ def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None):
             if st.cooldown_until_ms and st.cooldown_until_ms <= cursor:
                 st.cooldown_until_ms = 0
             cursor = seg_end
-            # AUDIT 2026-07-10 (codex P0#4): half-open window [t0,t1). Funding stamped exactly at the exclusive
-            # end (seg_end == t1_ms) belongs to the NEXT window; applying it here charged boundary/test funding
-            # into the pretest ROE. Apply only strictly INSIDE the window.
-            if seg_end == next_funding and seg_end < t1_ms:
+            # AUDIT 2026-07-10 (codex P0#4 + fix): the FOLD is half-open [start, fold_end). Funding stamped
+            # exactly at the fold's exclusive end belongs to the NEXT fold -> skip it (was charging boundary/test
+            # funding into pretest ROE). But do NOT skip funding at an INTERIOR action boundary that merely
+            # coincides with an hourly stamp (t1_ms here is often an action time, not the fold end) -- only skip
+            # when seg_end IS the fold exclusive end.
+            if seg_end == next_funding and (fold_end_ms is None or seg_end != int(fold_end_ms)):
                 _apply_funding(st, md, seg_end, summary)
                 # POST-FUNDING solvency check (codex code-r4 #1): a settlement can push below
                 # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
@@ -1444,6 +1482,12 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
         elif iso_eq < maint:
             _liq_close(st, md, coin, m, ts_ms, summary=summary)
 
+    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
+    # (isolated-only account wiped), it is RUIN too -> finalize via _ruin (was leaving backstop w/o account_ruin/
+    # time_to_ruin). Checked after the isolated loop to avoid mutating st.positions mid-iteration.
+    if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
+        _ruin(st, md, summary, events, int(ts_ms))
+
     # CROSS scopes
     for scope in st.cross_scopes():
         coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
@@ -1463,6 +1507,13 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
             st.cross_collateral[scope] = 0.0
             summary["n_backstop_transfer"] += 1
             summary["outcome_states"].add("backstop")
+            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
+            # ALL remaining scopes+positions <= ~0), it is RUIN -> set ruin/time_to_ruin so `ruin`-based
+            # downstream filters (m06b, etc.) don't treat a wiped account as non-ruined. A multi-scope account
+            # whose OTHER scopes still hold collateral is NOT ruined by a single-scope backstop (n_backstop_transfer
+            # still flags it; m08 counts any backstop as wiped).
+            if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
+                _ruin(st, md, summary, events, int(ts_ms))   # full ruin finalization (zeros equity, no stale _core_final_eq)
         elif eq < maint:
             _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks)
 

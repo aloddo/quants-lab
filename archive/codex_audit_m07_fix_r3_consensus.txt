@@ -1,0 +1,2074 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c4e-96cc-71d1-9482-bab4b8c143c1
+--------
+user
+# Round-3 m07 — final 2 gaps closed
+
+Your round-2 verdict: P0#4/P0#5-isolated/P0#6/P0#1 correct; 2 remaining: (a) CROSS flips (not "increasing")
+bypassed the IM gate; (b) n_late_copy_skipped counted spot rows. Fixed both. Read research/v15/v15_m07_engine.py.
+
+## Fixes
+- Cross flip gate: the cross IM admissibility block now runs for `(increasing or (flipping and mode=="cross"))
+  and not (flipping and mode=="isolated")`. So a cross reversal (same-or-smaller residual) is checked by the
+  existing cross-scope IM-vs-equity gate; validated isolated flips (handled by the isolated flip block above)
+  are excluded from re-gating.
+- n_late_copy_skipped now counts only non-spot (copyable) rows with our_ts >= end_ts_ms.
+
+## Questions
+- Is the cross flip now correctly gated (no double-gate of isolated flips, no missed flip class)? Does routing a
+  cross flip through the existing cross gate (which nets scope equity incl uPnL at mark) adequately prevent an
+  under-IM residual, given the realized close happens in _book_fill at fill_px? Any remaining ungated flip path?
+- Confirm no regression: an increasing (non-flip) order still gated exactly as before; a pure reduce/close still ungated.
+- Any new bug. 56 m07 + full v15 pass.
+
+## Output
+Confirm: are all 7 m07 P0s now correctly fixed and m07 trustworthy for accounting-sensitive results (consensus)?
+Name anything that still must change, else state consensus.
+codex
+I’ll review the specific engine changes and surrounding order admissibility paths, then check the late-copy metric implementation and test coverage signals before giving a verdict.
+exec
+/bin/zsh -lc 'git diff -- research/v15/v15_m07_engine.py' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc 'rg -n "cross|isolated|flipping|increasing|n_late_copy_skipped|IM|initial|admiss" research/v15/v15_m07_engine.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+diff --git a/research/v15/v15_m07_engine.py b/research/v15/v15_m07_engine.py
+index 3f3cc20..4ce260b 100644
+--- a/research/v15/v15_m07_engine.py
++++ b/research/v15/v15_m07_engine.py
+@@ -627,7 +627,10 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float,
+     # row was generated for its fold's window, not a stale test run. window_end is the half-open exclusive bound.
+     summary["window_start_ms"] = int(_win_lo)
+     summary["window_end_ms"] = int(end_ts_ms)
+-    summary["n_late_copy_skipped"] = 0
++    # count of COPYABLE (perp, non-spot) actions whose latency-pushed our_ts lands at/after the fold end
++    # (codex P0#1 minor; spot rows are skipped by the loop so they must not inflate this reject count).
++    summary["n_late_copy_skipped"] = sum(
++        1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
+     # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+     # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+     # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
+@@ -646,9 +649,12 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float,
+     else:
+         prev_ts = end_ts_ms
+ 
+-    # causal_carry_in: seed the opening position from the first action's pre-state (design D9)
++    # causal_carry_in: seed the opening position from the first action's pre-state (design D9).
++    # AUDIT 2026-07-10 (codex P0#3): seed at the WINDOW START mark (prev_ts), NOT the first action's mark, so
++    # the main loop's first _advance_between(start -> first action) captures any intra-window drawdown/
++    # liquidation on the carried position (seeding at the first-action price skipped it = wrong max_dd/roe/ruin).
+     if rows and params.start_policy == "causal_carry_in":
+-        _seed_carry_in(st, md, rows[0], params, summary)
++        _seed_carry_in(st, md, rows[0], params, summary, seed_ts=prev_ts)
+ 
+     # FOLLOWER-TRAIL peak init (codex review bug #8): when carrying state into the fold, the breaker peak
+     # must start from the REAL marked equity at fold start, not the caller's (possibly stale) start_equity
+@@ -682,10 +688,9 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float,
+         # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
+         # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
+         if our_ts >= int(end_ts_ms):
+-            summary["n_late_copy_skipped"] += 1
+-            break
++            break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
+ 
+-        _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit)
++        _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
+         if summary["ruin"]:
+             break
+ 
+@@ -755,7 +760,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float,
+     # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
+     # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
+     if not summary["ruin"] and end_ts_ms > prev_ts:
+-        _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary, _emit=_emit)
++        _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
+         marks = _marks(st, md, end_ts_ms)
+         eq = st.equity(marks)
+         peak_equity = max(peak_equity, eq)
+@@ -899,19 +904,21 @@ def _te_l1_active(st, md, src_target: dict, ts_ms: int) -> tuple:
+     return l1, bool(coins)
+ 
+ 
+-def _seed_carry_in(st, md, first_row, params, summary):
++def _seed_carry_in(st, md, first_row, params, summary, seed_ts=None):
+     """causal_carry_in: seed an opening position to match the source's exposure that pre-exists the
+-    window. We back-fill the position to (position_after - signed_size) at the first action, sized to
+-    OUR equity by the same target fraction. Conservative: only seeds if the source enters the window
+-    already holding (carry_in_status present)."""
++    window. We back-fill the position to (position_after - signed_size), sized to OUR equity by the same
++    target fraction, and mark it at the WINDOW START (seed_ts) so the pre-existing position is exposed to
++    the full in-window path (codex P0#3). Conservative: only seeds if the source enters already holding."""
+     status = str(first_row.get("carry_in_status", "") or "")
+     if "carry" not in status.lower():
+         return
+     coin = first_row["coin"]
+     if coin_is_spot(coin):
+         return
+-    our_ts = int(first_row["ts"]) + params.copy_latency_ms
+-    mark = md.mark(coin, our_ts)
++    # AUDIT 2026-07-10 (codex P0#3): mark the carried position at the window START (seed_ts), not at the first
++    # action's latency-adjusted time -- otherwise the start->first-action drawdown/liquidation is invisible.
++    ref_ts = int(seed_ts) if seed_ts is not None else int(first_row["ts"]) + params.copy_latency_ms
++    mark = md.mark(coin, ref_ts, causal=True)
+     if mark is None or mark != mark or mark <= 0:
+         return
+     post_pct = _action_target_pct(first_row, params)       # SIGNED exposure% AFTER the first action
+@@ -1030,7 +1037,30 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills,
+     cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
+     new_szi = cur_szi + delta_szi
+     increasing = abs(new_szi) > abs(cur_szi) + 10 ** (-szdec)
+-    if increasing:
++    # AUDIT 2026-07-10 (codex P0#5 gate): a REVERSAL (flip through zero) is not "increasing" in magnitude, so it
++    # skipped the IM gate and could open a residual isolated position that drives main NEGATIVE. Gate the flip:
++    # after settling the old leg (main + old_im + realized_close - close_fee), the residual's fresh IM + open_fee
++    # + slip must fit; else REJECT the copy (stay as-is; tracking_error captures the divergence).
++    flipping = (cur_szi != 0.0 and abs(new_szi) > 10 ** (-szdec)
++                and ((cur_szi >= 0) != (new_szi >= 0)))
++    if flipping and mode == "isolated":
++        p0 = st.positions[coin]
++        realized_close = abs(cur_szi) * (fill_px - p0.entry_px) * (1.0 if cur_szi > 0 else -1.0)
++        closed_sz, opened_sz = abs(cur_szi), abs(new_szi)
++        total_sz = closed_sz + opened_sz
++        close_fee = fee * (closed_sz / total_sz) if total_sz > 0 else fee
++        open_fee = fee - close_fee
++        slip_cost = abs(delta_szi) * abs(fill_px - mark)
++        settled_main = st.cross_collateral.get("main", 0.0) + p0.isolated_margin + realized_close - close_fee
++        new_notional = opened_sz * fill_px
++        resid_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
++        if settled_main < resid_im + open_fee + slip_cost:
++            summary["n_rejected"] += 1
++            return
++    # codex r2: a CROSS flip (same-or-smaller residual, so not "increasing") must ALSO pass the cross IM
++    # admissibility gate below (else a reversal can realize loss + open a residual that leaves the scope under
++    # IM). Route cross flips into the gate; validated isolated flips (handled above) are excluded.
++    if (increasing or (flipping and mode == "cross")) and not (flipping and mode == "isolated"):
+         # use the SLIPPAGE-ADJUSTED fill_px (codex code-r4 #2) so the gate matches what _book_fill
+         # actually posts/debits; also charge the immediate slippage loss on the new size.
+         new_notional = abs(new_szi) * fill_px
+@@ -1179,22 +1209,28 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
+             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
+         _rt_add(summary, coin, fee=fee)    # CHANGE A: add into open round-trip (no realized)
+     elif (p.szi >= 0) != (new_szi >= 0):
+-        p.entry_px = fill_px      # flipped through zero
+-        if p.mode == "isolated":
+-            p.isolated_margin += realized - fee
+-        else:
+-            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+-        # CHANGE A: flip-through-zero CLOSES the prior round-trip (the closed portion's realized + fee)
+-        # and OPENS a new one for the residual that re-entered on the opposite side.
+-        # FIX (codex finding #2): SPLIT the single flip-order fee by closing vs opening notional so each
+-        # round-trip bears ITS OWN fee. Previously the WHOLE fee was charged to the closing RT and the
+-        # new opposite-side RT opened fee-free -> the closing RT was over-penalized and the new RT was
+-        # under-costed (mis-ranking both legs). delta is the flip order; |p.szi| closes, |new_szi| opens.
++        # FLIPPED THROUGH ZERO. Split the flip-order fee by closing vs opening notional so each round-trip
++        # bears its own fee (codex finding #2). |p.szi| closes, |new_szi| opens.
+         closed_sz = abs(p.szi)
+         opened_sz = abs(new_szi)
+         total_sz = closed_sz + opened_sz
+         close_fee = fee * (closed_sz / total_sz) if total_sz > 0 else fee
+         open_fee = fee - close_fee
++        if p.mode == "isolated":
++            # AUDIT 2026-07-10 (codex P0#5): a reversal must CLOSE the old isolated leg (return its margin +
++            # realized - close_fee to main) and OPEN a fresh isolated leg for the RESIDUAL with its OWN new IM
++            # drawn from main. The old code did `isolated_margin += realized - fee`, leaving a live opposite
++            # position with a stale/NEGATIVE isolated margin (e.g. -40) and breaking cash/IM conservation.
++            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin + realized - close_fee
++            new_notional = opened_sz * fill_px
++            new_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
++            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - new_im - open_fee
++            p.isolated_margin = new_im
++        else:
++            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
++        p.entry_px = fill_px      # residual opposite leg re-enters at the flip price
++        # CHANGE A: flip CLOSES the prior round-trip (closed portion's realized + close_fee) and OPENS a new
++        # one for the residual (open_fee).
+         _rt_add(summary, coin, realized=realized, fee=close_fee)
+         _rt_close(summary, coin)
+         _rt_open(summary, coin)
+@@ -1227,7 +1263,7 @@ def _apply_funding(st, md, h, summary):
+         _rt_add(summary, coin, funding=fund)   # CHANGE A: funding is a round-trip cost (signed)
+ 
+ 
+-def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None):
++def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None, fold_end_ms=None):
+     """CHRONOLOGICAL event loop over (t0,t1] (codex code-r2 #1/#5): interleave hourly funding
+     settlements with repeated maintenance-breach scans + liquidations, in time order. A position
+     liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
+@@ -1267,10 +1303,12 @@ def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None):
+             if st.cooldown_until_ms and st.cooldown_until_ms <= cursor:
+                 st.cooldown_until_ms = 0
+             cursor = seg_end
+-            # AUDIT 2026-07-10 (codex P0#4): half-open window [t0,t1). Funding stamped exactly at the exclusive
+-            # end (seg_end == t1_ms) belongs to the NEXT window; applying it here charged boundary/test funding
+-            # into the pretest ROE. Apply only strictly INSIDE the window.
+-            if seg_end == next_funding and seg_end < t1_ms:
++            # AUDIT 2026-07-10 (codex P0#4 + fix): the FOLD is half-open [start, fold_end). Funding stamped
++            # exactly at the fold's exclusive end belongs to the NEXT fold -> skip it (was charging boundary/test
++            # funding into pretest ROE). But do NOT skip funding at an INTERIOR action boundary that merely
++            # coincides with an hourly stamp (t1_ms here is often an action time, not the fold end) -- only skip
++            # when seg_end IS the fold exclusive end.
++            if seg_end == next_funding and (fold_end_ms is None or seg_end != int(fold_end_ms)):
+                 _apply_funding(st, md, seg_end, summary)
+                 # POST-FUNDING solvency check (codex code-r4 #1): a settlement can push below
+                 # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
+@@ -1444,6 +1482,12 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
+         elif iso_eq < maint:
+             _liq_close(st, md, coin, m, ts_ms, summary=summary)
+ 
++    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
++    # (isolated-only account wiped), it is RUIN too -> finalize via _ruin (was leaving backstop w/o account_ruin/
++    # time_to_ruin). Checked after the isolated loop to avoid mutating st.positions mid-iteration.
++    if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
++        _ruin(st, md, summary, events, int(ts_ms))
++
+     # CROSS scopes
+     for scope in st.cross_scopes():
+         coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+@@ -1463,6 +1507,13 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
+             st.cross_collateral[scope] = 0.0
+             summary["n_backstop_transfer"] += 1
+             summary["outcome_states"].add("backstop")
++            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
++            # ALL remaining scopes+positions <= ~0), it is RUIN -> set ruin/time_to_ruin so `ruin`-based
++            # downstream filters (m06b, etc.) don't treat a wiped account as non-ruined. A multi-scope account
++            # whose OTHER scopes still hold collateral is NOT ruined by a single-scope backstop (n_backstop_transfer
++            # still flags it; m08 counts any backstop as wiped).
++            if not summary["ruin"] and st.equity(_adverse_marks(st, md, ts_ms)) <= 1e-6:
++                _ruin(st, md, summary, events, int(ts_ms))   # full ruin finalization (zeros equity, no stale _core_final_eq)
+         elif eq < maint:
+             _market_liquidate_scope(st, md, scope, ts_ms, params, events, summary, marks)
+ 
+
+ succeeded in 0ms:
+6:revision addresses all 12 (final-horizon risk, isolated margin+liq, 3-valued breach, causal
+70:DEFAULT_IMPACT_K_BPS = 8.0
+71:DEFAULT_IMPACT_ALPHA = 0.5
+79:# to a late taker (a BUY in an up-bar / a SELL in a down-bar fills worse). 1m-RESOLUTION APPROXIMATION
+90:    """Margin-sharing SCOPE key (design D19): the DEX. main perps share cross within main; each HIP-3
+102:    """Design D3: main -> cross; HIP-3 (onlyIsolated) dexes -> isolated."""
+103:    return "isolated" if coin_dex(coin) in ISOLATED_ONLY_DEXES else "cross"
+161:    the initial margin at the tier's max leverage; the tier is the largest lowerBound <= notional
+421:                    "impact_k_bps": float(cal.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)),
+422:                    "impact_alpha": float(cal.get("impact_alpha", DEFAULT_IMPACT_ALPHA)),
+435:                    "impact_k_bps": float(cal.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)),
+436:                    "impact_alpha": float(cal.get("impact_alpha", DEFAULT_IMPACT_ALPHA)),
+443:# Account state (design §1.2/§3.1) — DEX-scoped cross buckets + per-isolated buckets
+450:    mode: str                   # "cross" | "isolated"
+453:    isolated_margin: float = 0.0    # collateral posted for isolated positions (cross posts 0)
+458:    cross_collateral: dict[str, float] = field(default_factory=dict)   # scope(dex) -> cross cash
+462:    def cross_scopes(self) -> list[str]:
+463:        scopes = set(self.cross_collateral) | {coin_dex(c) for c, p in self.positions.items() if p.mode == "cross"}
+467:        eq = sum(self.cross_collateral.values())
+472:            eq += (p.isolated_margin + upnl) if p.mode == "isolated" else upnl
+525:    st = copy.deepcopy(start_state) if start_state is not None else AccountState(cross_collateral={"main": float(start_equity)})
+526:    if not st.cross_collateral:
+527:        st.cross_collateral = {"main": float(start_equity)}
+563:            if p.mode == "isolated":
+564:                st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin
+632:    summary["n_late_copy_skipped"] = sum(
+691:            break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
+861:    is still penalized. This is a conservative CAUSAL VOL-PROXY APPROXIMATION of the unknown realized
+928:        eq = sum(st.cross_collateral.values())
+941:            if mode == "isolated":
+942:                # post isolated IM from main at the causal mark (codex code-r2 #6) -- never seed an
+943:                # isolated position with 0 margin (would liquidate instantly). Reject if main can't fund.
+945:                if st.cross_collateral.get("main", 0.0) < im:
+948:                st.cross_collateral["main"] -= im
+949:                pos.isolated_margin = im
+956:    """Order lifecycle (design §4.4): lot round -> min-notional skip -> leverage/IM check -> capacity
+1001:    impact_k = liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)        # D1: calibrated-or-prior slope
+1002:    impact_alpha = liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA)
+1016:    # is preserved while the look-ahead is removed. Conservative CAUSAL VOL-PROXY APPROXIMATION pending
+1033:    # pre-trade INITIAL-MARGIN admissibility (design §4.4; codex code-r2 #3). Only gate orders that
+1034:    # INCREASE exposure (reduces/closes free margin, always allowed). Reject if the required IM + fee
+1035:    # exceeds available bucket collateral -> prevents driving main negative on isolated opens and
+1036:    # caps cross leverage at the tier. Conservative: cross availability nets existing-position IM.
+1039:    increasing = abs(new_szi) > abs(cur_szi) + 10 ** (-szdec)
+1040:    # AUDIT 2026-07-10 (codex P0#5 gate): a REVERSAL (flip through zero) is not "increasing" in magnitude, so it
+1041:    # skipped the IM gate and could open a residual isolated position that drives main NEGATIVE. Gate the flip:
+1042:    # after settling the old leg (main + old_im + realized_close - close_fee), the residual's fresh IM + open_fee
+1044:    flipping = (cur_szi != 0.0 and abs(new_szi) > 10 ** (-szdec)
+1046:    if flipping and mode == "isolated":
+1054:        settled_main = st.cross_collateral.get("main", 0.0) + p0.isolated_margin + realized_close - close_fee
+1060:    # codex r2: a CROSS flip (same-or-smaller residual, so not "increasing") must ALSO pass the cross IM
+1061:    # admissibility gate below (else a reversal can realize loss + open a residual that leaves the scope under
+1062:    # IM). Route cross flips into the gate; validated isolated flips (handled above) are excluded.
+1063:    if (increasing or (flipping and mode == "cross")) and not (flipping and mode == "isolated"):
+1067:        new_im = new_notional * md.meta.init_margin_rate(coin, new_notional)   # TOTAL IM (tier-correct; codex code-r3)
+1069:        if mode == "isolated":
+1070:            cur_im = st.positions[coin].isolated_margin if coin in st.positions else 0.0
+1071:            if (new_im - cur_im) + fee + slip_cost > max(0.0, st.cross_collateral.get("main", 0.0)):
+1075:            # TOTAL cross IM of the scope AFTER the fill (existing positions re-rated at their tier)
+1079:            equity = st.cross_collateral.get(scope_k, 0.0) - fee - slip_cost
+1084:                if pp.mode != "cross" or coin_dex(cc) != scope_k or cc == coin:
+1163:    """Update position + the right bucket. ISOLATED opens post initial margin from main cross bucket;
+1164:    isolated realized/funding/fees route to the position's isolated bucket; closing returns isolated
+1171:        if mode == "isolated":
+1173:            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - im - fee
+1174:            new.isolated_margin = im
+1176:            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
+1190:        if p.mode == "isolated":
+1191:            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin + realized - fee
+1193:            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+1201:        if p.mode == "isolated":
+1202:            # post the TIER-CORRECT total IM for the resulting notional; draw the delta (incl any
+1206:            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - (target_im - p.isolated_margin) - fee
+1207:            p.isolated_margin = target_im
+1209:            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
+1219:        if p.mode == "isolated":
+1220:            # AUDIT 2026-07-10 (codex P0#5): a reversal must CLOSE the old isolated leg (return its margin +
+1221:            # realized - close_fee to main) and OPEN a fresh isolated leg for the RESIDUAL with its OWN new IM
+1222:            # drawn from main. The old code did `isolated_margin += realized - fee`, leaving a live opposite
+1223:            # position with a stale/NEGATIVE isolated margin (e.g. -40) and breaking cash/IM conservation.
+1224:            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin + realized - close_fee
+1227:            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - new_im - open_fee
+1228:            p.isolated_margin = new_im
+1230:            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+1241:        if p.mode == "isolated":
+1242:            p.isolated_margin += realized - fee
+1244:            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+1257:        if p.mode == "cross":
+1258:            st.cross_collateral[coin_dex(coin)] = st.cross_collateral.get(coin_dex(coin), 0.0) + fund
+1260:            p.isolated_margin += fund
+1346:    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+1357:        eq_a = p.isolated_margin + p.szi * (adverse - p.entry_px)
+1362:            eq_f = p.isolated_margin + p.szi * (favorable[int(bad_a[0])] - p.entry_px)
+1371:    for coin in sorted(c for c, p in st.positions.items() if p.mode == "cross"):
+1385:        cash = st.cross_collateral.get(scope, 0.0)
+1413:    wick) can drop a scope/isolated bucket below maintenance. If breached, run liquidation (which
+1420:    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+1423:        if p.isolated_margin + p.szi * (m - p.entry_px) < notion * md.meta.maint_rate(coin, notion):
+1426:        for scope in st.cross_scopes():
+1427:            coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+1430:            eq = st.cross_collateral.get(scope, 0.0) + sum(
+1462:    """Cross/isolated liquidation state machine (design §3.3/§3.4/D12/D15; codex code-r1 #2/#3/#5).
+1463:    Backstop = position+cross-margin TRANSFER to vault (event-only, NO fee). Market-liq orders are
+1469:    for coin in sorted(c for c, p in st.positions.items() if p.mode == "isolated"):
+1473:        iso_eq = p.isolated_margin + p.szi * (m - p.entry_px)
+1485:    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
+1486:    # (isolated-only account wiped), it is RUIN too -> finalize via _ruin (was leaving backstop w/o account_ruin/
+1487:    # time_to_ruin). Checked after the isolated loop to avoid mutating st.positions mid-iteration.
+1492:    for scope in st.cross_scopes():
+1493:        coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+1496:        cash = st.cross_collateral.get(scope, 0.0)
+1507:            st.cross_collateral[scope] = 0.0
+1510:            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
+1522:    """ONE HL market-liquidation STEP for the breached cross scope (codex code-r2 #5): close the
+1528:    # cooling down. This makes it IMPOSSIBLE for any caller path (price breach, post-funding, terminal
+1533:    coins = [c for c, p in st.positions.items() if p.mode == "cross" and coin_dex(c) == scope]
+1571:    impact_k = float(liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS))
+1572:    impact_alpha = float(liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA))
+1578:    if p.mode == "cross":
+1580:        st.cross_collateral[sc] = st.cross_collateral.get(sc, 0.0) + realized
+1582:        p.isolated_margin += realized
+1596:        if p.mode == "isolated":
+1597:            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + max(0.0, p.isolated_margin)
+1628:    for k in list(st.cross_collateral):
+1629:        st.cross_collateral[k] = 0.0
+1664:    ending_state = {"cross_collateral": dict(st.cross_collateral),
+
+exec
+/bin/zsh -lc "rg -n \"m07|P0|late_copy|cross flip|isolated flip|flip\" research/v15 tests -g '*.*'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_slippage_calib.py:5:of building the WS-L2 collector (deferred). This is the COST source that flips M6b provisional->FINAL.
+research/v15/v15_slippage_calib.py:230:    import v15_m07_engine as E  # for MarketData.mark (causal=True)
+tests/v15/test_m06b_golden.py:4:- P0#2: a run on NON-fold-pure (global, look-ahead) M4 is never stamped investable.
+tests/v15/test_m06b_golden.py:5:- P0#3: a duplicate (entity_id, fold_id) row in any fold-keyed input fails closed (merge validate) instead of
+tests/v15/test_m06b_golden.py:39:    inp["m07_summary"] = pd.concat([inp["m07_summary"], inp["m07_summary"].iloc[[0]]], ignore_index=True)
+tests/v15/test_m06b_golden.py:51:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:109:        "folds": folds, "m07_summary": summ, "m07_fills_path": fills,  # path slots hold DFs for tests
+tests/v15/test_m06b.py:111:        "m04_fold_pure": fold_pure,  # audit 2026-07-10 P0#2: investable requires fold-pure M4
+tests/v15/test_m06b.py:112:        "m02_journeys_path": journeys, "m07_equity": equity,
+tests/v15/test_m06b.py:119:    def fake_exposure(fills_obj, _m07_dir):
+tests/v15/test_m06b.py:261:                       realized=True, fold_pure=True)   # audit P0#2: investable requires fold-pure M4
+tests/v15/test_m06b.py:263:    assert manifest["consistency_source"] == "m07_equity_block_roe"
+tests/v15/test_m06b.py:264:    assert manifest["fidelity_source"] == "m07_tracking_error"
+tests/v15/test_m06b.py:285:    inp["m07_summary"].loc[inp["m07_summary"].entity_id.isin([0, 1, 2]), "tracking_error"] = np.nan
+tests/v15/test_m06b.py:299:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 0, "tracking_error"] = np.inf
+tests/v15/test_m06b.py:377:    assert manifest["consistency_source"] == "m07_equity_block_roe"
+tests/v15/test_m06b.py:401:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 0, "roe_engine"] = 100.0
+tests/v15/test_m06b.py:402:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 0, "max_dd"] = 0.05
+tests/v15/test_m06b.py:410:def test_missing_m07_row_excluded():
+tests/v15/test_m06b.py:413:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 5, "roe_engine"] = np.nan
+tests/v15/test_m06b.py:417:    assert "missing_m07_row" in e5["excluded_reason"]
+tests/v15/test_m06b.py:420:def test_absent_m07_row_preserved_as_excluded():
+tests/v15/test_m06b.py:421:    # codex r1 #1: a M6a row with NO M7 summary row must stay in output as missing_m07_row, not drop.
+tests/v15/test_m06b.py:424:    inp["m07_summary"] = inp["m07_summary"][inp["m07_summary"].entity_id != 7].copy()
+tests/v15/test_m06b.py:429:    assert "missing_m07_row" in e7["excluded_reason"]
+tests/v15/test_m06b.py:486:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:511:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:539:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:556:    summ = inp["m07_summary"]
+research/v15/leadlag_clean_rank_sim.py:302:    is_long = 'Long' in dir; flips (Long>Short) skipped (matches load_wallet_opens_closes). This is the
+tests/v15/test_m07.py:3:Design: brain projects/quant/v15/modules/m07. Run:
+tests/v15/test_m07.py:4:  /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m07.py -q
+tests/v15/test_m07.py:14:import v15_m07_engine as E  # noqa: E402
+tests/v15/test_m07.py:510:    # codex code-r4 #3: a SHORT carry-in must seed a NEGATIVE szi (signed exposure, no double-flip).
+tests/v15/test_m07.py:861:# codex finding #2 — flip-through-zero fee SPLIT across the two round-trips
+tests/v15/test_m07.py:863:def test_finding2_flip_fee_split_across_round_trips():
+tests/v15/test_m07.py:864:    # Flat price 100. Open +100 szi long, then flip to -100 szi short in ONE order (delta -200), then
+tests/v15/test_m07.py:865:    # close the short. The flip order's fee must be SPLIT: half to the closing (long) RT, half to the
+tests/v15/test_m07.py:870:        _action("BTC", T0 + 25 * E.MS_MIN, -1.0, "FLIP", position_after=-100.0),  # flip to -100 short
+tests/v15/test_m07.py:874:    # two completed round-trips (the long that flipped closed + the short that closed)
+tests/v15/test_m07.py:877:    # the split is proportional. Equity-flat so realized=0 on the flip; both RTs differ ONLY by fees.
+tests/v15/test_m07.py:884:    # flip -200 @100 -> closes 100 (long RT) + opens 100 short. Fee on 200 sz; must split 50/50.
+tests/v15/test_m07.py:885:    flip_fee = 200.0 * 100.0 * 0.00045
+tests/v15/test_m07.py:886:    E._book_fill(st, md, "BTC", -200.0, 100.0, "cross", fee=flip_fee, summary=summ)
+tests/v15/test_m07.py:887:    # exactly one RT closed by the flip
+tests/v15/test_m07.py:889:    closing_rt_pnl = summ["realized_pnl_total"] - pnl_before   # = -(entry fee on long) - (half flip fee)
+tests/v15/test_m07.py:891:    expected_close = -(long_entry_fee + flip_fee * 0.5)        # realized MTM is 0 (flat px)
+tests/v15/test_m07.py:892:    assert abs(closing_rt_pnl - expected_close) < 1e-9, "closing RT must bear only HALF the flip fee"
+tests/v15/test_m07.py:894:    assert abs(summ["_rt"]["BTC"]["fee"] - flip_fee * 0.5) < 1e-9, "short RT must bear its own half"
+tests/v15/test_m02.py:237:    # position flips sign
+tests/v15/test_m08.py:13:sys.path.insert(0, str(Path(__file__).resolve().parent))   # reuse test_m07 fakes
+tests/v15/test_m08.py:15:import v15_m07_engine as E  # noqa: E402
+tests/v15/test_m08.py:16:import test_m07 as T7  # noqa: E402
+tests/v15/test_m08.py:119:def test_attribution_flags_missing_m07_rows():
+tests/v15/test_m08.py:128:    assert fw["n_entities"] == 2 and fw["n_missing_m07"] == 1
+tests/v15/test_m08_golden.py:5:- P0#2/#4: a stress run with ZERO fills (empty/filtered stream or NaN sizing skipped by M7) -> KILL data-gap,
+tests/v15/test_m08_golden.py:6:- P0#3: run_m08 without fold-pure --m04-dir (the global M4 map is look-ahead) fails closed unless explicitly
+tests/v15/test_m10_golden.py:4:- P0#1: NaN/non-bool kill/floor/pool status FAILS CLOSED (bool(np.nan) is True was the footgun),
+tests/v15/test_m10_golden.py:5:- P0#2: non-finite / out-of-domain metrics FAIL CLOSED (inf ROE, negative DD, etc.),
+tests/v15/test_m10_golden.py:6:- P0#3: G2 denominator verified (a partial <8-fold run cannot pass "6 of 8"),
+research/v15/.audit_m03.txt:36:PRIORITIZED bug catalog: P0 (breaks OOS integrity -> fake validation) / P1 / P2, each with file:line, concrete
+research/v15/.audit_m03.txt:69:tests/v15/test_m07.py
+research/v15/.audit_m03.txt:897:tests/v15/test_m07.py:237:    s = _run(acts, md, entity_id=1, fold_id=1)["summary"]
+research/v15/.audit_m03.txt:898:tests/v15/test_m07.py:491:def test_no_same_ts_double_when_funding_at_fold_end():
+research/v15/.audit_m03.txt:899:tests/v15/test_m07.py:570:                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+research/v15/.audit_m03.txt:900:tests/v15/test_m07.py:573:    assert "fold_start" in flags and "block_boundary" in flags and "fold_end" in flags
+research/v15/.audit_m03.txt:901:tests/v15/test_m07.py:574:    fs = eq[eq.event_flag == "fold_start"].iloc[0]
+research/v15/.audit_m03.txt:902:tests/v15/test_m07.py:588:                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+research/v15/.audit_m03.txt:903:tests/v15/test_m07.py:590:    anchors = sorted(eq[eq.event_flag.isin(["fold_start", "block_boundary"])]["ts"].unique())
+research/v15/.audit_m03.txt:904:tests/v15/test_m07.py:601:                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+research/v15/.audit_m03.txt:905:tests/v15/test_m07.py:632:    # remaining boundary anchors + fold_end at equity 0 (so M6b post-wipe block ROE = -100%).
+research/v15/.audit_m03.txt:906:tests/v15/test_m07.py:644:                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+research/v15/.audit_m03.txt:907:tests/v15/test_m07.py:650:    fe = eq[eq.event_flag == "fold_end"].iloc[-1]
+research/v15/.audit_m03.txt:908:tests/v15/test_m07.py:704:def test_follower_trail_fires_at_fold_end_no_action():
+research/v15/.audit_m03.txt:909:tests/v15/test_m07.py:760:    s = _run(acts, md, entity_id=7, fold_id=3)["summary"]
+research/v15/.audit_m03.txt:910:tests/v15/test_m07.py:873:    s = _run(acts, md, entity_id=9, fold_id=1)["summary"]
+research/v15/.audit_m03.txt:997:research/v15/v15_m08_survival.py:165:    df = tiers.merge(m07_summary[["entity_id", "fold_id", "roe_engine", "ruin"]],
+research/v15/.audit_m03.txt:1094:research/v15/v15_m06b_ranking.py:200:    fills_path: m07 fills (entity_id, fold_id, our_ts) -> per-block n_fills (engine fills).
+research/v15/.audit_m03.txt:1194:research/v15/v15_two_regime_test.py:71:    tst = pd.read_parquet(m07_test)[["entity_id", "fold_id", "roe_engine",
+research/v15/.audit_m03.txt:1198:research/v15/v15_m07_engine.py:513:                    entity_id=None, fold_id=None) -> dict:
+research/v15/.audit_m03.txt:1199:research/v15/v15_m07_engine.py:532:    summary = _new_summary(entity_id, fold_id, start_equity, len(actions), params, md)
+research/v15/.audit_m03.txt:1200:research/v15/v15_m07_engine.py:585:                       "fold_id": fold_id, "trail": params.follower_trail,
+research/v15/.audit_m03.txt:1201:research/v15/v15_m07_engine.py:591:    # CHANGE 1: block-boundary anchors b_k = start_ts + k*14d in [start_ts, end_ts) (fold_start = b_0;
+research/v15/.audit_m03.txt:1202:research/v15/v15_m07_engine.py:592:    # interior = block_boundary; the fold_end sample is the final anchor). `_emit` is a PURE-READ
+research/v15/.audit_m03.txt:1203:research/v15/v15_m07_engine.py:617:            flag = "fold_start" if b == _bstart else "block_boundary"
+research/v15/.audit_m03.txt:1204:research/v15/v15_m07_engine.py:618:            equity_samples.append(_eq_sample(entity_id, fold_id, b, eqb, flag, state, summary["max_dd"]))
+research/v15/.audit_m03.txt:1205:research/v15/v15_m07_engine.py:679:            equity_samples.append(_eq_sample(entity_id, fold_id, our_ts, cur_eq, "action", st, summary["max_dd"]))
+research/v15/.audit_m03.txt:1206:research/v15/v15_m07_engine.py:715:        equity_samples.append(_eq_sample(entity_id, fold_id, our_ts, eq, "action", st, summary["max_dd"]))
+research/v15/.audit_m03.txt:1207:research/v15/v15_m07_engine.py:745:        equity_samples.append(_eq_sample(entity_id, fold_id, end_ts_ms, eq, "fold_end", st, summary["max_dd"]))
+research/v15/.audit_m03.txt:1208:research/v15/v15_m07_engine.py:749:    # zero-equity samples at every REMAINING block boundary + a fold_end anchor so M6b block ROE has no
+research/v15/.audit_m03.txt:1209:research/v15/v15_m07_engine.py:754:            equity_samples.append(_eq_sample(entity_id, fold_id, b, 0.0, "block_boundary", st, summary["max_dd"]))
+research/v15/.audit_m03.txt:1210:research/v15/v15_m07_engine.py:755:        equity_samples.append(_eq_sample(entity_id, fold_id, end_ts_ms, 0.0, "fold_end", st, summary["max_dd"]))
+research/v15/.audit_m03.txt:1211:research/v15/v15_m07_engine.py:763:        # time-weighted to fold_end, advancing the source target vector read-only over later actions.
+research/v15/.audit_m03.txt:1212:research/v15/v15_m07_engine.py:788:def _new_summary(entity_id, fold_id, start_equity, n_actions, params, md):
+research/v15/.audit_m03.txt:1213:research/v15/v15_m07_engine.py:790:        "entity_id": entity_id, "fold_id": fold_id, "start_equity": float(start_equity),
+research/v15/.audit_m03.txt:1214:research/v15/v15_m07_engine.py:808:        # fold_end) ONLY -> the new boundary/ruin-drain samples never change them (byte-identical).
+research/v15/.audit_m03.txt:1215:research/v15/v15_m07_engine.py:820:def _eq_sample(entity_id, fold_id, ts, eq, flag, st, dd):
+research/v15/.audit_m03.txt:1216:research/v15/v15_m07_engine.py:821:    return {"entity_id": entity_id, "fold_id": fold_id, "ts": ts, "subaccount_equity": eq,
+research/v15/.audit_m03.txt:1217:research/v15/v15_m07_engine.py:1049:        "entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
+research/v15/.audit_m03.txt:1218:research/v15/v15_m07_engine.py:1227:                         summary.get("entity_id"), summary.get("fold_id"))
+research/v15/.audit_m03.txt:1219:research/v15/v15_m07_engine.py:1508:        fl.append({"entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
+research/v15/.audit_m03.txt:1220:research/v15/v15_m07_engine.py:1526:    return {"entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "ts": ts_ms,
+research/v15/.audit_m03.txt:1221:research/v15/v15_m07_engine.py:1630:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+research/v15/.audit_m03.txt:1222:research/v15/v15_m07_engine.py:1634:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
+research/v15/.audit_m03.txt:1223:research/v15/v15_m07_engine.py:1638:    sl = pd.read_parquet(shortlist_path, columns=["entity_id", "primary_wallet", "fold_id", "in_shortlist"])
+research/v15/.audit_m03.txt:1224:research/v15/v15_m07_engine.py:1646:        seats_by_wallet.setdefault(r.primary_wallet, []).append((int(r.entity_id), int(r.fold_id)))
+research/v15/.audit_m03.txt:1225:research/v15/v15_m07_engine.py:1680:    # D1: optional slippage calibration (per-fold as-of). Installed per seat by fold_id.
+research/v15/.audit_m03.txt:1226:research/v15/v15_m07_engine.py:1686:        calib_per_fold = {int(k): v for k, v in cal.get("per_fold_asof", {}).items()}
+research/v15/.audit_m03.txt:1227:research/v15/v15_m07_engine.py:1706:        for entity_id, fold_id in sorted(seats_by_wallet.get(w, [])):
+research/v15/.audit_m03.txt:1228:research/v15/v15_m07_engine.py:1707:            t0ms, t1ms = fold_win[fold_id]
+research/v15/.audit_m03.txt:1229:research/v15/v15_m07_engine.py:1708:            md.set_slip_calib(calib_per_fold.get(int(fold_id)), calib_version)   # D1 per-fold as-of
+research/v15/.audit_m03.txt:1230:research/v15/v15_m07_engine.py:1711:                                  entity_id=entity_id, fold_id=fold_id)
+research/v15/.audit_m03.txt:1295:research/v15/v15_m01_equity_reconstruct.py:1548:    # and silently backfilled into history (codex P0). The walk filters events by
+research/v15/.audit_m03.txt:1798:/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '1600,1720p'" in /Users/hermes/quants-lab
+research/v15/.audit_m03.txt:1822:  1622	    install_memory_guard(soft_gb=12, label="m07")
+research/v15/.audit_m03.txt:1852:  1652	    shard_dir = out_dir / "_m07_wallet_shards"
+research/v15/.audit_m03.txt:1889:  1689	    fw = ShardedParquetWriter(out_dir / "m07_fills.parquet", flush_rows=flush_rows)
+research/v15/.audit_m03.txt:1890:  1690	    ew = ShardedParquetWriter(out_dir / "m07_events.parquet", flush_rows=flush_rows)
+research/v15/.audit_m03.txt:1891:  1691	    sw = ShardedParquetWriter(out_dir / "m07_summary.parquet", flush_rows=200_000)
+research/v15/.audit_m03.txt:1892:  1692	    qw = ShardedParquetWriter(out_dir / "m07_equity.parquet", flush_rows=flush_rows)  # CHANGE 1
+research/v15/.audit_m03.txt:2349:tests/v15/test_m07.py:422:def test_start_state_open_position_advances_risk_with_no_actions():
+research/v15/.audit_m03.txt:2350:tests/v15/test_m07.py:530:def test_ending_account_state_returned():
+research/v15/.audit_m03.txt:2495:research/v15/v15_m07_engine.py:1626:    # window selects the simulated span per fold: "test" = OOS [test_start,test_end) (M9 eval input);
+research/v15/.audit_m03.txt:2496:research/v15/v15_m07_engine.py:1627:    # "pretest" = [train_start,test_start) (M6b fold-pure ranking input). Same shipped engine; only the
+research/v15/.audit_m03.txt:2497:research/v15/v15_m07_engine.py:1631:                                     int(pd.Timestamp(r.test_start).timestamp() * 1000))
+research/v15/.audit_m03.txt:2498:research/v15/v15_m07_engine.py:1634:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
+research/v15/.audit_m03.txt:2499:research/v15/v15_m07_engine.py:1635:                                     int(pd.Timestamp(r.test_end_excl).timestamp() * 1000))
+research/v15/.audit_m03.txt:2500:research/v15/v15_m07_engine.py:1725:    ap.add_argument("--folds", default=str(DATA_DIR / "m03_folds.parquet"))
+research/v15/.audit_m03.txt:2730:research/v15/v15_m07_engine.py:1630:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+research/v15/.audit_m03.txt:2731:research/v15/v15_m07_engine.py:1631:                                     int(pd.Timestamp(r.test_start).timestamp() * 1000))
+research/v15/.audit_m03.txt:2732:research/v15/v15_m07_engine.py:1634:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
+research/v15/.audit_m03.txt:2733:research/v15/v15_m07_engine.py:1635:                                     int(pd.Timestamp(r.test_end_excl).timestamp() * 1000))
+research/v15/.audit_m03.txt:2796:**P0 Findings**
+research/v15/.audit_m03.txt:2843:**P0 Findings**
+research/v15/v15_forward_select.py:22:import v15_m07_engine as E      # noqa: E402
+research/v15/v15_forward_select.py:30:    oos = pd.read_parquet(DATA / "m07_test_final" / "m07_summary.parquet")[
+research/v15/v15_forward_select.py:32:    pre = pd.read_parquet(DATA / "m07_pretest_final" / "m07_summary.parquet")[
+research/v15/v15_m06b_ranking.py:20:      --m07-dir app/data/v15/m07_pretest --out app/data/v15
+research/v15/v15_m06b_ranking.py:125:def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None) -> dict:
+research/v15/v15_m06b_ranking.py:133:    m07_summary = _read_parquet_maybe_parts(m07_dir / "m07_summary.parquet")
+research/v15/v15_m06b_ranking.py:134:    # m07_fills only needed for exposure_time (per (entity,fold) our_ts span). Read lazily/aggregated.
+research/v15/v15_m06b_ranking.py:135:    fills_path = m07_dir / "m07_fills.parquet"
+research/v15/v15_m06b_ranking.py:153:    eq_path = m07_dir / "m07_equity.parquet"
+research/v15/v15_m06b_ranking.py:154:    m07_equity = None
+research/v15/v15_m06b_ranking.py:156:        m07_equity = _read_parquet_maybe_parts(eq_path)
+research/v15/v15_m06b_ranking.py:157:        if m07_equity.empty:
+research/v15/v15_m06b_ranking.py:158:            m07_equity = None
+research/v15/v15_m06b_ranking.py:160:        m07_equity = None
+research/v15/v15_m06b_ranking.py:164:        "m07_summary": m07_summary,
+research/v15/v15_m06b_ranking.py:165:        "m07_fills_path": fills_path,
+research/v15/v15_m06b_ranking.py:172:        "m07_equity": m07_equity,
+research/v15/v15_m06b_ranking.py:176:def _exposure_days_from_fills(fills_path: Path, m07_dir: Path) -> pd.DataFrame:
+research/v15/v15_m06b_ranking.py:189:# FINAL source = m07_equity per-block ROE. PROVISIONAL fallback = M6a source persistence (clearly
+research/v15/v15_m06b_ranking.py:197:    (block_idx >= n_full) is excluded by the consumer. Only computed when m07_equity is present
+research/v15/v15_m06b_ranking.py:200:    fills_path: m07 fills (entity_id, fold_id, our_ts) -> per-block n_fills (engine fills).
+research/v15/v15_m06b_ranking.py:358:                     "consistency_source": "m07_equity_block_roe"})
+research/v15/v15_m06b_ranking.py:363:    """PROVISIONAL fallback when m07_equity is absent. Uses M6a source persistence
+research/v15/v15_m06b_ranking.py:396:    summ = inputs["m07_summary"].copy()
+research/v15/v15_m06b_ranking.py:475:    exposure = _exposure_days_from_fills(inputs["m07_fills_path"], None)
+research/v15/v15_m06b_ranking.py:479:    if inputs["m07_equity"] is not None:
+research/v15/v15_m06b_ranking.py:480:        blocks_act = _blocks_activity(inputs["m07_fills_path"], inputs["m02_journeys_path"],
+research/v15/v15_m06b_ranking.py:482:        cons = _consistency_from_equity(inputs["m07_equity"], folds, m, blocks_act)
+research/v15/v15_m06b_ranking.py:498:    #     no M7 row stays in the output with roe_adj NaN -> excluded (missing_m07_row), never dropped. ---
+research/v15/v15_m06b_ranking.py:499:    # AUDIT 2026-07-10 (codex P0#3): validate="one_to_one" on every fold-keyed merge. A duplicate
+research/v15/v15_m06b_ranking.py:510:        "unavailable" if inputs["m07_equity"] is None else "m07_equity_block_roe")
+research/v15/v15_m06b_ranking.py:516:        df = df.merge(ent_copy, on=["entity_id", "fold_id"], how="left", validate="one_to_one")  # codex P0#3
+research/v15/v15_m06b_ranking.py:520:        df = df.merge(ent_copy, on="entity_id", how="left", validate="many_to_one")  # codex P0#3
+research/v15/v15_m06b_ranking.py:535:        df["fidelity_source"] = np.where(te_finite, "m07_tracking_error", "unavailable_provisional")
+research/v15/v15_m06b_ranking.py:596:            reasons.append("missing_m07_row")
+research/v15/v15_m06b_ranking.py:730:    fidelity_final = bool(rk_mask.any() and out.loc[rk_mask, "fidelity_source"].eq("m07_tracking_error").all())
+research/v15/v15_m06b_ranking.py:731:    consistency_final = bool(rk_mask.any() and out.loc[rk_mask, "consistency_source"].eq("m07_equity_block_roe").all())
+research/v15/v15_m06b_ranking.py:744:    # AUDIT 2026-07-10 (codex P0#2): FINAL/investable additionally REQUIRES fold-pure M4. The global
+research/v15/v15_m06b_ranking.py:820:    ap.add_argument("--m07-dir", default=str(DATA_DIR / "m07_pretest"),
+research/v15/v15_m06b_ranking.py:821:                    help="M7 PRETEST-window run dir (m07_summary/fills/[equity].parquet)")
+research/v15/v15_m06b_ranking.py:835:        Path(args.m07_dir), data_dir=Path(args.data_dir),
+research/v15/forward_oos_hot.py:116:# main() flips it for the sensitivity run so we can report whether PASS count holds under the conservative floor.
+research/v15/forward_oos_hot.py:193:    # P0 carry-in fix (codex 2026-07-09): prepend by_wallet history [0, first-break) so roundtrips() tracks
+research/v15/v15_m02_journey_trace.py:258:        return "fast-flip"
+research/v15/s3_taker_verify.py:53:    # P0 fix (codex 2026-07-09): load FULL history [0, hi) so roundtrips() tracks true carry-in position
+research/v15/s3_taker_verify.py:78:    Codex 2026-07-09 fixes: (P0) load FULL history ONCE per wallet -> roundtrips() tracks true carry-in,
+research/v15/v15_m01_equity_reconstruct.py:1291:      BURST-AWARE seed. pos = P0 + cumsum(signed_sz of fills<=anchor), where P0 (the
+research/v15/v15_m01_equity_reconstruct.py:1294:      mid-burst garbage startPosition), in which case P0 is anchored to the authoritative
+research/v15/v15_m01_equity_reconstruct.py:1295:      fetch-time snapshot: P0 = snapshot_position - sum(ALL signed_sz). This kills the
+research/v15/v15_m01_equity_reconstruct.py:1298:      signed_sz is order-independent so only P0 needed the fix. Coins in the snapshot but
+research/v15/v15_m01_equity_reconstruct.py:1320:    # pos(anchor) = P0 + cumulative signed_sz of fills at-or-before the anchor. The
+research/v15/v15_m01_equity_reconstruct.py:1321:    # cumulative sum is order-independent and robust. P0 (pre-first-fill carry) was the
+research/v15/v15_m01_equity_reconstruct.py:1329:    # fill is a same-ms burst, take P0 from the AUTHORITATIVE fetch-time snapshot instead:
+research/v15/v15_m01_equity_reconstruct.py:1330:    # P0 = snapshot_position(coin) - sum(ALL signed_sz) (order-independent, ground-truth-
+research/v15/v15_m01_equity_reconstruct.py:1392:    # caller can flag/quarantine the day instead of trusting it (P0).
+research/v15/v15_m01_equity_reconstruct.py:1548:    # and silently backfilled into history (codex P0). The walk filters events by
+research/v15/v15_m01_equity_reconstruct.py:1705:    # (P0). All dexes are in scope now, so merely touching a no-anchor-row dex
+research/v15/v15_two_regime_test.py:16:     --m07-test app/data/v15/m07_test_final/m07_summary.parquet \
+research/v15/v15_two_regime_test.py:70:def run(m07_test: str, m04_entities: str, since: str, min_fills: int, min_equity: float) -> dict:
+research/v15/v15_two_regime_test.py:71:    tst = pd.read_parquet(m07_test)[["entity_id", "fold_id", "roe_engine",
+research/v15/v15_two_regime_test.py:112:    ap.add_argument("--m07-test", default="app/data/v15/m07_test_final/m07_summary.parquet")
+research/v15/v15_two_regime_test.py:119:    summary, table = run(args.m07_test, args.m04_entities, args.since, args.min_fills, args.min_equity)
+research/v15/v15_m07_engine.py:4:Design: brain projects/quant/v15/modules/m07 (codex DESIGN loop r1->r5 SHIP, 2026-05-31).
+research/v15/v15_m07_engine.py:40:logger = logging.getLogger("m07_engine")
+research/v15/v15_m07_engine.py:621:    # AUDIT 2026-07-10 (codex P0#1): WINDOW PURITY. Defensively drop any SOURCE action outside [win_lo, end)
+research/v15/v15_m07_engine.py:626:    # AUDIT 2026-07-10 (codex P0#2): emit window provenance on the summary so a consumer (m06b) can PROVE the
+research/v15/v15_m07_engine.py:631:    # (codex P0#1 minor; spot rows are skipped by the loop so they must not inflate this reject count).
+research/v15/v15_m07_engine.py:632:    summary["n_late_copy_skipped"] = sum(
+research/v15/v15_m07_engine.py:634:    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+research/v15/v15_m07_engine.py:641:        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+research/v15/v15_m07_engine.py:653:    # AUDIT 2026-07-10 (codex P0#3): seed at the WINDOW START mark (prev_ts), NOT the first action's mark, so
+research/v15/v15_m07_engine.py:687:        # AUDIT 2026-07-10 (codex P0#1): a latency-pushed fill at our_ts >= end_ts_ms would execute on
+research/v15/v15_m07_engine.py:691:            break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
+research/v15/v15_m07_engine.py:911:    the full in-window path (codex P0#3). Conservative: only seeds if the source enters already holding."""
+research/v15/v15_m07_engine.py:918:    # AUDIT 2026-07-10 (codex P0#3): mark the carried position at the window START (seed_ts), not at the first
+research/v15/v15_m07_engine.py:934:            # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
+research/v15/v15_m07_engine.py:1040:    # AUDIT 2026-07-10 (codex P0#5 gate): a REVERSAL (flip through zero) is not "increasing" in magnitude, so it
+research/v15/v15_m07_engine.py:1041:    # skipped the IM gate and could open a residual isolated position that drives main NEGATIVE. Gate the flip:
+research/v15/v15_m07_engine.py:1044:    flipping = (cur_szi != 0.0 and abs(new_szi) > 10 ** (-szdec)
+research/v15/v15_m07_engine.py:1046:    if flipping and mode == "isolated":
+research/v15/v15_m07_engine.py:1060:    # codex r2: a CROSS flip (same-or-smaller residual, so not "increasing") must ALSO pass the cross IM
+research/v15/v15_m07_engine.py:1062:    # IM). Route cross flips into the gate; validated isolated flips (handled above) are excluded.
+research/v15/v15_m07_engine.py:1063:    if (increasing or (flipping and mode == "cross")) and not (flipping and mode == "isolated"):
+research/v15/v15_m07_engine.py:1212:        # FLIPPED THROUGH ZERO. Split the flip-order fee by closing vs opening notional so each round-trip
+research/v15/v15_m07_engine.py:1220:            # AUDIT 2026-07-10 (codex P0#5): a reversal must CLOSE the old isolated leg (return its margin +
+research/v15/v15_m07_engine.py:1231:        p.entry_px = fill_px      # residual opposite leg re-enters at the flip price
+research/v15/v15_m07_engine.py:1232:        # CHANGE A: flip CLOSES the prior round-trip (closed portion's realized + close_fee) and OPENS a new
+research/v15/v15_m07_engine.py:1287:            logger.error("m07 _advance_between guard tripped (entity=%s fold=%s)",
+research/v15/v15_m07_engine.py:1306:            # AUDIT 2026-07-10 (codex P0#4 + fix): the FOLD is half-open [start, fold_end). Funding stamped
+research/v15/v15_m07_engine.py:1485:    # AUDIT 2026-07-10 (codex P0#6 gap): if the isolated backstop(s) above left the account with no equity
+research/v15/v15_m07_engine.py:1510:            # AUDIT 2026-07-10 (codex P0#6): if this backstop leaves the account with no equity (total across
+research/v15/v15_m07_engine.py:1701:    install_memory_guard(soft_gb=12, label="m07")
+research/v15/v15_m07_engine.py:1731:    shard_dir = out_dir / "_m07_wallet_shards"
+research/v15/v15_m07_engine.py:1768:    fw = ShardedParquetWriter(out_dir / "m07_fills.parquet", flush_rows=flush_rows)
+research/v15/v15_m07_engine.py:1769:    ew = ShardedParquetWriter(out_dir / "m07_events.parquet", flush_rows=flush_rows)
+research/v15/v15_m07_engine.py:1770:    sw = ShardedParquetWriter(out_dir / "m07_summary.parquet", flush_rows=200_000)
+research/v15/v15_m07_engine.py:1771:    qw = ShardedParquetWriter(out_dir / "m07_equity.parquet", flush_rows=flush_rows)  # CHANGE 1
+research/v15/v15_m08_survival.py:14:  python research/v15/v15_m08_survival.py --m07-dir app/data/v15/m07_pretest --out app/data/v15
+research/v15/v15_m08_survival.py:32:import v15_m07_engine as E  # noqa: E402
+research/v15/v15_m08_survival.py:56:    # STALENESS gate (audit 2026-07-10 P0#1; Alberto delegated the cutoff TG 11133): a wallet must have OPENED
+research/v15/v15_m08_survival.py:104:    # AUDIT 2026-07-10 (P0#1, Alberto-delegated cutoff): STALENESS gate. A wallet whose most recent in-window
+research/v15/v15_m08_survival.py:124:    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
+research/v15/v15_m08_survival.py:188:def tier_attribution(tiers: pd.DataFrame, m07_summary: pd.DataFrame) -> pd.DataFrame:
+research/v15/v15_m08_survival.py:197:    df = tiers.merge(m07_summary[["entity_id", "fold_id", "roe_engine", "ruin"]],
+research/v15/v15_m08_survival.py:202:    df["_missing_m07"] = df["roe_engine"].isna()
+research/v15/v15_m08_survival.py:203:    n_missing_total = int(df["_missing_m07"].sum())
+research/v15/v15_m08_survival.py:208:    present = df[~df["_missing_m07"]]
+research/v15/v15_m08_survival.py:214:            gp = g[~g["_missing_m07"]]
+research/v15/v15_m08_survival.py:217:                "n_missing_m07": int(g["_missing_m07"].sum()),
+research/v15/v15_m08_survival.py:266:def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optional[str] = None,
+research/v15/v15_m08_survival.py:284:    # AUDIT 2026-07-10 (codex P0#3): the global m04_entities.parquet maps entity->primary_wallet using
+research/v15/v15_m08_survival.py:391:    summ = _read_m07_summary(m07_dir)
+research/v15/v15_m08_survival.py:404:def _read_m07_summary(m07_dir: Path) -> pd.DataFrame:
+research/v15/v15_m08_survival.py:405:    p = m07_dir / "m07_summary.parquet"
+research/v15/v15_m08_survival.py:406:    parts = m07_dir / "m07_summary.parquet.parts"
+research/v15/v15_m08_survival.py:415:    ap.add_argument("--m07-dir", default=str(DATA_DIR / "m07_pretest_final"))
+research/v15/v15_m08_survival.py:436:    run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
+research/v15/v15_m10_gates.py:28:    expected_n_folds: int = 8              # G2 denominator MUST be verified (codex P0#3)
+research/v15/v15_m10_gates.py:76:    # key f"p{int(pct)}" (pct=95.5 would silently use p95). Also require a FINITE strategy value (P0#2 partial).
+research/v15/v15_m10_gates.py:115:    Guards codex P0#1 (literal bools), P0#2 (finite + valid domains), P0#3 (verified fold denominator)."""
+research/v15/v15_m10_gates.py:154:    # AUDIT 2026-07-10 (codex P0#1,#2,#3): FAIL CLOSED on invalid inputs BEFORE gating. bool(np.nan) is True, so a
+research/v15/v15_m10_gates.py:163:    # G2: n_positive_folds >= min AND the denominator is verified == expected_n_folds (codex P0#3).
+
+codex
+I have the diff and references. I’m going to read the exact admissibility and fill-booking code as one block so the verdict is based on the executed cash/IM math, not just the comments.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '980,1245p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   980	        return
+   981	    if liq.get("uncalibrated"):
+   982	        summary["slippage_uncalibrated"] = True
+   983	    elif getattr(md, "slip_calib_version", None) is not None:
+   984	        summary["slippage_calibration_version"] = md.slip_calib_version
+   985	    adv = liq.get("adv", 0.0)
+   986	    capacity_capped = False
+   987	    if adv > 0 and not force_close:
+   988	        max_notional = CAPACITY_PARTICIPATION_CAP * adv
+   989	        if delta_notional > max_notional:
+   990	            delta_szi *= max_notional / delta_notional
+   991	            delta_szi = round(delta_szi, szdec)
+   992	            delta_notional = abs(delta_szi) * mark
+   993	            capacity_capped = True
+   994	            summary["n_capacity_capped"] += 1
+   995	            if delta_notional < MIN_ORDER_NOTIONAL:
+   996	                return
+   997	
+   998	    # If ADV is unavailable on a forced close, use a full-ADV conservative
+   999	    # fallback. New exposure already fails closed above.
+  1000	    participation = (delta_notional / adv) if adv > 0 else (1.0 if force_close else CAPACITY_PARTICIPATION_CAP)
+  1001	    impact_k = liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)        # D1: calibrated-or-prior slope
+  1002	    impact_alpha = liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA)
+  1003	    impact_bps = impact_k * (participation ** impact_alpha) * band
+  1004	    half_spread_bps = liq.get("half_spread_bps", DEFAULT_HALF_SPREAD_BPS) * band
+  1005	    slip_bps = half_spread_bps + impact_bps
+  1006	    side = 1 if delta_szi > 0 else -1
+  1007	    fill_px = mark * (1 + side * slip_bps / 1e4)
+  1008	
+  1009	    # CHANGE B: explicit ADVERSE LATENCY DRIFT (latency_model="bar_drift_v1"). At a 1m mark resolution a
+  1010	    # 2s copy latency resolves to the same bar-close price as 0s ~97% of the time, so the latency cost is
+  1011	    # otherwise invisible. We charge a haircut = LAT_DRIFT_K * (latency as a fraction of a 1m bar) *
+  1012	    # |causal vol proxy|, applied ALWAYS-adverse to a late taker: a BUY fills higher, a SELL fills lower.
+  1013	    # CAUSAL FIX (codex finding #3): the vol proxy is the PRIOR COMPLETED bar's |return| (fully known
+  1014	    # before our_ts), NOT the containing bar's (close-open) which was within-minute future info (look-
+  1015	    # ahead). High prior-bar vol = scalper/UHFT territory is still penalized -> the discriminating power
+  1016	    # is preserved while the look-ahead is removed. Conservative CAUSAL VOL-PROXY APPROXIMATION pending
+  1017	    # real sub-minute (HL trades / L2 book) data. Determinism: derived from the frozen OHLC cache + the
+  1018	    # fixed copy_latency_ms only.
+  1019	    lat_frac = min(1.0, params.copy_latency_ms / 60_000.0)   # fraction of a 1m bar our latency spans
+  1020	    vol_proxy = _bar_vol_proxy(md, coin, our_ts)             # UNSIGNED |return| of the PRIOR closed bar
+  1021	    latency_drift_bps = 0.0
+  1022	    if lat_frac > 0.0 and vol_proxy == vol_proxy:
+  1023	        # ALWAYS a cost: magnitude scales with the prior-bar vol proxy, and `side` makes it adverse to
+  1024	        # our trade. Large exactly on fast directional bars; charged on every copied fill so the latency
+  1025	        # haircut is never silently zero.
+  1026	        latency_drift = LAT_DRIFT_K * lat_frac * vol_proxy
+  1027	        latency_drift_bps = latency_drift * 1e4   # for the slip diagnostic (codex finding #4)
+  1028	        fill_px *= (1 + side * latency_drift)
+  1029	
+  1030	    fee_rate = md.fees.taker(coin)
+  1031	    fee = abs(delta_szi) * fill_px * fee_rate
+  1032	
+  1033	    # pre-trade INITIAL-MARGIN admissibility (design §4.4; codex code-r2 #3). Only gate orders that
+  1034	    # INCREASE exposure (reduces/closes free margin, always allowed). Reject if the required IM + fee
+  1035	    # exceeds available bucket collateral -> prevents driving main negative on isolated opens and
+  1036	    # caps cross leverage at the tier. Conservative: cross availability nets existing-position IM.
+  1037	    cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
+  1038	    new_szi = cur_szi + delta_szi
+  1039	    increasing = abs(new_szi) > abs(cur_szi) + 10 ** (-szdec)
+  1040	    # AUDIT 2026-07-10 (codex P0#5 gate): a REVERSAL (flip through zero) is not "increasing" in magnitude, so it
+  1041	    # skipped the IM gate and could open a residual isolated position that drives main NEGATIVE. Gate the flip:
+  1042	    # after settling the old leg (main + old_im + realized_close - close_fee), the residual's fresh IM + open_fee
+  1043	    # + slip must fit; else REJECT the copy (stay as-is; tracking_error captures the divergence).
+  1044	    flipping = (cur_szi != 0.0 and abs(new_szi) > 10 ** (-szdec)
+  1045	                and ((cur_szi >= 0) != (new_szi >= 0)))
+  1046	    if flipping and mode == "isolated":
+  1047	        p0 = st.positions[coin]
+  1048	        realized_close = abs(cur_szi) * (fill_px - p0.entry_px) * (1.0 if cur_szi > 0 else -1.0)
+  1049	        closed_sz, opened_sz = abs(cur_szi), abs(new_szi)
+  1050	        total_sz = closed_sz + opened_sz
+  1051	        close_fee = fee * (closed_sz / total_sz) if total_sz > 0 else fee
+  1052	        open_fee = fee - close_fee
+  1053	        slip_cost = abs(delta_szi) * abs(fill_px - mark)
+  1054	        settled_main = st.cross_collateral.get("main", 0.0) + p0.isolated_margin + realized_close - close_fee
+  1055	        new_notional = opened_sz * fill_px
+  1056	        resid_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
+  1057	        if settled_main < resid_im + open_fee + slip_cost:
+  1058	            summary["n_rejected"] += 1
+  1059	            return
+  1060	    # codex r2: a CROSS flip (same-or-smaller residual, so not "increasing") must ALSO pass the cross IM
+  1061	    # admissibility gate below (else a reversal can realize loss + open a residual that leaves the scope under
+  1062	    # IM). Route cross flips into the gate; validated isolated flips (handled above) are excluded.
+  1063	    if (increasing or (flipping and mode == "cross")) and not (flipping and mode == "isolated"):
+  1064	        # use the SLIPPAGE-ADJUSTED fill_px (codex code-r4 #2) so the gate matches what _book_fill
+  1065	        # actually posts/debits; also charge the immediate slippage loss on the new size.
+  1066	        new_notional = abs(new_szi) * fill_px
+  1067	        new_im = new_notional * md.meta.init_margin_rate(coin, new_notional)   # TOTAL IM (tier-correct; codex code-r3)
+  1068	        slip_cost = abs(delta_szi) * abs(fill_px - mark)
+  1069	        if mode == "isolated":
+  1070	            cur_im = st.positions[coin].isolated_margin if coin in st.positions else 0.0
+  1071	            if (new_im - cur_im) + fee + slip_cost > max(0.0, st.cross_collateral.get("main", 0.0)):
+  1072	                summary["n_rejected"] += 1
+  1073	                return
+  1074	        else:
+  1075	            # TOTAL cross IM of the scope AFTER the fill (existing positions re-rated at their tier)
+  1076	            # must not exceed scope equity (cash + uPnL) net of fee + immediate slippage cost.
+  1077	            scope_k = coin_dex(coin)
+  1078	            total_im = new_im
+  1079	            equity = st.cross_collateral.get(scope_k, 0.0) - fee - slip_cost
+  1080	            if coin in st.positions:          # uPnL on the pre-existing portion of this coin
+  1081	                equity += cur_szi * (mark - st.positions[coin].entry_px)
+  1082	            for cc in sorted(st.positions):
+  1083	                pp = st.positions[cc]
+  1084	                if pp.mode != "cross" or coin_dex(cc) != scope_k or cc == coin:
+  1085	                    continue
+  1086	                mm = md.mark(cc, our_ts)
+  1087	                base = mm if (mm is not None and mm == mm) else pp.entry_px
+  1088	                total_im += abs(pp.szi) * base * md.meta.init_margin_rate(cc, abs(pp.szi) * base)
+  1089	                equity += pp.szi * (base - pp.entry_px)
+  1090	            if total_im > max(0.0, equity):
+  1091	                summary["n_rejected"] += 1
+  1092	                return
+  1093	
+  1094	    _book_fill(st, md, coin, delta_szi, fill_px, mode, fee, summary)
+  1095	
+  1096	    summary["n_fills"] += 1
+  1097	    summary["total_fees"] += fee
+  1098	    summary["notional_traded"] += delta_notional
+  1099	    # FIX (codex finding #4): include the latency-drift bps in the notional-weighted slip diagnostic so
+  1100	    # the reported execution haircut isn't understated (the drift is a real per-fill execution cost
+  1101	    # already priced into fill_px above; it must show up in slip_bps_notional_weighted too).
+  1102	    summary["slip_bps_notional_sum"] += (slip_bps + latency_drift_bps) * delta_notional
+  1103	    fills.append({
+  1104	        "entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
+  1105	        "our_ts": our_ts, "source_ts": int(a["ts"]), "side": "buy" if side > 0 else "sell",
+  1106	        "our_fill_size": float(delta_szi), "our_fill_px": float(fill_px), "ref_mark": float(mark),
+  1107	        "half_spread_bps": float(half_spread_bps), "impact_bps": float(impact_bps), "fee": float(fee),
+  1108	        "fill_type": "normal", "capacity_capped": bool(capacity_capped), "margin_mode": mode,
+  1109	    })
+  1110	
+  1111	
+  1112	# --------------------------------------------------------------------------- #
+  1113	# CHANGE A — realized round-trip accounting (per-coin accumulator -> M6b aggregates)
+  1114	# --------------------------------------------------------------------------- #
+  1115	def _rt_open(summary: dict, coin: str):
+  1116	    """Start (or re-arm) the round-trip accumulator for `coin` when its position opens from flat."""
+  1117	    summary["_rt"][coin] = {"realized": 0.0, "fee": 0.0, "funding": 0.0}
+  1118	
+  1119	
+  1120	def _rt_add(summary: dict, coin: str, realized: float = 0.0, fee: float = 0.0, funding: float = 0.0):
+  1121	    """Accumulate realized PnL / fee / funding onto the open round-trip for `coin` (no-op if no open
+  1122	    round-trip is being tracked, e.g. a carried-in position seeded before tracking started)."""
+  1123	    acc = summary["_rt"].get(coin)
+  1124	    if acc is None:
+  1125	        return
+  1126	    acc["realized"] += realized
+  1127	    acc["fee"] += fee
+  1128	    acc["funding"] += funding
+  1129	
+  1130	
+  1131	def _rt_realize_terminal(summary: dict, p: "Position", terminal_px: float, extra_loss: float = 0.0):
+  1132	    """CHANGE A FIX (codex finding #1): book the FULL terminal loss of a force-closed position into its
+  1133	    open round-trip BEFORE _rt_close, so a RUIN / BACKSTOP / LIQUIDATION wipe is correctly a LOSS in
+  1134	    realized_pnl_total + round_trip_win_rate (otherwise the RT had only entry-fee/funding and could
+  1135	    score as a win). terminal_px is the (adverse / causal) price the position is wiped at; the realized
+  1136	    MTM = szi*(terminal_px - entry_px) (signed; deeply negative for the move that wiped it). extra_loss
+  1137	    (>=0) is any additional penalty/fee the forced close eats (e.g. liquidation slippage already in
+  1138	    terminal_px, so pass 0 there) charged as a positive cost. No-op if no RT is open for the coin."""
+  1139	    acc = summary["_rt"].get(p.coin)
+  1140	    if acc is None:
+  1141	        return
+  1142	    realized = p.szi * (terminal_px - p.entry_px)
+  1143	    acc["realized"] += realized
+  1144	    if extra_loss:
+  1145	        acc["fee"] += float(extra_loss)
+  1146	
+  1147	
+  1148	def _rt_close(summary: dict, coin: str):
+  1149	    """Finalize a CLOSED round-trip: realized PnL after OUR costs = realized - fees + funding (funding
+  1150	    is already signed: negative = paid). Pushes into the summary totals and clears the accumulator."""
+  1151	    acc = summary["_rt"].pop(coin, None)
+  1152	    if acc is None:
+  1153	        return
+  1154	    pnl = acc["realized"] - acc["fee"] + acc["funding"]
+  1155	    summary["n_round_trips"] += 1
+  1156	    if pnl > 0:
+  1157	        summary["n_round_trip_wins"] += 1
+  1158	    summary["realized_pnl_total"] += pnl
+  1159	
+  1160	
+  1161	def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fill_px: float,
+  1162	               mode: str, fee: float, summary: dict):
+  1163	    """Update position + the right bucket. ISOLATED opens post initial margin from main cross bucket;
+  1164	    isolated realized/funding/fees route to the position's isolated bucket; closing returns isolated
+  1165	    margin + realized to main (design §1.2/§3.1; codex code-r1 #2)."""
+  1166	    scope = coin_dex(coin)
+  1167	    p = st.positions.get(coin)
+  1168	    realized = 0.0
+  1169	    if p is None:
+  1170	        new = Position(coin, delta_szi, fill_px, mode, md.meta.max_leverage(coin))
+  1171	        if mode == "isolated":
+  1172	            im = abs(delta_szi) * fill_px * md.meta.init_margin_rate(coin, abs(delta_szi) * fill_px)
+  1173	            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - im - fee
+  1174	            new.isolated_margin = im
+  1175	        else:
+  1176	            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
+  1177	        st.positions[coin] = new
+  1178	        _rt_open(summary, coin)            # CHANGE A: round-trip opens from flat
+  1179	        _rt_add(summary, coin, fee=fee)    # entry fee is a round-trip cost
+  1180	        return
+  1181	
+  1182	    reducing = (p.szi > 0 and delta_szi < 0) or (p.szi < 0 and delta_szi > 0)
+  1183	    if reducing:
+  1184	        reduce = min(abs(delta_szi), abs(p.szi))
+  1185	        realized = reduce * (fill_px - p.entry_px) * (1 if p.szi > 0 else -1)
+  1186	    new_szi = p.szi + delta_szi
+  1187	
+  1188	    if abs(new_szi) < 10 ** (-md.meta.szdec(coin)):
+  1189	        # full close
+  1190	        if p.mode == "isolated":
+  1191	            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin + realized - fee
+  1192	        else:
+  1193	            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+  1194	        del st.positions[coin]
+  1195	        _rt_add(summary, coin, realized=realized, fee=fee)   # CHANGE A: book exit realized + fee
+  1196	        _rt_close(summary, coin)                             # ...and finalize the closed round-trip
+  1197	        return
+  1198	
+  1199	    if (p.szi >= 0) == (new_szi >= 0) and abs(new_szi) > abs(p.szi):
+  1200	        p.entry_px = (p.entry_px * abs(p.szi) + fill_px * abs(delta_szi)) / abs(new_szi)
+  1201	        if p.mode == "isolated":
+  1202	            # post the TIER-CORRECT total IM for the resulting notional; draw the delta (incl any
+  1203	            # tier-jump re-rate of the existing portion) from main (codex code-r3 consistency).
+  1204	            new_notional = abs(new_szi) * fill_px
+  1205	            target_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
+  1206	            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - (target_im - p.isolated_margin) - fee
+  1207	            p.isolated_margin = target_im
+  1208	        else:
+  1209	            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
+  1210	        _rt_add(summary, coin, fee=fee)    # CHANGE A: add into open round-trip (no realized)
+  1211	    elif (p.szi >= 0) != (new_szi >= 0):
+  1212	        # FLIPPED THROUGH ZERO. Split the flip-order fee by closing vs opening notional so each round-trip
+  1213	        # bears its own fee (codex finding #2). |p.szi| closes, |new_szi| opens.
+  1214	        closed_sz = abs(p.szi)
+  1215	        opened_sz = abs(new_szi)
+  1216	        total_sz = closed_sz + opened_sz
+  1217	        close_fee = fee * (closed_sz / total_sz) if total_sz > 0 else fee
+  1218	        open_fee = fee - close_fee
+  1219	        if p.mode == "isolated":
+  1220	            # AUDIT 2026-07-10 (codex P0#5): a reversal must CLOSE the old isolated leg (return its margin +
+  1221	            # realized - close_fee to main) and OPEN a fresh isolated leg for the RESIDUAL with its OWN new IM
+  1222	            # drawn from main. The old code did `isolated_margin += realized - fee`, leaving a live opposite
+  1223	            # position with a stale/NEGATIVE isolated margin (e.g. -40) and breaking cash/IM conservation.
+  1224	            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin + realized - close_fee
+  1225	            new_notional = opened_sz * fill_px
+  1226	            new_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
+  1227	            st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) - new_im - open_fee
+  1228	            p.isolated_margin = new_im
+  1229	        else:
+  1230	            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+  1231	        p.entry_px = fill_px      # residual opposite leg re-enters at the flip price
+  1232	        # CHANGE A: flip CLOSES the prior round-trip (closed portion's realized + close_fee) and OPENS a new
+  1233	        # one for the residual (open_fee).
+  1234	        _rt_add(summary, coin, realized=realized, fee=close_fee)
+  1235	        _rt_close(summary, coin)
+  1236	        _rt_open(summary, coin)
+  1237	        _rt_add(summary, coin, fee=open_fee)   # the opposite-side RT bears its own entry fee
+  1238	    else:
+  1239	        # reducing (same side, smaller): realize to bucket
+  1240	        _rt_add(summary, coin, realized=realized, fee=fee)   # CHANGE A: partial realized + fee
+  1241	        if p.mode == "isolated":
+  1242	            p.isolated_margin += realized - fee
+  1243	        else:
+  1244	            st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
+  1245	    p.szi = new_szi
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '600,705p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   600	        _bstart = int(end_ts_ms)
+   601	    boundaries_q = []
+   602	    k = 0
+   603	    while True:
+   604	        b = _bstart + k * BLOCK_MS
+   605	        if b >= end_ts_ms:
+   606	            break
+   607	        boundaries_q.append(b)
+   608	        k += 1
+   609	    _bi = [0]
+   610	
+   611	    def _emit(cursor_ts, state):
+   612	        if cursor_ts is None:
+   613	            return
+   614	        while _bi[0] < len(boundaries_q) and boundaries_q[_bi[0]] <= cursor_ts:
+   615	            b = boundaries_q[_bi[0]]; _bi[0] += 1
+   616	            eqb = state.equity(_marks(state, md, b))
+   617	            flag = "fold_start" if b == _bstart else "block_boundary"
+   618	            equity_samples.append(_eq_sample(entity_id, fold_id, b, eqb, flag, state, summary["max_dd"]))
+   619	
+   620	    rows = actions.sort_values(["ts", "event_order"]).to_dict("records") if not actions.empty else []
+   621	    # AUDIT 2026-07-10 (codex P0#1): WINDOW PURITY. Defensively drop any SOURCE action outside [win_lo, end)
+   622	    # so a mis-scoped input can't pollute the metrics with test-window data (the runner filters, but M8/M9
+   623	    # call step_subaccount directly). The latency-pushed our_ts >= end guard is enforced in the loop below.
+   624	    _win_lo = int(start_ts_ms) if start_ts_ms is not None else _bstart
+   625	    rows = [r for r in rows if _win_lo <= int(r["ts"]) < int(end_ts_ms)]
+   626	    # AUDIT 2026-07-10 (codex P0#2): emit window provenance on the summary so a consumer (m06b) can PROVE the
+   627	    # row was generated for its fold's window, not a stale test run. window_end is the half-open exclusive bound.
+   628	    summary["window_start_ms"] = int(_win_lo)
+   629	    summary["window_end_ms"] = int(end_ts_ms)
+   630	    # count of COPYABLE (perp, non-spot) actions whose latency-pushed our_ts lands at/after the fold end
+   631	    # (codex P0#1 minor; spot rows are skipped by the loop so they must not inflate this reject count).
+   632	    summary["n_late_copy_skipped"] = sum(
+   633	        1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
+   634	    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+   635	    # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+   636	    # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
+   637	    # until ADL is implemented or the stress model is accepted without it (Alberto decision).
+   638	    summary["adl_stress_requested"] = bool(params.adl_stress)
+   639	    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+   640	    if params.adl_stress:
+   641	        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+   642	                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+   643	    # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
+   644	    # zero actions (codex code-r2 #2). Falls back to the first action time, then end_ts.
+   645	    if start_ts_ms is not None:
+   646	        prev_ts = int(start_ts_ms)
+   647	    elif rows:
+   648	        prev_ts = int(rows[0]["ts"]) + params.copy_latency_ms
+   649	    else:
+   650	        prev_ts = end_ts_ms
+   651	
+   652	    # causal_carry_in: seed the opening position from the first action's pre-state (design D9).
+   653	    # AUDIT 2026-07-10 (codex P0#3): seed at the WINDOW START mark (prev_ts), NOT the first action's mark, so
+   654	    # the main loop's first _advance_between(start -> first action) captures any intra-window drawdown/
+   655	    # liquidation on the carried position (seeding at the first-action price skipped it = wrong max_dd/roe/ruin).
+   656	    if rows and params.start_policy == "causal_carry_in":
+   657	        _seed_carry_in(st, md, rows[0], params, summary, seed_ts=prev_ts)
+   658	
+   659	    # FOLLOWER-TRAIL peak init (codex review bug #8): when carrying state into the fold, the breaker peak
+   660	    # must start from the REAL marked equity at fold start, not the caller's (possibly stale) start_equity
+   661	    # scalar -- otherwise a chained fold can fire/suppress wrongly at t0. Gated on follower_trail so the
+   662	    # disabled path keeps the original peak (max_dd byte-identical).
+   663	    if params.follower_trail is not None and start_state is not None:
+   664	        _pe = st.equity(_marks(st, md, prev_ts))
+   665	        if _pe == _pe and _pe > peak_equity:
+   666	            peak_equity = _pe
+   667	
+   668	    # CHANGE 2 tracking_error state: the SOURCE signed target vector + the open interval's L1/active.
+   669	    src_target: dict = {}
+   670	    te_prev_ts = None
+   671	    te_prev_l1 = 0.0
+   672	    te_prev_active = False
+   673	
+   674	    def _te_accrue(to_ts):
+   675	        """accrue the open interval [te_prev_ts, to_ts) at the held L1 (active intervals only)."""
+   676	        nonlocal te_prev_ts
+   677	        if te_prev_ts is not None and to_ts > te_prev_ts and te_prev_active:
+   678	            dt = to_ts - te_prev_ts
+   679	            summary["_te_weighted_sum"] += dt * te_prev_l1
+   680	            summary["tracking_error_active_ms"] += dt
+   681	
+   682	    for a in rows:
+   683	        coin = a["coin"]
+   684	        if coin_is_spot(coin):
+   685	            continue
+   686	        our_ts = int(a["ts"]) + params.copy_latency_ms
+   687	        # AUDIT 2026-07-10 (codex P0#1): a latency-pushed fill at our_ts >= end_ts_ms would execute on
+   688	        # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
+   689	        # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
+   690	        if our_ts >= int(end_ts_ms):
+   691	            break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
+   692	
+   693	        _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
+   694	        if summary["ruin"]:
+   695	            break
+   696	
+   697	        marks = _marks(st, md, our_ts, extra=coin)
+   698	        cur_eq = st.equity(marks)
+   699	        if cur_eq <= 0:
+   700	            _ruin(st, md, summary, events, our_ts)
+   701	            break
+   702	
+   703	        # FOLLOWER trailing exit: check on the freshly-advanced equity BEFORE copying this action. If we
+   704	        # breach, flatten + latch; once halted we stop copying source entries for the rest of the fold.
+   705	        cur_eq = _trail_fire(cur_eq, our_ts)
+
+exec
+/bin/zsh -lc "nl -ba tests/v15/test_m07.py | sed -n '820,940p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   820	def test_finding1_ruined_round_trip_is_a_loss():
+   821	    # explicit D2 ruin path: crash wipes equity, a post-crash action triggers _ruin. The open
+   822	    # round-trip must be a LOSS in the realized aggregates (not flat/win).
+   823	    n = 200
+   824	    o = _flat_ohlc("BTC", T0, n, 100.0)
+   825	    mins, op, hi, lo, cl = o["BTC"]
+   826	    for arr in (op, hi, lo, cl):
+   827	        arr[60:] = 1.0      # -99% crash
+   828	    md = FakeMarketData(ohlc={"BTC": (mins, op, hi, lo, cl)}, maxlev=10.0)
+   829	    acts = pd.DataFrame([
+   830	        _action("BTC", T0 + 5 * E.MS_MIN, 5.0, "ENTRY", position_after=500.0),
+   831	        _action("BTC", T0 + 120 * E.MS_MIN, 5.0, "ADDON", position_after=500.0),  # sees cur_eq<=0 -> _ruin
+   832	    ])
+   833	    s = _run(acts, md, end=T0 + 190 * E.MS_MIN)["summary"]
+   834	    assert s["ruin"] is True
+   835	    assert s["n_round_trips"] >= 1
+   836	    assert s["n_round_trip_wins"] == 0
+   837	    assert s["realized_pnl_total"] < 0.0
+   838	
+   839	
+   840	def test_ruin_final_equity_and_roe_not_stale():
+   841	    # codex regression: after a RUIN, _finalize must report the POST-ruin equity (0), not the last
+   842	    # positive pre-ruin _core_final_eq sample. A ruined subaccount has final_equity ~= 0 and
+   843	    # roe_engine ~= -1.0 (-100%), consistent with the realized terminal round-trip loss.
+   844	    n = 200
+   845	    o = _flat_ohlc("BTC", T0, n, 100.0)
+   846	    mins, op, hi, lo, cl = o["BTC"]
+   847	    for arr in (op, hi, lo, cl):
+   848	        arr[60:] = 1.0      # -99% crash
+   849	    md = FakeMarketData(ohlc={"BTC": (mins, op, hi, lo, cl)}, maxlev=10.0)
+   850	    acts = pd.DataFrame([
+   851	        _action("BTC", T0 + 5 * E.MS_MIN, 5.0, "ENTRY", position_after=500.0),
+   852	        _action("BTC", T0 + 120 * E.MS_MIN, 5.0, "ADDON", position_after=500.0),  # sees cur_eq<=0 -> _ruin
+   853	    ])
+   854	    s = _run(acts, md, end=T0 + 190 * E.MS_MIN)["summary"]
+   855	    assert s["ruin"] is True
+   856	    assert s["final_equity"] < 1e-6, "ruined subaccount must report ~0 final_equity, not a stale positive"
+   857	    assert abs(s["roe_engine"] - (-1.0)) < 1e-9, "ruined subaccount ROE must be -100%, not stale"
+   858	
+   859	
+   860	# --------------------------------------------------------------------------- #
+   861	# codex finding #2 — flip-through-zero fee SPLIT across the two round-trips
+   862	# --------------------------------------------------------------------------- #
+   863	def test_finding2_flip_fee_split_across_round_trips():
+   864	    # Flat price 100. Open +100 szi long, then flip to -100 szi short in ONE order (delta -200), then
+   865	    # close the short. The flip order's fee must be SPLIT: half to the closing (long) RT, half to the
+   866	    # opening (short) RT -- not all charged to the closing RT with a fee-free short open.
+   867	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
+   868	    acts = pd.DataFrame([
+   869	        _action("BTC", T0 + 5 * E.MS_MIN, 1.0, "ENTRY", position_after=100.0),    # +100 long
+   870	        _action("BTC", T0 + 25 * E.MS_MIN, -1.0, "FLIP", position_after=-100.0),  # flip to -100 short
+   871	        _action("BTC", T0 + 45 * E.MS_MIN, 0.0, "EXIT", position_after=0.0),      # close the short
+   872	    ])
+   873	    s = _run(acts, md, entity_id=9, fold_id=1)["summary"]
+   874	    # two completed round-trips (the long that flipped closed + the short that closed)
+   875	    assert s["n_round_trips"] == 2
+   876	    # build the SAME scenario but inspect per-RT booking via a controlled _book_fill replay to assert
+   877	    # the split is proportional. Equity-flat so realized=0 on the flip; both RTs differ ONLY by fees.
+   878	    summ = E._new_summary(1, 1, 10_000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+   879	    st = E.AccountState(cross_collateral={"main": 10_000.0})
+   880	    # open long 100 @100 (entry fee on 100 sz)
+   881	    E._book_fill(st, md, "BTC", 100.0, 100.0, "cross", fee=100.0 * 100.0 * 0.00045, summary=summ)
+   882	    pnl_before = summ["realized_pnl_total"]
+   883	    nrt_before = summ["n_round_trips"]
+   884	    # flip -200 @100 -> closes 100 (long RT) + opens 100 short. Fee on 200 sz; must split 50/50.
+   885	    flip_fee = 200.0 * 100.0 * 0.00045
+   886	    E._book_fill(st, md, "BTC", -200.0, 100.0, "cross", fee=flip_fee, summary=summ)
+   887	    # exactly one RT closed by the flip
+   888	    assert summ["n_round_trips"] == nrt_before + 1
+   889	    closing_rt_pnl = summ["realized_pnl_total"] - pnl_before   # = -(entry fee on long) - (half flip fee)
+   890	    long_entry_fee = 100.0 * 100.0 * 0.00045
+   891	    expected_close = -(long_entry_fee + flip_fee * 0.5)        # realized MTM is 0 (flat px)
+   892	    assert abs(closing_rt_pnl - expected_close) < 1e-9, "closing RT must bear only HALF the flip fee"
+   893	    # the new short RT now carries the OTHER half as its open fee
+   894	    assert abs(summ["_rt"]["BTC"]["fee"] - flip_fee * 0.5) < 1e-9, "short RT must bear its own half"
+   895	
+   896	
+   897	# --------------------------------------------------------------------------- #
+   898	# codex finding #3 — latency drift is CAUSAL: it depends on the PRIOR bar, not the containing bar
+   899	# --------------------------------------------------------------------------- #
+   900	def test_finding3_latency_drift_uses_prior_bar_not_containing_bar():
+   901	    # Build a grid where the PRIOR bar (the one that closed before our fill) is VOLATILE while the
+   902	    # CONTAINING bar (the one our fill lands in) is FLAT. A causal drift must charge a haircut (prior
+   903	    # bar vol), whereas the old non-causal containing-bar logic would charge ZERO. Conversely, a flat
+   904	    # prior bar + volatile containing bar must charge ~ZERO causal haircut.
+   905	    n = 60
+   906	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   907	    # CASE A: prior bar volatile, containing bar flat. action at minute 10, latency 0 -> our_ts in
+   908	    # minute 10's bar (flat). The PRIOR completed bar is minute 9 (volatile).
+   909	    o = np.full(n, 100.0); c = np.full(n, 100.0); h = np.full(n, 100.0); lo = np.full(n, 100.0)
+   910	    o[9], c[9], h[9], lo[9] = 100.0, 110.0, 110.0, 100.0   # minute-9 bar: +10% (volatile, causal/prior)
+   911	    # minute-10 bar stays flat at 100 (containing bar of a 0-latency fill at minute 10)
+   912	    md_a = FakeMarketData(ohlc={"BTC": (mins, o, h, lo, c)}, maxlev=10.0)
+   913	    px_prior = E._bar_vol_proxy(md_a, "BTC", T0 + 10 * E.MS_MIN)
+   914	    assert abs(px_prior - 0.10) < 1e-9, "vol proxy must read the PRIOR (minute-9) bar's |return| = 10%"
+   915	
+   916	    # CASE B: prior bar flat, containing bar volatile -> causal proxy must be ~0 (no look-ahead into
+   917	    # the containing bar). minute-9 flat, minute-10 volatile.
+   918	    o2 = np.full(n, 100.0); c2 = np.full(n, 100.0); h2 = np.full(n, 100.0); lo2 = np.full(n, 100.0)
+   919	    o2[10], c2[10], h2[10], lo2[10] = 100.0, 110.0, 110.0, 100.0
+   920	    md_b = FakeMarketData(ohlc={"BTC": (mins, o2, h2, lo2, c2)}, maxlev=10.0)
+   921	    px_flat = E._bar_vol_proxy(md_b, "BTC", T0 + 10 * E.MS_MIN)
+   922	    assert abs(px_flat) < 1e-9, "containing-bar vol must NOT leak in (causal): prior bar is flat -> 0"
+   923	
+   924	    # end-to-end: the volatile-PRIOR-bar fill must be WORSE (higher buy) than the flat-prior-bar fill,
+   925	    # at the same latency, proving the drift is driven by the causal prior bar.
+   926	    def _buy_px(md):
+   927	        acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0)])
+   928	        res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=30_000),
+   929	                                end_ts_ms=T0 + 50 * E.MS_MIN)
+   930	        buys = [f for f in res["fills"] if f["side"] == "buy" and f["fill_type"] == "normal"]
+   931	        return buys[0]["our_fill_px"] if buys else None
+   932	    pa, pb = _buy_px(md_a), _buy_px(md_b)
+   933	    assert pa is not None and pb is not None
+   934	    assert pa > pb, "volatile PRIOR bar -> worse fill; flat prior bar -> no causal haircut"
+   935	
+   936	
+   937	def test_finding4_latency_drift_in_slip_diagnostic():
+   938	    # the notional-weighted slip diagnostic must INCLUDE the latency drift bps (not understate the
+   939	    # execution haircut). Same up-bar; higher latency -> bigger drift -> bigger reported slip.
+   940	    md = FakeMarketData(ohlc=_drift_ohlc("BTC", 200, 100.0, 102.0), maxlev=10.0)  # +2% bars
+
+codex
+The main routing logic is clear: isolated flips have a dedicated settle-then-open gate, cross flips are now sent through the shared cross scope gate, and same-side reductions/full closes still avoid the IM gate. I’m checking for a more subtle mismatch: whether the cross gate’s equity projection uses the same realized close price path as `_book_fill`.
+exec
+/bin/zsh -lc "nl -ba tests/v15/test_m07.py | sed -n '1,220p'" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "nl -ba tests/v15/test_m07.py | sed -n '220,760p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   220	
+   221	
+   222	def test_account_equity_derivation():
+   223	    st = E.AccountState(cross_collateral={"main": 1000.0})
+   224	    st.positions["BTC"] = E.Position("BTC", szi=1.0, entry_px=100.0, mode="cross", leverage=1.0)
+   225	    assert abs(st.equity({"BTC": 110.0}) - 1010.0) < 1e-9
+   226	
+   227	
+   228	# --------------------------------------------------------------------------- #
+   229	# Core journey
+   230	# --------------------------------------------------------------------------- #
+   231	def test_round_trip_costs_money():
+   232	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
+   233	    acts = pd.DataFrame([
+   234	        _action("BTC", T0 + 5 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0),
+   235	        _action("BTC", T0 + 50 * E.MS_MIN, 0.0, "EXIT", position_after=0.0),
+   236	    ])
+   237	    s = _run(acts, md, entity_id=1, fold_id=1)["summary"]
+   238	    assert s["n_fills"] == 2
+   239	    assert s["total_fees"] > 0
+   240	    assert s["final_equity"] < 10_000.0
+   241	    assert s["roe_engine"] < 0
+   242	
+   243	
+   244	def test_min_order_skip():
+   245	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 100, 100.0))
+   246	    acts = pd.DataFrame([_action("BTC", T0 + 5 * E.MS_MIN, 1e-7, "ENTRY", position_after=0.001)])
+   247	    assert _run(acts, md)["summary"]["n_fills"] == 0
+   248	
+   249	
+   250	def test_survived_state_on_flat():
+   251	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
+   252	    acts = pd.DataFrame([_action("BTC", T0 + 5 * E.MS_MIN, 0.3, "ENTRY", position_after=30.0)])
+   253	    assert "account_ruin" not in _run(acts, md)["summary"]["outcome_states"]
+   254	
+   255	
+   256	# --------------------------------------------------------------------------- #
+   257	# Liquidation + isolation invariant
+   258	# --------------------------------------------------------------------------- #
+   259	def test_backstop_on_crash_isolation_invariant():
+   260	    n = 300
+   261	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   262	    px = np.full(n, 100.0)
+   263	    px[100:] = 60.0
+   264	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+   265	    acts = pd.DataFrame([
+   266	        _action("BTC", T0 + 5 * E.MS_MIN, 5.0, "ENTRY", position_after=500.0),
+   267	        _action("BTC", T0 + 250 * E.MS_MIN, 5.0, "ADDON", position_after=500.0),
+   268	    ])
+   269	    s = _run(acts, md)["summary"]
+   270	    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+   271	    assert s["final_equity"] >= -1e-6
+   272	
+   273	
+   274	def test_im_admissibility_rejects_on_tier_jump():
+   275	    # codex code-r3: total resulting-position IM (tier-correct), not marginal-on-delta. Adding into a
+   276	    # >100k notional re-rates the WHOLE position to the higher tier; if cash can't fund it -> reject.
+   277	    class TierMeta(FakeMeta):
+   278	        def init_margin_rate(self, coin, notional):
+   279	            return 0.1 if abs(notional) <= 100_000 else 0.2
+   280	        def maint_rate(self, coin, notional):
+   281	            return self.init_margin_rate(coin, notional) / 2
+   282	        def tier_maxlev(self, coin, notional):
+   283	            return 1.0 / self.init_margin_rate(coin, notional)
+   284	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 20, 100.0), adv=1e12)
+   285	    md.meta = TierMeta(); md.meta.coin_szdec["BTC"] = 3
+   286	    st = E.AccountState(cross_collateral={"main": 14000.0})
+   287	    st.positions["BTC"] = E.Position("BTC", szi=900.0, entry_px=100.0, mode="cross", leverage=10.0)
+   288	    summary = E._new_summary(None, None, 14000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+   289	    summary["_fills_ref"] = []
+   290	    fills, events = [], []
+   291	    # add 200 -> new notional 110k, total IM = 22k > ~14k cash -> must reject
+   292	    E._apply_order(st, md, "BTC", 200.0, 100.0, T0 + 5 * E.MS_MIN, {"ts": T0 + 5 * E.MS_MIN},
+   293	                   E.EngineParams(copy_latency_ms=0), 1.0, fills, events, summary)
+   294	    assert summary["n_rejected"] == 1 and len(fills) == 0
+   295	
+   296	
+   297	def test_market_liquidation_path_produces_liq_fill():
+   298	    # moderate drop: cross account breaches maintenance but stays ABOVE 2/3 maint -> market-liq order
+   299	    # (not backstop). 5x exposure, maxlev 10 (maint 5%). px 100 -> 84 lands in the market-liq band.
+   300	    n = 300
+   301	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   302	    px = np.full(n, 100.0); px[100:] = 84.0
+   303	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+   304	    acts = pd.DataFrame([
+   305	        _action("BTC", T0 + 5 * E.MS_MIN, 5.0, "ENTRY", position_after=500.0),
+   306	        _action("BTC", T0 + 250 * E.MS_MIN, 5.0, "ADDON", position_after=500.0),
+   307	    ])
+   308	    res = _run(acts, md)
+   309	    s = res["summary"]
+   310	    assert s["n_market_liq_orders"] >= 1 or "backstop" in s["outcome_states"]
+   311	    liq_fills = [f for f in res["fills"] if f["fill_type"] == "market_liq_order"]
+   312	    if s["n_market_liq_orders"] >= 1:
+   313	        assert liq_fills and all(f["fee"] == 0.0 for f in liq_fills)   # forced-liq fills carry no fee
+   314	    assert s["final_equity"] >= -1e-6
+   315	
+   316	
+   317	def test_market_liquidation_charges_full_order_adv_impact_above_floor():
+   318	    md = FakeMarketData(
+   319	        ohlc=_flat_ohlc("BTC", T0, 10, 100.0), adv=1_000.0,
+   320	        half_spread_bps=1.0,
+   321	    )
+   322	    st = E.AccountState(cross_collateral={"main": 20_000.0})
+   323	    st.positions["BTC"] = E.Position(
+   324	        "BTC", szi=1_000.0, entry_px=100.0, mode="cross", leverage=10.0
+   325	    )
+   326	    summary = E._new_summary(None, None, 20_000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+   327	    summary["_fills_ref"] = []
+   328	    E._rt_open(summary, "BTC")
+   329	    E._liq_close(st, md, "BTC", 100.0, T0 + E.MS_MIN, summary)
+   330	    fill = summary["_fills_ref"][0]
+   331	    total_slip = fill["half_spread_bps"] + fill["impact_bps"]
+   332	    assert total_slip > E.FORCED_LIQ_SLIP_BPS
+   333	    assert fill["our_fill_px"] < 100.0 * (1 - E.FORCED_LIQ_SLIP_BPS / 1e4)
+   334	    assert fill["fee"] == 0.0
+   335	
+   336	
+   337	def test_isolated_position_posts_margin_and_can_liquidate():
+   338	    # xyz coin -> isolated. Open isolated long, crash -> isolated liquidation, cross main untouched.
+   339	    n = 300
+   340	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   341	    px = np.full(n, 100.0); px[100:] = 50.0
+   342	    md = FakeMarketData(ohlc={"xyz:AMD": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+   343	    acts = pd.DataFrame([
+   344	        _action("xyz:AMD", T0 + 5 * E.MS_MIN, 2.0, "ENTRY", position_after=200.0),
+   345	        _action("xyz:AMD", T0 + 250 * E.MS_MIN, 2.0, "ADDON", position_after=200.0),
+   346	    ])
+   347	    res = _run(acts, md)
+   348	    s = res["summary"]
+   349	    # isolated margin was posted from main on open (main cross collateral dropped below start)
+   350	    assert "position_liquidated" in s["outcome_states"] or "backstop" in s["outcome_states"]
+   351	    assert s["final_equity"] >= -1e-6
+   352	
+   353	
+   354	# --------------------------------------------------------------------------- #
+   355	# Funding
+   356	# --------------------------------------------------------------------------- #
+   357	def test_funding_sign_long_pays_positive_rate():
+   358	    n = 200
+   359	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   360	    px = np.full(n, 100.0)
+   361	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())},
+   362	                        funding={"BTC": (np.array([T0 + 30 * E.MS_MIN], "int64"), np.array([0.0001]))},
+   363	                        maxlev=10.0)
+   364	    acts = pd.DataFrame([
+   365	        _action("BTC", T0 + 5 * E.MS_MIN, 1.0, "ENTRY", position_after=100.0),
+   366	        _action("BTC", T0 + 120 * E.MS_MIN, 1.0, "ADDON", position_after=100.0),
+   367	    ])
+   368	    assert _run(acts, md)["summary"]["total_funding"] < 0
+   369	
+   370	
+   371	# --------------------------------------------------------------------------- #
+   372	# Final-horizon risk (codex code-r1 #1): a crash AFTER the last action must still be seen
+   373	# --------------------------------------------------------------------------- #
+   374	def test_final_horizon_risk_seen_after_last_action():
+   375	    n = 400
+   376	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   377	    px = np.full(n, 100.0)
+   378	    px[200:] = 55.0      # crash AFTER the last action (which is at minute ~10)
+   379	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+   380	    acts = pd.DataFrame([_action("BTC", T0 + 5 * E.MS_MIN, 5.0, "ENTRY", position_after=500.0)])
+   381	    s = _run(acts, md, end=T0 + 390 * E.MS_MIN)["summary"]
+   382	    # the crash at minute 200 is well after the only action; final-horizon advance must catch it
+   383	    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+   384	
+   385	
+   386	# --------------------------------------------------------------------------- #
+   387	# Determinism + causal + purity
+   388	# --------------------------------------------------------------------------- #
+   389	def test_determinism():
+   390	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
+   391	    acts = pd.DataFrame([
+   392	        _action("BTC", T0 + 5 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0),
+   393	        _action("BTC", T0 + 40 * E.MS_MIN, 0.0, "EXIT", position_after=0.0),
+   394	    ])
+   395	    r1 = _run(acts, md)["summary"]
+   396	    r2 = _run(acts, md)["summary"]
+   397	    assert r1["final_equity"] == r2["final_equity"]
+   398	    assert r1["total_fees"] == r2["total_fees"]
+   399	
+   400	
+   401	def test_causal_fill_uses_prior_minute_not_future():
+   402	    # step up at minute 10; action at minute 8, latency lands minute 9 -> causal mark = minute-8 close
+   403	    # (prior completed bar), never the future 200.
+   404	    n = 60
+   405	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   406	    px = np.full(n, 100.0); px[10:] = 200.0
+   407	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())})
+   408	    acts = pd.DataFrame([_action("BTC", T0 + 8 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0)])
+   409	    res = _run(acts, md, params=E.EngineParams(copy_latency_ms=E.MS_MIN))
+   410	    assert abs(res["fills"][0]["ref_mark"] - 100.0) < 1e-6
+   411	
+   412	
+   413	def test_pure_does_not_mutate_caller_state():
+   414	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
+   415	    start = E.AccountState(cross_collateral={"main": 10_000.0})
+   416	    acts = pd.DataFrame([_action("BTC", T0 + 5 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0)])
+   417	    E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0), end_ts_ms=END, start_state=start)
+   418	    assert start.cross_collateral == {"main": 10_000.0}
+   419	    assert start.positions == {}
+   420	
+   421	
+   422	def test_start_state_open_position_advances_risk_with_no_actions():
+   423	    # codex code-r2 #2: a carried start_state position must accrue risk + liquidate even with ZERO
+   424	    # actions, anchored at start_ts. Crash after start -> liquidation/backstop without any action.
+   425	    n = 400
+   426	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   427	    px = np.full(n, 100.0); px[150:] = 55.0
+   428	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+   429	    start = E.AccountState(cross_collateral={"main": 2000.0})
+   430	    start.positions["BTC"] = E.Position("BTC", szi=400.0, entry_px=100.0, mode="cross", leverage=10.0)  # $40k @ 5% maint
+   431	    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+   432	                            end_ts_ms=T0 + 390 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+   433	    s = res["summary"]
+   434	    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+   435	    # purity: caller start_state untouched
+   436	    assert start.positions["BTC"].szi == 400.0
+   437	
+   438	
+   439	def test_funding_stops_after_liquidation():
+   440	    # chronological: a position liquidated early should not keep accruing funding to fold end.
+   441	    n = 400
+   442	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   443	    px = np.full(n, 100.0); px[120:] = 50.0
+   444	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())},
+   445	                        funding={"BTC": (np.array([T0 + h * E.MS_HOUR for h in range(1, 7)], "int64"),
+   446	                                          np.array([0.001] * 6))}, maxlev=10.0)
+   447	    start = E.AccountState(cross_collateral={"main": 2000.0})
+   448	    start.positions["BTC"] = E.Position("BTC", szi=400.0, entry_px=100.0, mode="cross", leverage=10.0)
+   449	    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+   450	                            end_ts_ms=T0 + 390 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+   451	    # liquidated around the crash; funding only accrues on hours BEFORE liquidation, not all 6
+   452	    assert set(res["summary"]["outcome_states"]) & {"backstop", "position_liquidated", "account_ruin"}
+   453	
+   454	
+   455	def test_post_funding_boundary_liquidation():
+   456	    # codex code-r4 #1: a settled funding payment at the fold boundary can push below maintenance;
+   457	    # must liquidate, not report 'survived' with an insolvent open position. Flat price, large
+   458	    # positive funding at the last hour, position sized so funding eats the maintenance buffer.
+   459	    n = 200
+   460	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   461	    px = np.full(n, 100.0)
+   462	    last_h = ((T0 // E.MS_HOUR) + 2) * E.MS_HOUR     # a settlement inside the window
+   463	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())},
+   464	                        funding={"BTC": (np.array([last_h], "int64"), np.array([0.5]))},  # huge rate
+   465	                        maxlev=10.0)
+   466	    start = E.AccountState(cross_collateral={"main": 600.0})       # thin buffer over maint
+   467	    start.positions["BTC"] = E.Position("BTC", szi=100.0, entry_px=100.0, mode="cross", leverage=10.0)  # $10k, maint $500
+   468	    res = E.step_subaccount(pd.DataFrame([]), md, 600.0, E.EngineParams(copy_latency_ms=0),
+   469	                            end_ts_ms=last_h + E.MS_MIN, start_ts_ms=T0, start_state=start)
+   470	    s = res["summary"]
+   471	    assert s["total_funding"] < 0                       # paid the funding
+   472	    assert "survived" not in s["outcome_states"]        # not silently solvent
+   473	    assert set(s["outcome_states"]) & {"backstop", "position_liquidated", "account_ruin"}
+   474	
+   475	
+   476	def test_liquidation_cooldown_no_same_ts_double_fill():
+   477	    # codex code-r5 #1: a >100k partial liquidation (20%) must NOT be immediately followed by a full
+   478	    # close at the SAME timestamp (30s cooldown). Assert market_liq_order fills have distinct our_ts.
+   479	    n = 200
+   480	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   481	    px = np.full(n, 100.0); px[20:] = 99.0          # mild breach -> market-liq band for a >100k pos
+   482	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
+   483	    start = E.AccountState(cross_collateral={"main": 8000.0})
+   484	    start.positions["BTC"] = E.Position("BTC", szi=1500.0, entry_px=100.0, mode="cross", leverage=10.0)  # $150k
+   485	    res = E.step_subaccount(pd.DataFrame([]), md, 8000.0, E.EngineParams(copy_latency_ms=0),
+   486	                            end_ts_ms=T0 + 190 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+   487	    liq_ts = [f["our_ts"] for f in res["fills"] if f["fill_type"] == "market_liq_order"]
+   488	    assert len(liq_ts) == len(set(liq_ts))           # no two forced fills at the same instant
+   489	
+   490	
+   491	def test_no_same_ts_double_when_funding_at_fold_end():
+   492	    # codex code-r6 #1: when the funding settlement == fold end (t1), the in-loop post-funding check
+   493	    # and the terminal fold-boundary check must not BOTH liquidate the same >100k position at the
+   494	    # same ts (the second would full-close inside the 30s cooldown).
+   495	    t1 = ((T0 // E.MS_HOUR) + 1) * E.MS_HOUR        # a funding hour that we also use as fold end
+   496	    n = int((t1 - T0) // E.MS_MIN) + 5
+   497	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   498	    px = np.full(n, 100.0)
+   499	    md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())},
+   500	                        funding={"BTC": (np.array([t1], "int64"), np.array([0.5]))}, maxlev=10.0)
+   501	    start = E.AccountState(cross_collateral={"main": 7600.0})
+   502	    start.positions["BTC"] = E.Position("BTC", szi=1500.0, entry_px=100.0, mode="cross", leverage=10.0)  # $150k
+   503	    res = E.step_subaccount(pd.DataFrame([]), md, 7600.0, E.EngineParams(copy_latency_ms=0),
+   504	                            end_ts_ms=t1, start_ts_ms=T0, start_state=start)
+   505	    liq_ts = [f["our_ts"] for f in res["fills"] if f["fill_type"] == "market_liq_order"]
+   506	    assert len(liq_ts) == len(set(liq_ts))           # no same-ts double at the funding==fold-end boundary
+   507	
+   508	
+   509	def test_carry_in_seeds_short_not_long():
+   510	    # codex code-r4 #3: a SHORT carry-in must seed a NEGATIVE szi (signed exposure, no double-flip).
+   511	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 100, 100.0))
+   512	    # source carried a short, then adds -10 to -110 with signed (negative) exposure% post-action
+   513	    act = _action("BTC", T0 + 5 * E.MS_MIN, -1.0, "ADDON", position_after=-110.0, signed_size=-10.0,
+   514	                  carry_in_status="carry")
+   515	    res = E.step_subaccount(pd.DataFrame([act]), md, 10_000.0,
+   516	                            E.EngineParams(copy_latency_ms=0, start_policy="causal_carry_in"),
+   517	                            end_ts_ms=T0 + 20 * E.MS_MIN)
+   518	    # ending position is a SHORT (negative szi), ~the source's -110/-100 ratio scaled to our equity
+   519	    bt = res["ending_account_state"]["positions"].get("BTC")
+   520	    assert bt is not None and bt["szi"] < 0
+   521	
+   522	
+   523	def test_empty_actions_survives_flat():
+   524	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 50, 100.0))
+   525	    res = _run(pd.DataFrame([]), md)
+   526	    assert res["summary"]["final_equity"] == 10_000.0
+   527	    assert res["summary"]["outcome_states"] == ["survived"]
+   528	
+   529	
+   530	def test_ending_account_state_returned():
+   531	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
+   532	    acts = pd.DataFrame([_action("BTC", T0 + 5 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0)])
+   533	    res = _run(acts, md)
+   534	    eas = res["ending_account_state"]
+   535	    assert "cross_collateral" in eas and "positions" in eas and "cooldown_until_ms" in eas
+   536	    assert "BTC" in eas["positions"]      # the open long carries into ending state for M9 chaining
+   537	
+   538	
+   539	# --------------------------------------------------------------------------- #
+   540	# Streaming
+   541	# --------------------------------------------------------------------------- #
+   542	def test_streaming_writer_multipart(tmp_path):
+   543	    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+   544	    from _streaming_io import ShardedParquetWriter
+   545	    w = ShardedParquetWriter(tmp_path / "out.parquet", flush_rows=3)
+   546	    for i in range(10):
+   547	        w.add({"a": i, "b": float(i)})
+   548	    n = w.close()
+   549	    assert n == 10
+   550	    df = pd.read_parquet(tmp_path / "out.parquet")
+   551	    assert len(df) == 10 and list(df.a) == list(range(10))
+   552	
+   553	
+   554	# --------------------------------------------------------------------------- #
+   555	# M6b-FINAL producers: CHANGE 1 boundary equity, D1 calib, CHANGE 2 tracking_error
+   556	# (empirical value assertions -- byte-identical proves the EXISTING outputs unchanged,
+   557	#  these prove the NEW outputs are CORRECT)
+   558	# --------------------------------------------------------------------------- #
+   559	DAY = 86_400_000
+   560	T14 = 14 * DAY
+   561	
+   562	
+   563	def test_change1_boundary_equity_samples_emitted():
+   564	    # 30-day flat-price hold -> a block boundary at T0+14d must be sampled with ~constant equity.
+   565	    n = 31 * 1440
+   566	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, n, 100.0))
+   567	    end = T0 + 30 * DAY
+   568	    acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 0.5)])
+   569	    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+   570	                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+   571	    eq = pd.DataFrame(res["equity"])
+   572	    flags = set(eq["event_flag"])
+   573	    assert "fold_start" in flags and "block_boundary" in flags and "fold_end" in flags
+   574	    fs = eq[eq.event_flag == "fold_start"].iloc[0]
+   575	    assert fs["ts"] == T0 and abs(fs["subaccount_equity"] - 10_000.0) < 1e-6   # pre-action cash
+   576	    bb = eq[(eq.event_flag == "block_boundary")]
+   577	    assert (bb["ts"] == T0 + T14).any()                                        # the 14d anchor exists
+   578	    b14 = bb[bb.ts == T0 + T14].iloc[0]
+   579	    assert abs(b14["subaccount_equity"] - 10_000.0) < 50.0                      # flat px -> ~unchanged
+   580	
+   581	
+   582	def test_change1_boundary_anchor_count_matches_blocks():
+   583	    n = 31 * 1440
+   584	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, n, 100.0))
+   585	    end = T0 + 30 * DAY                       # 30d -> boundaries at k=0,1,2 (0,14,28d); 42d would be 3
+   586	    acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 0.5)])
+   587	    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+   588	                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+   589	    eq = pd.DataFrame(res["equity"])
+   590	    anchors = sorted(eq[eq.event_flag.isin(["fold_start", "block_boundary"])]["ts"].unique())
+   591	    assert anchors == [T0, T0 + T14, T0 + 2 * T14]    # 0, 14, 28 days (< 30d end)
+   592	
+   593	
+   594	def test_change2_te_zero_when_tracking_well():
+   595	    # source holds 50% long; our copy enters 50% and holds flat -> our_pct ~= target -> TE ~ 0.
+   596	    n = 31 * 1440
+   597	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, n, 100.0))
+   598	    end = T0 + 20 * DAY
+   599	    acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 0.5)])
+   600	    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+   601	                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+   602	    s = res["summary"]
+   603	    assert s["tracking_error"] is not None
+   604	    assert s["tracking_error_active_ms"] > 0
+   605	    assert s["tracking_error"] < 0.05            # tracks the source closely
+   606	
+   607	
+   608	def test_te_l1_helper_signed_additive():
+   609	    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 10, 100.0))
+   610	    st = E.AccountState(cross_collateral={"main": 0.0})
+   611	    # equity 1000; BTC szi=5 @100 -> notional 500 -> our_pct=0.5
+   612	    st.positions["BTC"] = E.Position("BTC", szi=5.0, entry_px=100.0, mode="cross", leverage=1.0)
+   613	    st.cross_collateral["main"] = 500.0          # equity = 500 cash + 500 uPnL@entry = ... use mark
+   614	    ts = T0 + 5 * E.MS_MIN
+   615	    # perfect match
+   616	    l1, act = E._te_l1_active(st, md, {"BTC": st.positions["BTC"].szi * 100.0 / st.equity(E._marks(st, md, ts))}, ts)
+   617	    assert act and l1 < 1e-9
+   618	    our_pct = st.positions["BTC"].szi * 100.0 / st.equity(E._marks(st, md, ts))
+   619	    # opposite sign target -> additive (|our - (-our)| = 2*our)
+   620	    l1_opp, _ = E._te_l1_active(st, md, {"BTC": -our_pct}, ts)
+   621	    assert abs(l1_opp - 2 * our_pct) < 1e-9
+   622	    # disjoint coin in target we don't hold -> adds |target|
+   623	    l1_dis, _ = E._te_l1_active(st, md, {"BTC": our_pct, "ETH": 0.4}, ts)
+   624	    assert abs(l1_dis - 0.4) < 1e-9
+   625	    # fully flat -> inactive
+   626	    _, act2 = E._te_l1_active(E.AccountState(cross_collateral={"main": 1000.0}), md, {}, ts)
+   627	    assert act2 is False
+   628	
+   629	
+   630	def test_d2_wipeout_emits_zero_equity_anchors():
+   631	    # crash after entry -> account wiped -> a post-crash action sees cur_eq<=0 -> true _ruin (D2 path).
+   632	    # remaining boundary anchors + fold_end at equity 0 (so M6b post-wipe block ROE = -100%).
+   633	    n = 31 * 1440
+   634	    o = _flat_ohlc("BTC", T0, n, 100.0)
+   635	    mins, op, hi, lo, cl = o["BTC"]
+   636	    crash_from = 1500
+   637	    for arr in (op, hi, lo, cl):
+   638	        arr[crash_from:] = 1.0   # -99% crash -> long 5x position wiped
+   639	    md = FakeMarketData(ohlc={"BTC": (mins, op, hi, lo, cl)}, maxlev=10.0)
+   640	    end = T0 + 30 * DAY
+   641	    acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 5.0),
+   642	                         _action("BTC", T0 + 25 * DAY, 5.0)])     # post-crash action -> _ruin
+   643	    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+   644	                            end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
+   645	    s = res["summary"]
+   646	    eq = pd.DataFrame(res["equity"])
+   647	    assert s["ruin"] is True                         # second action sees cur_eq<=0 -> _ruin (D2 path)
+   648	    post = eq[(eq.event_flag == "block_boundary") & (eq.ts.isin([T0 + T14, T0 + 2 * T14]))]
+   649	    assert len(post) >= 1 and (post["subaccount_equity"] == 0.0).all()
+   650	    fe = eq[eq.event_flag == "fold_end"].iloc[-1]
+   651	    assert fe["subaccount_equity"] == 0.0
+   652	    # D3: post-ruin TE accrues full penalty (source still 5x exposure) over the remaining horizon
+   653	    assert s["tracking_error"] is not None and s["tracking_error"] > 0.5
+   654	
+   655	
+   656	# --------------------------------------------------------------------------- #
+   657	# FOLLOWER TRAILING EXIT (7% circuit breaker) — codex review fixes (bugs #1-#8)
+   658	# --------------------------------------------------------------------------- #
+   659	def _ohlc_path(coin, prices, start_ms=T0):
+   660	    n = len(prices)
+   661	    mins = np.arange(n, dtype="int64") * E.MS_MIN + start_ms
+   662	    arr = np.array(prices, dtype="float64")
+   663	    return {coin: (mins, arr.copy(), arr.copy(), arr.copy(), arr.copy())}
+   664	
+   665	
+   666	def test_follower_trail_fires_flattens_and_halts():
+   667	    # prices per minute; causal mark at minute k = prices[k-1]. enter@100, peak@110, breach@102 (>7% DD).
+   668	    prices = [100, 100, 110, 110, 102, 102, 120, 120]
+   669	    md = FakeMarketData(ohlc=_ohlc_path("BTC", prices))
+   670	    acts = pd.DataFrame([
+   671	        _action("BTC", T0 + 1 * E.MS_MIN, 1.0, "ENTRY"),       # enter long @100
+   672	        _action("BTC", T0 + 3 * E.MS_MIN, 1.0, "ADDON"),       # observe peak @110
+   673	        _action("BTC", T0 + 5 * E.MS_MIN, 1.0, "ADDON"),       # @102 -> pre-action breaker fires
+   674	        _action("BTC", T0 + 7 * E.MS_MIN, 1.0, "ADDON"),       # @120 -> MUST be ignored (halted)
+   675	    ])
+   676	    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, follower_trail=0.07),
+   677	                            end_ts_ms=T0 + 9 * E.MS_MIN)
+   678	    exits = [e for e in res["events"] if e.get("event_type") == "follower_trail_exit"]
+   679	    assert len(exits) == 1, "breaker must fire exactly once"
+   680	    # all positions flat after the halt (guaranteed close-all)
+   681	    assert res["ending_account_state"]["positions"] == {}
+   682	    # halted: the favorable @120 action was NOT copied -> no re-entry after the exit ts
+   683	    exit_ts = exits[0]["ts"]
+   684	    assert not any(f["our_ts"] > exit_ts for f in res["fills"]), "no copy after halt"
+   685	    assert not res["summary"]["ruin"]
+   686	
+   687	
+   688	def test_follower_trail_disabled_is_byte_identical():
+   689	    prices = [100, 100, 110, 110, 102, 102, 120, 120]
+   690	    md = FakeMarketData(ohlc=_ohlc_path("BTC", prices))
+   691	    acts = pd.DataFrame([
+   692	        _action("BTC", T0 + 1 * E.MS_MIN, 1.0, "ENTRY"),
+   693	        _action("BTC", T0 + 3 * E.MS_MIN, 1.0, "ADDON"),
+   694	        _action("BTC", T0 + 5 * E.MS_MIN, 1.0, "ADDON"),
+   695	        _action("BTC", T0 + 7 * E.MS_MIN, 1.0, "ADDON"),
+   696	    ])
+   697	    base = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, follower_trail=None),
+   698	                             end_ts_ms=T0 + 9 * E.MS_MIN)
+   699	    # disabled path: NO breaker event, and a position remains open (verbatim copy)
+   700	    assert not any(e.get("event_type") == "follower_trail_exit" for e in base["events"])
+   701	    assert "BTC" in base["ending_account_state"]["positions"]
+   702	
+   703	
+   704	def test_follower_trail_fires_at_fold_end_no_action():
+   705	    # carried long, ZERO actions; price drifts 100 -> 90 (>7% DD on 1x) -> must flatten at fold END (#2).
+   706	    prices = [100] * 3 + [90] * 6
+   707	    md = FakeMarketData(ohlc=_ohlc_path("BTC", prices))
+   708	    start = E.AccountState(cross_collateral={"main": 0.0})
+   709	    start.positions["BTC"] = E.Position("BTC", szi=100.0, entry_px=100.0, mode="cross", leverage=1.0)
+   710	    start.cross_collateral["main"] = 10_000.0 - 100.0 * 100.0 + 100.0 * 100.0  # cash s.t. eq@100 ~ 10k
+   711	    # peak seeded from real equity at fold start (#8); breach realized only via fold-end MTM.
+   712	    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0,
+   713	                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+   714	                            end_ts_ms=T0 + 8 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+   715	    assert any(e.get("event_type") == "follower_trail_exit" for e in res["events"]), "fold-end breach must fire"
+   716	    assert res["ending_account_state"]["positions"] == {}
+   717	
+   718	
+   719	def test_follower_trail_force_close_ignores_min_notional_and_capacity():
+   720	    # BIG BTC position triggers the breach (DD>7%); a separate DUST position (closing notional <<
+   721	    # MIN_ORDER_NOTIONAL) co-exists. tiny adv -> normal orders would capacity-cap. After the breaker
+   722	    # fires, BOTH must be gone (force_close bypasses min-notional + capacity; residual drop catches dust) (#5).
+   723	    ohlc = {}
+   724	    ohlc.update(_ohlc_path("BTC", [100] * 3 + [80] * 6))
+   725	    ohlc.update(_ohlc_path("ETH", [100] * 9))     # dust coin, flat
+   726	    md = FakeMarketData(ohlc=ohlc, adv=1.0)        # adv tiny -> normal orders would cap
+   727	    start = E.AccountState(cross_collateral={"main": 10_000.0})
+   728	    start.positions["BTC"] = E.Position("BTC", szi=100.0, entry_px=100.0, mode="cross", leverage=1.0)
+   729	    start.positions["ETH"] = E.Position("ETH", szi=0.01, entry_px=100.0, mode="cross", leverage=1.0)  # dust ($1)
+   730	    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0,
+   731	                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+   732	                            end_ts_ms=T0 + 8 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+   733	    assert any(e.get("event_type") == "follower_trail_exit" for e in res["events"])
+   734	    assert res["ending_account_state"]["positions"] == {}, "no position (incl dust) may survive a breaker flatten"
+   735	    btc_exit = max((f for f in res["fills"] if f["coin"] == "BTC"), key=lambda f: abs(f["our_fill_size"]))
+   736	    capped_impact = E.DEFAULT_IMPACT_K_BPS * E.CAPACITY_PARTICIPATION_CAP ** E.DEFAULT_IMPACT_ALPHA
+   737	    assert btc_exit["impact_bps"] > capped_impact, "forced-exit impact must use full order/ADV participation"
+   738	
+   739	
+   740	# --------------------------------------------------------------------------- #
+   741	# CHANGE A — realized round-trip aggregates (consumed by M6b)
+   742	# --------------------------------------------------------------------------- #
+   743	def test_change_a_round_trip_aggregates_two_round_trips():
+   744	    # Two complete round-trips on a coin that finishes UP: enter@100, exit@110 (win); enter@110,
+   745	    # exit@120 (win). Causal mark = prior-minute close, so price-step minutes are placed so each
+   746	    # entry/exit sees the intended causal price. n_round_trips=2, both wins, realized_pnl>0.
+   747	    n = 200
+   748	    mins = np.arange(n, dtype="int64") * E.MS_MIN + T0
+   749	    px = np.full(n, 100.0)
+   750	    px[20:] = 110.0      # from minute 20 the causal mark (minute 21+) is 110
+   751	    px[60:] = 120.0      # from minute 60 the causal mark (minute 61+) is 120
+   752	    o = {"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}
+   753	    md = FakeMarketData(ohlc=o, maxlev=10.0)
+   754	    acts = pd.DataFrame([
+   755	        _action("BTC", T0 + 5 * E.MS_MIN, 1.0, "ENTRY", position_after=100.0),   # @100
+   756	        _action("BTC", T0 + 25 * E.MS_MIN, 0.0, "EXIT", position_after=0.0),     # @110 -> RT#1 win
+   757	        _action("BTC", T0 + 30 * E.MS_MIN, 1.0, "ENTRY", position_after=100.0),  # @110
+   758	        _action("BTC", T0 + 65 * E.MS_MIN, 0.0, "EXIT", position_after=0.0),     # @120 -> RT#2 win
+   759	    ])
+   760	    s = _run(acts, md, entity_id=7, fold_id=3)["summary"]
+
+ succeeded in 0ms:
+     1	"""V15 M7 engine tests — golden HL mechanics + synthetic scenarios + streaming + determinism + causal.
+     2	
+     3	Design: brain projects/quant/v15/modules/m07. Run:
+     4	  /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m07.py -q
+     5	"""
+     6	import sys
+     7	from pathlib import Path
+     8	
+     9	import numpy as np
+    10	import pandas as pd
+    11	import pytest
+    12	
+    13	sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+    14	import v15_m07_engine as E  # noqa: E402
+    15	
+    16	
+    17	# --------------------------------------------------------------------------- #
+    18	# Fakes: a controllable MarketData so scenarios are exact + look-ahead-free.
+    19	# --------------------------------------------------------------------------- #
+    20	class FakeMeta:
+    21	    def __init__(self, maxlev=10.0, szdec=3):
+    22	        self._maxlev = maxlev
+    23	        self.coin_szdec = {}
+    24	        self.coin_maxlev = {}
+    25	        self._default_szdec = szdec
+    26	
+    27	    def maint_rate(self, coin, notional):
+    28	        return 1.0 / (2.0 * self._maxlev)
+    29	
+    30	    def init_margin_rate(self, coin, notional):
+    31	        return 1.0 / self._maxlev
+    32	
+    33	    def max_leverage(self, coin):
+    34	        return self._maxlev
+    35	
+    36	    def tier_maxlev(self, coin, notional):
+    37	        return self._maxlev
+    38	
+    39	    def szdec(self, coin):
+    40	        return self.coin_szdec.get(coin, self._default_szdec)
+    41	
+    42	
+    43	class FakeMarketData:
+    44	    """Inject per-coin minute grids + OHLC + funding. Deterministic, no Mongo. `mark()` is causal
+    45	    (prior completed minute) matching the engine, so look-ahead tests are meaningful."""
+    46	    def __init__(self, ohlc=None, funding=None, maxlev=10.0, adv=1e12, half_spread_bps=1.0):
+    47	        self._ohlc = ohlc or {}
+    48	        self._funding = funding or {}
+    49	        self.meta = FakeMeta(maxlev=maxlev)
+    50	        for c in self._ohlc:
+    51	            self.meta.coin_szdec[c] = 3
+    52	            self.meta.coin_maxlev[c] = maxlev
+    53	        self._adv = adv
+    54	        self._hs = half_spread_bps
+    55	
+    56	        class _Fees:
+    57	            versioned = False
+    58	            def taker(self, coin):
+    59	                return E.DEFAULT_TAKER_FEE_ONEWAY * (E.HIP3_FEE_MULT_FALLBACK if E.coin_dex(coin) != "main" else 1.0)
+    60	        self.fees = _Fees()
+    61	
+    62	    def ohlc(self, coin):
+    63	        return self._ohlc.get(coin, (np.empty(0, "int64"),) + tuple(np.empty(0, "float64") for _ in range(4)))
+    64	
+    65	    def mark(self, coin, ts_ms, causal=True):
+    66	        mins, _o, _h, _l, c = self.ohlc(coin)
+    67	        if mins.size == 0:
+    68	            return None
+    69	        key = (ts_ms // E.MS_MIN) * E.MS_MIN - (E.MS_MIN if causal else 0)
+    70	        i = int(np.searchsorted(mins, key, side="right")) - 1
+    71	        if i < 0:
+    72	            return None
+    73	        v = c[i]
+    74	        return None if v != v else float(v)
+    75	
+    76	    def funding_rate_at(self, coin, ts_ms):
+    77	        s = self._funding.get(coin)
+    78	        if not s:
+    79	            return 0.0
+    80	        ts, r = s
+    81	        i = int(np.searchsorted(ts, ts_ms, side="right")) - 1
+    82	        return float(r[i]) if i >= 0 else 0.0
+    83	
+    84	    def liquidity(self, coin, ts_ms):
+    85	        return {"adv": self._adv, "half_spread_bps": self._hs, "uncalibrated": False}
+    86	
+    87	
+    88	def _flat_ohlc(coin, start_min_ms, n, px):
+    89	    mins = np.arange(n, dtype="int64") * E.MS_MIN + start_min_ms
+    90	    arr = np.full(n, float(px))
+    91	    return {coin: (mins, arr.copy(), arr.copy(), arr.copy(), arr.copy())}
+    92	
+    93	
+    94	def _action(coin, ts, target_pct, action_type="ENTRY", position_after=1.0, signed_size=1.0,
+    95	            carry_in_status=""):
+    96	    return {"coin": coin, "ts": ts, "event_order": 0, "action_type": action_type,
+    97	            "signed_size": signed_size, "position_after": position_after,
+    98	            "target_exposure_pct": target_pct, "is_liquidation": False, "carry_in_status": carry_in_status}
+    99	
+   100	
+   101	T0 = 1_700_000_000_000 // E.MS_MIN * E.MS_MIN
+   102	END = T0 + 500 * E.MS_MIN
+   103	
+   104	
+   105	def _run(acts, md, eq=10_000.0, params=None, end=END, **kw):
+   106	    return E.step_subaccount(acts, md, eq, params or E.EngineParams(copy_latency_ms=0), end_ts_ms=end, **kw)
+   107	
+   108	
+   109	# --------------------------------------------------------------------------- #
+   110	# Metadata / helpers
+   111	# --------------------------------------------------------------------------- #
+   112	def test_coin_dex_scope():
+   113	    assert E.coin_dex("BTC") == "main"
+   114	    assert E.coin_dex("xyz:AMD") == "xyz"
+   115	    assert E.coin_dex("flx:FOO") == "flx"
+   116	    assert E.coin_is_spot("#42") is True
+   117	    assert E.coin_is_spot("PURR/USDC") is True
+   118	
+   119	
+   120	def test_fixed_position_sizing_runs_without_leader_equity():
+   121	    md = FakeMarketData(_flat_ohlc("BTC", T0 - E.MS_MIN, 20, 100.0))
+   122	    acts = pd.DataFrame([
+   123	        _action("BTC", T0 + 2 * E.MS_MIN, np.nan, "ENTRY", position_after=1.0),
+   124	        _action("BTC", T0 + 3 * E.MS_MIN, np.nan, "EXIT", position_after=0.0, signed_size=-1.0),
+   125	    ])
+   126	    params = E.EngineParams(
+   127	        copy_latency_ms=0, sizing_mode="fixed_position", fixed_target_exposure=0.25
+   128	    )
+   129	    out = _run(acts, md, eq=1_000.0, params=params, end=T0 + 4 * E.MS_MIN)
+   130	    assert out["summary"]["sizing_mode"] == "fixed_position"
+   131	    assert out["summary"]["n_fills"] == 2
+   132	    assert out["ending_account_state"]["positions"] == {}
+   133	
+   134	
+   135	def test_m7_rejects_stale_m2_schema_without_stream_validity(tmp_path):
+   136	    import pyarrow.dataset as ds
+   137	
+   138	    p = tmp_path / "old_actions.parquet"
+   139	    pd.DataFrame({"wallet": ["0x1"], "coin": ["BTC"], "ts": [T0]}).to_parquet(p)
+   140	    with pytest.raises(ValueError, match="rebuilt causal M2"):
+   141	        E._require_action_schema(ds.dataset(p, format="parquet"))
+   142	
+   143	
+   144	def test_margin_mode_inference():
+   145	    assert E.default_margin_mode("BTC") == "cross"
+   146	    assert E.default_margin_mode("xyz:AMD") == "isolated"
+   147	
+   148	
+   149	def test_hlmeta_maint_rate_from_real_cache():
+   150	    meta = E.HLMeta().load()
+   151	    if not meta.has("BTC"):
+   152	        pytest.skip("HL meta cache not present")
+   153	    r = meta.maint_rate("BTC", 1000.0)
+   154	    assert 0 < r < 0.5
+   155	    assert abs(r - 1.0 / (2.0 * meta.tier_maxlev("BTC", 1000.0))) < 1e-9
+   156	
+   157	
+   158	def test_m7_fee_schedule_uses_effective_subaccount_rate(tmp_path):
+   159	    p = tmp_path / "fees.json"
+   160	    p.write_text(__import__("json").dumps({
+   161	        "base_taker_oneway": 0.000432,
+   162	        "effective_subaccount_taker_oneway": 0.00045,
+   163	        "hip3_mult": 2.0,
+   164	    }))
+   165	    f = E.FeeSchedule(p)
+   166	    assert f.taker("BTC") == pytest.approx(0.00045)
+   167	    assert f.taker("xyz:TEST") == pytest.approx(0.0009)
+   168	
+   169	
+   170	def test_liquidity_adv_is_trailing_dollar_volume_not_price_proxy():
+   171	    md = E.MarketData(allow_mongo=False)
+   172	    mins = np.arange(3, dtype="int64") * E.MS_MIN + T0
+   173	    px = np.full(3, 100.0)
+   174	    md._ohlc["BTC"] = (mins, px.copy(), px.copy(), px.copy(), px.copy())
+   175	    md._volume["BTC"] = np.array([1.0, 2.0, 3.0])
+   176	
+   177	    liq = md.liquidity("BTC", T0 + 4 * E.MS_MIN)
+   178	
+   179	    assert liq["adv"] == pytest.approx(600.0)
+   180	    assert liq["adv_unavailable"] is False
+   181	
+   182	
+   183	def test_liquidity_adv_uses_24h_wall_clock_for_sparse_bars():
+   184	    md = E.MarketData(allow_mongo=False)
+   185	    mins = np.array([T0, T0 + 48 * E.MS_HOUR], dtype="int64")
+   186	    px = np.array([100.0, 100.0])
+   187	    md._ohlc["xyz:TEST"] = (mins, px.copy(), px.copy(), px.copy(), px.copy())
+   188	    md._volume["xyz:TEST"] = np.array([10.0, 2.0])
+   189	
+   190	    liq = md.liquidity("xyz:TEST", T0 + 48 * E.MS_HOUR + 2 * E.MS_MIN)
+   191	
+   192	    assert liq["adv"] == pytest.approx(200.0)
+   193	
+   194	
+   195	def test_missing_adv_rejects_new_exposure_fail_closed():
+   196	    class MissingAdv(FakeMarketData):
+   197	        def liquidity(self, coin, ts_ms):
+   198	            return {
+   199	                "adv": 0.0,
+   200	                "half_spread_bps": 1.0,
+   201	                "uncalibrated": False,
+   202	                "adv_unavailable": True,
+   203	            }
+   204	
+   205	    md = MissingAdv(_flat_ohlc("BTC", T0 - 10 * E.MS_MIN, 600, 100.0))
+   206	    out = _run(pd.DataFrame([_action("BTC", T0, 0.1)]), md)
+   207	
+   208	    assert out["summary"]["n_fills"] == 0
+   209	    assert out["summary"]["n_rejected"] == 1
+   210	    assert out["summary"]["adv_unavailable"] is True
+   211	
+   212	
+   213	def test_market_data_mark_rejects_stale_asof_bar():
+   214	    md = E.MarketData(allow_mongo=False)
+   215	    px = np.array([100.0])
+   216	    md._ohlc["BTC"] = (np.array([T0], dtype="int64"), px, px, px, px)
+   217	
+   218	    assert md.mark("BTC", T0 + E.MS_MIN, causal=True) == 100.0
+   219	    assert md.mark("BTC", T0 + E.MARK_MAX_AGE_MS + 2 * E.MS_MIN, causal=True) is None
+   220	
+
+exec
+/bin/zsh -lc 'rg -n "P0#|late_copy|n_late_copy|isolated|cross.*flip|flip.*cross|funding.*fold|carry|backstop|ruin" tests/v15/test_m07.py' in /Users/hermes/quants-lab
+ succeeded in 486ms:
+95:            carry_in_status=""):
+98:            "target_exposure_pct": target_pct, "is_liquidation": False, "carry_in_status": carry_in_status}
+146:    assert E.default_margin_mode("xyz:AMD") == "isolated"
+253:    assert "account_ruin" not in _run(acts, md)["summary"]["outcome_states"]
+259:def test_backstop_on_crash_isolation_invariant():
+270:    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+299:    # (not backstop). 5x exposure, maxlev 10 (maint 5%). px 100 -> 84 lands in the market-liq band.
+310:    assert s["n_market_liq_orders"] >= 1 or "backstop" in s["outcome_states"]
+313:        assert liq_fills and all(f["fee"] == 0.0 for f in liq_fills)   # forced-liq fills carry no fee
+337:def test_isolated_position_posts_margin_and_can_liquidate():
+338:    # xyz coin -> isolated. Open isolated long, crash -> isolated liquidation, cross main untouched.
+349:    # isolated margin was posted from main on open (main cross collateral dropped below start)
+350:    assert "position_liquidated" in s["outcome_states"] or "backstop" in s["outcome_states"]
+383:    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+424:    # actions, anchored at start_ts. Crash after start -> liquidation/backstop without any action.
+434:    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+440:    # chronological: a position liquidated early should not keep accruing funding to fold end.
+452:    assert set(res["summary"]["outcome_states"]) & {"backstop", "position_liquidated", "account_ruin"}
+456:    # codex code-r4 #1: a settled funding payment at the fold boundary can push below maintenance;
+473:    assert set(s["outcome_states"]) & {"backstop", "position_liquidated", "account_ruin"}
+491:def test_no_same_ts_double_when_funding_at_fold_end():
+492:    # codex code-r6 #1: when the funding settlement == fold end (t1), the in-loop post-funding check
+495:    t1 = ((T0 // E.MS_HOUR) + 1) * E.MS_HOUR        # a funding hour that we also use as fold end
+506:    assert len(liq_ts) == len(set(liq_ts))           # no same-ts double at the funding==fold-end boundary
+509:def test_carry_in_seeds_short_not_long():
+510:    # codex code-r4 #3: a SHORT carry-in must seed a NEGATIVE szi (signed exposure, no double-flip).
+514:                  carry_in_status="carry")
+516:                            E.EngineParams(copy_latency_ms=0, start_policy="causal_carry_in"),
+631:    # crash after entry -> account wiped -> a post-crash action sees cur_eq<=0 -> true _ruin (D2 path).
+642:                         _action("BTC", T0 + 25 * DAY, 5.0)])     # post-crash action -> _ruin
+647:    assert s["ruin"] is True                         # second action sees cur_eq<=0 -> _ruin (D2 path)
+652:    # D3: post-ruin TE accrues full penalty (source still 5x exposure) over the remaining horizon
+685:    assert not res["summary"]["ruin"]
+713:                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+731:                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+801:    # leveraged long, then a hard crash forces a liquidation/backstop/ruin wipe. The forced-close
+812:    # the position was force-closed by ruin/backstop/liquidation
+813:    assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
+820:def test_finding1_ruined_round_trip_is_a_loss():
+821:    # explicit D2 ruin path: crash wipes equity, a post-crash action triggers _ruin. The open
+831:        _action("BTC", T0 + 120 * E.MS_MIN, 5.0, "ADDON", position_after=500.0),  # sees cur_eq<=0 -> _ruin
+834:    assert s["ruin"] is True
+840:def test_ruin_final_equity_and_roe_not_stale():
+841:    # codex regression: after a RUIN, _finalize must report the POST-ruin equity (0), not the last
+842:    # positive pre-ruin _core_final_eq sample. A ruined subaccount has final_equity ~= 0 and
+852:        _action("BTC", T0 + 120 * E.MS_MIN, 5.0, "ADDON", position_after=500.0),  # sees cur_eq<=0 -> _ruin
+855:    assert s["ruin"] is True
+856:    assert s["final_equity"] < 1e-6, "ruined subaccount must report ~0 final_equity, not a stale positive"
+857:    assert abs(s["roe_engine"] - (-1.0)) < 1e-9, "ruined subaccount ROE must be -100%, not stale"
+861:# codex finding #2 — flip-through-zero fee SPLIT across the two round-trips
+863:def test_finding2_flip_fee_split_across_round_trips():
+886:    E._book_fill(st, md, "BTC", -200.0, 100.0, "cross", fee=flip_fee, summary=summ)
+998:def test_follower_trail_records_ruin_if_flatten_nonpositive():
+999:    # equity already essentially gone at the breach; post-flatten equity <= 0 -> ruin MUST be set (#6).
+1005:                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+1008:    assert res["summary"]["ruin"], "non-positive post-flatten equity must record ruin"
+
+codex
+The cross projection matches `_book_fill`: pre-trade uPnL at mark minus full-order slippage cost is algebraically the same as realizing the closed leg at `fill_px`, charging the full fee, and marking the residual at `mark`. That means the cross gate is checking post-fill scope equity against residual plus other cross IM, not a stale pre-fill value.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '930,985p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   930	        if params.sizing_mode == "fixed_position":
+   931	            pre_pct = float(np.sign(pre_pos) * abs(params.fixed_target_exposure))
+   932	        else:
+   933	            # source exposure% BEFORE the first observed action = post% scaled by the pre/post size ratio.
+   934	            # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
+   935	            # shorts -- codex code-r4 #3). The main loop's first order then trades to the post target.
+   936	            pre_pct = post_pct * pre_pos / pa
+   937	        seed_szi = pre_pct * eq / mark
+   938	        if abs(seed_szi) > 0:
+   939	            mode = default_margin_mode(coin)
+   940	            pos = Position(coin, seed_szi, mark, mode, md.meta.max_leverage(coin))
+   941	            if mode == "isolated":
+   942	                # post isolated IM from main at the causal mark (codex code-r2 #6) -- never seed an
+   943	                # isolated position with 0 margin (would liquidate instantly). Reject if main can't fund.
+   944	                im = abs(seed_szi) * mark * md.meta.init_margin_rate(coin, abs(seed_szi) * mark)
+   945	                if st.cross_collateral.get("main", 0.0) < im:
+   946	                    summary["outcome_states"].add("carry_in_rejected")
+   947	                    return
+   948	                st.cross_collateral["main"] -= im
+   949	                pos.isolated_margin = im
+   950	            st.positions[coin] = pos
+   951	            summary["outcome_states"].add("carry_in_seeded")
+   952	
+   953	
+   954	def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary,
+   955	                 force_close=False):
+   956	    """Order lifecycle (design §4.4): lot round -> min-notional skip -> leverage/IM check -> capacity
+   957	    cap (execution depth, recorded) -> fill at slippage price -> versioned fee -> position+bucket
+   958	    update.
+   959	
+   960	    force_close (codex follower-trail review bug #5): a RISK exit (breaker flatten) must reliably close
+   961	    the full position. It still pays realistic fee + slippage, but is NOT blocked by the min-notional
+   962	    skip and is NOT downsized by the participation/capacity cap. Exit impact is charged on the FULL
+   963	    order/ADV ratio; capping impact at the entry participation limit would make emergency exits
+   964	    optimistically cheap exactly when capacity is breached."""
+   965	    if abs(delta_szi) < 1e-15:
+   966	        return
+   967	    szdec = md.meta.szdec(coin)
+   968	    delta_szi = round(delta_szi, szdec)
+   969	    if abs(delta_szi) < 10 ** (-szdec):
+   970	        return
+   971	    delta_notional = abs(delta_szi) * mark
+   972	    if delta_notional < MIN_ORDER_NOTIONAL and not force_close:
+   973	        return
+   974	
+   975	    mode = default_margin_mode(coin)
+   976	    liq = md.liquidity(coin, our_ts)
+   977	    if liq.get("adv_unavailable") and not force_close:
+   978	        summary["adv_unavailable"] = True
+   979	        summary["n_rejected"] += 1
+   980	        return
+   981	    if liq.get("uncalibrated"):
+   982	        summary["slippage_uncalibrated"] = True
+   983	    elif getattr(md, "slip_calib_version", None) is not None:
+   984	        summary["slippage_calibration_version"] = md.slip_calib_version
+   985	    adv = liq.get("adv", 0.0)
+
+codex
+I don’t see a new ungated order class from the static read. I’m going to run the m07 unit file locally once in this workspace to make sure the current checkout matches the claimed green state.
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m07.py -q' in /Users/hermes/quants-lab
+ succeeded in 1028ms:
+........................................................                 [100%]
+56 passed in 0.62s
+
+codex
+Consensus.
+
+I reviewed [research/v15/v15_m07_engine.py](/Users/hermes/quants-lab/research/v15/v15_m07_engine.py:1033) and the two round-3 fixes look correct:
+
+- Cross flips are now gated through the cross IM admissibility path, while isolated flips are handled only by the isolated settle/open gate. I do not see a remaining ungated flip path.
+- The cross gate’s `equity = cash - fee - slip_cost + pre uPnL` projection matches `_book_fill`’s realized-at-`fill_px` close plus residual marked at `mark`, so it adequately prevents under-IM residuals.
+- Increasing non-flip orders still route through the same gate as before.
+- Pure reduces/full closes still remain ungated.
+- `n_late_copy_skipped` now counts only non-spot copyable rows, matching the actual loop behavior.
+
+I ran the m07 test file locally: `56 passed in 0.62s`.
+
+No new bug found. All 7 m07 P0s are fixed to my satisfaction, and m07 is trustworthy for accounting-sensitive results, with the existing explicit caveat that `adl_stress=True` is flagged as requested-but-not-applied rather than silently represented as an ADL-stressed run.
+tokens used
+52.388
+Consensus.
+
+I reviewed [research/v15/v15_m07_engine.py](/Users/hermes/quants-lab/research/v15/v15_m07_engine.py:1033) and the two round-3 fixes look correct:
+
+- Cross flips are now gated through the cross IM admissibility path, while isolated flips are handled only by the isolated settle/open gate. I do not see a remaining ungated flip path.
+- The cross gate’s `equity = cash - fee - slip_cost + pre uPnL` projection matches `_book_fill`’s realized-at-`fill_px` close plus residual marked at `mark`, so it adequately prevents under-IM residuals.
+- Increasing non-flip orders still route through the same gate as before.
+- Pure reduces/full closes still remain ungated.
+- `n_late_copy_skipped` now counts only non-spot copyable rows, matching the actual loop behavior.
+
+I ran the m07 test file locally: `56 passed in 0.62s`.
+
+No new bug found. All 7 m07 P0s are fixed to my satisfaction, and m07 is trustworthy for accounting-sensitive results, with the existing explicit caveat that `adl_stress=True` is flagged as requested-but-not-applied rather than silently represented as an ADL-stressed run.
