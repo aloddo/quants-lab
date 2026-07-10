@@ -251,7 +251,7 @@ def get_mark(coin: str, ts_ms: int, causal: bool = False) -> Optional[float]:
     if minute_key - int(mins[i]) > CANDLE_MAX_AGE_MS:
         return None
     px = closes[i]
-    return None if px != px else float(px)  # NaN-safe (missing close -> None)
+    return None if not np.isfinite(px) else float(px)  # NaN/inf-safe (codex m01: inf mark -> None)
 
 
 # Candle-fallback staleness cap (codex marks-gate 2026-06-24). The 1m candle close is an at-or-before
@@ -315,7 +315,7 @@ def _oracle_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
     if ts_ms - int(ts_arr[i]) > max_age_ms:  # too stale -> let caller fall back to candle
         return None
     v = px[i]
-    return None if v != v else float(v)
+    return None if not np.isfinite(v) else float(v)
 
 
 # setOracle MARK price (markPxs[0]) -- the price HL uses for accountValue/uPnL (oracle is funding-only).
@@ -360,7 +360,7 @@ def _markpx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
     if ts_ms - int(ts_arr[i]) > max_age_ms:
         return None
     v = px[i]
-    return None if v != v else float(v)
+    return None if not np.isfinite(v) else float(v)
 
 
 # asset_ctxs EXACT mark for MAIN coins: per-coin (minute_ms, mark_px) .npy written by
@@ -392,7 +392,7 @@ def _assetctx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
     if ts_ms - int(ts_arr[i]) > max_age_ms:
         return None
     v = px[i]
-    return None if v != v else float(v)
+    return None if not np.isfinite(v) else float(v)
 
 
 # Earliest ms at which a coin has ANY price (candle minute, else oracle ts). A coin cannot be
@@ -2150,6 +2150,22 @@ def compute_event_equity(
     # Coins whose carry-in (pre-anchor holding) has already been folded into the
     # book+cash under the ACTIVE anchor. Reset per anchor cycle (codex r4 BUG 1).
     carried_in: set[str] = set()
+    # AUDIT 2026-07-10 (codex m01 P1a): the anchor cash SNAP (cash = a_v - Sum seed*mark(a_t)) OMITS any
+    # seeded/carry-in position UNMARKABLE at the anchor time -> cash (and equity_post) overstated while
+    # markable_all was falsely True. Track per-cycle incompleteness; when set, the denominator is unreliable
+    # -> the event fails CLOSED (has_past_anchor=False -> M02 NO_ANCHOR).
+    anchor_snap_incomplete = [False]   # list = mutable closure cell
+    # AUDIT 2026-07-10 (codex m01 P1b): an UNKNOWN ledger type applies cash=0 (its real move is unknown), so
+    # equity after it is silently wrong. Once one occurs at ts <= event, the cash is untrustworthy -> taint
+    # every event at/after it (causal). Precompute the unknown-ledger timestamps once.
+    import bisect as _bisect
+    _unknown_ledger_ts = sorted(
+        it["ts"] for it in ordered
+        if it["type"] == "ledger" and ledger_cash_delta(it["ev"], wallet_lc).unknown
+    )
+
+    def _tainted_by_unknown_ledger(ts: int) -> bool:
+        return _bisect.bisect_right(_unknown_ledger_ts, ts) > 0
 
     def _carry_in_fill(ev: dict) -> None:
         """CAUSAL replacement for seed_positions case 2 (codex r4 BUG 1).
@@ -2179,6 +2195,10 @@ def compute_event_equity(
             cash -= sp * m  # mirror the anchor cash snap for this carried-in coin
             last_val[coin] = sp * m
             last_val_ts.setdefault(coin, active_anchor_ts)
+        else:
+            # codex m01 P1a: carry-in coin unmarkable at the anchor -> its anchor value was NOT removed from
+            # cash -> the snap is incomplete -> equity denominator unreliable for this cycle. Fail closed.
+            anchor_snap_incomplete[0] = True
 
     def _past_anchor(ts: int) -> Optional[tuple[int, float]]:
         chosen = None
@@ -2227,6 +2247,7 @@ def compute_event_equity(
             # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
             active_anchor_ts = a_t
             active_anchor_eq = a_v
+            anchor_snap_incomplete[0] = False   # codex m01 P1a: fresh cycle, re-assess snap completeness
             seeded = seed_positions(fills, anchor, a_t, causal_cutoff=True)
             anchor_pos_value = 0.0
             for c, sz in seeded.items():
@@ -2237,6 +2258,10 @@ def compute_event_equity(
                     anchor_pos_value += sz * m
                     last_val[c] = sz * m
                     last_val_ts[c] = a_t
+                else:
+                    # codex m01 P1a: seeded position unmarkable at the anchor -> its value is NOT subtracted
+                    # from the cash snap -> incomplete denominator -> fail closed for this cycle.
+                    anchor_snap_incomplete[0] = True
             cash = a_v - anchor_pos_value
             positions = {c: s for c, s in seeded.items() if abs(s) > 1e-9}
             # Coins already in the anchor seed are carried-in; their fills must NOT
@@ -2290,11 +2315,36 @@ def compute_event_equity(
             mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
 
         equity_post = cash + pos_value  # markable + cash; frozen excluded here
+        whole_equity = equity_post + frozen_value
+
+        # AUDIT 2026-07-10 (codex m01 P1a/P1b/P2): fail CLOSED when the reconstructed denominator is untrustworthy
+        # -> emit the NO_ANCHOR form (M02 -> unsizeable), never a falsely-clean anchored equity:
+        #   (a) anchor snap incomplete (a seed/carry-in coin was unmarkable at the anchor -> cash overstated),
+        #   (b) an unknown ledger type at/before this ts (its real cash move was applied as 0),
+        #   (c) any non-finite cash/equity (inf mark or NaN funding/ledger delta leaked through).
+        _degraded = (anchor_snap_incomplete[0]
+                     or _tainted_by_unknown_ledger(ts)
+                     or not np.isfinite(cash) or not np.isfinite(whole_equity))
+        if _degraded:
+            results.append(
+                EventEquity(
+                    event_order=order, ts=ts, type=item["type"],
+                    source_seq=item["source_seq"], equity_post=float("nan"),
+                    cash=float("nan"), position_value=float("nan"),
+                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
+                    mark_ts=None, markable_all=False, n_unmarkable=max(1, n_unmarkable),
+                    no_extradex_without_anchor=(not extradex_no_anchor),
+                    frozen_component_value=0.0, frozen_component_age_ms=0,
+                    has_past_anchor=False,
+                    fill=(item["ev"] if item["type"] == "fill" else None),
+                )
+            )
+            continue
         results.append(
             EventEquity(
                 event_order=order, ts=ts, type=item["type"],
                 source_seq=item["source_seq"],
-                equity_post=equity_post + frozen_value,  # whole-account incl frozen
+                equity_post=whole_equity,  # whole-account incl frozen
                 cash=cash, position_value=pos_value,
                 anchor_ts=a_t, anchor_equity=a_v,
                 age_since_anchor_ms=ts - a_t,

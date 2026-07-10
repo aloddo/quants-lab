@@ -1,0 +1,2621 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4ccc-8fc1-7003-a35b-3c220cf3859d
+--------
+user
+# Round-2 m01 — the 2 P1 + P2 fail-opens closed (m02-facing causal EventEquity)
+
+Your audit CONFIRMED m01 look-ahead-safe and found 2 P1 + 1 P2 fail-opens in the m02-facing compute_event_equity
+contract. All fixed. Read research/v15/v15_m01_equity_reconstruct.py (get_mark ~L254 + the 3 lookups; the
+compute_event_equity state ~L2153-2175, _carry_in_fill ~L2194-2201, anchor cycle ~L2248-2266, emission guard
+~L2317-2345) + tests/v15/test_m01_golden.py.
+
+## Applied
+- P1a anchor snap incomplete: a per-cycle flag anchor_snap_incomplete is set when ANY seeded OR carry-in
+  position is UNMARKABLE at the anchor time (get_mark(coin, a_t) is None) -- exactly the case where its value
+  is NOT subtracted from the cash snap, overstating equity. When set, the event fails CLOSED
+  (has_past_anchor=False, equity_post/cash NaN, markable_all=False) -> M02 NO_ANCHOR.
+- P1b unknown ledger: precompute the sorted ts of ledgers whose ledger_cash_delta(...).unknown is True; any
+  event at ts >= an unknown-ledger ts is tainted (its cash was applied as 0) -> fails CLOSED (causal via
+  bisect). Pre-unknown-ledger events stay clean.
+- P2 non-finite: get_mark + all 3 mark lookups now reject inf as well as NaN (np.isfinite); and the emission
+  guard also fails closed on any non-finite cash/whole_equity (catches inf mark / NaN funding / NaN ledger
+  delta that leaks through).
+Golden: tests/v15/test_m01_golden.py (5 cases: seeded-unmarkable, clean control, unknown-ledger taint, inf
+mark, NaN funding). 5 golden + full v15 (400) pass. m02 (which consumes EventEquity) unregressed.
+
+## Verify
+- Are ALL 3 findings closed? Any remaining path where compute_event_equity emits has_past_anchor=True with an
+  untrustworthy denominator (incomplete anchor snap, unknown-ledger-tainted cash, or non-finite)?
+- Is the causal taint correct (an unknown ledger at ts_u taints ts>=ts_u, not earlier)? Is per-cycle
+  anchor_snap_incomplete reset correctly at each new anchor?
+- Does forcing has_past_anchor=False (vs a lesser PARTIAL_MTM degrade) correctly route M02 to NO_ANCHOR
+  (unsizeable) -- the right conservative choice when the DENOMINATOR itself is unreliable?
+- Any NEW look-ahead or regression introduced (esp. the emission-guard early-continue).
+
+## Output
+Verdict. End OVERALL: is m01 now look-ahead-safe AND fail-CLOSED and ready to mark TRUSTED (completing the whole
+m01-m10 audit), yes/no + exactly what remains.
+codex
+I’ll review this as an audit, focusing on the specific m01 contract paths and tests you named, then I’ll run the relevant test targets if the repo setup allows it.
+exec
+/bin/zsh -lc 'git diff -- research/v15/v15_m01_equity_reconstruct.py tests/v15/test_m01_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+diff --git a/research/v15/v15_m01_equity_reconstruct.py b/research/v15/v15_m01_equity_reconstruct.py
+index 2f2c267..70aa27c 100644
+--- a/research/v15/v15_m01_equity_reconstruct.py
++++ b/research/v15/v15_m01_equity_reconstruct.py
+@@ -251,7 +251,7 @@ def get_mark(coin: str, ts_ms: int, causal: bool = False) -> Optional[float]:
+     if minute_key - int(mins[i]) > CANDLE_MAX_AGE_MS:
+         return None
+     px = closes[i]
+-    return None if px != px else float(px)  # NaN-safe (missing close -> None)
++    return None if not np.isfinite(px) else float(px)  # NaN/inf-safe (codex m01: inf mark -> None)
+ 
+ 
+ # Candle-fallback staleness cap (codex marks-gate 2026-06-24). The 1m candle close is an at-or-before
+@@ -315,7 +315,7 @@ def _oracle_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+     if ts_ms - int(ts_arr[i]) > max_age_ms:  # too stale -> let caller fall back to candle
+         return None
+     v = px[i]
+-    return None if v != v else float(v)
++    return None if not np.isfinite(v) else float(v)
+ 
+ 
+ # setOracle MARK price (markPxs[0]) -- the price HL uses for accountValue/uPnL (oracle is funding-only).
+@@ -360,7 +360,7 @@ def _markpx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+     if ts_ms - int(ts_arr[i]) > max_age_ms:
+         return None
+     v = px[i]
+-    return None if v != v else float(v)
++    return None if not np.isfinite(v) else float(v)
+ 
+ 
+ # asset_ctxs EXACT mark for MAIN coins: per-coin (minute_ms, mark_px) .npy written by
+@@ -392,7 +392,7 @@ def _assetctx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+     if ts_ms - int(ts_arr[i]) > max_age_ms:
+         return None
+     v = px[i]
+-    return None if v != v else float(v)
++    return None if not np.isfinite(v) else float(v)
+ 
+ 
+ # Earliest ms at which a coin has ANY price (candle minute, else oracle ts). A coin cannot be
+@@ -2150,6 +2150,22 @@ def compute_event_equity(
+     # Coins whose carry-in (pre-anchor holding) has already been folded into the
+     # book+cash under the ACTIVE anchor. Reset per anchor cycle (codex r4 BUG 1).
+     carried_in: set[str] = set()
++    # AUDIT 2026-07-10 (codex m01 P1a): the anchor cash SNAP (cash = a_v - Sum seed*mark(a_t)) OMITS any
++    # seeded/carry-in position UNMARKABLE at the anchor time -> cash (and equity_post) overstated while
++    # markable_all was falsely True. Track per-cycle incompleteness; when set, the denominator is unreliable
++    # -> the event fails CLOSED (has_past_anchor=False -> M02 NO_ANCHOR).
++    anchor_snap_incomplete = [False]   # list = mutable closure cell
++    # AUDIT 2026-07-10 (codex m01 P1b): an UNKNOWN ledger type applies cash=0 (its real move is unknown), so
++    # equity after it is silently wrong. Once one occurs at ts <= event, the cash is untrustworthy -> taint
++    # every event at/after it (causal). Precompute the unknown-ledger timestamps once.
++    import bisect as _bisect
++    _unknown_ledger_ts = sorted(
++        it["ts"] for it in ordered
++        if it["type"] == "ledger" and ledger_cash_delta(it["ev"], wallet_lc).unknown
++    )
++
++    def _tainted_by_unknown_ledger(ts: int) -> bool:
++        return _bisect.bisect_right(_unknown_ledger_ts, ts) > 0
+ 
+     def _carry_in_fill(ev: dict) -> None:
+         """CAUSAL replacement for seed_positions case 2 (codex r4 BUG 1).
+@@ -2179,6 +2195,10 @@ def compute_event_equity(
+             cash -= sp * m  # mirror the anchor cash snap for this carried-in coin
+             last_val[coin] = sp * m
+             last_val_ts.setdefault(coin, active_anchor_ts)
++        else:
++            # codex m01 P1a: carry-in coin unmarkable at the anchor -> its anchor value was NOT removed from
++            # cash -> the snap is incomplete -> equity denominator unreliable for this cycle. Fail closed.
++            anchor_snap_incomplete[0] = True
+ 
+     def _past_anchor(ts: int) -> Optional[tuple[int, float]]:
+         chosen = None
+@@ -2227,6 +2247,7 @@ def compute_event_equity(
+             # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
+             active_anchor_ts = a_t
+             active_anchor_eq = a_v
++            anchor_snap_incomplete[0] = False   # codex m01 P1a: fresh cycle, re-assess snap completeness
+             seeded = seed_positions(fills, anchor, a_t, causal_cutoff=True)
+             anchor_pos_value = 0.0
+             for c, sz in seeded.items():
+@@ -2237,6 +2258,10 @@ def compute_event_equity(
+                     anchor_pos_value += sz * m
+                     last_val[c] = sz * m
+                     last_val_ts[c] = a_t
++                else:
++                    # codex m01 P1a: seeded position unmarkable at the anchor -> its value is NOT subtracted
++                    # from the cash snap -> incomplete denominator -> fail closed for this cycle.
++                    anchor_snap_incomplete[0] = True
+             cash = a_v - anchor_pos_value
+             positions = {c: s for c, s in seeded.items() if abs(s) > 1e-9}
+             # Coins already in the anchor seed are carried-in; their fills must NOT
+@@ -2290,11 +2315,36 @@ def compute_event_equity(
+             mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
+ 
+         equity_post = cash + pos_value  # markable + cash; frozen excluded here
++        whole_equity = equity_post + frozen_value
++
++        # AUDIT 2026-07-10 (codex m01 P1a/P1b/P2): fail CLOSED when the reconstructed denominator is untrustworthy
++        # -> emit the NO_ANCHOR form (M02 -> unsizeable), never a falsely-clean anchored equity:
++        #   (a) anchor snap incomplete (a seed/carry-in coin was unmarkable at the anchor -> cash overstated),
++        #   (b) an unknown ledger type at/before this ts (its real cash move was applied as 0),
++        #   (c) any non-finite cash/equity (inf mark or NaN funding/ledger delta leaked through).
++        _degraded = (anchor_snap_incomplete[0]
++                     or _tainted_by_unknown_ledger(ts)
++                     or not np.isfinite(cash) or not np.isfinite(whole_equity))
++        if _degraded:
++            results.append(
++                EventEquity(
++                    event_order=order, ts=ts, type=item["type"],
++                    source_seq=item["source_seq"], equity_post=float("nan"),
++                    cash=float("nan"), position_value=float("nan"),
++                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
++                    mark_ts=None, markable_all=False, n_unmarkable=max(1, n_unmarkable),
++                    no_extradex_without_anchor=(not extradex_no_anchor),
++                    frozen_component_value=0.0, frozen_component_age_ms=0,
++                    has_past_anchor=False,
++                    fill=(item["ev"] if item["type"] == "fill" else None),
++                )
++            )
++            continue
+         results.append(
+             EventEquity(
+                 event_order=order, ts=ts, type=item["type"],
+                 source_seq=item["source_seq"],
+-                equity_post=equity_post + frozen_value,  # whole-account incl frozen
++                equity_post=whole_equity,  # whole-account incl frozen
+                 cash=cash, position_value=pos_value,
+                 anchor_ts=a_t, anchor_equity=a_v,
+                 age_since_anchor_ms=ts - a_t,
+
+exec
+/bin/zsh -lc 'rg -n "def get_mark|compute_event_equity|_carry_in_fill|anchor_snap_incomplete|unknown" research/v15/v15_m01_equity_reconstruct.py tests/v15/test_m01_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m01_golden.py:35:    return m01.compute_event_equity(ordered, fills, anchor, "0xtest",
+tests/v15/test_m01_golden.py:60:def test_p1b_unknown_ledger_taints_subsequent_events(monkeypatch):
+tests/v15/test_m01_golden.py:62:    fills = [_fill(1500, "BTC", "B", 1, 100, 0, tid=1),         # BEFORE the unknown ledger -> clean
+tests/v15/test_m01_golden.py:67:    assert fills_ev[0].has_past_anchor is True                 # pre-unknown-ledger fill stays clean
+tests/v15/test_m01_golden.py:68:    assert fills_ev[1].has_past_anchor is False                # post-unknown-ledger fill fails closed
+research/v15/v15_m01_equity_reconstruct.py:68:    n_position_mismatches, unknown_ledger_types, quarantined, ...
+research/v15/v15_m01_equity_reconstruct.py:164:# explicitly means they never fall through to the "unknown type" quarantine.
+research/v15/v15_m01_equity_reconstruct.py:203:def get_mark(coin: str, ts_ms: int, causal: bool = False) -> Optional[float]:
+research/v15/v15_m01_equity_reconstruct.py:1065:    unknown: bool = False  # True if the type is unrecognized -> quarantine
+research/v15/v15_m01_equity_reconstruct.py:1069:    """Classify a ledger event into (cash_delta, ext_flow_delta, unknown).
+research/v15/v15_m01_equity_reconstruct.py:1077:    Unknown ledger types return unknown=True (caller quarantines the wallet);
+research/v15/v15_m01_equity_reconstruct.py:1123:            return LedgerDelta(0.0, 0.0, unknown=touches_perp)
+research/v15/v15_m01_equity_reconstruct.py:1207:        return LedgerDelta(0.0, 0.0, unknown=True)
+research/v15/v15_m01_equity_reconstruct.py:1265:    had_unknown_ledger: bool
+research/v15/v15_m01_equity_reconstruct.py:1391:    # absorbs its (unknown) value -> equity is corrupted. Count those so the
+research/v15/v15_m01_equity_reconstruct.py:1412:    # mirrors compute_event_equity and avoids both future leakage and the old
+research/v15/v15_m01_equity_reconstruct.py:1416:    had_unknown = False
+research/v15/v15_m01_equity_reconstruct.py:1445:            had_unknown = had_unknown or ld.unknown
+research/v15/v15_m01_equity_reconstruct.py:1483:        had_unknown_ledger=had_unknown,
+research/v15/v15_m01_equity_reconstruct.py:1601:    had_unknown_any = False
+research/v15/v15_m01_equity_reconstruct.py:1617:        had_unknown_any = had_unknown_any or wr.had_unknown_ledger
+research/v15/v15_m01_equity_reconstruct.py:1686:        "unknown_ledger_types": sorted(
+research/v15/v15_m01_equity_reconstruct.py:1690:                if ledger_cash_delta(e, wallet_lc).unknown
+research/v15/v15_m01_equity_reconstruct.py:1703:    # Quarantine only when equity genuinely cannot be trusted: unknown ledger
+research/v15/v15_m01_equity_reconstruct.py:1719:        had_unknown_any
+research/v15/v15_m01_equity_reconstruct.py:1720:        or audit["unknown_ledger_types"]
+research/v15/v15_m01_equity_reconstruct.py:2115:def compute_event_equity(
+research/v15/v15_m01_equity_reconstruct.py:2157:    anchor_snap_incomplete = [False]   # list = mutable closure cell
+research/v15/v15_m01_equity_reconstruct.py:2158:    # AUDIT 2026-07-10 (codex m01 P1b): an UNKNOWN ledger type applies cash=0 (its real move is unknown), so
+research/v15/v15_m01_equity_reconstruct.py:2160:    # every event at/after it (causal). Precompute the unknown-ledger timestamps once.
+research/v15/v15_m01_equity_reconstruct.py:2162:    _unknown_ledger_ts = sorted(
+research/v15/v15_m01_equity_reconstruct.py:2164:        if it["type"] == "ledger" and ledger_cash_delta(it["ev"], wallet_lc).unknown
+research/v15/v15_m01_equity_reconstruct.py:2167:    def _tainted_by_unknown_ledger(ts: int) -> bool:
+research/v15/v15_m01_equity_reconstruct.py:2168:        return _bisect.bisect_right(_unknown_ledger_ts, ts) > 0
+research/v15/v15_m01_equity_reconstruct.py:2170:    def _carry_in_fill(ev: dict) -> None:
+research/v15/v15_m01_equity_reconstruct.py:2201:            anchor_snap_incomplete[0] = True
+research/v15/v15_m01_equity_reconstruct.py:2250:            anchor_snap_incomplete[0] = False   # codex m01 P1a: fresh cycle, re-assess snap completeness
+research/v15/v15_m01_equity_reconstruct.py:2264:                    anchor_snap_incomplete[0] = True
+research/v15/v15_m01_equity_reconstruct.py:2269:            # get folded causally at their first fill via _carry_in_fill.
+research/v15/v15_m01_equity_reconstruct.py:2283:                    _carry_in_fill(prev["ev"])
+research/v15/v15_m01_equity_reconstruct.py:2289:            _carry_in_fill(item["ev"])
+research/v15/v15_m01_equity_reconstruct.py:2323:        #   (b) an unknown ledger type at/before this ts (its real cash move was applied as 0),
+research/v15/v15_m01_equity_reconstruct.py:2325:        _degraded = (anchor_snap_incomplete[0]
+research/v15/v15_m01_equity_reconstruct.py:2326:                     or _tainted_by_unknown_ledger(ts)
+research/v15/v15_m01_equity_reconstruct.py:2430:    events = compute_event_equity(
+
+exec
+/bin/zsh -lc 'git status --short' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+ M research/v15/v15_m01_equity_reconstruct.py
+?? archive/codex_audit_m01_DEFERRED.txt
+?? archive/codex_audit_m03.txt
+?? archive/codex_audit_m05.txt
+?? archive/codex_audit_m06b.txt
+?? archive/codex_audit_m08.txt
+?? research/v15/.audit_m03.txt
+?? tests/v15/test_m01_golden.py
+
+codex
+I see the intended changes in the diff and one untracked golden test file. Next I’m reading the surrounding control flow to check whether the fail-closed states can be bypassed by ordering, anchor resets, or the early continue.
+exec
+/bin/zsh -lc "sed -n '180,420p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+)
+
+
+# --------------------------------------------------------------------------- #
+# Worker-process globals (Mongo client + mark cache, lazily created per process)
+# --------------------------------------------------------------------------- #
+
+_mongo: Optional[pymongo.database.Database] = None
+_mark_cache: dict[tuple[str, int], Optional[float]] = {}
+# Per-coin in-memory 1m close series for ASOF lookups (replaces per-action Mongo round-trips, which
+# were ~94% of M2 wall time: 1.3M find_one calls / 10 wallets). Each coin loaded ONCE (one indexed
+# range query) into sorted (minutes, closes) numpy arrays; get_mark then does a binary-search asof.
+# Bounded memory: only coins actually touched, one series each. (Perf decision 2026-05-31.)
+_mark_series: dict[str, tuple] = {}
+
+
+def get_mongo() -> pymongo.database.Database:
+    global _mongo
+    if _mongo is None:
+        _mongo = pymongo.MongoClient(MONGO_URI)["quants_lab"]
+    return _mongo
+
+
+def get_mark(coin: str, ts_ms: int, causal: bool = False) -> Optional[float]:
+    """1m candle close at-or-before ts_ms (latest). None if no candle covers it.
+
+    Works for any prefix (main + xyz:/cash:/hyna:/para:/vntl:/flx:/km:) since the
+    candle ``coin`` carries the full prefixed symbol.
+
+    EXACT-MARK FIX (2026-06-04, Alberto "reconcile to the cent"): for EXOTIC HIP-3
+    coins (prefixed dexes xyz:/cash:/flx:/vntl:/km:/para:/hyna:) the trade-candle close
+    diverges materially from HL's setOracle mark (observed xyz:SILVER -12.8%, xyz:GOLD
+    -4.7% on 2026-03-04) -> on leveraged positions this is a dominant equity-recon drift
+    source. HL computes accountValue on the MARK (oracle), not the last trade. So we now
+    PREFER the oracle mark (hyperliquid_oracle, from v13_extract_oracle_marks setOracle)
+    for prefixed coins, with a candle fallback when oracle is absent/stale. Main-dex
+    (unprefixed) coins keep the trade-candle close (their oracle is consensus-level, not
+    in explorer_blocks; main mark precision tracked separately via asset_ctxs).
+
+    Set causal=True for forward decisions: use the last one-minute bar whose
+    close time is <= ts_ms, matching M07's convention (bar_open <= ts - 60s).
+    Keep causal=False for point-in-time MTM where the mark genuinely existed at ts_ms.
+    """
+    lookup_ms = (ts_ms // 60_000) * 60_000 - 60_000 if causal else ts_ms
+    # EXACT MARK first: exotic (prefixed) coins -> setOracle oracle; MAIN (unprefixed) coins ->
+    # asset_ctxs mark_px (HL's exact per-minute mark, the price accountValue uses). Candle fallback.
+    if ":" in coin:
+        # HL values accountValue/uPnL at the MARK price (markPxs[0]); ORACLE px is FUNDING-ONLY
+        # and is WRONG for m2m (robust-price-indices doc; Alberto, repeatedly). markPx ONLY here --
+        # NO oracle in the m2m path. If markPx is absent, fall through to the trade-candle last
+        # resort (still imperfect on thin books, but never the funding oracle).
+        mkpx = _markpx_lookup(coin, lookup_ms, ORACLE_MAX_AGE_MS)
+        if mkpx is not None:
+            return mkpx
+    else:
+        mpx = _assetctx_lookup(coin, lookup_ms, ASSETCTX_MAX_AGE_MS)
+        if mpx is not None:
+            return mpx
+    minute_key = lookup_ms // 60_000 * 60_000
+    mins, closes = _coin_series(coin)
+    if mins.size == 0:
+        return None
+    i = int(np.searchsorted(mins, minute_key, side="right")) - 1  # latest candle minute <= minute_key
+    if i < 0:
+        return None
+    # STALENESS CAP (codex marks-gate 2026-06-24): the candle fallback is at-or-before with NO age
+    # bound, so a candle from hours ago was returned as if current -> silently-stale MTM that callers
+    # treat as a live mark (markable_all=True). Cap the as-of age: if the nearest prior 1m bar is older
+    # than CANDLE_MAX_AGE_MS, return None so the caller flags it (degraded / NO_ANCHOR) instead of
+    # marking on a stale price. With dense all-market candles this rarely triggers; it only catches the
+    # genuinely-dormant-coin case the cap is meant to surface.
+    if minute_key - int(mins[i]) > CANDLE_MAX_AGE_MS:
+        return None
+    px = closes[i]
+    return None if not np.isfinite(px) else float(px)  # NaN/inf-safe (codex m01: inf mark -> None)
+
+
+# Candle-fallback staleness cap (codex marks-gate 2026-06-24). The 1m candle close is an at-or-before
+# lookup; without a bound a stale bar (delisted/dormant coin, or a data gap) is returned as a live mark.
+# Set to 15min to MATCH ASSETCTX_MAX_AGE_MS (codex recheck 2026-06-24: prefer 15min for a deploy-driving
+# reconstruction; 60min still allows materially-stale MTM on a fast-moving thin coin). With dense
+# all-market 1m candles a held coin has a bar most minutes, so this fires only on genuine dormancy/gaps
+# -> caller flags degraded/NO_ANCHOR. The pre/post-05-24 coverage+staleness AUDIT validates the cap does
+# not over-flag thin HIP-3 instruments; bump back toward 60min only if the audit shows false positives.
+CANDLE_MAX_AGE_MS = 15 * 60 * 1000  # 15min (matches ASSETCTX_MAX_AGE_MS)
+
+# Equity-dependent selection requires repeated out-of-sample anchor checks.
+# One or zero segments is not enough evidence that the reconstruction is
+# stable; such wallets remain usable only in the equity-independent lane.
+MIN_INTER_ANCHOR_CHECKS = 2
+
+
+# Oracle/setOracle series, per-coin in-memory asof cache. ``mark_px`` is the
+# exact account-value mark when observed, but a sparse historical extraction is
+# not permission to reuse it for hours. The 30-wallet multi-dex sensitivity
+# showed 15 minutes weakly dominated 6 hours on inter-anchor drift (6 improved,
+# 0 worsened for median drift; 7 improved, 0 worsened for max drift). Older
+# observations therefore fall back to the contemporaneous trade candle.
+_oracle_series: dict[str, tuple] = {}
+ORACLE_MAX_AGE_MS = 15 * 60 * 1000
+
+
+def _load_oracle_from_mongo(coin: str) -> tuple:
+    db = get_mongo()
+    cur = db.hyperliquid_oracle.find(
+        {"coin": coin}, projection={"timestamp_utc": 1, "oracle_px": 1, "_id": 0}
+    )
+    pts: list[tuple[int, float]] = []
+    for d in cur:
+        t = d.get("timestamp_utc")
+        p = d.get("oracle_px")
+        if t is None or p is None:
+            continue
+        try:
+            pts.append((int(t), float(p)))
+        except (TypeError, ValueError):
+            continue
+    pts.sort(key=lambda x: x[0])
+    if not pts:
+        return (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+    return (np.asarray([x[0] for x in pts], dtype="int64"),
+            np.asarray([x[1] for x in pts], dtype="float64"))
+
+
+def _oracle_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+    s = _oracle_series.get(coin)
+    if s is None:
+        s = _load_oracle_from_mongo(coin)
+        _oracle_series[coin] = s
+    ts_arr, px = s
+    if ts_arr.size == 0:
+        return None
+    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1  # latest oracle point <= ts_ms
+    if i < 0:
+        return None
+    if ts_ms - int(ts_arr[i]) > max_age_ms:  # too stale -> let caller fall back to candle
+        return None
+    v = px[i]
+    return None if not np.isfinite(v) else float(v)
+
+
+# setOracle MARK price (markPxs[0]) -- the price HL uses for accountValue/uPnL (oracle is funding-only).
+# Mirrors _oracle_lookup; reads the mark_px field written by scripts/pull_oracle_targeted.py.
+_markpx_series: dict[str, tuple] = {}
+
+
+def _load_markpx_from_mongo(coin: str) -> tuple:
+    db = get_mongo()
+    cur = db.hyperliquid_oracle.find(
+        {"coin": coin, "mark_px": {"$ne": None}},
+        projection={"timestamp_utc": 1, "mark_px": 1, "_id": 0},
+    )
+    pts: list[tuple[int, float]] = []
+    for d in cur:
+        t = d.get("timestamp_utc")
+        p = d.get("mark_px")
+        if t is None or p is None:
+            continue
+        try:
+            pts.append((int(t), float(p)))
+        except (TypeError, ValueError):
+            continue
+    pts.sort(key=lambda x: x[0])
+    if not pts:
+        return (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+    return (np.asarray([x[0] for x in pts], dtype="int64"),
+            np.asarray([x[1] for x in pts], dtype="float64"))
+
+
+def _markpx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+    s = _markpx_series.get(coin)
+    if s is None:
+        s = _load_markpx_from_mongo(coin)
+        _markpx_series[coin] = s
+    ts_arr, px = s
+    if ts_arr.size == 0:
+        return None
+    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1
+    if i < 0:
+        return None
+    if ts_ms - int(ts_arr[i]) > max_age_ms:
+        return None
+    v = px[i]
+    return None if not np.isfinite(v) else float(v)
+
+
+# asset_ctxs EXACT mark for MAIN coins: per-coin (minute_ms, mark_px) .npy written by
+# scripts/extract_asset_ctx_marks.py. 1-min granularity -> tight staleness cap. Mirrors _coin_series.
+_assetctx_series: dict[str, tuple] = {}
+ASSETCTX_MAX_AGE_MS = 15 * 60 * 1000  # 15min (asset_ctxs is 1-min; small cap)
+ASSETCTX_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "assetctx_marks"
+
+
+def _assetctx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+    s = _assetctx_series.get(coin)
+    if s is None:
+        p = ASSETCTX_DIR / f"{_ulib.quote(coin, safe='')}.npy"
+        if p.exists():
+            try:
+                arr = np.load(p, mmap_mode="r")
+                s = (np.asarray(arr[0], dtype="int64"), np.asarray(arr[1], dtype="float64"))
+            except Exception:  # noqa: BLE001
+                s = (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+        else:
+            s = (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+        _assetctx_series[coin] = s
+    ts_arr, px = s
+    if ts_arr.size == 0:
+        return None
+    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1
+    if i < 0:
+        return None
+    if ts_ms - int(ts_arr[i]) > max_age_ms:
+        return None
+    v = px[i]
+    return None if not np.isfinite(v) else float(v)
+
+
+# Earliest ms at which a coin has ANY price (candle minute, else oracle ts). A coin cannot be
+# held before it has a price (its listing) -> used to bound phantom position back-projection in
+# seed_positions. None = no price source ever. Cached.
+_coin_first_price: dict[str, Optional[int]] = {}
+
+
+def _coin_first_price_ms(coin: str) -> Optional[int]:
+    if coin in _coin_first_price:
+        return _coin_first_price[coin]
+    fp: Optional[int] = None
+    mins, _ = _coin_series(coin)
+    if mins.size:
+        fp = int(mins[0])
+    if fp is None:  # no candle -> try oracle series
+        oser = _oracle_series.get(coin)
+        if oser is None:
+            oser = _load_oracle_from_mongo(coin)
+            _oracle_series[coin] = oser
+        ts_arr, _ = oser
+        if ts_arr.size:
+            fp = int(ts_arr[0])
+    _coin_first_price[coin] = fp
+    return fp
+
+exec
+/bin/zsh -lc "sed -n '1040,1230p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '1,180p' tests/v15/test_m01_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+
+# --------------------------------------------------------------------------- #
+# Cash-delta functions
+# --------------------------------------------------------------------------- #
+
+
+def fill_cash_delta(f: dict) -> float:
+    """Per fill: ``-signed_sz * price - fee``.
+
+    Hyperliquid's API defines ``fee`` as the total wallet charge (signed;
+    negative means maker rebate). ``builderFee`` and ``deployerFee`` are
+    informational components of that total and must not be added again. Spot
+    and dropped markets are excluded at load time, but guard defensively.
+    """
+    if not coin_is_allowed_perp(f["coin"]):
+        return 0.0
+    return -f["signed_sz"] * f["price"] - f["fee"]
+
+
+@dataclass
+class LedgerDelta:
+    """Result of classifying a ledger event: cash impact + external-flow tag."""
+
+    cash: float  # delta to perp cash (affects equity walk)
+    ext_flow: float  # portion to accumulate into ext_flow_cum (neutralizable)
+    unknown: bool = False  # True if the type is unrecognized -> quarantine
+
+
+def ledger_cash_delta(e: dict, wallet_lc: str) -> LedgerDelta:
+    """Classify a ledger event into (cash_delta, ext_flow_delta, unknown).
+
+    Cash signs mirror v8's proven mapper. The NEW V15 behaviour is that every
+    EXTERNAL-CAPITAL / non-copyable type ALSO reports its cash impact as
+    ext_flow so downstream can neutralize it:
+        trading_pnl = equity_change - ext_flow_cum.
+    Trading results (fills, funding, liquidation) are NOT in ext_flow.
+
+    Unknown ledger types return unknown=True (caller quarantines the wallet);
+    they are never silently zeroed.
+    """
+    d = e.get("delta", {})
+    k = d.get("type", "")
+
+    def _f(*keys, default=0.0) -> float:
+        for key in keys:
+            v = d.get(key)
+            if v is not None:
+                return float(v)
+        return float(default)
+
+    # --- External capital / non-copyable flows (cash == ext_flow) ----------- #
+    if k == "deposit":
+        c = _f("usdc")
+        return LedgerDelta(c, c)
+    if k == "withdraw":
+        c = -(_f("usdc") + _f("fee"))
+        return LedgerDelta(c, c)
+    if k == "accountClassTransfer":
+        # Perp-account model: spot -> perp is an inflow and perp -> spot an
+        # outflow. Neutralize both as external/non-copyable capital flow.
+        amt = abs(_f("usdc", "amount"))
+        c = amt if bool(d.get("toPerp")) else -amt
+        return LedgerDelta(c, c)
+    if k == "send":
+        # Perp-account model: only a leg touching an in-scope perp dex changes
+        # reconstructed perp cash. HIP-3 dexes can use non-USDC collateral
+        # (e.g. USDH on flx/km, USDT0 on cash); ``usdcValue`` is the canonical
+        # USD value for those sends. Spot-only token transfers remain zero
+        # because neither leg is in scope. Self-transfers spot<->perp remain
+        # perp inflows/outflows and are neutralized from trading ROE.
+        user = (d.get("user") or "").lower()
+        dest = (d.get("destination") or "").lower()
+        src_dex = str(d.get("sourceDex", "")).strip().lower()
+        dst_dex = str(d.get("destinationDex", "")).strip().lower()
+        if d.get("usdcValue") is not None:
+            amt = _f("usdcValue")
+        elif d.get("token") == "USDC":
+            amt = _f("amount")
+        else:
+            # A non-USDC perp transfer without a USD valuation cannot be
+            # reconstructed safely. Quarantine rather than treating token
+            # quantity as dollars.
+            touches_perp = dex_in_scope(src_dex) or dex_in_scope(dst_dex)
+            return LedgerDelta(0.0, 0.0, unknown=touches_perp)
+        fee = _f("fee")
+        c = 0.0
+        if user == wallet_lc and dex_in_scope(src_dex):
+            c -= amt + fee
+        if dest == wallet_lc and dex_in_scope(dst_dex):
+            c += amt
+        return LedgerDelta(c, c)
+    if k == "spotTransfer":
+        # Spot-side balance movement; accountClassTransfer/send carry any
+        # corresponding movement into or out of perp cash.
+        return LedgerDelta(0.0, 0.0)
+    if k == "internalTransfer":
+        if d.get("token") not in (None, "USDC"):
+            return LedgerDelta(0.0, 0.0)
+        user = (d.get("user") or "").lower()
+        dest = (d.get("destination") or "").lower()
+        amt = _f("usdc", "amount")
+        fee = _f("fee")
+        c = 0.0
+        if user == wallet_lc and dest != wallet_lc:
+            c = -(amt + fee)
+        elif dest == wallet_lc and user != wallet_lc:
+            c = amt
+        return LedgerDelta(c, c)
+    if k == "subAccountTransfer":
+        user = (d.get("user") or "").lower()
+        dest = (d.get("destination") or "").lower()
+        amt = _f("usdc", "amount")
+        c = 0.0
+        if user == wallet_lc:
+            c = -amt
+        elif dest == wallet_lc:
+            c = amt
+        return LedgerDelta(c, c)
+    if k == "vaultDeposit":
+        c = -_f("usdc", "amount")
+        return LedgerDelta(c, c)
+    if k == "vaultWithdraw":
+        c = _f("netWithdrawnUsd", "usdc", "amount")
+        return LedgerDelta(c, c)
+    if k == "vaultCreate":
+        c = -(_f("usdc", "amount") + _f("fee"))
+        return LedgerDelta(c, c)
+    if k in ("vaultDistribution", "vaultLeaderCommission"):
+        c = _f("usdc", "amount")
+        return LedgerDelta(c, c)
+    if k == "rewardsClaim":
+        if d.get("token") != "USDC":
+            return LedgerDelta(0.0, 0.0)
+        c = _f("usdc", "amount")
+        return LedgerDelta(c, c)
+    if k == "borrowLend":
+        if d.get("token") != "USDC":
+            return LedgerDelta(0.0, 0.0)
+        amt = abs(_f("usdc", "amount"))
+        op = (d.get("operation") or "").lower()
+        if op in ("supply", "lend", "deposit"):
+            return LedgerDelta(-amt, -amt)
+        if op in ("withdraw", "redeem"):
+            return LedgerDelta(amt, amt)
+        # borrow / repay -> debt offsets cash, no equity change, no ext flow.
+        return LedgerDelta(0.0, 0.0)
+    if k == "activateDexAbstraction":
+        ev_dex = str(d.get("dex", "")).strip().lower()
+        if not dex_in_scope(ev_dex):  # all perp dexes in scope (was main-only)
+            return LedgerDelta(0.0, 0.0)
+        token = d.get("token")
+        if token == "USDC" or token is None:
+            c = -abs(_f("usdc", "amount"))
+        else:
+            c = -_f("fee")
+        return LedgerDelta(c, c)
+    if k in ("accountActivationGas", "deployGasAuction", "gossipPriorityGasAuction"):
+        # Operational cost; neutralize as external (non-trading).
+        c = -abs(_f("usdc", "amount", "fee"))
+        return LedgerDelta(c, c)
+
+    # --- Zero / ignore (no perp-equity impact) ------------------------------ #
+    if k in ZERO_LEDGER_TYPES:
+        return LedgerDelta(0.0, 0.0)
+
+    # --- Unknown type -> quarantine ----------------------------------------- #
+    if k:
+        return LedgerDelta(0.0, 0.0, unknown=True)
+    return LedgerDelta(0.0, 0.0)
+
+
+def funding_cash_delta(e: dict) -> float:
+    """Funding USDC (signed, wallet perspective) for all included perp dexes.
+    """
+    d = e.get("delta", {})
+    if d.get("type") != "funding":
+        return 0.0
+    coin = str(d.get("coin", ""))
+    # Only funding on an included perp coin counts (parity with fills/positions).
+    if not coin_is_allowed_perp(coin):
+        return 0.0
+    return float(d.get("usdc", 0))
+
+
+# --------------------------------------------------------------------------- #
+# Position seeding + reconstruction
+# --------------------------------------------------------------------------- #
+
+
+def positions_at(fills: list[dict], t_ms: int) -> dict[str, float]:
+    """Position per coin at time t = (EARLIEST fill's startPosition) + cumulative
+
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m01_equity_reconstruct trust-audit fixes (2026-07-10).
+
+m01 is the causal-equity FOUNDATION consumed by the (trusted) m02. Codex confirmed it is look-ahead-safe;
+these lock the fail-CLOSED fixes so an untrustworthy denominator can NEVER be emitted as a clean anchored
+equity (M02 must see has_past_anchor=False -> NO_ANCHOR -> unsizeable):
+- P1a: a seeded/carry-in position UNMARKABLE at the anchor time (cash snap incomplete) -> degraded.
+- P1b: an UNKNOWN ledger type at/before an event (its real cash move applied as 0) -> events at/after tainted.
+- P2:  a non-finite (inf/NaN) mark or cash delta -> degraded (never a finite-looking anchored equity).
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m01_equity_reconstruct as m01  # noqa: E402
+from test_m02 import _fill  # noqa: E402   reuse the fill builder
+
+
+class _Anchor:
+    entry_px: dict = {}
+    fetched_ms = 2000            # near the 1000 anchor (< 1 day) -> near_fetch seeding
+    dexes_seen = {"main"}
+    has_flx_anchor = False
+    has_unmarkable_dex_anchor = False
+    acct_value_by_dex = {"main": 1000.0}
+    aggregate_acct_value = 1000.0
+
+    def __init__(self, positions=None):
+        self.positions = positions or {}
+
+
+def _events(fills, anchor, ledger=None, funding=None, window_anchors=None):
+    ordered = m01.build_event_stream(fills, funding or [], ledger or [])
+    return m01.compute_event_equity(ordered, fills, anchor, "0xtest",
+                                    window_anchors or [(1000, 1000.0)], extradex_no_anchor=False)
+
+
+def test_p1a_seeded_unmarkable_at_anchor_fails_closed(monkeypatch):
+    # anchor seeds an exotic ALT that has NO mark at the anchor -> cash snap incomplete -> denominator
+    # unreliable -> the BTC event must be degraded (has_past_anchor=False), NOT a clean anchored equity.
+    monkeypatch.setattr(m01, "get_mark", lambda c, ts, causal=False: (100.0 if c == "BTC" else None))
+    fills = [_fill(2000, "BTC", "B", 1, 100, 0, tid=1)]
+    ev = _events(fills, _Anchor(positions={"ALT": 1.0}))
+    btc = [e for e in ev if e.type == "fill"][0]
+    assert btc.has_past_anchor is False and btc.markable_all is False
+    assert not (btc.equity_post == btc.equity_post)   # NaN
+
+
+def test_p1a_clean_anchor_still_anchored(monkeypatch):
+    # control: everything markable at the anchor -> normal anchored equity.
+    monkeypatch.setattr(m01, "get_mark", lambda c, ts, causal=False: 100.0)
+    fills = [_fill(2000, "BTC", "B", 1, 100, 0, tid=1)]
+    ev = _events(fills, _Anchor())
+    btc = [e for e in ev if e.type == "fill"][0]
+    assert btc.has_past_anchor is True and btc.markable_all is True
+    assert np.isfinite(btc.equity_post)
+
+
+def test_p1b_unknown_ledger_taints_subsequent_events(monkeypatch):
+    monkeypatch.setattr(m01, "get_mark", lambda c, ts, causal=False: 100.0)
+    fills = [_fill(1500, "BTC", "B", 1, 100, 0, tid=1),         # BEFORE the unknown ledger -> clean
+             _fill(3000, "BTC", "B", 1, 100, 0, tid=2)]         # AFTER -> tainted
+    ledger = [{"time": 2500, "hash": "h", "delta": {"type": "totallyNewLedgerType", "usdc": 5000}}]
+    ev = _events(fills, _Anchor(), ledger=ledger)
+    fills_ev = [e for e in ev if e.type == "fill"]
+    assert fills_ev[0].has_past_anchor is True                 # pre-unknown-ledger fill stays clean
+    assert fills_ev[1].has_past_anchor is False                # post-unknown-ledger fill fails closed
+
+
+def test_p2_inf_mark_fails_closed(monkeypatch):
+    monkeypatch.setattr(m01, "get_mark", lambda c, ts, causal=False: float("inf"))
+    fills = [_fill(2000, "BTC", "B", 1, 100, 0, tid=1)]
+    ev = _events(fills, _Anchor())
+    btc = [e for e in ev if e.type == "fill"][0]
+    assert btc.has_past_anchor is False and not (btc.equity_post == btc.equity_post)
+
+
+def test_p2_nan_funding_fails_closed(monkeypatch):
+    monkeypatch.setattr(m01, "get_mark", lambda c, ts, causal=False: 100.0)
+    fills = [_fill(2000, "BTC", "B", 1, 100, 0, tid=1)]
+    funding = [{"time": 2500, "coin": "BTC", "delta": {"type": "funding", "coin": "BTC", "usdc": float("nan")}}]
+    ev = _events(fills, _Anchor(), funding=funding)
+    # the funding event (and anything after) has non-finite cash -> degraded
+    fund_ev = [e for e in ev if e.type == "funding"]
+    assert fund_ev and fund_ev[0].has_past_anchor is False
+
+exec
+/bin/zsh -lc "sed -n '2115,2355p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+def compute_event_equity(
+    ordered: list[dict],
+    fills: list[dict],
+    anchor: "AnchorState",
+    wallet_lc: str,
+    window_anchors: list[tuple[int, float]],
+    extradex_no_anchor: bool,
+    causal_mark: bool = True,
+) -> list[EventEquity]:
+    """Walk the ordered event stream ONCE and emit equity_post per event.
+
+    Causal contract (spec NON-LOOK-AHEAD INVARIANTS):
+      * base anchor for event k = last weekly anchor with anchor_ts STRICTLY < ts(k).
+      * equity_post(k) = cash + Sum pos*mark(ts(k)) using ONLY events order <= k.
+        By default the terminal live-position MTM uses closed causal marks so
+        M02's sizing denominator matches its causal numerator.
+      * mark_ts <= ts(k); anchor_ts < ts(k); event_order strictly monotone.
+
+    We re-seed/re-snap cash whenever the active base anchor changes (each weekly
+    anchor cycle), exactly like compute_eq_at, then incrementally apply each
+    event's cash/position delta. Mark-to-market is recomputed at each event ts
+    over the live positions, tracking unmarkable positions' last-known value
+    (the FROZEN component) so M02 can do PARTIAL_MTM without look-ahead.
+    """
+    results: list[EventEquity] = []
+
+    # Active base-anchor state. Re-initialised lazily when the base anchor for
+    # the current event differs from the one in force.
+    active_anchor_ts: Optional[int] = None
+    active_anchor_eq: Optional[float] = None
+    cash = 0.0
+    positions: dict[str, float] = {}
+    # last-known mark value per coin (for the frozen unmarkable component)
+    last_val: dict[str, float] = {}
+    last_val_ts: dict[str, int] = {}
+    # Coins whose carry-in (pre-anchor holding) has already been folded into the
+    # book+cash under the ACTIVE anchor. Reset per anchor cycle (codex r4 BUG 1).
+    carried_in: set[str] = set()
+    # AUDIT 2026-07-10 (codex m01 P1a): the anchor cash SNAP (cash = a_v - Sum seed*mark(a_t)) OMITS any
+    # seeded/carry-in position UNMARKABLE at the anchor time -> cash (and equity_post) overstated while
+    # markable_all was falsely True. Track per-cycle incompleteness; when set, the denominator is unreliable
+    # -> the event fails CLOSED (has_past_anchor=False -> M02 NO_ANCHOR).
+    anchor_snap_incomplete = [False]   # list = mutable closure cell
+    # AUDIT 2026-07-10 (codex m01 P1b): an UNKNOWN ledger type applies cash=0 (its real move is unknown), so
+    # equity after it is silently wrong. Once one occurs at ts <= event, the cash is untrustworthy -> taint
+    # every event at/after it (causal). Precompute the unknown-ledger timestamps once.
+    import bisect as _bisect
+    _unknown_ledger_ts = sorted(
+        it["ts"] for it in ordered
+        if it["type"] == "ledger" and ledger_cash_delta(it["ev"], wallet_lc).unknown
+    )
+
+    def _tainted_by_unknown_ledger(ts: int) -> bool:
+        return _bisect.bisect_right(_unknown_ledger_ts, ts) > 0
+
+    def _carry_in_fill(ev: dict) -> None:
+        """CAUSAL replacement for seed_positions case 2 (codex r4 BUG 1).
+
+        seed_positions(causal_cutoff=True) deliberately omits a coin first traded
+        AFTER the active anchor, to avoid look-ahead at earlier events. But that
+        coin DID hold a pre-anchor position (its first fill's startPosition), which
+        the anchor equity a_v already includes. The first time we REACH that coin's
+        fill in the ordered walk (order <= k = causal), we fold its carry-in in the
+        SAME way case 2 + the cash snap would have: add startPosition to the book
+        AND subtract its anchor-time value from cash (mark at active_anchor_ts < ts,
+        causal) so equity is not double-counted. Coins already in the anchor seed,
+        or already folded, are skipped. Identical end-state to compute_eq_at, but
+        revealed only at the causal moment instead of at the anchor (no leak at
+        earlier events)."""
+        nonlocal cash
+        coin = ev["coin"]
+        if coin in carried_in or active_anchor_ts is None:
+            return
+        carried_in.add(coin)
+        sp = float(ev.get("startPosition", 0.0) or 0.0)
+        if abs(sp) <= 1e-9:
+            return
+        positions[coin] = positions.get(coin, 0.0) + sp
+        m = get_mark(coin, active_anchor_ts)
+        if m is not None:
+            cash -= sp * m  # mirror the anchor cash snap for this carried-in coin
+            last_val[coin] = sp * m
+            last_val_ts.setdefault(coin, active_anchor_ts)
+        else:
+            # codex m01 P1a: carry-in coin unmarkable at the anchor -> its anchor value was NOT removed from
+            # cash -> the snap is incomplete -> equity denominator unreliable for this cycle. Fail closed.
+            anchor_snap_incomplete[0] = True
+
+    def _past_anchor(ts: int) -> Optional[tuple[int, float]]:
+        chosen = None
+        for a_t, a_v in window_anchors:
+            if a_t < ts:            # STRICT (codex r3)
+                chosen = (a_t, a_v)
+            else:
+                break
+        return chosen
+
+    for order, item in enumerate(ordered):
+        ts = item["ts"]
+        base = _past_anchor(ts)
+
+        if base is None:
+            # No past anchor → cannot reconstruct a causal denominator. Still
+            # advance the position book from startPosition-derived seeding so
+            # that once an anchor appears the book is correct, but emit
+            # has_past_anchor=False (M02 maps this to NO_ANCHOR).
+            # We seed positions at this ts from fills only (causal: positions_at
+            # uses startPosition + cumulative signed_sz, all <= ts).
+            ev = item["ev"]
+            if item["type"] == "fill":
+                positions[ev["coin"]] = positions.get(ev["coin"], 0.0) + ev["signed_sz"]
+                if abs(positions[ev["coin"]]) < 1e-9:
+                    positions.pop(ev["coin"], None)
+            results.append(
+                EventEquity(
+                    event_order=order, ts=ts, type=item["type"],
+                    source_seq=item["source_seq"], equity_post=float("nan"),
+                    cash=float("nan"), position_value=float("nan"),
+                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
+                    mark_ts=None, markable_all=False, n_unmarkable=0,
+                    no_extradex_without_anchor=(not extradex_no_anchor),
+                    frozen_component_value=0.0, frozen_component_age_ms=0,
+                    has_past_anchor=False,
+                    fill=(item["ev"] if item["type"] == "fill" else None),
+                )
+            )
+            continue
+
+        a_t, a_v = base
+        if a_t != active_anchor_ts:
+            # New base anchor cycle → re-seed positions at the anchor and snap
+            # cash, identically to compute_eq_at. This rebuild uses only fills
+            # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
+            active_anchor_ts = a_t
+            active_anchor_eq = a_v
+            anchor_snap_incomplete[0] = False   # codex m01 P1a: fresh cycle, re-assess snap completeness
+            seeded = seed_positions(fills, anchor, a_t, causal_cutoff=True)
+            anchor_pos_value = 0.0
+            for c, sz in seeded.items():
+                if abs(sz) < 1e-9:
+                    continue
+                m = get_mark(c, a_t)
+                if m is not None:
+                    anchor_pos_value += sz * m
+                    last_val[c] = sz * m
+                    last_val_ts[c] = a_t
+                else:
+                    # codex m01 P1a: seeded position unmarkable at the anchor -> its value is NOT subtracted
+                    # from the cash snap -> incomplete denominator -> fail closed for this cycle.
+                    anchor_snap_incomplete[0] = True
+            cash = a_v - anchor_pos_value
+            positions = {c: s for c, s in seeded.items() if abs(s) > 1e-9}
+            # Coins already in the anchor seed are carried-in; their fills must NOT
+            # re-fold a startPosition. Coins NOT seeded (first traded after anchor)
+            # get folded causally at their first fill via _carry_in_fill.
+            carried_in = set(seeded.keys())
+            # Replay events strictly between the anchor and this event (anchor_ts
+            # < e_ts < ts) so the book/cash reflect everything order <= current.
+            for prev in ordered:
+                p_ts = prev["ts"]
+                if p_ts <= a_t:
+                    continue
+                # stop once we reach the current event's order position
+                if (p_ts, prev["type_rank"], prev["source_seq"]) >= (
+                    ts, item["type_rank"], item["source_seq"]
+                ):
+                    break
+                if prev["type"] == "fill":
+                    _carry_in_fill(prev["ev"])
+                _apply(prev, positions, last_val, last_val_ts, _cash_ref=None)
+                cash = _apply_cash(prev, cash, wallet_lc)
+
+        # Apply THIS event (order == k included).
+        if item["type"] == "fill":
+            _carry_in_fill(item["ev"])
+        _apply(item, positions, last_val, last_val_ts, _cash_ref=None)
+        cash = _apply_cash(item, cash, wallet_lc)
+
+        # Mark-to-market at ts over live positions; track frozen component.
+        pos_value = 0.0
+        n_unmarkable = 0
+        mark_ts_latest: Optional[int] = None
+        frozen_value = 0.0
+        frozen_age = 0
+        for c, sz in positions.items():
+            if abs(sz) < 1e-9:
+                continue
+            m = get_mark(c, ts, causal=causal_mark)
+            if m is None:
+                n_unmarkable += 1
+                fv = last_val.get(c, 0.0)
+                frozen_value += fv
+                if c in last_val_ts:
+                    frozen_age = max(frozen_age, ts - last_val_ts[c])
+                continue
+            val = sz * m
+            pos_value += val
+            last_val[c] = val
+            mk = ts // 60_000 * 60_000 - (60_000 if causal_mark else 0)
+            last_val_ts[c] = mk
+            mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
+
+        equity_post = cash + pos_value  # markable + cash; frozen excluded here
+        whole_equity = equity_post + frozen_value
+
+        # AUDIT 2026-07-10 (codex m01 P1a/P1b/P2): fail CLOSED when the reconstructed denominator is untrustworthy
+        # -> emit the NO_ANCHOR form (M02 -> unsizeable), never a falsely-clean anchored equity:
+        #   (a) anchor snap incomplete (a seed/carry-in coin was unmarkable at the anchor -> cash overstated),
+        #   (b) an unknown ledger type at/before this ts (its real cash move was applied as 0),
+        #   (c) any non-finite cash/equity (inf mark or NaN funding/ledger delta leaked through).
+        _degraded = (anchor_snap_incomplete[0]
+                     or _tainted_by_unknown_ledger(ts)
+                     or not np.isfinite(cash) or not np.isfinite(whole_equity))
+        if _degraded:
+            results.append(
+                EventEquity(
+                    event_order=order, ts=ts, type=item["type"],
+                    source_seq=item["source_seq"], equity_post=float("nan"),
+                    cash=float("nan"), position_value=float("nan"),
+                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
+                    mark_ts=None, markable_all=False, n_unmarkable=max(1, n_unmarkable),
+                    no_extradex_without_anchor=(not extradex_no_anchor),
+                    frozen_component_value=0.0, frozen_component_age_ms=0,
+                    has_past_anchor=False,
+                    fill=(item["ev"] if item["type"] == "fill" else None),
+                )
+            )
+            continue
+        results.append(
+            EventEquity(
+                event_order=order, ts=ts, type=item["type"],
+                source_seq=item["source_seq"],
+                equity_post=whole_equity,  # whole-account incl frozen
+                cash=cash, position_value=pos_value,
+                anchor_ts=a_t, anchor_equity=a_v,
+                age_since_anchor_ms=ts - a_t,
+                mark_ts=mark_ts_latest if mark_ts_latest is not None else (ts if not positions else None),
+                markable_all=(n_unmarkable == 0),
+                n_unmarkable=n_unmarkable,
+                no_extradex_without_anchor=(not extradex_no_anchor),
+                frozen_component_value=frozen_value,
+
+codex
+The main path matches the requested conservative behavior: degraded events emit the same structural shape as no-anchor events, so M02 should see them as unsizeable. I’m checking the helper functions and ordering details now, because that’s where a same-timestamp or replay bug would usually hide.
+exec
+/bin/zsh -lc "sed -n '2355,2395p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+                frozen_component_value=frozen_value,
+                frozen_component_age_ms=frozen_age,
+                has_past_anchor=True,
+                fill=(item["ev"] if item["type"] == "fill" else None),
+            )
+        )
+    return results
+
+
+def _apply(item: dict, positions: dict, last_val: dict, last_val_ts: dict, _cash_ref=None) -> None:
+    """Apply an event's POSITION delta (cash handled by _apply_cash)."""
+    if item["type"] == "fill":
+        ev = item["ev"]
+        coin = ev["coin"]
+        positions[coin] = positions.get(coin, 0.0) + ev["signed_sz"]
+        if abs(positions[coin]) < 1e-9:
+            positions.pop(coin, None)
+
+
+def _apply_cash(item: dict, cash: float, wallet_lc: str) -> float:
+    """Apply an event's CASH delta (mirrors compute_eq_at's walk)."""
+    t = item["type"]
+    ev = item["ev"]
+    if t == "fill":
+        return cash + fill_cash_delta(ev)
+    if t == "ledger":
+        return cash + ledger_cash_delta(ev, wallet_lc).cash
+    if t == "funding":
+        return cash + funding_cash_delta(ev)
+    return cash
+
+
+def reconstruct_wallet_event_equity(args: tuple) -> dict:
+    """M02 bridge driver: emit the per-event equity series + anchors for one wallet.
+
+    Returns {'wallet', 'events': [EventEquity...], 'weekly_anchors': [(ts,eq)],
+    'fills': [...], 'funding': [...], 'inter_anchor_drift': {...} (diagnostic
+    only, NEVER used to switch modes), 'extradex_no_anchor': bool}.
+    Mirrors reconstruct_wallet's loading + ordering exactly so equity_post is
+    consistent with the audited daily reconstruction.
+    """
+
+exec
+/bin/zsh -lc "sed -n '1230,1510p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    """Position per coin at time t = (EARLIEST fill's startPosition) + cumulative
+    sum of all signed sizes at-or-before t.
+
+    CRITICAL (root-cause of large drift, fixed 2026-05-30): do NOT use the LAST
+    fill's startPosition + signed_sz. Large orders fill as a SAME-MILLISECOND
+    BURST against many makers, and the S3 by-wallet partition carries no `tid`,
+    so same-ms fills are in arbitrary order. Picking the "last" one grabs a
+    mid-burst startPosition and invents a phantom open position (observed: a flat
+    wallet reconstructed as -90,492 MERL because the last-by-order fill in a
+    closing burst had startPosition=-105,010). The cumulative sum from the
+    EARLIEST fill's startPosition is ORDER-INDEPENDENT and exact regardless of
+    intra-ms ordering or a missing tid. (fills are time-sorted on load.)"""
+    by_coin: dict[str, list[dict]] = {}
+    for f in fills:
+        if f["time"] > t_ms:
+            break
+        by_coin.setdefault(f["coin"], []).append(f)
+    positions: dict[str, float] = {}
+    for coin, fs in by_coin.items():
+        pos = fs[0]["startPosition"] + sum(x["signed_sz"] for x in fs)
+        if abs(pos) > 1e-9:
+            positions[coin] = pos
+    return positions
+
+
+@dataclass
+class WalkResult:
+    cash: float
+    positions: dict[str, float]
+    equity: float
+    position_value: float  # independent mark-derived sum
+    gross_position_notional: float  # sum(abs(szi * mark)); never net long/short legs
+    n_unmarkable: int
+    unmarkable_notional: float  # |szi * entry-ish proxy| for coins lacking a mark
+    ext_flow_cum: float  # ext flow within (anchor_ms, t_ms] (per-SEGMENT, not series)
+    had_unknown_ledger: bool
+    anchor_unmarkable: int = 0  # seeded positions with NO mark at anchor_ms
+
+    @property
+    def recon_incomplete(self) -> bool:
+        """True if equity for this walk is NOT trustworthy: a seeded position
+        lacked an anchor mark (corrupted cash snap) or a terminal mark was missing
+        -> we cannot value the book, so the day must not be trusted. (Hidden
+        no-anchor-dex exposure is caught at the wallet level by the inter-anchor
+        DRIFT gate, not here, since by definition we cannot see it per-row.)"""
+        return self.anchor_unmarkable > 0 or self.n_unmarkable > 0
+
+
+def seed_positions(
+    fills: list[dict],
+    anchor: AnchorState,
+    anchor_ms: int,
+    causal_cutoff: bool = False,
+) -> dict[str, float]:
+    """Seed positions held at anchor_ms.
+
+    TWO paths:
+    * causal_cutoff=True (per-EVENT walk): fully causal -- positions_at(fills<=anchor)
+      + the anchor's OWN near-fetch snapshot. MUST NOT use any fill with time>anchor_ms
+      (look-ahead). Unchanged.
+    * causal_cutoff=False (daily reconstruction + cent reconciliation): EX-POST
+      BURST-AWARE seed. pos = P0 + cumsum(signed_sz of fills<=anchor), where P0 (the
+      pre-first-fill carry) is taken from the clean earliest-fill startPosition, EXCEPT
+      when that earliest fill is a same-millisecond BURST (no tid -> arbitrary order ->
+      mid-burst garbage startPosition), in which case P0 is anchored to the authoritative
+      fetch-time snapshot: P0 = snapshot_position - sum(ALL signed_sz). This kills the
+      phantom-seed leak (e2af8f54's 83-fill same-ms first DOGE fill read startPosition
+      1.79M -> 1.79M DOGE seeded at a Dec anchor where the wallet held zero). Cumulative
+      signed_sz is order-independent so only P0 needed the fix. Coins in the snapshot but
+      never traded in-window (Case A) are seeded at the snapshot size at every anchor.
+
+    NOTE: this CHANGES the daily reconstruction output (it was wrong: phantom positions).
+    Re-run M2->M10 on the corrected equity. The per-event causal path is byte-unchanged.
+    """
+    near_fetch = abs(anchor_ms - anchor.fetched_ms) <= 86_400_000
+
+    if causal_cutoff:
+        # FULLY-CAUSAL seed for the per-event walk (codex r2 BUG): the seed serves
+        # every event k in this anchor's segment and MUST NOT depend on any fill with
+        # time > anchor_ms (look-ahead). Causal seed = positions from fills <= anchor_ms
+        # + the anchor's OWN near-fetch snapshot, full stop. A far-from-fetch snapshot is
+        # not causal evidence; any genuine unseen exposure surfaces as inter-anchor DRIFT.
+        start_positions = positions_at(fills, anchor_ms)
+        if near_fetch:
+            for coin, szi in anchor.positions.items():
+                if coin not in start_positions and abs(szi) >= 1e-9:
+                    start_positions[coin] = float(szi)
+        return start_positions
+
+    # ----- EX-POST BURST-AWARE seed (causal_cutoff=False; daily + reconciliation) ----- #
+    # pos(anchor) = P0 + cumulative signed_sz of fills at-or-before the anchor. The
+    # cumulative sum is order-independent and robust. P0 (pre-first-fill carry) was the
+    # leak: M1 took it from the earliest fill's startPosition, but large orders fill as
+    # SAME-MILLISECOND bursts and the S3 by-wallet partition carries no tid -> the fills
+    # are in arbitrary order, so a burst startPosition is mid-burst GARBAGE. Observed
+    # (Alberto "reconcile to the cent", 2026-06-04): e2af8f54's first DOGE fill is an
+    # 83-fill same-ms burst reading startPosition 1,792,138 -> the old seed put 1.79M DOGE
+    # at a December anchor where the wallet held ZERO (phantom; its mark drift == the
+    # inter-anchor residual to the dollar). Same for SOL/kPEPE/MON. FIX: when the earliest
+    # fill is a same-ms burst, take P0 from the AUTHORITATIVE fetch-time snapshot instead:
+    # P0 = snapshot_position(coin) - sum(ALL signed_sz) (order-independent, ground-truth-
+    # anchored). reconstruct_wallet loads fills through fetched_ms so the sum reaches the
+    # snapshot. A CLEAN earliest fill keeps the forward startPosition (the snapshot carries
+    # minor fetch-instant noise that would otherwise leak into every anchor, e.g. the
+    # main-only wallet a9881f6f: backward-everywhere regressed it from $0.04 to $272 median,
+    # burst-aware preserves $0.04). Validated: a9881f6f $0.04 max $2.10 PRESERVED; e2af8f54
+    # median $18,628 -> $2.28; daf50e49 $4,787 -> $710; 4ac21adc $9,311 -> $99.
+    by_coin: dict[str, list[dict]] = {}
+    for f in fills:
+        by_coin.setdefault(f["coin"], []).append(f)  # already time-sorted on load
+    cur = anchor.positions
+    start_positions = {}
+    for coin, fs in by_coin.items():
+        if not coin_is_allowed_perp(coin):
+            continue
+        t0 = fs[0]["time"]
+        burst = sum(1 for f in fs if f["time"] == t0) > 1
+        net_all = 0.0
+        cum_le = 0.0
+        for f in fs:
+            net_all += f["signed_sz"]
+            if f["time"] <= anchor_ms:
+                cum_le += f["signed_sz"]
+        if burst:
+            p0 = float(cur.get(coin, 0.0)) - net_all  # backward: perp snapshot-anchored
+        else:
+            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill
+        pos = p0 + cum_le
+        if abs(pos) > 1e-9:
+            start_positions[coin] = pos
+    # Case A: coins in the fetch snapshot but NEVER traded in-window -> established
+    # before the window and held constant (no trades = no size change) -> seed the
+    # snapshot size at every anchor.
+    for coin, szi in cur.items():
+        if coin not in by_coin and coin_is_allowed_perp(coin) and abs(szi) >= 1e-9:
+            start_positions[coin] = float(szi)
+    return start_positions
+
+
+def compute_eq_at(
+    stream: list[tuple[int, str, dict]],
+    fills: list[dict],
+    anchor: AnchorState,
+    wallet_lc: str,
+    t_ms: int,
+    anchor_ms: int,
+    anchor_eq: float,
+    causal_seed: bool = False,
+) -> WalkResult:
+    """Re-anchored forward walk from anchor_ms to t_ms.
+
+    cash := anchor_eq - Sum pos*mark(anchor_ms); then walk the merged event
+    stream in (anchor_ms, t_ms]. equity(t) = cash + Sum pos*mark(t_ms).
+
+    Missing marks are COUNTED (n_unmarkable) and their notional estimated, but
+    not silently zeroed into equity; the caller decides whether to flag the day.
+    """
+    start_positions = seed_positions(fills, anchor, anchor_ms, causal_cutoff=causal_seed)
+
+    # Snap cash to the anchor equity using marked position value at anchor_ms.
+    # If a SEEDED position has no mark at anchor_ms, the cash snap silently
+    # absorbs its (unknown) value -> equity is corrupted. Count those so the
+    # caller can flag/quarantine the day instead of trusting it (P0).
+    anchor_pos_value = 0.0
+    anchor_unmarkable = 0
+    for c, sz in start_positions.items():
+        if abs(sz) < 1e-9:
+            continue
+        mark = get_mark(c, anchor_ms)
+        if mark is None and coin_is_spot(c):
+            mark = _last_fill_price(fills, c, anchor_ms) or None  # spot: candle may be absent -> fill price
+        if mark is not None:
+            anchor_pos_value += sz * mark
+        else:
+            anchor_unmarkable += 1
+    cash = anchor_eq - anchor_pos_value
+
+    positions = dict(start_positions)
+    # Coins present in the anchor seed are already folded into both position
+    # value and the cash snap. A coin first observed AFTER the anchor can still
+    # reveal a pre-anchor carry via its authoritative startPosition. In causal
+    # mode we fold that carry only when its first fill becomes observable; this
+    # mirrors compute_event_equity and avoids both future leakage and the old
+    # error of treating a trim as a fresh short/open.
+    carried_in = set(start_positions)
+    ext_flow_cum = 0.0
+    had_unknown = False
+    for ts, typ, ev in stream:
+        if ts <= anchor_ms or ts > t_ms:
+            continue
+        if typ == "fill":
+            if not coin_is_allowed_perp(ev["coin"]):
+                continue
+            coin = ev["coin"]
+            if causal_seed and coin not in carried_in:
+                carried_in.add(coin)
+                sp = float(ev.get("startPosition", 0.0) or 0.0)
+                if abs(sp) > 1e-9:
+                    positions[coin] = positions.get(coin, 0.0) + sp
+                    anchor_mark = get_mark(coin, anchor_ms)
+                    if anchor_mark is None:
+                        # The anchor cash allocation for this newly revealed
+                        # carry is unknowable. Flag the walk incomplete rather
+                        # than silently absorbing it into cash.
+                        anchor_unmarkable += 1
+                    else:
+                        cash -= sp * anchor_mark
+            cash += fill_cash_delta(ev)
+            positions[coin] = positions.get(coin, 0.0) + ev["signed_sz"]
+            if abs(positions[coin]) < 1e-9:
+                positions.pop(coin, None)
+        elif typ == "ledger":
+            ld = ledger_cash_delta(ev, wallet_lc)
+            cash += ld.cash
+            ext_flow_cum += ld.ext_flow
+            had_unknown = had_unknown or ld.unknown
+        elif typ == "funding":
+            cash += funding_cash_delta(ev)
+
+    # Mark-to-market at t_ms (independent of cash).
+    pos_value = 0.0
+    gross_position_notional = 0.0
+    n_unmarkable = 0
+    unmarkable_notional = 0.0
+    for c, sz in positions.items():
+        if abs(sz) < 1e-9:
+            continue  # dust; not a real position
+        mark = get_mark(c, t_ms)
+        if mark is None and coin_is_spot(c):
+            mark = _last_fill_price(fills, c, t_ms) or None  # spot: candle may be absent -> fill price
+        if mark is None:
+            n_unmarkable += 1
+            # Best-effort notional proxy: last in-window fill price for the coin;
+            # fall back to the anchor parquet entryPx for statically-held coins
+            # that were never traded in-window (and thus have no fill price).
+            proxy_px = _last_fill_price(fills, c, t_ms)
+            if proxy_px <= 0.0:
+                proxy_px = anchor.entry_px.get(c, 0.0)
+            unmarkable_notional += abs(sz) * proxy_px
+            continue
+        pos_value += sz * mark
+        gross_position_notional += abs(sz * mark)
+    equity = cash + pos_value
+    return WalkResult(
+        cash=cash,
+        positions=positions,
+        equity=equity,
+        position_value=pos_value,
+        gross_position_notional=gross_position_notional,
+        n_unmarkable=n_unmarkable,
+        unmarkable_notional=unmarkable_notional,
+        anchor_unmarkable=anchor_unmarkable,
+        ext_flow_cum=ext_flow_cum,
+        had_unknown_ledger=had_unknown,
+    )
+
+
+def _last_fill_price(fills: list[dict], coin: str, t_ms: int) -> float:
+    """Notional-proxy price for an unmarkable coin position.
+
+    Prefers the last traded price at-or-before t_ms. If the position was carried
+    in from pre-window history (seeded via startPosition, no fill at-or-before
+    t_ms), fall back to the FIRST fill price after t_ms so we still produce a
+    sane notional estimate. 0.0 only if the coin never appears in the fills.
+    """
+    px_before = 0.0
+    px_after = 0.0
+    for f in fills:
+        if f["coin"] != coin:
+            continue
+        if f["time"] <= t_ms:
+            px_before = f["price"]
+        elif px_after == 0.0:
+            px_after = f["price"]
+    return px_before if px_before > 0.0 else px_after
+
+
+# --------------------------------------------------------------------------- #
+# Per-wallet reconstruction + accuracy diagnostics
+# --------------------------------------------------------------------------- #
+
+
+exec
+/bin/zsh -lc "rg -n \"def build_event_stream|type_rank|source_seq|_apply\\(|def _apply_cash|has_past_anchor|NO_ANCHOR|EventEquity\" research/v15 tests/v15 -g'*.py'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m01_golden.py:5:equity (M02 must see has_past_anchor=False -> NO_ANCHOR -> unsizeable):
+tests/v15/test_m01_golden.py:41:    # unreliable -> the BTC event must be degraded (has_past_anchor=False), NOT a clean anchored equity.
+tests/v15/test_m01_golden.py:46:    assert btc.has_past_anchor is False and btc.markable_all is False
+tests/v15/test_m01_golden.py:56:    assert btc.has_past_anchor is True and btc.markable_all is True
+tests/v15/test_m01_golden.py:67:    assert fills_ev[0].has_past_anchor is True                 # pre-unknown-ledger fill stays clean
+tests/v15/test_m01_golden.py:68:    assert fills_ev[1].has_past_anchor is False                # post-unknown-ledger fill fails closed
+tests/v15/test_m01_golden.py:76:    assert btc.has_past_anchor is False and not (btc.equity_post == btc.equity_post)
+tests/v15/test_m01_golden.py:86:    assert fund_ev and fund_ev[0].has_past_anchor is False
+tests/v15/test_m02_golden.py:122:    """Minimal EventEquity stand-in: anchored, finite equity, fully markable."""
+tests/v15/test_m02_golden.py:126:    has_past_anchor = True
+tests/v15/test_m02.py:147:    # first fill is BEFORE any anchor -> NO_ANCHOR, target null.
+tests/v15/test_m02.py:154:    assert a0["equity_basis_mode"] == "NO_ANCHOR"
+research/v15/balanced_step3_riskparity.py:167:def hedge_apply(eq, br, mode, W=336, band=0.10, btc_cost=0.00043):
+research/v15/balanced_step3_riskparity.py:225:        m0 = hedge_apply(eq, br, "none"); m1 = hedge_apply(eq, br, "roll"); m3 = hedge_apply(eq, br, "band")
+research/v15/v15_m02_journey_trace.py:24:      4-mode HYBRID (INTRAWEEK / PARTIAL_MTM / ANCHOR_FALLBACK / NO_ANCHOR) decided
+research/v15/v15_m02_journey_trace.py:34:  event_order strictly monotone per wallet ; NO_ANCHOR ⇒ target_exposure_pct null.
+research/v15/v15_m02_journey_trace.py:99:    mode: str                 # INTRAWEEK | PARTIAL_MTM | ANCHOR_FALLBACK | NO_ANCHOR
+research/v15/v15_m02_journey_trace.py:100:    equity: Optional[float]   # source_equity_post (None for NO_ANCHOR)
+research/v15/v15_m02_journey_trace.py:120:def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+research/v15/v15_m02_journey_trace.py:125:    if not ee.has_past_anchor:
+research/v15/v15_m02_journey_trace.py:127:            mode="NO_ANCHOR", equity=None, equity_ts=None,
+research/v15/v15_m02_journey_trace.py:155:            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+research/v15/v15_m02_journey_trace.py:283:    events: list["m01.EventEquity"],
+research/v15/v15_m02_journey_trace.py:583:            if basis.mode == "NO_ANCHOR" or not eq_ok or not mark_ok:
+research/v15/v15_m01_equity_reconstruct.py:248:    # than CANDLE_MAX_AGE_MS, return None so the caller flags it (degraded / NO_ANCHOR) instead of
+research/v15/v15_m01_equity_reconstruct.py:262:# -> caller flags degraded/NO_ANCHOR. The pre/post-05-24 coverage+staleness AUDIT validates the cap does
+research/v15/v15_m01_equity_reconstruct.py:2000:#   event_order key = (ts_ms, type_rank, source_seq)
+research/v15/v15_m01_equity_reconstruct.py:2001:#     type_rank: ledger=0, fill=1, funding=2   (ledger settles, then trade,
+research/v15/v15_m01_equity_reconstruct.py:2003:#     source_seq: stable causal fill sequence; per-type append index otherwise.
+research/v15/v15_m01_equity_reconstruct.py:2014:# type_rank for the total event order (codex r3/r4).
+research/v15/v15_m01_equity_reconstruct.py:2032:def build_event_stream(
+research/v15/v15_m01_equity_reconstruct.py:2040:        ts, type ('fill'|'funding'|'ledger'), type_rank, source_seq, ev (payload)
+research/v15/v15_m01_equity_reconstruct.py:2041:    sorted by (ts, type_rank, source_seq). source_seq is the causal per-wallet
+research/v15/v15_m01_equity_reconstruct.py:2059:                "type_rank": _TYPE_RANK["fill"],
+research/v15/v15_m01_equity_reconstruct.py:2060:                "source_seq": seq,
+research/v15/v15_m01_equity_reconstruct.py:2069:                "type_rank": _TYPE_RANK["ledger"],
+research/v15/v15_m01_equity_reconstruct.py:2070:                "source_seq": i,
+research/v15/v15_m01_equity_reconstruct.py:2079:                "type_rank": _TYPE_RANK["funding"],
+research/v15/v15_m01_equity_reconstruct.py:2080:                "source_seq": i,
+research/v15/v15_m01_equity_reconstruct.py:2084:    out.sort(key=lambda x: (x["ts"], x["type_rank"], x["source_seq"]))
+research/v15/v15_m01_equity_reconstruct.py:2089:class EventEquity:
+research/v15/v15_m01_equity_reconstruct.py:2095:    source_seq: int
+research/v15/v15_m01_equity_reconstruct.py:2108:    has_past_anchor: bool
+research/v15/v15_m01_equity_reconstruct.py:2123:) -> list[EventEquity]:
+research/v15/v15_m01_equity_reconstruct.py:2139:    results: list[EventEquity] = []
+research/v15/v15_m01_equity_reconstruct.py:2156:    # -> the event fails CLOSED (has_past_anchor=False -> M02 NO_ANCHOR).
+research/v15/v15_m01_equity_reconstruct.py:2220:            # has_past_anchor=False (M02 maps this to NO_ANCHOR).
+research/v15/v15_m01_equity_reconstruct.py:2229:                EventEquity(
+research/v15/v15_m01_equity_reconstruct.py:2231:                    source_seq=item["source_seq"], equity_post=float("nan"),
+research/v15/v15_m01_equity_reconstruct.py:2237:                    has_past_anchor=False,
+research/v15/v15_m01_equity_reconstruct.py:2278:                if (p_ts, prev["type_rank"], prev["source_seq"]) >= (
+research/v15/v15_m01_equity_reconstruct.py:2279:                    ts, item["type_rank"], item["source_seq"]
+research/v15/v15_m01_equity_reconstruct.py:2284:                _apply(prev, positions, last_val, last_val_ts, _cash_ref=None)
+research/v15/v15_m01_equity_reconstruct.py:2290:        _apply(item, positions, last_val, last_val_ts, _cash_ref=None)
+research/v15/v15_m01_equity_reconstruct.py:2321:        # -> emit the NO_ANCHOR form (M02 -> unsizeable), never a falsely-clean anchored equity:
+research/v15/v15_m01_equity_reconstruct.py:2330:                EventEquity(
+research/v15/v15_m01_equity_reconstruct.py:2332:                    source_seq=item["source_seq"], equity_post=float("nan"),
+research/v15/v15_m01_equity_reconstruct.py:2338:                    has_past_anchor=False,
+research/v15/v15_m01_equity_reconstruct.py:2344:            EventEquity(
+research/v15/v15_m01_equity_reconstruct.py:2346:                source_seq=item["source_seq"],
+research/v15/v15_m01_equity_reconstruct.py:2357:                has_past_anchor=True,
+research/v15/v15_m01_equity_reconstruct.py:2364:def _apply(item: dict, positions: dict, last_val: dict, last_val_ts: dict, _cash_ref=None) -> None:
+research/v15/v15_m01_equity_reconstruct.py:2374:def _apply_cash(item: dict, cash: float, wallet_lc: str) -> float:
+research/v15/v15_m01_equity_reconstruct.py:2390:    Returns {'wallet', 'events': [EventEquity...], 'weekly_anchors': [(ts,eq)],
+
+codex
+One important detail checks out: the unknown-ledger taint uses `bisect_right`, so an event exactly at the unknown ledger timestamp is tainted, while earlier timestamps are not. I’m running the targeted tests next and then I’ll inspect M02’s basis selection to confirm the routing contract.
+exec
+/bin/zsh -lc "sed -n '1990,2114p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+# --------------------------------------------------------------------------- #
+# M02 BRIDGE — additive per-event equity series (NO reconstruction-MATH change)
+# --------------------------------------------------------------------------- #
+#
+# This block is ADDITIVE for V15 M02 (journey_trace). It does NOT touch the
+# existing daily/audit reconstruction above; it reuses the SAME helpers
+# (seed_positions, get_mark, fill/ledger/funding cash deltas) to emit, per
+# wallet, a PER-EVENT equity_post series in the TOTAL EVENT ORDER required by
+# the M02 design spec:
+#
+#   event_order key = (ts_ms, type_rank, source_seq)
+#     type_rank: ledger=0, fill=1, funding=2   (ledger settles, then trade,
+#                then funding accrues on the post-trade position)
+#     source_seq: stable causal fill sequence; per-type append index otherwise.
+#
+# For each event k we re-anchor to the last weekly anchor with anchor_ts
+# STRICTLY < ts(k) (codex r3: an anchor sharing the action's ms is NOT a valid
+# base), walk forward applying every event with order <= k (incl. this one),
+# then mark-to-market at ts(k). equity_post(k) therefore uses ONLY data with
+# order <= k — no look-ahead. We also emit the per-event reliability fields M02
+# needs to pick its equity-basis mode (markable_all, n_unmarkable, frozen
+# component value/age, age_since_anchor, mark_ts, anchor_ts) — all derived from
+# data <= k only.
+
+# type_rank for the total event order (codex r3/r4).
+_TYPE_RANK = {"ledger": 0, "fill": 1, "funding": 2}
+
+# STALE_CAP: fall back if reconstruction base anchor is older than one anchor
+# cycle (7d) while material unmarkable exposure exists. Tunable (spec).
+STALE_CAP_MS = 7 * 86_400_000
+
+SPOT_USDC_INVARIANT_NOTE = (
+    "HL is a unified wallet: spot USDC IS perp margin. The weekly perpAllTime "
+    "anchor (marginSummary.accountValue summed across perp dexes) already "
+    "includes collateral (USDC) + uPnL. Re-anchoring snaps cash := anchor_eq - "
+    "Sum pos*mark, so the spot-USDC/collateral component is captured inside "
+    "`cash` and carried causally by ledger deposit/withdraw/transfer deltas. "
+    "equity_post is therefore whole-account (collateral-inclusive) by "
+    "construction; see test_m01_spot_collateral_invariant."
+)
+
+
+def build_event_stream(
+    fills: list[dict],
+    funding: list[dict],
+    ledger: list[dict],
+) -> list[dict]:
+    """Merge fills+funding+ledger into the TOTAL EVENT ORDER (spec v4).
+
+    Returns a list of event dicts each carrying:
+        ts, type ('fill'|'funding'|'ledger'), type_rank, source_seq, ev (payload)
+    sorted by (ts, type_rank, source_seq). source_seq is the causal per-wallet
+    fill sequence, else a stable per-type append index so the order is deterministic
+    and reproducible across M01 (equity) and M02 (actions).
+
+    SAME-MS FILL ORDER: tid is identity, not sequence. Partial fills are ordered
+    by chaining startPosition -> startPosition+signed_size. The fill payload is
+    carried directly so M2 never rematches on a lossy key.
+    """
+    out: list[dict] = []
+    ordered_fills = order_wallet_fills_causally(list(fills))
+    for i, f in enumerate(ordered_fills):
+        if not coin_is_allowed_perp(f["coin"]):
+            continue
+        seq = int(f.get("fill_seq", i))
+        out.append(
+            {
+                "ts": int(f["time"]),
+                "type": "fill",
+                "type_rank": _TYPE_RANK["fill"],
+                "source_seq": seq,
+                "ev": f,
+            }
+        )
+    for i, e in enumerate(ledger):
+        out.append(
+            {
+                "ts": int(e["time"]),
+                "type": "ledger",
+                "type_rank": _TYPE_RANK["ledger"],
+                "source_seq": i,
+                "ev": e,
+            }
+        )
+    for i, e in enumerate(funding):
+        out.append(
+            {
+                "ts": int(e["time"]),
+                "type": "funding",
+                "type_rank": _TYPE_RANK["funding"],
+                "source_seq": i,
+                "ev": e,
+            }
+        )
+    out.sort(key=lambda x: (x["ts"], x["type_rank"], x["source_seq"]))
+    return out
+
+
+@dataclass
+class EventEquity:
+    """Per-event reconstruction output (whole-account, causal)."""
+
+    event_order: int           # strictly monotone index in the ordered stream
+    ts: int
+    type: str
+    source_seq: int
+    equity_post: float         # whole-account equity AFTER this event
+    cash: float
+    position_value: float
+    anchor_ts: Optional[int]   # base anchor (strictly < ts); None if no past anchor
+    anchor_equity: Optional[float]
+    age_since_anchor_ms: Optional[int]
+    mark_ts: Optional[int]     # latest mark <= ts across marked positions
+    markable_all: bool         # every held nonzero position markable at ts
+    n_unmarkable: int
+    no_extradex_without_anchor: bool
+    frozen_component_value: float   # last-known value of unmarkable positions
+    frozen_component_age_ms: int    # staleness of the frozen value at ts
+    has_past_anchor: bool
+    fill: Optional[dict] = None     # for type=='fill': the EXACT fill payload of
+                                    # this event (codex r4 BUG 2) — M02 consumes it
+                                    # directly off the stream, never rematching by
+                                    # (ts, tid). None for funding/ledger events.
+
+
+
+exec
+/bin/zsh -lc "sed -n '110,170p' research/v15/v15_m02_journey_trace.py && sed -n '560,595p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+@dataclass
+class LifecycleFillEvent:
+    """Minimal M02 event contract; deliberately contains no leader equity."""
+
+    ts: int
+    event_order: int
+    fill: dict
+    type: str = "fill"
+
+
+def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+    """Pick the causal equity basis for one event, using ONLY data <= the event.
+
+    Per-segment drift and whole-window recon-PASS are NEVER consulted (look-ahead).
+    """
+    if not ee.has_past_anchor:
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None,
+            anchor_ts=None, mark_ts=None, degraded=True,
+            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+        )
+
+    eq = ee.equity_post
+    frozen = ee.frozen_component_value
+    frozen_age_ms = ee.frozen_component_age_ms
+    materiality = (abs(frozen) / abs(eq)) if (eq and abs(eq) > EPS) else float("nan")
+    age = ee.age_since_anchor_ms or 0
+    anchor_eq = ee.anchor_equity
+
+    # EQUITY-FLOOR (causal): a non-positive or implausibly-small reconstructed equity is a
+    # degenerate denominator -> never emit a huge target off it. Uses only equity_post(k)
+    # and the last PAST exact anchor (anchor_ts < ts), so no look-ahead. Falls back to the
+    # exact anchor equity when sane, else marks the event unsizeable.
+    eq_floor = EQUITY_FLOOR_ABS
+    if anchor_eq is not None and anchor_eq == anchor_eq:
+        eq_floor = max(EQUITY_FLOOR_ABS, EQUITY_FLOOR_FRAC * abs(anchor_eq))
+    if eq is None or eq != eq or eq <= eq_floor:
+        if anchor_eq is not None and anchor_eq == anchor_eq and anchor_eq > EQUITY_FLOOR_ABS:
+            return EquityBasis(
+                mode="ANCHOR_FALLBACK", equity=anchor_eq, equity_ts=ee.anchor_ts,
+                anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+                frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+                frozen_materiality_frac=materiality,
+            )
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+            mark_ts=ee.mark_ts, degraded=True, frozen_value=frozen,
+            frozen_age_s=frozen_age_ms / 1000.0, frozen_materiality_frac=materiality,
+        )
+
+    # ANCHOR_FALLBACK: base anchor too stale AND material unmarkable exposure, OR
+    # the frozen component is itself stale/material. Hold last PAST anchor flat.
+    stale_anchor = age > STALE_CAP_MS
+    material_frozen = (materiality == materiality and materiality > FROZEN_MATERIALITY_CAP)
+    stale_frozen = frozen_age_ms > STALE_CAP_MS
+    if (stale_anchor and ee.n_unmarkable > 0) or material_frozen or stale_frozen:
+        return EquityBasis(
+            mode="ANCHOR_FALLBACK", equity=ee.anchor_equity,
+            equity_ts=ee.anchor_ts, anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts,
+            degraded=True, frozen_value=frozen,
+            frozen_age_s=frozen_age_ms / 1000.0,
+                fees_paid=opening_fee, fee_scope=row_scope,
+                carry_in_status="SEEDED",
+            )
+            coin_state[coin] = st
+            action_type = "REVERSE"
+            opening_jid = st["journey_id"]
+
+        st["position"] = new_pos
+
+        # ---- optional equity basis + action row ----
+        # Core M02 deliberately does not read M01, anchors, or market marks.
+        if equity_enriched:
+            basis = select_equity_basis(ee)
+            # SIZING signal: use only a bar that has closed by ts.
+            _raw_mark = m01.get_mark(coin, ts, causal=True)
+            # AUDIT 2026-07-10 (codex m02 P1): a NaN/inf mark (or NaN/inf equity) must NOT survive into
+            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
+            # Require FINITE mark AND finite non-trivial equity, else the action is unsizeable (target=None).
+            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
+            mark = float(_raw_mark) if mark_ok else None
+            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark_ok else None
+            eq_finite = basis.equity is not None and np.isfinite(basis.equity)
+            eq_ok = eq_finite and abs(basis.equity) > EPS
+            if basis.mode == "NO_ANCHOR" or not eq_ok or not mark_ok:
+                target_pct = None
+            else:
+                target_pct = (new_pos * mark) / basis.equity
+        else:
+            basis = EquityBasis(
+                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+                anchor_ts=None, mark_ts=None, degraded=False,
+                frozen_value=0.0, frozen_age_s=0.0,
+                frozen_materiality_frac=float("nan"),
+            )
+            mark = None
+            sizing_mark_ts = None
+
+exec
+/bin/zsh -lc 'pytest -q tests/v15/test_m01_golden.py' in /Users/hermes/quants-lab
+ exited 2 in 1055ms:
+
+==================================== ERRORS ====================================
+________________ ERROR collecting tests/v15/test_m01_golden.py _________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m01_golden.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m01_golden.py:16: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+=========================== short test summary info ============================
+ERROR tests/v15/test_m01_golden.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.68s
+
+codex
+The local bare `pytest` failed at import because this shell doesn’t have `pymongo`; I haven’t treated that as a code failure yet. I’m checking the repo’s Python environment instructions/venv and then I’ll rerun through the project’s configured interpreter if present.
+exec
+/bin/zsh -lc "rg -n \"pymongo|pytest|python\" pyproject.toml requirements*.txt environment*.yml setup.cfg tox.ini . -g'"'!app/data/**'"' -g'"'!node_modules/**'"'" in /Users/hermes/quants-lab
+ exited 1 in 0ms:
+zsh:1: no matches found: requirements*.txt
+
+exec
+/bin/zsh -lc 'ls -la' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+total 352
+drwxr-xr-x   57 hermes  staff   1824 Jul 10 13:05 .
+drwxr-x---+ 118 hermes  staff   3776 Jul 10 19:10 ..
+-rw-r--r--    1 hermes  staff    299 Jun 10 15:52 .HB_STACK_DISABLED
+drwxr-xr-x    2 hermes  staff     64 Jul 10 13:05 .audit
+drwxr-xr-x    5 hermes  staff    160 Jun 13 23:55 .claude
+-rw-r--r--    1 hermes  staff    243 May  1 16:17 .claudeignore
+drwxr-xr-x    3 hermes  staff     96 May  2 15:01 .context
+drwxr-xr-x    3 hermes  staff     96 Apr 13 12:27 .docker-build
+-rw-r--r--    1 hermes  staff   1111 Mar 26 07:41 .dockerignore
+-rw-------    1 hermes  staff   1797 Jul  1 10:00 .env
+-rw-------    1 hermes  staff   1723 Jun 23 16:20 .env.bak-bybitkeyfix-20260623-152016
+-rw-r--r--    1 hermes  staff     64 May 20 13:49 .gbrainignore
+drwxr-xr-x   16 hermes  staff    512 Jul 10 19:02 .git
+drwxr-xr-x    3 hermes  staff     96 Mar 26 07:41 .github
+-rw-r--r--    1 hermes  staff   4699 Jul 10 10:42 .gitignore
+drwx------    5 hermes  staff    160 May 12 14:27 .gstack
+drwxr-xr-x    4 hermes  staff    128 Jul  6 17:03 .patches
+-rw-r--r--    1 hermes  staff    826 Mar 26 07:41 .pre-commit-config.yaml
+drwxr-xr-x    6 hermes  staff    192 Apr  9 11:07 .pytest_cache
+drwxr-xr-x    8 hermes  staff    256 Apr 18 13:13 .venv
+-rw-r--r--    1 hermes  staff  12090 Apr  2 12:36 ARCHITECTURE.md
+-rw-r--r--    1 hermes  staff   6574 Jun 10 17:29 CLAUDE.md
+-rw-r--r--    1 hermes  staff    308 Apr 22 09:49 Dockerfile.hb-demo-v2
+-rw-r--r--    1 hermes  staff  11357 Mar 26 07:41 LICENSE
+-rw-r--r--    1 hermes  staff   8292 Apr  6 15:07 NEXT_STEPS.md
+-rw-r--r--    1 hermes  staff   3921 Mar 26 07:41 README.md
+-rw-r--r--    1 hermes  staff   7026 May 31 16:45 REPO_MAP.md
+-rw-r--r--    1 hermes  staff   5525 Jul 10 12:54 SYSTEM.md
+drwxr-xr-x    6 hermes  staff    192 Jul 10 11:32 app
+drwxr-xr-x   52 hermes  staff   1664 Jul 10 19:02 archive
+-rw-r--r--    1 hermes  staff   6220 Jun  8 18:45 closedpnl_recon.py
+drwxr-xr-x   32 hermes  staff   1024 Jul 10 11:31 config
+drwxr-xr-x   15 hermes  staff    480 May 11 01:10 core
+drwxr-xr-x   30 hermes  staff    960 Jul 10 11:30 data_pipeline
+drwxr-xr-x    3 hermes  staff     96 Jul 10 11:28 docker
+drwxr-xr-x    3 hermes  staff     96 Apr 16 00:55 docker-build
+-rw-r--r--    1 hermes  staff    792 Mar 26 07:41 docker-compose-db.yml
+drwxr-xr-x   52 hermes  staff   1664 Jul 10 10:42 docs
+-rw-r--r--    1 hermes  staff    737 Mar 26 07:41 environment.yml
+-rwxr-xr-x    1 hermes  staff   8723 Mar 26 07:41 install.sh
+drwxr-xr-x    3 hermes  staff     96 May 23 23:17 logs
+drwxr-xr-x    3 hermes  staff     96 May 22 16:21 ops
+-rw-r--r--    1 hermes  staff   5561 Jun  8 18:45 parallel_compare.py
+-rw-r--r--    1 hermes  staff   1813 Mar 26 07:41 pyproject.toml
+drwxr-xr-x    8 hermes  staff    256 Mar 26 07:47 quants_lab.egg-info
+drwxr-xr-x   10 hermes  staff    320 Jul 10 11:28 research
+drwxr-xr-x   11 hermes  staff    352 Apr  9 11:38 research_notebooks
+drwxr-xr-x   50 hermes  staff   1600 Jul 10 11:37 scripts
+drwxr-xr-x    4 hermes  staff    128 Jul  5 17:11 strategies
+drwxr-xr-x    7 hermes  staff    224 Jul 10 12:44 tests
+drwxr-xr-x   19 hermes  staff    608 Jul 10 11:37 tools
+-rwxr-xr-x    1 hermes  staff   8202 Mar 26 07:41 uninstall.sh
+-rw-r--r--    1 hermes  staff   3031 May 11 10:59 voice_msg.json
+-rw-r--r--    1 hermes  staff    704 May 11 10:59 voice_msg.srt
+-rw-r--r--    1 hermes  staff    587 May 11 10:59 voice_msg.tsv
+-rw-r--r--    1 hermes  staff    506 May 11 10:59 voice_msg.txt
+-rw-r--r--    1 hermes  staff    664 May 11 10:59 voice_msg.vtt
+
+exec
+/bin/zsh -lc "rg --files -g'pyproject.toml' -g'requirements*.txt' -g'.venv/**' -g'venv/**' -g'pytest.ini' -g'conftest.py'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+pyproject.toml
+archive/tests/v13/conftest.py
+archive/tests/v25/conftest.py
+archive/tests/v26/conftest.py
+
+codex
+There is a repo `.venv`, so I’m switching to that for verification. I’m also checking whether the test file’s import style matches the rest of `tests/v15`, because a golden test that only runs under one working directory is a common source of false confidence.
+exec
+/bin/zsh -lc "sed -n '1,220p' pyproject.toml" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quants-lab"
+version = "2.0.0"
+description = "Quantitative research framework for Hummingbot trading strategies"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "QuantsLab Team", email = "team@quantslab.io"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "hummingbot",
+    "pycoingecko",
+    "geckoterminal-py==0.2.5",
+    "glom",
+    "defillama",
+    "statsmodels",
+    "numpy",
+    "pandas",
+    "plotly",
+    "scikit-learn",
+    "pydantic",
+    "pyyaml",
+    "optuna",
+    "optuna-dashboard",
+    "streamlit",
+    "python-dotenv",
+    "asyncpg",
+    "psycopg2-binary",
+    "pyarrow",
+    "motor>=3.3.2",
+    "fastapi",
+    "uvicorn[standard]",
+    "croniter",
+    "pytz",
+    "sqlalchemy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "isort",
+    "flake8",
+    "jupyter",
+]
+
+[project.scripts]
+quants-lab = "cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "app*"]
+
+[tool.black]
+line-length = 130
+target-version = ["py312"]
+
+[tool.isort]
+line_length = 130
+profile = "black"
+multi_line_output = 3
+include_trailing_comma = true
+use_parentheses = true
+ensure_newline_before_comments = true
+combine_as_imports = true
+
+[tool.pre-commit]
+repos = [
+    { repo = "https://github.com/pre-commit/pre-commit-hooks", rev = "v3.4.0", hooks = [{ id = "check-yaml" }, { id = "end-of-file-fixer" }] },
+    { repo = "https://github.com/psf/black", rev = "21.6b0", hooks = [{ id = "black" }] },
+    { repo = "https://github.com/pre-commit/mirrors-isort", rev = "v5.9.3", hooks = [{ id = "isort" }] }
+]
+
+exec
+/bin/zsh -lc "ls tests/v15 && sed -n '1,80p' tests/v15/test_m02.py && sed -n '1,80p' tests/v15/test_m02_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+__pycache__
+test_equity_independent_actions.py
+test_execution_model.py
+test_fidelity_replay.py
+test_fixed_notional_signals.py
+test_m01_golden.py
+test_m02.py
+test_m025_golden.py
+test_m02_golden.py
+test_m03.py
+test_m03_golden.py
+test_m04.py
+test_m05.py
+test_m05_golden.py
+test_m06a.py
+test_m06a_golden.py
+test_m06b.py
+test_m06b_golden.py
+test_m07.py
+test_m08.py
+test_m08_golden.py
+test_m09.py
+test_m09_golden.py
+test_m10.py
+test_m10_golden.py
+test_mem_budget.py
+test_slippage_calib.py
+#!/usr/bin/env python3
+"""V15 M02 unit tests — NON-LOOK-AHEAD invariants + state machine correctness.
+
+Synthetic fixtures only; no network, no Mongo, no parquet. We monkeypatch
+m01.get_mark so equity reconstruction is deterministic, then drive
+trace_wallet / compute_event_equity directly.
+
+Run:
+    /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02.py -q
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "research" / "v15"))
+
+import v15_m01_equity_reconstruct as m01  # noqa: E402
+import v15_m02_journey_trace as m02  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures / helpers
+# --------------------------------------------------------------------------- #
+
+FIXED_MARK = 100.0
+
+
+@pytest.fixture(autouse=True)
+def _patch_marks(monkeypatch):
+    """Deterministic mark: $100 for BTC, None for an unmarkable exotic coin."""
+    def fake_mark(coin, ts_ms, causal=False):
+        if coin.startswith("EXOTIC"):
+            return None
+        return FIXED_MARK
+    monkeypatch.setattr(m01, "get_mark", fake_mark)
+    monkeypatch.setattr(m02.m01, "get_mark", fake_mark)
+
+
+def _fill(ts, coin, side, size, price, start_pos, tid, closed=0.0, dir_="", liq=False):
+    return {
+        "coin": coin, "side": side, "size": float(size), "price": float(price),
+        "time": int(ts), "tid": int(tid), "dir": dir_,
+        "closedPnl": float(closed), "startPosition": float(start_pos),
+        "fee": 0.0, "builderFee": 0.0, "deployerFee": 0.0,
+        "signed_sz": float(size) if side == "B" else -float(size),
+        "is_liquidation": liq,
+    }
+
+
+class _Anchor:
+    """Minimal AnchorState stand-in: no pre-anchor positions, far-future fetch."""
+    positions: dict = {}
+    entry_px: dict = {}
+    fetched_ms = 10**15
+    dexes_seen = {"main"}
+    has_flx_anchor = False
+    has_unmarkable_dex_anchor = False
+    acct_value_by_dex = {"main": 1000.0}
+    aggregate_acct_value = 1000.0
+
+
+def _run(fills, funding=None, anchors=None):
+    funding = funding or []
+    # default anchor strictly BEFORE the first fill so events are sizeable.
+    anchors = anchors if anchors is not None else [(fills[0]["time"] - 1000, 1000.0)]
+    anchor = _Anchor()
+    ordered = m01.build_event_stream(fills, funding, [])
+    events = m01.compute_event_equity(
+        ordered, fills, anchor, "0xtest", anchors, extradex_no_anchor=False
+    )
+    actions, journeys = m02.trace_wallet("0xtest", events, fills, funding)
+    return events, actions, journeys
+
+
+def test_core_m02_does_not_reconstruct_equity(monkeypatch):
+"""GOLDEN regression test for v15_m02_journey_trace trust-audit fixes (2026-07-10).
+
+Locks the fail-CLOSED / accounting fixes from the codex m02 audit:
+- P1 open-at-window-end: an open journey finalizes through END_MS (real duration + funding), not peak_ts (0).
+- P1 non-finite startPosition/size/price: fails CLOSED (lifecycle_valid=False, carry_in UNKNOWN, not a
+  fabricated clean flat SEEDED).
+- P1 NaN/inf mark (or equity): does NOT survive into target_exposure_pct -> unsizeable (None), mark None.
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m02_journey_trace as m02  # noqa: E402
+from v15_m02_journey_trace import LifecycleFillEvent  # noqa: E402
+from test_m02 import _fill  # noqa: E402
+
+
+def _core_events(fills):
+    return [LifecycleFillEvent(ts=int(f["time"]), event_order=i, fill=f) for i, f in enumerate(fills)]
+
+
+def test_p1_open_journey_finalizes_at_window_end():
+    # one open BTC long at ts=1000; funding +5 at t=2000; window end 3000. Journey stays open (exit_ts None)
+    # but duration + funding must run to 3000, not collapse to peak_ts (0 duration / 0 funding).
+    fills = [_fill(1000, "BTC", "B", 1, 100, 0, tid=1)]
+    funding = [{"time": 2000, "delta": {"type": "funding", "coin": "BTC", "usdc": 5.0}}]
+    _a, journeys = m02.trace_wallet("0x", _core_events(fills), fills, funding,
+                                    equity_enriched=False, end_ms=3000)
+    assert len(journeys) == 1
+    j = journeys[0]
+    assert j["open_at_window_end"] is True and j["exit_ts"] is None
+    assert j["duration_h"] > 0.0                       # (3000-1000)/3600e3, NOT 0
+    assert abs(j["funding_net"] - 5.0) < 1e-9          # funding through window end included
+
+
+def test_p1_open_journey_without_end_ms_is_backward_compatible():
+    # end_ms omitted -> old peak_ts behavior (byte-identical for existing callers).
+    fills = [_fill(1000, "BTC", "B", 1, 100, 0, tid=1)]
+    _a, journeys = m02.trace_wallet("0x", _core_events(fills), fills, [], equity_enriched=False)
+    assert journeys[0]["duration_h"] == 0.0            # peak_ts == open_ts -> 0 (unchanged)
+
+
+def test_p1_nonfinite_startposition_fails_closed():
+    f = _fill(1000, "BTC", "A", 1, 100, 0, tid=1, closed=10.0)
+    f["startPosition"] = float("nan")                  # unknown pre-position
+    actions, _j = m02.trace_wallet("0x", _core_events([f]), [f], [], equity_enriched=False)
+    assert len(actions) == 1
+    assert actions[0]["lifecycle_valid"] is False
+    assert actions[0]["stream_replay_valid"] is False
+    assert actions[0]["carry_in_status"] == "UNKNOWN"
+
+
+def test_p1_nonfinite_price_dropped():
+    # codex r3: a non-finite price poisons notional/cost_basis/fee -> DROP the fill (no action), coin invalid.
+    bad = _fill(1000, "BTC", "B", 1, 100, 0, tid=1); bad["price"] = float("inf")
+    good = _fill(2000, "BTC", "B", 1, 100, 0, tid=2)
+    actions, _j = m02.trace_wallet("0x", _core_events([bad, good]), [bad, good], [], equity_enriched=False)
+    assert all(np.isfinite(a["price"]) for a in actions)
+    assert len(actions) == 1 and actions[0]["ts"] == 2000
+    assert actions[0]["lifecycle_valid"] is False and actions[0]["stream_replay_valid"] is False
+
+
+def test_p1_inf_fee_does_not_flow_into_accounting():
+    # codex r3: an inf reported fee must fall back to the computed fee, never inf into fees_paid.
+    o = _fill(1000, "BTC", "B", 1, 100, 0, tid=1)
+    c = _fill(2000, "BTC", "A", 1, 110, 1, tid=2, closed=10.0)
+    c["fee"] = float("inf")
+    _a, journeys = m02.trace_wallet("0x", _core_events([o, c]), [o, c], [], equity_enriched=False)
+    assert len(journeys) == 1
+    assert np.isfinite(journeys[0]["fees"]) and np.isfinite(journeys[0]["net_realized_pnl"])
+
+
+def test_p1_inf_closedpnl_invalidates_and_stays_finite():
+    # codex r3: an inf reported closedPnl -> derived (finite) + lifecycle invalidated.
+    o = _fill(1000, "BTC", "B", 1, 100, 0, tid=1)
+    c = _fill(2000, "BTC", "A", 1, 110, 1, tid=2)
+    c["closedPnl"] = float("inf")
+    _a, journeys = m02.trace_wallet("0x", _core_events([o, c]), [o, c], [], equity_enriched=False)
+
+exec
+/bin/zsh -lc '.venv/bin/python -m pytest -q tests/v15/test_m01_golden.py' in /Users/hermes/quants-lab
+ exited 1 in 0ms:
+/Users/hermes/quants-lab/.venv/bin/python: No module named pytest
+
+codex
+The existing v15 tests document the intended interpreter as `/Users/hermes/miniforge3/envs/quants-lab/bin/python`; I’m using that now. The code review still hasn’t found a fail-open bypass, but test execution is the remaining validation point.
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15/test_m01_golden.py' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15/test_m02.py tests/v15/test_m02_golden.py' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '120,165p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+    """Pick the causal equity basis for one event, using ONLY data <= the event.
+
+    Per-segment drift and whole-window recon-PASS are NEVER consulted (look-ahead).
+    """
+    if not ee.has_past_anchor:
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None,
+            anchor_ts=None, mark_ts=None, degraded=True,
+            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+        )
+
+    eq = ee.equity_post
+    frozen = ee.frozen_component_value
+    frozen_age_ms = ee.frozen_component_age_ms
+    materiality = (abs(frozen) / abs(eq)) if (eq and abs(eq) > EPS) else float("nan")
+    age = ee.age_since_anchor_ms or 0
+    anchor_eq = ee.anchor_equity
+
+    # EQUITY-FLOOR (causal): a non-positive or implausibly-small reconstructed equity is a
+    # degenerate denominator -> never emit a huge target off it. Uses only equity_post(k)
+    # and the last PAST exact anchor (anchor_ts < ts), so no look-ahead. Falls back to the
+    # exact anchor equity when sane, else marks the event unsizeable.
+    eq_floor = EQUITY_FLOOR_ABS
+    if anchor_eq is not None and anchor_eq == anchor_eq:
+        eq_floor = max(EQUITY_FLOOR_ABS, EQUITY_FLOOR_FRAC * abs(anchor_eq))
+    if eq is None or eq != eq or eq <= eq_floor:
+        if anchor_eq is not None and anchor_eq == anchor_eq and anchor_eq > EQUITY_FLOOR_ABS:
+            return EquityBasis(
+                mode="ANCHOR_FALLBACK", equity=anchor_eq, equity_ts=ee.anchor_ts,
+                anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+                frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+                frozen_materiality_frac=materiality,
+            )
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+            mark_ts=ee.mark_ts, degraded=True, frozen_value=frozen,
+            frozen_age_s=frozen_age_ms / 1000.0, frozen_materiality_frac=materiality,
+        )
+
+    # ANCHOR_FALLBACK: base anchor too stale AND material unmarkable exposure, OR
+    # the frozen component is itself stale/material. Hold last PAST anchor flat.
+    stale_anchor = age > STALE_CAP_MS
+    material_frozen = (materiality == materiality and materiality > FROZEN_MATERIALITY_CAP)
+    stale_frozen = frozen_age_ms > STALE_CAP_MS
+    if (stale_anchor and ee.n_unmarkable > 0) or material_frozen or stale_frozen:
+
+ succeeded in 1089ms:
+.....                                                                    [100%]
+5 passed in 0.67s
+
+ succeeded in 1006ms:
+.........................................                                [100%]
+41 passed in 0.72s
+
+codex
+Targeted verification passes under the project interpreter: 5/5 m01 golden and 41/41 m02 tests. I’m doing one final pass over non-finite propagation and then I’ll give the verdict with any residual caveats.
+exec
+/bin/zsh -lc "rg -n \"np\\.isfinite|isfinite|float\\(\" research/v15/v15_m01_equity_reconstruct.py research/v15/v15_m02_journey_trace.py tests/v15/test_m01_golden.py tests/v15/test_m02_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m01_golden.py:57:    assert np.isfinite(btc.equity_post)
+tests/v15/test_m01_golden.py:72:    monkeypatch.setattr(m01, "get_mark", lambda c, ts, causal=False: float("inf"))
+tests/v15/test_m01_golden.py:82:    funding = [{"time": 2500, "coin": "BTC", "delta": {"type": "funding", "coin": "BTC", "usdc": float("nan")}}]
+research/v15/v15_m02_journey_trace.py:129:            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+research/v15/v15_m02_journey_trace.py:135:    materiality = (abs(frozen) / abs(eq)) if (eq and abs(eq) > EPS) else float("nan")
+research/v15/v15_m02_journey_trace.py:211:        fv = float(v)
+research/v15/v15_m02_journey_trace.py:215:    # flow inf into fees_paid). np.isfinite catches both.
+research/v15/v15_m02_journey_trace.py:216:    return fv if np.isfinite(fv) else None
+research/v15/v15_m02_journey_trace.py:254:                u = float(d.get("usdc", 0) or 0)
+research/v15/v15_m02_journey_trace.py:257:            if np.isfinite(u):
+research/v15/v15_m02_journey_trace.py:367:        price = float(f["price"]) or 0.0
+research/v15/v15_m02_journey_trace.py:378:        sp = float(f.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m02_journey_trace.py:383:        sp_finite = bool(np.isfinite(sp))
+research/v15/v15_m02_journey_trace.py:384:        signed_finite = bool(np.isfinite(signed))
+research/v15/v15_m02_journey_trace.py:385:        price_finite = bool(np.isfinite(price))
+research/v15/v15_m02_journey_trace.py:446:                raw_pnl = float(raw_pnl)
+research/v15/v15_m02_journey_trace.py:449:        _raw_pnl_nonfinite = raw_pnl is not None and not np.isfinite(raw_pnl)
+research/v15/v15_m02_journey_trace.py:461:                closed_pnl = float((price - cost_basis) * closed_qty)
+research/v15/v15_m02_journey_trace.py:465:            closed_pnl = float(raw_pnl)
+research/v15/v15_m02_journey_trace.py:578:            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
+research/v15/v15_m02_journey_trace.py:579:            mark = float(_raw_mark) if mark_ok else None
+research/v15/v15_m02_journey_trace.py:581:            eq_finite = basis.equity is not None and np.isfinite(basis.equity)
+research/v15/v15_m02_journey_trace.py:592:                frozen_materiality_frac=float("nan"),
+research/v15/v15_m02_journey_trace.py:601:        source_equity_out = (float(basis.equity)
+research/v15/v15_m02_journey_trace.py:602:                             if (basis.equity is not None and np.isfinite(basis.equity)) else None)
+research/v15/v15_m02_journey_trace.py:604:                            if (basis.frozen_value is not None and np.isfinite(basis.frozen_value)) else None)
+research/v15/v15_m02_journey_trace.py:607:                              and np.isfinite(basis.frozen_materiality_frac)) else None)
+research/v15/v15_m02_journey_trace.py:609:                          if (basis.frozen_age_s is not None and np.isfinite(basis.frozen_age_s)) else None)
+tests/v15/test_m02_golden.py:47:    f["startPosition"] = float("nan")                  # unknown pre-position
+tests/v15/test_m02_golden.py:57:    bad = _fill(1000, "BTC", "B", 1, 100, 0, tid=1); bad["price"] = float("inf")
+tests/v15/test_m02_golden.py:60:    assert all(np.isfinite(a["price"]) for a in actions)
+tests/v15/test_m02_golden.py:69:    c["fee"] = float("inf")
+tests/v15/test_m02_golden.py:72:    assert np.isfinite(journeys[0]["fees"]) and np.isfinite(journeys[0]["net_realized_pnl"])
+tests/v15/test_m02_golden.py:79:    c["closedPnl"] = float("inf")
+tests/v15/test_m02_golden.py:82:    assert np.isfinite(journeys[0]["realized_pnl"]) and np.isfinite(journeys[0]["net_realized_pnl"])
+tests/v15/test_m02_golden.py:90:    bad["signed_sz"] = float("nan")
+tests/v15/test_m02_golden.py:95:    assert all(np.isfinite(a["signed_size"]) for a in actions)
+tests/v15/test_m02_golden.py:105:    funding = [{"time": 3000, "delta": {"type": "funding", "coin": "BTC", "usdc": float("inf")}}]
+tests/v15/test_m02_golden.py:108:    assert np.isfinite(journeys[0]["funding_net"]) and np.isfinite(journeys[0]["net_realized_pnl"])
+tests/v15/test_m02_golden.py:118:    assert np.isfinite(journeys[0]["realized_pnl"]) and journeys[0]["lifecycle_valid"] is False
+tests/v15/test_m02_golden.py:144:    for bad in (float("nan"), float("inf")):
+tests/v15/test_m02_golden.py:152:    equity_post = float("inf")          # M01 emitted a non-finite equity
+tests/v15/test_m02_golden.py:153:    anchor_equity = float("inf")
+research/v15/v15_m01_equity_reconstruct.py:254:    return None if not np.isfinite(px) else float(px)  # NaN/inf-safe (codex m01: inf mark -> None)
+research/v15/v15_m01_equity_reconstruct.py:294:            pts.append((int(t), float(p)))
+research/v15/v15_m01_equity_reconstruct.py:318:    return None if not np.isfinite(v) else float(v)
+research/v15/v15_m01_equity_reconstruct.py:339:            pts.append((int(t), float(p)))
+research/v15/v15_m01_equity_reconstruct.py:363:    return None if not np.isfinite(v) else float(v)
+research/v15/v15_m01_equity_reconstruct.py:395:    return None if not np.isfinite(v) else float(v)
+research/v15/v15_m01_equity_reconstruct.py:446:        closes_l.append(float(c) if c is not None else float("nan"))
+research/v15/v15_m01_equity_reconstruct.py:626:                return [(int(t), float(v)) for t, v in json.load(f)]
+research/v15/v15_m01_equity_reconstruct.py:646:                        (int(x[0]), float(x[1]))
+research/v15/v15_m01_equity_reconstruct.py:662:                json.dump([[int(t), float(v)] for t, v in result], f)
+research/v15/v15_m01_equity_reconstruct.py:689:                return [(int(t), float(v)) for t, v in json.load(f)]
+research/v15/v15_m01_equity_reconstruct.py:705:                    result = [(int(x[0]), float(x[1])) for x in wd.get("accountValueHistory", [])]
+research/v15/v15_m01_equity_reconstruct.py:716:                json.dump([[int(t), float(v)] for t, v in result], f)
+research/v15/v15_m01_equity_reconstruct.py:749:    return round(float(value), 10)
+research/v15/v15_m01_equity_reconstruct.py:831:            size = float(rec["size"])
+research/v15/v15_m01_equity_reconstruct.py:840:                "price": float(rec["price"]),
+research/v15/v15_m01_equity_reconstruct.py:844:                "closedPnl": float(rec.get("closedPnl", 0) or 0),
+research/v15/v15_m01_equity_reconstruct.py:845:                "startPosition": float(rec.get("startPosition", 0) or 0),
+research/v15/v15_m01_equity_reconstruct.py:846:                "fee": float(rec.get("fee", 0) or 0),
+research/v15/v15_m01_equity_reconstruct.py:847:                "builderFee": float(rec.get("builderFee", 0) or 0),
+research/v15/v15_m01_equity_reconstruct.py:848:                "deployerFee": float(rec.get("deployerFee", 0) or 0),
+research/v15/v15_m01_equity_reconstruct.py:1004:        acct_val = float(row["accountValue"])
+research/v15/v15_m01_equity_reconstruct.py:1006:        ts_ms = int(float(row["fetched_at_ts"]) * 1000)
+research/v15/v15_m01_equity_reconstruct.py:1021:            szi = float(p["szi"])
+research/v15/v15_m01_equity_reconstruct.py:1026:                entry_px[coin] = abs(float(p.get("entryPx", 0.0)))
+research/v15/v15_m01_equity_reconstruct.py:1087:                return float(v)
+research/v15/v15_m01_equity_reconstruct.py:1088:        return float(default)
+research/v15/v15_m01_equity_reconstruct.py:1221:    return float(d.get("usdc", 0))
+research/v15/v15_m01_equity_reconstruct.py:1316:                    start_positions[coin] = float(szi)
+research/v15/v15_m01_equity_reconstruct.py:1354:            p0 = float(cur.get(coin, 0.0)) - net_all  # backward: perp snapshot-anchored
+research/v15/v15_m01_equity_reconstruct.py:1356:            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill
+research/v15/v15_m01_equity_reconstruct.py:1365:            start_positions[coin] = float(szi)
+research/v15/v15_m01_equity_reconstruct.py:1426:                sp = float(ev.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m01_equity_reconstruct.py:1698:        "max_unmarkable_notional_usd": float(df_out["unmarkable_notional_usd"].max()),
+research/v15/v15_m01_equity_reconstruct.py:1700:        "frac_incomplete_rows": float(n_incomplete_rows / len(df_out)) if len(df_out) else np.nan,
+research/v15/v15_m01_equity_reconstruct.py:1790:        "max_drift_pct": float(a.max()),
+research/v15/v15_m01_equity_reconstruct.py:1791:        "median_drift_pct": float(np.median(a)),
+research/v15/v15_m01_equity_reconstruct.py:1862:        "max_err_usd": float(np.max(errs)),
+research/v15/v15_m01_equity_reconstruct.py:1863:        "median_err_usd": float(np.median(errs)),
+research/v15/v15_m01_equity_reconstruct.py:1923:            total += float(av)
+research/v15/v15_m01_equity_reconstruct.py:1956:    gap_h = (anchor.fetched_ms - last_fill_ms) / 3_600_000 if last_fill_ms else float("inf")
+research/v15/v15_m01_equity_reconstruct.py:1975:        a = float(anchor.positions.get(c, 0.0))
+research/v15/v15_m01_equity_reconstruct.py:2189:        sp = float(ev.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m01_equity_reconstruct.py:2231:                    source_seq=item["source_seq"], equity_post=float("nan"),
+research/v15/v15_m01_equity_reconstruct.py:2232:                    cash=float("nan"), position_value=float("nan"),
+research/v15/v15_m01_equity_reconstruct.py:2327:                     or not np.isfinite(cash) or not np.isfinite(whole_equity))
+research/v15/v15_m01_equity_reconstruct.py:2332:                    source_seq=item["source_seq"], equity_post=float("nan"),
+research/v15/v15_m01_equity_reconstruct.py:2333:                    cash=float("nan"), position_value=float("nan"),
+research/v15/v15_m01_equity_reconstruct.py:2576:                f"inter-drift med {res['audit'].get('median_inter_anchor_drift_pct', float('nan'))*100:.2f}%"
+
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15' in /Users/hermes/quants-lab
+ succeeded in 3870ms:
+........................................................................ [ 17%]
+........................................................................ [ 35%]
+........................................................................ [ 53%]
+........................................................................ [ 71%]
+........................................................................ [ 88%]
+.............................................                            [100%]
+405 passed in 3.49s
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m01_equity_reconstruct.py | sed -n '2150,2345p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+  2150	    # Coins whose carry-in (pre-anchor holding) has already been folded into the
+  2151	    # book+cash under the ACTIVE anchor. Reset per anchor cycle (codex r4 BUG 1).
+  2152	    carried_in: set[str] = set()
+  2153	    # AUDIT 2026-07-10 (codex m01 P1a): the anchor cash SNAP (cash = a_v - Sum seed*mark(a_t)) OMITS any
+  2154	    # seeded/carry-in position UNMARKABLE at the anchor time -> cash (and equity_post) overstated while
+  2155	    # markable_all was falsely True. Track per-cycle incompleteness; when set, the denominator is unreliable
+  2156	    # -> the event fails CLOSED (has_past_anchor=False -> M02 NO_ANCHOR).
+  2157	    anchor_snap_incomplete = [False]   # list = mutable closure cell
+  2158	    # AUDIT 2026-07-10 (codex m01 P1b): an UNKNOWN ledger type applies cash=0 (its real move is unknown), so
+  2159	    # equity after it is silently wrong. Once one occurs at ts <= event, the cash is untrustworthy -> taint
+  2160	    # every event at/after it (causal). Precompute the unknown-ledger timestamps once.
+  2161	    import bisect as _bisect
+  2162	    _unknown_ledger_ts = sorted(
+  2163	        it["ts"] for it in ordered
+  2164	        if it["type"] == "ledger" and ledger_cash_delta(it["ev"], wallet_lc).unknown
+  2165	    )
+  2166	
+  2167	    def _tainted_by_unknown_ledger(ts: int) -> bool:
+  2168	        return _bisect.bisect_right(_unknown_ledger_ts, ts) > 0
+  2169	
+  2170	    def _carry_in_fill(ev: dict) -> None:
+  2171	        """CAUSAL replacement for seed_positions case 2 (codex r4 BUG 1).
+  2172	
+  2173	        seed_positions(causal_cutoff=True) deliberately omits a coin first traded
+  2174	        AFTER the active anchor, to avoid look-ahead at earlier events. But that
+  2175	        coin DID hold a pre-anchor position (its first fill's startPosition), which
+  2176	        the anchor equity a_v already includes. The first time we REACH that coin's
+  2177	        fill in the ordered walk (order <= k = causal), we fold its carry-in in the
+  2178	        SAME way case 2 + the cash snap would have: add startPosition to the book
+  2179	        AND subtract its anchor-time value from cash (mark at active_anchor_ts < ts,
+  2180	        causal) so equity is not double-counted. Coins already in the anchor seed,
+  2181	        or already folded, are skipped. Identical end-state to compute_eq_at, but
+  2182	        revealed only at the causal moment instead of at the anchor (no leak at
+  2183	        earlier events)."""
+  2184	        nonlocal cash
+  2185	        coin = ev["coin"]
+  2186	        if coin in carried_in or active_anchor_ts is None:
+  2187	            return
+  2188	        carried_in.add(coin)
+  2189	        sp = float(ev.get("startPosition", 0.0) or 0.0)
+  2190	        if abs(sp) <= 1e-9:
+  2191	            return
+  2192	        positions[coin] = positions.get(coin, 0.0) + sp
+  2193	        m = get_mark(coin, active_anchor_ts)
+  2194	        if m is not None:
+  2195	            cash -= sp * m  # mirror the anchor cash snap for this carried-in coin
+  2196	            last_val[coin] = sp * m
+  2197	            last_val_ts.setdefault(coin, active_anchor_ts)
+  2198	        else:
+  2199	            # codex m01 P1a: carry-in coin unmarkable at the anchor -> its anchor value was NOT removed from
+  2200	            # cash -> the snap is incomplete -> equity denominator unreliable for this cycle. Fail closed.
+  2201	            anchor_snap_incomplete[0] = True
+  2202	
+  2203	    def _past_anchor(ts: int) -> Optional[tuple[int, float]]:
+  2204	        chosen = None
+  2205	        for a_t, a_v in window_anchors:
+  2206	            if a_t < ts:            # STRICT (codex r3)
+  2207	                chosen = (a_t, a_v)
+  2208	            else:
+  2209	                break
+  2210	        return chosen
+  2211	
+  2212	    for order, item in enumerate(ordered):
+  2213	        ts = item["ts"]
+  2214	        base = _past_anchor(ts)
+  2215	
+  2216	        if base is None:
+  2217	            # No past anchor → cannot reconstruct a causal denominator. Still
+  2218	            # advance the position book from startPosition-derived seeding so
+  2219	            # that once an anchor appears the book is correct, but emit
+  2220	            # has_past_anchor=False (M02 maps this to NO_ANCHOR).
+  2221	            # We seed positions at this ts from fills only (causal: positions_at
+  2222	            # uses startPosition + cumulative signed_sz, all <= ts).
+  2223	            ev = item["ev"]
+  2224	            if item["type"] == "fill":
+  2225	                positions[ev["coin"]] = positions.get(ev["coin"], 0.0) + ev["signed_sz"]
+  2226	                if abs(positions[ev["coin"]]) < 1e-9:
+  2227	                    positions.pop(ev["coin"], None)
+  2228	            results.append(
+  2229	                EventEquity(
+  2230	                    event_order=order, ts=ts, type=item["type"],
+  2231	                    source_seq=item["source_seq"], equity_post=float("nan"),
+  2232	                    cash=float("nan"), position_value=float("nan"),
+  2233	                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
+  2234	                    mark_ts=None, markable_all=False, n_unmarkable=0,
+  2235	                    no_extradex_without_anchor=(not extradex_no_anchor),
+  2236	                    frozen_component_value=0.0, frozen_component_age_ms=0,
+  2237	                    has_past_anchor=False,
+  2238	                    fill=(item["ev"] if item["type"] == "fill" else None),
+  2239	                )
+  2240	            )
+  2241	            continue
+  2242	
+  2243	        a_t, a_v = base
+  2244	        if a_t != active_anchor_ts:
+  2245	            # New base anchor cycle → re-seed positions at the anchor and snap
+  2246	            # cash, identically to compute_eq_at. This rebuild uses only fills
+  2247	            # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
+  2248	            active_anchor_ts = a_t
+  2249	            active_anchor_eq = a_v
+  2250	            anchor_snap_incomplete[0] = False   # codex m01 P1a: fresh cycle, re-assess snap completeness
+  2251	            seeded = seed_positions(fills, anchor, a_t, causal_cutoff=True)
+  2252	            anchor_pos_value = 0.0
+  2253	            for c, sz in seeded.items():
+  2254	                if abs(sz) < 1e-9:
+  2255	                    continue
+  2256	                m = get_mark(c, a_t)
+  2257	                if m is not None:
+  2258	                    anchor_pos_value += sz * m
+  2259	                    last_val[c] = sz * m
+  2260	                    last_val_ts[c] = a_t
+  2261	                else:
+  2262	                    # codex m01 P1a: seeded position unmarkable at the anchor -> its value is NOT subtracted
+  2263	                    # from the cash snap -> incomplete denominator -> fail closed for this cycle.
+  2264	                    anchor_snap_incomplete[0] = True
+  2265	            cash = a_v - anchor_pos_value
+  2266	            positions = {c: s for c, s in seeded.items() if abs(s) > 1e-9}
+  2267	            # Coins already in the anchor seed are carried-in; their fills must NOT
+  2268	            # re-fold a startPosition. Coins NOT seeded (first traded after anchor)
+  2269	            # get folded causally at their first fill via _carry_in_fill.
+  2270	            carried_in = set(seeded.keys())
+  2271	            # Replay events strictly between the anchor and this event (anchor_ts
+  2272	            # < e_ts < ts) so the book/cash reflect everything order <= current.
+  2273	            for prev in ordered:
+  2274	                p_ts = prev["ts"]
+  2275	                if p_ts <= a_t:
+  2276	                    continue
+  2277	                # stop once we reach the current event's order position
+  2278	                if (p_ts, prev["type_rank"], prev["source_seq"]) >= (
+  2279	                    ts, item["type_rank"], item["source_seq"]
+  2280	                ):
+  2281	                    break
+  2282	                if prev["type"] == "fill":
+  2283	                    _carry_in_fill(prev["ev"])
+  2284	                _apply(prev, positions, last_val, last_val_ts, _cash_ref=None)
+  2285	                cash = _apply_cash(prev, cash, wallet_lc)
+  2286	
+  2287	        # Apply THIS event (order == k included).
+  2288	        if item["type"] == "fill":
+  2289	            _carry_in_fill(item["ev"])
+  2290	        _apply(item, positions, last_val, last_val_ts, _cash_ref=None)
+  2291	        cash = _apply_cash(item, cash, wallet_lc)
+  2292	
+  2293	        # Mark-to-market at ts over live positions; track frozen component.
+  2294	        pos_value = 0.0
+  2295	        n_unmarkable = 0
+  2296	        mark_ts_latest: Optional[int] = None
+  2297	        frozen_value = 0.0
+  2298	        frozen_age = 0
+  2299	        for c, sz in positions.items():
+  2300	            if abs(sz) < 1e-9:
+  2301	                continue
+  2302	            m = get_mark(c, ts, causal=causal_mark)
+  2303	            if m is None:
+  2304	                n_unmarkable += 1
+  2305	                fv = last_val.get(c, 0.0)
+  2306	                frozen_value += fv
+  2307	                if c in last_val_ts:
+  2308	                    frozen_age = max(frozen_age, ts - last_val_ts[c])
+  2309	                continue
+  2310	            val = sz * m
+  2311	            pos_value += val
+  2312	            last_val[c] = val
+  2313	            mk = ts // 60_000 * 60_000 - (60_000 if causal_mark else 0)
+  2314	            last_val_ts[c] = mk
+  2315	            mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
+  2316	
+  2317	        equity_post = cash + pos_value  # markable + cash; frozen excluded here
+  2318	        whole_equity = equity_post + frozen_value
+  2319	
+  2320	        # AUDIT 2026-07-10 (codex m01 P1a/P1b/P2): fail CLOSED when the reconstructed denominator is untrustworthy
+  2321	        # -> emit the NO_ANCHOR form (M02 -> unsizeable), never a falsely-clean anchored equity:
+  2322	        #   (a) anchor snap incomplete (a seed/carry-in coin was unmarkable at the anchor -> cash overstated),
+  2323	        #   (b) an unknown ledger type at/before this ts (its real cash move was applied as 0),
+  2324	        #   (c) any non-finite cash/equity (inf mark or NaN funding/ledger delta leaked through).
+  2325	        _degraded = (anchor_snap_incomplete[0]
+  2326	                     or _tainted_by_unknown_ledger(ts)
+  2327	                     or not np.isfinite(cash) or not np.isfinite(whole_equity))
+  2328	        if _degraded:
+  2329	            results.append(
+  2330	                EventEquity(
+  2331	                    event_order=order, ts=ts, type=item["type"],
+  2332	                    source_seq=item["source_seq"], equity_post=float("nan"),
+  2333	                    cash=float("nan"), position_value=float("nan"),
+  2334	                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
+  2335	                    mark_ts=None, markable_all=False, n_unmarkable=max(1, n_unmarkable),
+  2336	                    no_extradex_without_anchor=(not extradex_no_anchor),
+  2337	                    frozen_component_value=0.0, frozen_component_age_ms=0,
+  2338	                    has_past_anchor=False,
+  2339	                    fill=(item["ev"] if item["type"] == "fill" else None),
+  2340	                )
+  2341	            )
+  2342	            continue
+  2343	        results.append(
+  2344	            EventEquity(
+  2345	                event_order=order, ts=ts, type=item["type"],
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m01_equity_reconstruct.py | sed -n '248,398p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   248	    # than CANDLE_MAX_AGE_MS, return None so the caller flags it (degraded / NO_ANCHOR) instead of
+   249	    # marking on a stale price. With dense all-market candles this rarely triggers; it only catches the
+   250	    # genuinely-dormant-coin case the cap is meant to surface.
+   251	    if minute_key - int(mins[i]) > CANDLE_MAX_AGE_MS:
+   252	        return None
+   253	    px = closes[i]
+   254	    return None if not np.isfinite(px) else float(px)  # NaN/inf-safe (codex m01: inf mark -> None)
+   255	
+   256	
+   257	# Candle-fallback staleness cap (codex marks-gate 2026-06-24). The 1m candle close is an at-or-before
+   258	# lookup; without a bound a stale bar (delisted/dormant coin, or a data gap) is returned as a live mark.
+   259	# Set to 15min to MATCH ASSETCTX_MAX_AGE_MS (codex recheck 2026-06-24: prefer 15min for a deploy-driving
+   260	# reconstruction; 60min still allows materially-stale MTM on a fast-moving thin coin). With dense
+   261	# all-market 1m candles a held coin has a bar most minutes, so this fires only on genuine dormancy/gaps
+   262	# -> caller flags degraded/NO_ANCHOR. The pre/post-05-24 coverage+staleness AUDIT validates the cap does
+   263	# not over-flag thin HIP-3 instruments; bump back toward 60min only if the audit shows false positives.
+   264	CANDLE_MAX_AGE_MS = 15 * 60 * 1000  # 15min (matches ASSETCTX_MAX_AGE_MS)
+   265	
+   266	# Equity-dependent selection requires repeated out-of-sample anchor checks.
+   267	# One or zero segments is not enough evidence that the reconstruction is
+   268	# stable; such wallets remain usable only in the equity-independent lane.
+   269	MIN_INTER_ANCHOR_CHECKS = 2
+   270	
+   271	
+   272	# Oracle/setOracle series, per-coin in-memory asof cache. ``mark_px`` is the
+   273	# exact account-value mark when observed, but a sparse historical extraction is
+   274	# not permission to reuse it for hours. The 30-wallet multi-dex sensitivity
+   275	# showed 15 minutes weakly dominated 6 hours on inter-anchor drift (6 improved,
+   276	# 0 worsened for median drift; 7 improved, 0 worsened for max drift). Older
+   277	# observations therefore fall back to the contemporaneous trade candle.
+   278	_oracle_series: dict[str, tuple] = {}
+   279	ORACLE_MAX_AGE_MS = 15 * 60 * 1000
+   280	
+   281	
+   282	def _load_oracle_from_mongo(coin: str) -> tuple:
+   283	    db = get_mongo()
+   284	    cur = db.hyperliquid_oracle.find(
+   285	        {"coin": coin}, projection={"timestamp_utc": 1, "oracle_px": 1, "_id": 0}
+   286	    )
+   287	    pts: list[tuple[int, float]] = []
+   288	    for d in cur:
+   289	        t = d.get("timestamp_utc")
+   290	        p = d.get("oracle_px")
+   291	        if t is None or p is None:
+   292	            continue
+   293	        try:
+   294	            pts.append((int(t), float(p)))
+   295	        except (TypeError, ValueError):
+   296	            continue
+   297	    pts.sort(key=lambda x: x[0])
+   298	    if not pts:
+   299	        return (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+   300	    return (np.asarray([x[0] for x in pts], dtype="int64"),
+   301	            np.asarray([x[1] for x in pts], dtype="float64"))
+   302	
+   303	
+   304	def _oracle_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+   305	    s = _oracle_series.get(coin)
+   306	    if s is None:
+   307	        s = _load_oracle_from_mongo(coin)
+   308	        _oracle_series[coin] = s
+   309	    ts_arr, px = s
+   310	    if ts_arr.size == 0:
+   311	        return None
+   312	    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1  # latest oracle point <= ts_ms
+   313	    if i < 0:
+   314	        return None
+   315	    if ts_ms - int(ts_arr[i]) > max_age_ms:  # too stale -> let caller fall back to candle
+   316	        return None
+   317	    v = px[i]
+   318	    return None if not np.isfinite(v) else float(v)
+   319	
+   320	
+   321	# setOracle MARK price (markPxs[0]) -- the price HL uses for accountValue/uPnL (oracle is funding-only).
+   322	# Mirrors _oracle_lookup; reads the mark_px field written by scripts/pull_oracle_targeted.py.
+   323	_markpx_series: dict[str, tuple] = {}
+   324	
+   325	
+   326	def _load_markpx_from_mongo(coin: str) -> tuple:
+   327	    db = get_mongo()
+   328	    cur = db.hyperliquid_oracle.find(
+   329	        {"coin": coin, "mark_px": {"$ne": None}},
+   330	        projection={"timestamp_utc": 1, "mark_px": 1, "_id": 0},
+   331	    )
+   332	    pts: list[tuple[int, float]] = []
+   333	    for d in cur:
+   334	        t = d.get("timestamp_utc")
+   335	        p = d.get("mark_px")
+   336	        if t is None or p is None:
+   337	            continue
+   338	        try:
+   339	            pts.append((int(t), float(p)))
+   340	        except (TypeError, ValueError):
+   341	            continue
+   342	    pts.sort(key=lambda x: x[0])
+   343	    if not pts:
+   344	        return (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+   345	    return (np.asarray([x[0] for x in pts], dtype="int64"),
+   346	            np.asarray([x[1] for x in pts], dtype="float64"))
+   347	
+   348	
+   349	def _markpx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+   350	    s = _markpx_series.get(coin)
+   351	    if s is None:
+   352	        s = _load_markpx_from_mongo(coin)
+   353	        _markpx_series[coin] = s
+   354	    ts_arr, px = s
+   355	    if ts_arr.size == 0:
+   356	        return None
+   357	    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1
+   358	    if i < 0:
+   359	        return None
+   360	    if ts_ms - int(ts_arr[i]) > max_age_ms:
+   361	        return None
+   362	    v = px[i]
+   363	    return None if not np.isfinite(v) else float(v)
+   364	
+   365	
+   366	# asset_ctxs EXACT mark for MAIN coins: per-coin (minute_ms, mark_px) .npy written by
+   367	# scripts/extract_asset_ctx_marks.py. 1-min granularity -> tight staleness cap. Mirrors _coin_series.
+   368	_assetctx_series: dict[str, tuple] = {}
+   369	ASSETCTX_MAX_AGE_MS = 15 * 60 * 1000  # 15min (asset_ctxs is 1-min; small cap)
+   370	ASSETCTX_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "assetctx_marks"
+   371	
+   372	
+   373	def _assetctx_lookup(coin: str, ts_ms: int, max_age_ms: int) -> Optional[float]:
+   374	    s = _assetctx_series.get(coin)
+   375	    if s is None:
+   376	        p = ASSETCTX_DIR / f"{_ulib.quote(coin, safe='')}.npy"
+   377	        if p.exists():
+   378	            try:
+   379	                arr = np.load(p, mmap_mode="r")
+   380	                s = (np.asarray(arr[0], dtype="int64"), np.asarray(arr[1], dtype="float64"))
+   381	            except Exception:  # noqa: BLE001
+   382	                s = (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+   383	        else:
+   384	            s = (np.empty(0, dtype="int64"), np.empty(0, dtype="float64"))
+   385	        _assetctx_series[coin] = s
+   386	    ts_arr, px = s
+   387	    if ts_arr.size == 0:
+   388	        return None
+   389	    i = int(np.searchsorted(ts_arr, ts_ms, side="right")) - 1
+   390	    if i < 0:
+   391	        return None
+   392	    if ts_ms - int(ts_arr[i]) > max_age_ms:
+   393	        return None
+   394	    v = px[i]
+   395	    return None if not np.isfinite(v) else float(v)
+   396	
+   397	
+   398	# Earliest ms at which a coin has ANY price (candle minute, else oracle ts). A coin cannot be
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '120,132p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   120	def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+   121	    """Pick the causal equity basis for one event, using ONLY data <= the event.
+   122	
+   123	    Per-segment drift and whole-window recon-PASS are NEVER consulted (look-ahead).
+   124	    """
+   125	    if not ee.has_past_anchor:
+   126	        return EquityBasis(
+   127	            mode="NO_ANCHOR", equity=None, equity_ts=None,
+   128	            anchor_ts=None, mark_ts=None, degraded=True,
+   129	            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+   130	        )
+   131	
+   132	    eq = ee.equity_post
+
+codex
+Verdict: pass. I found no remaining fail-open in the m02-facing `compute_event_equity` denominator path.
+
+All 3 findings are closed:
+
+- P1a: seeded and carry-in anchor-unmarkable positions set `anchor_snap_incomplete`, reset per anchor cycle, and emit `has_past_anchor=False` with NaN equity/cash. See [v15_m01_equity_reconstruct.py](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2157), [line 2201](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2201), [line 2250](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2250), [line 2264](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2264).
+- P1b: unknown ledger taint is causal by timestamp via `bisect_right`: `ts >= ts_u` tainted, earlier timestamps clean. See [line 2162](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2162).
+- P2: all mark sources reject NaN/inf, and the emission guard rejects non-finite `cash` or `whole_equity`. See [line 254](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:254), [line 318](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:318), [line 363](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:363), [line 395](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:395), [line 2325](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2325).
+
+M02 routing is correct: `has_past_anchor=False` maps directly to `NO_ANCHOR`, with `equity=None`, so these cases are unsizeable rather than degraded into `PARTIAL_MTM` or `ANCHOR_FALLBACK`. See [v15_m02_journey_trace.py](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:125).
+
+No new look-ahead or emission-guard regression found. The early `continue` happens only after applying the current event and computing its causal MTM state, then suppresses only the trusted anchored emission.
+
+Verification run:
+
+- `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15/test_m01_golden.py` → 5 passed
+- `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15/test_m02.py tests/v15/test_m02_golden.py` → 41 passed
+- `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15` → 405 passed
+
+OVERALL: yes, m01 is now look-ahead-safe and fail-CLOSED for the audited m02-facing EventEquity contract, ready to mark TRUSTED. Nothing remains from these findings.
+tokens used
+80.963
+Verdict: pass. I found no remaining fail-open in the m02-facing `compute_event_equity` denominator path.
+
+All 3 findings are closed:
+
+- P1a: seeded and carry-in anchor-unmarkable positions set `anchor_snap_incomplete`, reset per anchor cycle, and emit `has_past_anchor=False` with NaN equity/cash. See [v15_m01_equity_reconstruct.py](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2157), [line 2201](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2201), [line 2250](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2250), [line 2264](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2264).
+- P1b: unknown ledger taint is causal by timestamp via `bisect_right`: `ts >= ts_u` tainted, earlier timestamps clean. See [line 2162](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2162).
+- P2: all mark sources reject NaN/inf, and the emission guard rejects non-finite `cash` or `whole_equity`. See [line 254](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:254), [line 318](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:318), [line 363](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:363), [line 395](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:395), [line 2325](/Users/hermes/quants-lab/research/v15/v15_m01_equity_reconstruct.py:2325).
+
+M02 routing is correct: `has_past_anchor=False` maps directly to `NO_ANCHOR`, with `equity=None`, so these cases are unsizeable rather than degraded into `PARTIAL_MTM` or `ANCHOR_FALLBACK`. See [v15_m02_journey_trace.py](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:125).
+
+No new look-ahead or emission-guard regression found. The early `continue` happens only after applying the current event and computing its causal MTM state, then suppresses only the trusted anchored emission.
+
+Verification run:
+
+- `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15/test_m01_golden.py` → 5 passed
+- `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15/test_m02.py tests/v15/test_m02_golden.py` → 41 passed
+- `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15` → 405 passed
+
+OVERALL: yes, m01 is now look-ahead-safe and fail-CLOSED for the audited m02-facing EventEquity contract, ready to mark TRUSTED. Nothing remains from these findings.
