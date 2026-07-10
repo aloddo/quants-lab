@@ -51,6 +51,11 @@ def _make_inputs(n_entities=120, fold_id=1, *, uncalibrated=True, equity=None,
         "roe_engine": rng.normal(0.2, 0.5, n_entities),
         "slippage_uncalibrated": uncalibrated, "fee_unversioned": uncalibrated,
         "metadata_uncertain": False, "mode_uncertain": False,
+        # m07 window provenance (audit P0#1): must match the fold's [train_start, test_start).
+        "window_start_ms": pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000,
+        "window_end_ms": pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000,
+        # slippage version provenance (audit P1#4): calibrated runs carry the version M7 priced with.
+        "slippage_calibration_version": (None if uncalibrated else "v11-fills-v1"),
     })
     if tracking_error is not None:
         summ["tracking_error"] = float(tracking_error)

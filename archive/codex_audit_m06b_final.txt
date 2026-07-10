@@ -1,0 +1,1830 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c54-ef84-78c2-97e1-3d5ed7733abc
+--------
+user
+# Verify m06b final 2 fixes (P0#1 window provenance, P1#4 slippage version) -> m06b trusted?
+
+Earlier m06b audit: 5 findings. 3 fixed (fold-pure required, dup-key validate, nonfinite-score). The last 2 were
+unblocked by the m07 fix (m07 now emits window_start_ms/window_end_ms). Now applied. Read research/v15/v15_m06b_ranking.py.
+
+## Fixes
+- P0#1 M7-window provenance: in the provenance block, m06b now fails closed unless EVERY m07_summary row has
+  window_start_ms == train_start(fold) AND window_end_ms == test_start(fold). Missing columns -> fail closed
+  ("regenerate with current m07"). This proves the ranked metrics are the fold's PRETEST window, not a stale/test run.
+- P1#4 slippage version: investable now additionally requires every RANKABLE m07 row's slippage_calibration_version
+  == the manifest's claimed version (was only checking the CLI version is non-None). Mismatch/None -> not investable
+  + reason "slippage_version_mismatch".
+
+## Questions
+- P0#1: is the equality check correct (train_start/test_start in ms vs the m07 window_start/end)? Any fold that
+  could falsely pass/fail (dtype, NaN, fold not in folds)? Does it belong in the provenance block (before the merges)?
+- P1#4: is requiring version-match over RANKABLE rows correct + complete? Any path where a mismatched/None-version
+  run still gets investable=True? Interaction with the existing uncalibrated / slippage_uncalibrated checks?
+- Any new bug. 38 m06b + 5 golden + full v15 suite pass.
+
+## Output
+Verdict per fix. End OVERALL: with all 5 findings now fixed, is m06b TRUSTED (ranking + pool + investability), or what remains.
+codex
+I’ll inspect the ranking script and surrounding tests/contracts for the two patched paths, then I’ll give a review-style verdict focused on bypasses and false pass/fail cases.
+exec
+/bin/zsh -lc "sed -n '1,260p' research/v15/v15_m06b_ranking.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M6b -- Copyability-Adjusted FINAL Ranking (post-engine).
+
+Design (FROZEN): brain projects/quant/v15/modules/m06b (codex DESIGN-SHIP r3, Alberto greenlit
+2026-06-01). This module is the ONLY ranking that locks the V15 investable pool. It re-ranks the
+M6a high-recall shortlist on M7 AFTER-OUR-COST engine results computed FOLD-PRETEST-PURE on
+[train_start[k], test_start[k]) -- no OOS leak -- via a fully pre-registered spec, and emits the
+per-fold INVESTABLE POOL + a QUALITY-only weight. Raw source ROE never locks the pool (thesis 4b).
+
+SIZING CHAIN (one multiplier per module, applied in M9):
+  final_slice = quality_weight(M6b) x confidence(M4 alloc) x survival(M8 tier) x caps/anti-corr(M9)
+M6b owns ONLY quality_weight (does NOT multiply M4/M8 -- no double-count).
+
+PROVISIONAL vs FINAL (design §1): an M6b run on uncalibrated costs (slippage_uncalibrated or
+fee_unversioned True on its M7 input) is stamped investable=False (pipeline dry-run only). The FINAL
+investable pool reruns AFTER cost calibration, recording fee_schedule_version +
+slippage_calibration_version in the manifest.
+
+Run:
+  /Users/hermes/miniforge3/envs/quants-lab/bin/python research/v15/v15_m06b_ranking.py \
+      --m07-dir app/data/v15/m07_pretest --out app/data/v15
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger("m06b")
+
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15"
+MS_PER_DAY = 86_400_000
+
+# Pre-registered min CLOSED round-trips for an entity to be RANKABLE / pool-eligible (codex
+# finding): M7 emits realized_roe=0.0 / round_trip_win_rate=0.0 when n_round_trips==0, so an
+# open-only entity (zero closed round-trips) would otherwise look valid and rank/pool. The rank
+# basis is the after-cost REALIZED round-trip return; without enough closed round-trips that basis
+# is undefined/meaningless. Require >= this many closed round-trips to enter in_pool/quality_weight.
+MIN_ROUND_TRIPS = 5
+
+
+# --------------------------------------------------------------------------- #
+# FROZEN MANIFEST (design §3/§4/§5). Every constant here is pre-registered and
+# written verbatim into m06b_manifest.json BEFORE any OOS/M9/M10 run.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class M6bManifest:
+    manifest_version: str = "m06b-v2"
+    # Score coefficients (relative importances; NOT required to sum to 1 -- mixed scales).
+    # v2: return basis switched to M7 REALIZED round-trip ROE (was full-window MTM roe_engine);
+    #     win-rate term ADDED. New positive-weight vector sums to 0.95 (1.00 - 0.15 - 0.10 net of
+    #     the subtracted survivability penalty kept at its prior magnitude):
+    #       0.25 z_realized_roe + 0.20 z_calmar + 0.15 z_win_rate + 0.15 consistency
+    #       + 0.10 capacity_health + 0.10 fidelity - 0.15 survivability_penalty
+    w_realized_roe: float = 0.25
+    w_calmar: float = 0.20
+    w_win_rate: float = 0.15
+    w_consistency: float = 0.15
+    w_capacity_health: float = 0.10
+    w_fidelity: float = 0.10
+    w_survivability_penalty: float = 0.15  # subtracted
+    # calmar / winsor / fidelity
+    dd_floor: float = 0.05            # calmar = realized_roe / max(max_dd, dd_floor)
+    winsor_lo_pct: float = 1.0        # winsorize calmar + realized_roe at fold [p1, p99]
+    winsor_hi_pct: float = 99.0
+    fidelity_B: float = 0.25          # fidelity = 1 - clamp(tracking_error / B, 0, 1)  (M7 D5)
+    # consistency sub-split geometry (design §3): consecutive 14d blocks FROM train_start; trailing
+    # partial (<14d) DROPPED; sub-split ACTIVE iff >=1 journey opened AND >=5 fills in it.
+    block_days: int = 14
+    consistency_active_min_journeys: int = 1
+    consistency_active_min_fills: int = 5
+    consistency_min_active_subsplits: int = 2  # < this -> consistency = 0, not top-bucket eligible
+    # min-support to be RANKABLE
+    min_fills_pretest: int = 30
+    min_exposure_days: float = 3.0
+    min_active_subsplits_support: int = 2
+    # pool selection + G5
+    n_pool: int = 100
+    g5_min_active_pretest_folds: int = 3
+    g5_min_journeys_pretest: int = 5
+    # allocation -- quality weight only
+    bucket_weights: tuple = (5, 4, 3, 2, 1)   # quintile buckets, normalized to sum 1
+    n_buckets: int = 5
+    top_bucket_consistency_gate: float = 0.5  # bucket-1 entity with consistency < this -> demote 1
+    per_entity_quality_ceiling: float = 0.10  # pre-M9 ceiling = 10% of pool total
+    # provenance / provisional
+    informed_by: str = "pretest-distribution-only"
+    fee_schedule_version: Optional[str] = None
+    slippage_calibration_version: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+# INPUT LOADING (design §2: fold-pretest-pure; provenance fail-closed)
+# --------------------------------------------------------------------------- #
+def _read_parquet_maybe_parts(path: Path) -> pd.DataFrame:
+    """Read a parquet that may be a single file OR a `<name>.parts/` dir of shards (streaming I/O)."""
+    parts = path.parent / (path.name + ".parts")
+    if path.exists() and path.is_file():
+        return pd.read_parquet(path)
+    if parts.exists() and parts.is_dir():
+        shards = sorted(parts.glob("*.parquet"))
+        if not shards:
+            return pd.DataFrame()
+        return pd.concat((pd.read_parquet(s) for s in shards), ignore_index=True)
+    raise FileNotFoundError(f"neither {path} nor {parts} exists")
+
+
+def _load_m04_by_fold(m04_dir: Path, folds: pd.DataFrame, stem: str) -> pd.DataFrame:
+    parts = []
+    for fid in sorted(folds["fold_id"].astype(int).unique()):
+        p = m04_dir / f"{stem}_f{fid}.parquet"
+        if not p.exists():
+            raise FileNotFoundError(f"missing fold-pure M4 file for fold {fid}: {p}")
+        df = pd.read_parquet(p).copy()
+        df["fold_id"] = int(fid)
+        parts.append(df)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None) -> dict:
+    """Load the M7 pretest-window engine results + upstream M6a/M5/M4/M3 inputs.
+
+    Returns a dict of DataFrames. Provenance fail-closed checks happen in build_ranking once we
+    know each fold's test_start.
+    """
+    folds = pd.read_parquet(data_dir / "m03_folds.parquet")
+
+    m07_summary = _read_parquet_maybe_parts(m07_dir / "m07_summary.parquet")
+    # m07_fills only needed for exposure_time (per (entity,fold) our_ts span). Read lazily/aggregated.
+    fills_path = m07_dir / "m07_fills.parquet"
+
+    m06a = pd.read_parquet(data_dir / "m06a_shortlist.parquet")
+    m05 = pd.read_parquet(data_dir / "m05_eligibility.parquet")
+    if m04_dir is None:
+        logger.warning("LOUD WARNING: using single M4 authenticity/entities files for all folds; "
+                       "M6b M4 consumption is not fold-pure. Pass --m04-dir.")
+        m04_entities = pd.read_parquet(data_dir / "m04_entities.parquet")
+        # wallet -> entity_id map (for per-block journey-open counts from m02 when equity is present)
+        m04_auth = pd.read_parquet(data_dir / "m04_authenticity.parquet")
+        m04_fold_pure = False
+    else:
+        m04_entities = _load_m04_by_fold(m04_dir, folds, "m04_entities")
+        m04_auth = _load_m04_by_fold(m04_dir, folds, "m04_authenticity")
+        m04_fold_pure = True
+    m02_journeys_path = data_dir / "m02_journeys.parquet"
+
+    # optional: per-action equity path (FINAL consistency source). Absent in current shipped runner.
+    eq_path = m07_dir / "m07_equity.parquet"
+    m07_equity = None
+    try:
+        m07_equity = _read_parquet_maybe_parts(eq_path)
+        if m07_equity.empty:
+            m07_equity = None
+    except FileNotFoundError:
+        m07_equity = None
+
+    return {
+        "folds": folds,
+        "m07_summary": m07_summary,
+        "m07_fills_path": fills_path,
+        "m06a": m06a,
+        "m05": m05,
+        "m04_entities": m04_entities,
+        "m04_auth": m04_auth,
+        "m04_fold_pure": m04_fold_pure,
+        "m02_journeys_path": m02_journeys_path,
+        "m07_equity": m07_equity,
+    }
+
+
+def _exposure_days_from_fills(fills_path: Path, m07_dir: Path) -> pd.DataFrame:
+    """Per (entity_id, fold_id) exposure_time in days = (max our_ts - min our_ts)/day, from the M7
+    fills stream. Single streamed groupby; reads only the needed columns."""
+    df = _read_parquet_maybe_parts(fills_path)
+    if df.empty:
+        return pd.DataFrame(columns=["entity_id", "fold_id", "exposure_days"])
+    g = df.groupby(["entity_id", "fold_id"])["our_ts"].agg(["min", "max"]).reset_index()
+    g["exposure_days"] = (g["max"] - g["min"]) / MS_PER_DAY
+    return g[["entity_id", "fold_id", "exposure_days"]]
+
+
+# --------------------------------------------------------------------------- #
+# CONSISTENCY (design §3): per-sub-split (14d block from train_start) ENGINE after-cost ROE.
+# FINAL source = m07_equity per-block ROE. PROVISIONAL fallback = M6a source persistence (clearly
+# flagged non-final; provisional outputs are investable=False anyway).
+# --------------------------------------------------------------------------- #
+def _blocks_activity(fills_path, m02_journeys_path: Path, m04_auth: pd.DataFrame,
+                     folds: pd.DataFrame, m: M6bManifest) -> pd.DataFrame:
+    """Per (entity_id, fold_id, block_idx) -> n_fills + n_journeys, for the consistency activeness
+    test (active iff >= min_journeys opened AND >= min_fills in the block). Blocks are consecutive
+    14d windows FROM train_start within the pretest [train_start, test_start); trailing partial
+    (block_idx >= n_full) is excluded by the consumer. Only computed when m07_equity is present
+    (FINAL path); the provisional path uses M6a source persistence and does not call this.
+
+    fills_path: m07 fills (entity_id, fold_id, our_ts) -> per-block n_fills (engine fills).
+    m02 journeys (wallet, entry_ts) mapped to entity via m04_auth (wallet->entity_id) -> per-block
+    journey OPENS (entry_ts in block), assigned to every fold whose pretest window contains entry_ts.
+    """
+    block_ms = m.block_days * MS_PER_DAY
+    fold_win = [(int(r.fold_id), pd.Timestamp(r.train_start).value // 1_000_000,
+                 pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()]
+
+    # --- fills per (entity, fold, block) ---
+    fdf = fills_path if isinstance(fills_path, pd.DataFrame) else _read_parquet_maybe_parts(fills_path)
+    f_rows = []
+    if not fdf.empty:
+        fdf = fdf[["entity_id", "fold_id", "our_ts"]].copy()
+        for fid, t0, t1 in fold_win:
+            sub = fdf[fdf.fold_id == fid]
+            if sub.empty:
+                continue
+            blk = ((sub["our_ts"] - t0) // block_ms).astype(int)
+            sub = sub.assign(block_idx=blk)
+            sub = sub[(sub["our_ts"] >= t0) & (sub["our_ts"] < t1)]
+            g = sub.groupby(["entity_id", "block_idx"]).size().reset_index(name="n_fills_block")
+            g["fold_id"] = fid
+            f_rows.append(g)
+    fills_blocks = (pd.concat(f_rows, ignore_index=True) if f_rows
+                    else pd.DataFrame(columns=["entity_id", "block_idx", "n_fills_block", "fold_id"]))
+
+    # --- journey opens per (entity, fold, block) from m02 entry_ts ---
+    has_fold_m04 = "fold_id" in m04_auth.columns
+    if has_fold_m04:
+        w2e_by_fold = {int(fid): g[["wallet", "entity_id"]].drop_duplicates("wallet")
+                       for fid, g in m04_auth.groupby("fold_id")}
+        w2e = None
+    else:
+        w2e = m04_auth[["wallet", "entity_id"]].drop_duplicates("wallet")
+        w2e_by_fold = {}
+    j_rows = []
+    try:
+        jdf = _read_parquet_maybe_parts(Path(m02_journeys_path)) if not isinstance(
+            m02_journeys_path, pd.DataFrame) else m02_journeys_path
+        validity = {"lifecycle_valid", "stream_replay_valid"}
+        if not validity.issubset(jdf.columns):
+            if not isinstance(m02_journeys_path, pd.DataFrame):
+                raise ValueError(
+                    "M02 journeys lack lifecycle/stream replay validity; rebuild M2"
+                )
+        else:
+            jdf = jdf[
+                jdf["lifecycle_valid"].fillna(False).astype(bool)
+                & jdf["stream_replay_valid"].fillna(False).astype(bool)
+            ].copy()
+        jdf = jdf[["wallet", "entry_ts"]].copy()
+        for fid, t0, t1 in fold_win:
+            mapper = w2e_by_fold.get(int(fid), pd.DataFrame(columns=["wallet", "entity_id"])) \
+                if has_fold_m04 else w2e
+            sub = jdf[(jdf["entry_ts"] >= t0) & (jdf["entry_ts"] < t1)].merge(
+                mapper, on="wallet", how="inner")
+            if sub.empty:
+                continue
+            blk = ((sub["entry_ts"] - t0) // block_ms).astype(int)
+            sub = sub.assign(block_idx=blk, fold_id=fid)
+            g = sub.groupby(["entity_id", "fold_id", "block_idx"]).size().reset_index(
+
+exec
+/bin/zsh -lc "sed -n '260,620p' research/v15/v15_m06b_ranking.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            g = sub.groupby(["entity_id", "fold_id", "block_idx"]).size().reset_index(
+                name="n_journeys_block")
+            j_rows.append(g)
+    except (FileNotFoundError, KeyError):
+        pass
+    journeys_blocks = (pd.concat(j_rows, ignore_index=True) if j_rows
+                       else pd.DataFrame(columns=["entity_id", "fold_id", "block_idx", "n_journeys_block"]))
+
+    out = fills_blocks.merge(journeys_blocks, on=["entity_id", "fold_id", "block_idx"], how="outer")
+    out["n_fills_block"] = out["n_fills_block"].fillna(0).astype(int)
+    out["n_journeys_block"] = out["n_journeys_block"].fillna(0).astype(int)
+    return out
+
+
+def _consistency_from_equity(equity: pd.DataFrame, folds: pd.DataFrame,
+                             m: M6bManifest, blocks_activity: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """consistency = (# active sub-splits with block roe_adj>0) / (# active sub-splits).
+    A sub-split is ACTIVE iff >= min_journeys opened AND >= min_fills in it. Block roe_adj = engine
+    after-cost ROE on that block = eq[block_end]/eq[block_start] - 1.
+
+    NOTE: activeness needs per-block journey + fill counts. fills_blocks (per entity,fold,block ->
+    n_fills, n_journeys) supplies them; when unavailable we fall back to fill-count-only activeness
+    from the equity sample density (conservative: still requires the block to carry >=min_fills
+    equity-action samples).
+    """
+    rows = []
+    fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
+                                 pd.Timestamp(r.test_start).value // 1_000_000)
+                for r in folds.itertuples()}
+    block_ms = m.block_days * MS_PER_DAY
+    # (entity, fold, block) -> (n_fills_block, n_journeys_block) for the activeness test.
+    ba = {}
+    keys_act = set()
+    if blocks_activity is not None and not blocks_activity.empty:
+        for r in blocks_activity.itertuples():
+            ba[(int(r.entity_id), int(r.fold_id), int(r.block_idx))] = (
+                int(r.n_fills_block), int(r.n_journeys_block))
+            keys_act.add((int(r.entity_id), int(r.fold_id)))
+    # equity grouped for O(1) lookup; iterate the UNION of (entity,fold) from blocks_activity AND
+    # equity (codex r3 #1: an entity active by fills+journeys but with NO equity rows must still get
+    # active=N, positive=0, consistency=0 -- fail-closed, never silently absent).
+    eq_groups = {(int(k[0]), int(k[1])): g for k, g in equity.groupby(["entity_id", "fold_id"])} \
+        if not equity.empty else {}
+    all_keys = sorted(keys_act | set(eq_groups.keys()))  # sorted -> deterministic row order
+    for (eid, fid) in all_keys:
+        if int(fid) not in fold_win:
+            continue
+        t0, t1 = fold_win[int(fid)]
+        grp = eq_groups.get((int(eid), int(fid)))
+        anchor_ts = anchor_eq = None
+        if grp is not None and not grp.empty:
+            grp = grp.sort_values("ts")
+            ts = grp["ts"].to_numpy()
+            eq = grp["subaccount_equity"].to_numpy()
+            # D4: per-block ROE uses the EXACT boundary anchors (fold_start/block_boundary/fold_end),
+            # via nearest-at-or-before lookup -- NOT within-block first/last (which excludes the exact
+            # block-end sample). Fall back to within-block only when no anchors exist (synthetic equity).
+            if "event_flag" in grp.columns:
+                am = grp["event_flag"].isin(["fold_start", "block_boundary", "fold_end"]).to_numpy()
+                if am.any():
+                    anchor_ts = ts[am]
+                    anchor_eq = eq[am]
+        else:
+            ts = np.empty(0, dtype="int64")
+            eq = np.empty(0, dtype="float64")
+        # consecutive 14d blocks FROM train_start; drop trailing partial (<14d). The ACTIVE
+        # denominator is driven by _blocks_activity (fills+journeys), NOT by equity-sample presence
+        # (codex r2 #A: skipping equity-empty blocks biased consistency upward). A block that is
+        # active by nf/nj counts in the denominator; it is POSITIVE only if equity actually covers
+        # it AND its after-cost block ROE > 0 (an active block with no equity coverage = no
+        # measurable positive ROE = NOT positive; conservative, no leak).
+        n_full = int((t1 - t0) // block_ms)
+        active = 0
+        positive = 0
+        for b in range(n_full):
+            nf, nj = ba.get((int(eid), int(fid), b), (0, 0))
+            if nf < m.consistency_active_min_fills or nj < m.consistency_active_min_journeys:
+                continue  # block not active -> excluded from BOTH numerator and denominator
+            active += 1
+            b0 = t0 + b * block_ms
+            b1 = t0 + (b + 1) * block_ms
+            if anchor_ts is not None and anchor_ts.size:
+                # D4: anchor-to-anchor block ROE = eq_anchor(b1)/eq_anchor(b0) - 1.
+                i0 = int(np.searchsorted(anchor_ts, b0, side="right")) - 1
+                i1 = int(np.searchsorted(anchor_ts, b1, side="right")) - 1
+                if i0 >= 0 and i1 >= 0:
+                    e0, e1 = float(anchor_eq[i0]), float(anchor_eq[i1])
+                    if e0 > 0 and (e1 / e0 - 1.0) > 0:
+                        positive += 1
+            else:
+                mask = (ts >= b0) & (ts < b0 + block_ms)
+                if mask.any():
+                    eq_in = eq[mask]
+                    if eq_in[0] > 0 and (eq_in[-1] / eq_in[0] - 1.0) > 0:
+                        positive += 1
+        cons = 0.0 if active < m.consistency_min_active_subsplits else positive / active
+        rows.append({"entity_id": int(eid), "fold_id": int(fid),
+                     "consistency": cons, "n_active_subsplits": active,
+                     "consistency_source": "m07_equity_block_roe"})
+    return pd.DataFrame(rows)
+
+
+def _consistency_provisional(m06a: pd.DataFrame) -> pd.DataFrame:
+    """PROVISIONAL fallback when m07_equity is absent. Uses M6a source persistence
+    (active_blocks/possible_blocks) as a SOURCE proxy for cross-sub-split repeatability. Flagged
+    non-final: provisional M6b is investable=False, so this never reaches LP/live evidence."""
+    df = m06a[["entity_id", "fold_id", "active_blocks", "possible_blocks"]].copy()
+    poss = df["possible_blocks"].clip(lower=1)
+    df["consistency"] = (df["active_blocks"] / poss).clip(0, 1).fillna(0.0)
+    df["n_active_subsplits"] = df["active_blocks"].fillna(0).astype(int)
+    df["consistency_source"] = "m6a_source_persistence_PROVISIONAL"
+    return df[["entity_id", "fold_id", "consistency", "n_active_subsplits", "consistency_source"]]
+
+
+# --------------------------------------------------------------------------- #
+# SCORING
+# --------------------------------------------------------------------------- #
+def _winsorize(s: pd.Series, lo_pct: float, hi_pct: float) -> pd.Series:
+    if s.notna().sum() == 0:
+        return s
+    lo = np.nanpercentile(s, lo_pct)
+    hi = np.nanpercentile(s, hi_pct)
+    return s.clip(lower=lo, upper=hi)
+
+
+def _zscore(s: pd.Series) -> pd.Series:
+    mu = s.mean()
+    sd = s.std(ddof=0)
+    if not np.isfinite(sd) or sd == 0:
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s - mu) / sd
+
+
+def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
+    """Core M6b pipeline. Returns (pool_df, manifest_dict)."""
+    folds = inputs["folds"]
+    summ = inputs["m07_summary"].copy()
+    m06a = inputs["m06a"].copy()
+    m05 = inputs["m05"].copy()
+    m04e = inputs["m04_entities"].copy()
+
+    # --- provenance: per-fold pretest-pure. M6a/M5 carry as_of_ms; refuse any input stamped AFTER
+    #     test_start[k] (fixes r1#9 -- no inherited survivor bias / no leak). ---
+    fold_test_start_ms = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000
+                          for r in folds.itertuples()}
+    provenance_fail = []
+    prov_inputs = [("m06a", m06a), ("m05", m05)]
+    if inputs.get("m04_fold_pure"):
+        prov_inputs.extend([("m04_entities", m04e), ("m04_auth", inputs["m04_auth"])])
+    for nm, df in prov_inputs:
+        if "as_of_ms" not in df.columns:
+            provenance_fail.append(f"{nm}:no_as_of_ms_column")
+            continue
+        if nm.startswith("m04") and "fold_id" not in df.columns:
+            provenance_fail.append(f"{nm}:no_fold_id_column")
+            continue
+        # require PRESENT + non-null as_of_ms for every row (missing provenance is not provenance-OK)
+        n_null = int(df["as_of_ms"].isna().sum())
+        if n_null:
+            provenance_fail.append(f"{nm}:{n_null}_rows_null_as_of_ms")
+        ts_start = df["fold_id"].map(fold_test_start_ms)
+        if ts_start.isna().any():
+            provenance_fail.append(f"{nm}:{int(ts_start.isna().sum())}_rows_unknown_fold")
+        if nm.startswith("m04"):
+            bad = (df["as_of_ms"].astype("float64") != ts_start.astype("float64")).fillna(False)
+            if bad.any():
+                provenance_fail.append(f"{nm}:{int(bad.sum())}_rows_as_of_not_equal_test_start")
+        else:
+            bad = (df["as_of_ms"].astype("float64") > ts_start.astype("float64")).fillna(False)
+            if bad.any():
+                provenance_fail.append(f"{nm}:{int(bad.sum())}_rows_post_test_start")
+    # AUDIT 2026-07-10 (codex m06b P0#1, enabled by m07 P0#2 window metadata): PROVE the M7 metrics we rank on
+    # were generated for the fold's PRETEST window [train_start, test_start), not a stale/test-window run. Every
+    # m07_summary row must carry window_start_ms == train_start and window_end_ms == test_start for its fold.
+    fold_train_start_ms = {int(r.fold_id): pd.Timestamp(r.train_start).value // 1_000_000 for r in folds.itertuples()}
+    if "window_start_ms" not in summ.columns or "window_end_ms" not in summ.columns:
+        provenance_fail.append("m07_summary:no_window_provenance(regenerate with current m07 engine)")
+    else:
+        _ws = pd.to_numeric(summ["window_start_ms"], errors="coerce")
+        _we = pd.to_numeric(summ["window_end_ms"], errors="coerce")
+        _ews = summ["fold_id"].map(fold_train_start_ms).astype("float64")
+        _ewe = summ["fold_id"].map(fold_test_start_ms).astype("float64")
+        _bad = ((_ws.astype("float64") != _ews) | (_we.astype("float64") != _ewe)).fillna(True)
+        if _bad.any():
+            provenance_fail.append(f"m07_summary:{int(_bad.sum())}_rows_window!=[train_start,test_start) "
+                                   f"(test-window or stale m07 run -> look-ahead)")
+    if provenance_fail:
+        raise ValueError(f"M6b PROVENANCE FAIL-CLOSED: {provenance_fail}")
+
+    # --- engine after-cost results per (entity,fold) ---
+    summ = summ.rename(columns={"max_dd": "max_dd_pretest"})
+    summ["capacity_capped_frac"] = summ["n_capacity_capped"] / summ["n_actions"].clip(lower=1)
+    summ["account_ruin"] = summ["ruin"].astype(int)
+    # uncalibrated-cost flags -> drives provisional/FINAL
+    uncalibrated = bool(summ["slippage_uncalibrated"].any() or summ["fee_unversioned"].any())
+
+    # --- RETURN BASIS (v2): rank on M7 REALIZED round-trip ROE, NOT full-window MTM roe_engine.
+    #     The M7 engine emits realized_roe over CLEAN round-trips (realized_pnl_total / start_equity).
+    #     Fall back to roe_engine ONLY when realized_roe is absent, flagged per-run + per-row so a
+    #     fallback never silently masquerades as the realized basis. ---
+    has_realized = "realized_roe" in summ.columns
+    if has_realized:
+        realized = pd.to_numeric(summ["realized_roe"], errors="coerce")
+        summ["roe_adj"] = realized
+        # rows where realized_roe is NaN but roe_engine exists fall back per-row (flagged)
+        if "roe_engine" in summ.columns:
+            fb_mask = summ["roe_adj"].isna() & summ["roe_engine"].notna()
+            summ.loc[fb_mask, "roe_adj"] = pd.to_numeric(
+                summ.loc[fb_mask, "roe_engine"], errors="coerce")
+        summ["return_basis"] = np.where(realized.notna(), "realized_roe", "roe_engine_fallback")
+        return_basis_fallback = bool((summ["return_basis"] == "roe_engine_fallback").any())
+    else:
+        summ["roe_adj"] = pd.to_numeric(summ.get("roe_engine"), errors="coerce")
+        summ["return_basis"] = "roe_engine_fallback"
+        return_basis_fallback = True
+    # round-trip win-rate term (v2). Absent -> NaN (treated as missing realized metrics downstream).
+    if "round_trip_win_rate" in summ.columns:
+        summ["round_trip_win_rate"] = pd.to_numeric(summ["round_trip_win_rate"], errors="coerce")
+    else:
+        summ["round_trip_win_rate"] = np.nan
+    # whether the engine actually reported closed round-trips (drives the MIN_ROUND_TRIPS gate).
+    # When the column is entirely absent (legacy / pure roe_engine provisional input -- no realized
+    # round-trip accounting at all), the gate cannot apply; an open-only entity in a REAL M7 v2 run
+    # always carries n_round_trips (0 for open-only) and is therefore gated.
+    has_n_round_trips = "n_round_trips" in summ.columns
+    for c in ("n_round_trips", "n_round_trip_wins", "realized_pnl_total"):
+        if c not in summ.columns:
+            summ[c] = np.nan
+
+    # --- exposure_time from fills (min-support) ---
+    exposure = _exposure_days_from_fills(inputs["m07_fills_path"], None)
+
+    # --- consistency. FINAL path = M7 equity per-block ROE (activeness from per-block fills+journeys).
+    #     PROVISIONAL path (no equity) = M6a source persistence, flagged non-final. ---
+    if inputs["m07_equity"] is not None:
+        blocks_act = _blocks_activity(inputs["m07_fills_path"], inputs["m02_journeys_path"],
+                                      inputs["m04_auth"], folds, m)
+        cons = _consistency_from_equity(inputs["m07_equity"], folds, m, blocks_act)
+    else:
+        cons = _consistency_provisional(m06a)
+
+    # --- eligibility (M5 pass as-of k) ---
+    elig = m05[["entity_id", "fold_id", "eligible"]].rename(columns={"eligible": "m5_eligible"})
+
+    # --- M6a provenance/copyability + n_journeys + tier + alloc + G5 fields.
+    #     active_pretest_folds = # active 14d pretest sub-splits (m06a active_blocks), NOT
+    #     active_test_folds (post-test_start info -> look-ahead). G5 uses active_pretest_folds. ---
+    m6a_cols = m06a[["entity_id", "fold_id", "copyable", "rankable", "n_journeys_pretest",
+                     "m4_tier", "entity_alloc_weight", "active_blocks",
+                     "g5_pool_candidate_pass"]].copy()
+    m6a_cols = m6a_cols.rename(columns={"active_blocks": "active_pretest_folds"})
+
+    # --- assemble: UNIVERSE = M6a (every shortlist row), LEFT-join M7 engine results. A M6a row with
+    #     no M7 row stays in the output with roe_adj NaN -> excluded (missing_m07_row), never dropped. ---
+    # AUDIT 2026-07-10 (codex P0#3): validate="one_to_one" on every fold-keyed merge. A duplicate
+    # (entity_id, fold_id) row in ANY input (m6a/summ/elig/cons/exposure) would multiply the universe row and
+    # could hand one entity TWO pool slots via head(n_pool), displacing the legitimate #N. Fail closed on dups.
+    df = m6a_cols.merge(summ, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    df = df.merge(elig, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    df = df.merge(cons, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    df = df.merge(exposure, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    df["exposure_days"] = df["exposure_days"].fillna(0.0)
+    df["consistency"] = df["consistency"].fillna(0.0)
+    df["n_active_subsplits"] = df["n_active_subsplits"].fillna(0).astype(int)
+    df["consistency_source"] = df["consistency_source"].fillna(
+        "unavailable" if inputs["m07_equity"] is None else "m07_equity_block_roe")
+
+    # --- M4 copyable from entities (KILL/no-primary -> not copyable). m6a copyable already encodes it
+    #     but cross-check against m04_entities as the authority. ---
+    if inputs.get("m04_fold_pure") and "fold_id" in m04e.columns:
+        ent_copy = m04e[["entity_id", "fold_id", "copyable"]].rename(columns={"copyable": "entity_copyable"})
+        df = df.merge(ent_copy, on=["entity_id", "fold_id"], how="left", validate="one_to_one")  # codex P0#3
+    else:
+        ent_copy = m04e[["entity_id", "copyable"]].rename(columns={"copyable": "entity_copyable"})
+        # global M4 has one row per entity; df is many folds per entity -> many_to_one (fails on dup m04e).
+        df = df.merge(ent_copy, on="entity_id", how="left", validate="many_to_one")  # codex P0#3
+    df["entity_copyable"] = df["entity_copyable"].fillna(False)
+
+    # --- fidelity: needs tracking_error from M7 summary. Absent column OR NaN/inf value -> UNKNOWN.
+    #     Real fidelity only where tracking_error is finite (codex r2 #B: a present-but-NaN column
+    #     must not pass as real; flagged PER ROW). FIX (v2): an unknown-fidelity row is filled with the
+    #     FOLD MEAN of the known fidelities -- NOT the max (1.0). NaN->1.0 advantaged unknown rows
+    #     (best-possible fidelity, a free top-bucket boost). Fold-mean is neutral within the fold (no
+    #     advantage, no penalty). When a fold has NO known fidelities the term contributes 0 there.
+    #     Provisional rows still block investability via fidelity_source regardless of the fill value. ---
+    if "tracking_error" in df.columns:
+        te = pd.to_numeric(df["tracking_error"], errors="coerce")
+        te_finite = np.isfinite(te.to_numpy(dtype="float64"))  # rejects NaN AND +/-inf
+        real_fid = (1.0 - (te / m.fidelity_B).clip(0, 1)).where(te_finite)
+        df["fidelity"] = real_fid
+        df["fidelity_source"] = np.where(te_finite, "m07_tracking_error", "unavailable_provisional")
+        # fill unknown rows with the per-fold mean of KNOWN fidelities (neutral within fold)
+        fold_mean = df.groupby("fold_id")["fidelity"].transform("mean")
+        df["fidelity"] = df["fidelity"].fillna(fold_mean).fillna(0.0)
+    else:
+        # no tracking_error column at all -> no known fidelity anywhere -> term contributes 0.
+        df["fidelity"] = 0.0
+        df["fidelity_source"] = "unavailable_provisional"
+
+    df["capacity_health"] = 1.0 - df["capacity_capped_frac"].clip(0, 1)
+    nj = df["n_journeys_pretest"].clip(lower=1)
+    df["survivability_penalty"] = ((df["n_backstop_transfer"] + 2 * df["account_ruin"]) / nj).clip(0, 1)
+    df["calmar"] = df["roe_adj"] / df["max_dd_pretest"].clip(lower=m.dd_floor)
+
+    # --- RANKABLE eligibility (design §3): M5-pass + M4-copyable + provenance OK + MIN-SUPPORT. ---
+    # n_round_trips gate (codex finding): an entity with < MIN_ROUND_TRIPS CLOSED round-trips has
+    # no meaningful realized after-cost return basis (M7 emits 0.0 realized metrics when
+    # n_round_trips==0), so it must NOT be rankable / enter the pool. Applies whenever the engine
+    # reported round-trip accounting (column present in the M7 summary); for entities present in M7
+    # the NaN-or-below case fails. When the column is entirely absent (legacy/provisional input with
+    # no round-trip accounting) the gate is a no-op (all True) so dry-runs still rank.
+    n_round_trips = pd.to_numeric(df["n_round_trips"], errors="coerce")
+    round_trip_gate = (n_round_trips >= MIN_ROUND_TRIPS) if has_n_round_trips \
+        else pd.Series(True, index=df.index)
+    rankable = (
+        df["m5_eligible"].fillna(False)
+        & df["entity_copyable"]
+        & (df["n_fills"] >= m.min_fills_pretest)
+        & (df["exposure_days"] >= m.min_exposure_days)
+        & (df["n_active_subsplits"] >= m.min_active_subsplits_support)
+        & round_trip_gate
+        & df["roe_adj"].notna() & df["max_dd_pretest"].notna()
+        # AUDIT 2026-07-10 (codex P1#5): ALL score inputs must be finite. capacity_health / survivability_penalty
+        # derive from capacity_capped_frac / n_backstop_transfer / account_ruin; a NaN there makes m6b_score NaN,
+        # and the pool cut (`& m6b_score.notna()`) would SILENTLY drop a "rankable" row with a blank reason.
+        # Require them finite here so such a row is explicitly excluded (data-gap), not vanished.
+        & np.isfinite(pd.to_numeric(df["capacity_health"], errors="coerce").to_numpy(dtype="float64"))
+        & np.isfinite(pd.to_numeric(df["survivability_penalty"], errors="coerce").to_numpy(dtype="float64"))
+    )
+    df["m6b_rankable"] = rankable
+    excl = []
+    for _, r in df.iterrows():
+        if r["m6b_rankable"]:
+            excl.append("")
+            continue
+        reasons = []
+        if not bool(r["m5_eligible"]):
+            reasons.append("m5_ineligible")
+        if not bool(r["entity_copyable"]):
+            reasons.append("not_copyable")
+        if r["n_fills"] < m.min_fills_pretest:
+            reasons.append(f"n_fills<{m.min_fills_pretest}")
+        if r["exposure_days"] < m.min_exposure_days:
+            reasons.append(f"exposure<{m.min_exposure_days}d")
+        if r["n_active_subsplits"] < m.min_active_subsplits_support:
+            reasons.append("active_subsplits<2")
+        if has_n_round_trips:
+            _nrt = pd.to_numeric(pd.Series([r["n_round_trips"]]), errors="coerce").iloc[0]
+            if pd.isna(_nrt) or _nrt < MIN_ROUND_TRIPS:
+                reasons.append(f"n_round_trips<{MIN_ROUND_TRIPS}")
+        if pd.isna(r["roe_adj"]) or pd.isna(r["max_dd_pretest"]):
+            reasons.append("missing_m07_row")
+        if not np.isfinite(pd.to_numeric(pd.Series([r["capacity_health"]]), errors="coerce").iloc[0]) \
+                or not np.isfinite(pd.to_numeric(pd.Series([r["survivability_penalty"]]), errors="coerce").iloc[0]):
+            reasons.append("nonfinite_score_component")  # codex P1#5: was a silent blank-reason drop
+        excl.append("|".join(reasons) or "excluded")
+    df["excluded_reason"] = excl
+
+    # --- per-fold winsorize + z-score over RANKABLE entities, then frozen score ---
+    out_parts = []
+    for fid, g in df.groupby("fold_id"):
+
+exec
+/bin/zsh -lc "rg -n \"window_start_ms|window_end_ms|slippage_calibration_version|slippage_version_mismatch|investable|m07_summary|train_start|test_start\" research/v15 tests -g '*.py'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_slippage_calib.py:1:"""V15 slippage calibration from V11 real HL fills -> slippage_calibration_version = "v11-fills-v1".
+research/v15/v15_slippage_calib.py:16:AS-OF PURITY: per fold k, the calibration uses ONLY V11 fills with ts <= test_start[k] (no leak).
+research/v15/v15_slippage_calib.py:147:def calibrate(slipped: pd.DataFrame, fold_test_start_ms: dict[int, int],
+research/v15/v15_slippage_calib.py:203:    for k, ts in sorted(fold_test_start_ms.items()):
+research/v15/v15_slippage_calib.py:257:    fold_test_start_ms = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000
+research/v15/v15_slippage_calib.py:259:    calib = calibrate(slipped, fold_test_start_ms, coin_universe=universe, adv_map=adv_map)
+tests/v15/test_m06b_golden.py:4:- P0#2: a run on NON-fold-pure (global, look-ahead) M4 is never stamped investable.
+tests/v15/test_m06b_golden.py:20:def test_p0_2_global_m04_not_investable(_patch_exposure):
+tests/v15/test_m06b_golden.py:21:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b_golden.py:24:    # SAME inputs that are investable with fold-pure M4, but here fold_pure=False (global look-ahead M4).
+tests/v15/test_m06b_golden.py:28:    assert manifest["investable"] is False
+tests/v15/test_m06b_golden.py:29:    assert any("m04_not_fold_pure" in r for r in manifest["non_investable_reasons"])
+tests/v15/test_m06b_golden.py:33:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b_golden.py:39:    inp["m07_summary"] = pd.concat([inp["m07_summary"], inp["m07_summary"].iloc[[0]]], ignore_index=True)
+tests/v15/test_m06b_golden.py:46:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b_golden.py:51:    summ = inp["m07_summary"]
+tests/v15/test_m06b_golden.py:62:    # m07 rows stamped with a window != the fold's [train_start,test_start) (e.g. a stale TEST run) -> fail closed.
+tests/v15/test_m06b_golden.py:63:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b_golden.py:68:    inp["m07_summary"]["window_end_ms"] = inp["m07_summary"]["window_end_ms"] + 14 * 86_400_000  # shove into test window
+tests/v15/test_m06b_golden.py:73:def test_p1_4_slippage_version_mismatch_not_investable(_patch_exposure):
+tests/v15/test_m06b_golden.py:74:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b_golden.py:79:    inp["m07_summary"]["slippage_calibration_version"] = "SOME-OTHER-VERSION"  # not what the manifest claims
+tests/v15/test_m06b_golden.py:81:    assert manifest["investable"] is False
+tests/v15/test_m06b_golden.py:82:    assert any("slippage_version_mismatch" in r for r in manifest["non_investable_reasons"])
+tests/v15/test_m06b.py:24:        train_start = base + pd.Timedelta(days=14 * (k - 1))
+tests/v15/test_m06b.py:25:        test_start = train_start + pd.Timedelta(days=56)   # 42 train + 14 val = 4 x 14d blocks
+tests/v15/test_m06b.py:27:            "fold_id": k, "train_start": train_start, "test_start": test_start,
+tests/v15/test_m06b.py:28:            "test_end_excl": test_start + pd.Timedelta(days=14),
+tests/v15/test_m06b.py:38:    ts_asof = pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000 - 1000
+tests/v15/test_m06b.py:54:        # m07 window provenance (audit P0#1): must match the fold's [train_start, test_start).
+tests/v15/test_m06b.py:55:        "window_start_ms": pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000,
+tests/v15/test_m06b.py:56:        "window_end_ms": pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000,
+tests/v15/test_m06b.py:58:        "slippage_calibration_version": (None if uncalibrated else "v11-fills-v1"),
+tests/v15/test_m06b.py:89:        # fold-pure per-fold M4 carries fold_id + as_of_ms == test_start (m06b provenance requirement).
+tests/v15/test_m06b.py:90:        test_start_ms = pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000
+tests/v15/test_m06b.py:93:            _d["as_of_ms"] = test_start_ms
+tests/v15/test_m06b.py:94:    t0 = pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000
+tests/v15/test_m06b.py:114:        "folds": folds, "m07_summary": summ, "m07_fills_path": fills,  # path slots hold DFs for tests
+tests/v15/test_m06b.py:116:        "m04_fold_pure": fold_pure,  # audit 2026-07-10 P0#2: investable requires fold-pure M4
+tests/v15/test_m06b.py:229:    # stamp m06a as_of AFTER test_start -> must raise
+tests/v15/test_m06b.py:230:    bad_asof = pd.Timestamp(inp["folds"].loc[0, "test_start"]).value // 1_000_000 + 10_000
+tests/v15/test_m06b.py:239:    assert manifest["investable"] is False
+tests/v15/test_m06b.py:240:    assert bool(out["investable"].iloc[0]) is False
+tests/v15/test_m06b.py:247:    t0 = pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000
+tests/v15/test_m06b.py:260:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b.py:264:    # -> investable=True
+tests/v15/test_m06b.py:266:                       realized=True, fold_pure=True)   # audit P0#2: investable requires fold-pure M4
+tests/v15/test_m06b.py:271:    assert manifest["investable"] is True
+tests/v15/test_m06b.py:272:    assert bool(out["investable"].iloc[0]) is True
+tests/v15/test_m06b.py:276:    # codex r1 #5: calibrated costs but NO equity block consistency must NOT be investable.
+tests/v15/test_m06b.py:277:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b.py:280:    assert manifest["investable"] is False
+tests/v15/test_m06b.py:281:    assert any("consistency_provisional" in r for r in manifest["non_investable_reasons"])
+tests/v15/test_m06b.py:286:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b.py:290:    inp["m07_summary"].loc[inp["m07_summary"].entity_id.isin([0, 1, 2]), "tracking_error"] = np.nan
+tests/v15/test_m06b.py:292:    assert manifest["investable"] is False
+tests/v15/test_m06b.py:293:    assert any("fidelity_provisional" in r for r in manifest["non_investable_reasons"])
+tests/v15/test_m06b.py:300:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b.py:304:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 0, "tracking_error"] = np.inf
+tests/v15/test_m06b.py:306:    assert manifest["investable"] is False
+tests/v15/test_m06b.py:315:    t0 = pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000
+tests/v15/test_m06b.py:352:    # codex r1 #4: missing tracking_error (neutral fidelity) must NOT be investable.
+tests/v15/test_m06b.py:353:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b.py:358:    assert manifest["investable"] is False
+tests/v15/test_m06b.py:359:    assert any("fidelity_provisional" in r for r in manifest["non_investable_reasons"])
+tests/v15/test_m06b.py:371:    t0 = pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000
+tests/v15/test_m06b.py:392:    t0 = pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000
+tests/v15/test_m06b.py:406:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 0, "roe_engine"] = 100.0
+tests/v15/test_m06b.py:407:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 0, "max_dd"] = 0.05
+tests/v15/test_m06b.py:418:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 5, "roe_engine"] = np.nan
+tests/v15/test_m06b.py:429:    inp["m07_summary"] = inp["m07_summary"][inp["m07_summary"].entity_id != 7].copy()
+tests/v15/test_m06b.py:491:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:516:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:528:def test_investable_requires_realized_metrics():
+tests/v15/test_m06b.py:529:    # calibrated + real fidelity + real consistency but NO realized round-trip metrics -> NOT investable.
+tests/v15/test_m06b.py:530:    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+tests/v15/test_m06b.py:536:    assert manifest["investable"] is False
+tests/v15/test_m06b.py:537:    assert any("realized_metrics_missing" in r for r in manifest["non_investable_reasons"])
+tests/v15/test_m06b.py:544:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:558:    # global investable stamp.
+tests/v15/test_m06b.py:561:    summ = inp["m07_summary"]
+tests/v15/test_m06b.py:586:    # active_test_folds is post-test_start leak info -> must be dropped from output columns.
+research/v15/v15_m09_sim.py:414:        t0 = pd.Timestamp(fr.test_start).value // 1_000_000
+research/v15/v15_m09_sim.py:416:        # PRETEST (causal) window [train_start_k, test_start_k) -- the SAME look-ahead-safe window M5/M6
+research/v15/v15_m09_sim.py:417:        # use. Allocation/sizing decisions may ONLY use data known at test_start_k; never the test fold.
+research/v15/v15_m09_sim.py:418:        pt0 = pd.Timestamp(getattr(fr, "pretest_start", fr.train_start)).value // 1_000_000
+research/v15/v15_m09_sim.py:419:        pt1 = pd.Timestamp(getattr(fr, "pretest_end_excl", fr.test_start)).value // 1_000_000
+research/v15/v15_m09_sim.py:483:        # window (data known at test_start_k); NEVER from the test fold (that would be OOS look-ahead --
+tests/v15/test_m05.py:163:    # codex finding a: a position OPENED in pretest still OPEN at test_start with a censored hold
+research/v15/v15_m06a_shortlist.py:8:survivors by the codex#7 source_score, FOLD-PRETEST-PURE on [train_start_k, test_start_k) for the
+research/v15/v15_m06a_shortlist.py:22:  [max(START, test_start_k - 168d), test_start_k) (W1/W2 carve-out C3, Alberto-approved). No future
+research/v15/v15_m06a_shortlist.py:23:  leak: every block ends before test_start_k.
+research/v15/v15_m06a_shortlist.py:89:    recent_block_active: bool         # block 0 = [test_start-14d, test_start) had action OR open position
+research/v15/v15_m06a_shortlist.py:95:def _block_index(ts_ms: int, test_start_ms: int) -> int:
+research/v15/v15_m06a_shortlist.py:96:    """Fold-anchored block index walking back from test_start_k.
+research/v15/v15_m06a_shortlist.py:97:    block b = [test_start - 14d*(b+1), test_start - 14d*b). A ts strictly < test_start lands in
+research/v15/v15_m06a_shortlist.py:98:    b = floor((test_start - 1 - ts) / BLOCK_MS) so the instant test_start-1 is b=0 and test_start
+research/v15/v15_m06a_shortlist.py:100:    return (test_start_ms - 1 - ts_ms) // BLOCK_MS
+research/v15/v15_m06a_shortlist.py:103:def compute_persistence(ts_ms: np.ndarray, test_start_ms: int, start_ms: int) -> PersistenceResult:
+research/v15/v15_m06a_shortlist.py:105:    [max(START, test_start-168d), test_start) that contain >=1 ACTION (action-based; Alberto:
+research/v15/v15_m06a_shortlist.py:107:    <= test_start (no future data)."""
+research/v15/v15_m06a_shortlist.py:108:    horizon_start = max(start_ms, test_start_ms - HORIZON_MS)
+research/v15/v15_m06a_shortlist.py:109:    if test_start_ms <= horizon_start:
+research/v15/v15_m06a_shortlist.py:111:    # codex code-r1 #2: count fold-anchored blocks INTERSECTING [horizon_start, test_start), incl a
+research/v15/v15_m06a_shortlist.py:114:    possible = _block_index(horizon_start, test_start_ms) + 1
+research/v15/v15_m06a_shortlist.py:121:        if horizon_start <= ts < test_start_ms:
+research/v15/v15_m06a_shortlist.py:122:            b = _block_index(ts, test_start_ms)
+research/v15/v15_m06a_shortlist.py:134:        lookback_days=(test_start_ms - horizon_start) / MS_DAY,
+research/v15/v15_m06a_shortlist.py:136:        left_censored=(test_start_ms - horizon_start) < HORIZON_MS,
+research/v15/v15_m06a_shortlist.py:239:    # --- archive start (= fold 1 train_start) for the persistence horizon clamp ---
+research/v15/v15_m06a_shortlist.py:240:    start_ms = int(pd.Timestamp(folds["train_start"].min()).tz_localize("UTC").timestamp() * 1000) \
+research/v15/v15_m06a_shortlist.py:241:        if folds["train_start"].min().tzinfo is None \
+research/v15/v15_m06a_shortlist.py:242:        else int(pd.Timestamp(folds["train_start"].min()).timestamp() * 1000)
+research/v15/v15_m06a_shortlist.py:254:    fold_test_start = {int(r["fold_id"]): r["test_start"] for _, r in folds.iterrows()}
+research/v15/v15_m06a_shortlist.py:269:        test_start_ms = _ts_ms(fold_test_start[int(fid)])
+research/v15/v15_m06a_shortlist.py:276:            pr = compute_persistence(ts_arr, test_start_ms, start_ms)
+research/v15/v15_m06a_shortlist.py:339:                "as_of_ms": test_start_ms,
+tests/v15/test_m06a.py:27:# fold 1 test_start 2026-01-26 (START 2025-12-01 -> 56d -> 4 possible blocks)
+tests/v15/test_m06a.py:55:    # action AFTER test_start (future) and an action exactly AT test_start must NOT count
+tests/v15/test_m06a.py:80:        {"fold_id": 1, "train_start": pd.Timestamp("2025-12-01"), "test_start": pd.Timestamp("2026-01-26"), "oos_chain_order": 1},
+tests/v15/test_m06a.py:81:        {"fold_id": 2, "train_start": pd.Timestamp("2025-12-15"), "test_start": pd.Timestamp("2026-02-09"), "oos_chain_order": 2},
+tests/v15/test_m06a.py:279:    # 7d lookback (start = test_start - 7d): one partial block, recent action counts
+tests/v15/test_m03_golden.py:26:    assert (folds[0].train_start, folds[0].train_end_excl) == (date(2025, 12, 1), date(2026, 1, 12))
+tests/v15/test_m03_golden.py:28:    assert (folds[0].test_start, folds[0].test_end_excl) == (date(2026, 1, 26), date(2026, 2, 9))
+tests/v15/test_m03_golden.py:29:    # pretest = [train_start, test_start) excludes test
+tests/v15/test_m03_golden.py:30:    assert (folds[0].pretest_start, folds[0].pretest_end_excl) == (date(2025, 12, 1), date(2026, 1, 26))
+tests/v15/test_m03_golden.py:32:    assert (folds[7].test_start, folds[7].test_end_excl) == (date(2026, 5, 4), date(2026, 5, 18))
+tests/v15/test_m03_golden.py:38:        assert folds[i].test_end_excl == folds[i + 1].test_start  # contiguous, no gap/overlap
+tests/v15/test_m03_golden.py:39:        assert folds[i].test_start < folds[i].test_end_excl       # half-open, non-empty
+tests/v15/test_m03_golden.py:44:        assert f.pretest_end_excl == f.test_start  # selection window ends exactly at test start
+tests/v15/test_m09.py:290:                           "train_start": "2024-12-01", "test_start": "2025-01-01",
+tests/v15/test_m09.py:291:                           "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+tests/v15/test_m09.py:366:    # (a) NO LOOK-AHEAD: the allocation leverage must come from the PRETEST window [train_start,test_start)
+tests/v15/test_m09.py:376:    test_start_ms = pd.Timestamp("2025-01-01").value // 1_000_000
+tests/v15/test_m09.py:381:        # t0 < test_start => pretest window (causal). t0 >= test_start => test fold.
+tests/v15/test_m09.py:382:        exp = 1.0 if t0 < test_start_ms else 50.0
+tests/v15/test_m09.py:401:        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+tests/v15/test_m09.py:402:         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+tests/v15/test_m09.py:403:        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02", "pretest_start": "2024-12-02",
+tests/v15/test_m09.py:404:         "pretest_end_excl": "2025-01-02", "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+tests/v15/test_m09.py:429:        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+tests/v15/test_m09.py:430:         "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+tests/v15/test_m09.py:431:         "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+tests/v15/test_m09.py:432:        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02",
+tests/v15/test_m09.py:433:         "pretest_start": "2024-12-02", "pretest_end_excl": "2025-01-02",
+tests/v15/test_m09.py:434:         "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+tests/v15/test_m09.py:494:        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+tests/v15/test_m09.py:495:         "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+tests/v15/test_m09.py:496:         "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+tests/v15/test_m09.py:497:        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02",
+tests/v15/test_m09.py:498:         "pretest_start": "2024-12-02", "pretest_end_excl": "2025-01-02",
+tests/v15/test_m09.py:499:         "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+tests/v15/test_m09.py:523:        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+tests/v15/test_m09.py:524:         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+tests/v15/test_m09.py:525:        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02", "pretest_start": "2024-12-02",
+tests/v15/test_m09.py:526:         "pretest_end_excl": "2025-01-02", "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+tests/v15/test_m09.py:551:        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+tests/v15/test_m09.py:552:         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+tests/v15/test_m09.py:553:        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02", "pretest_start": "2024-12-02",
+tests/v15/test_m09.py:554:         "pretest_end_excl": "2025-01-02", "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+tests/v15/test_m09.py:603:        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+tests/v15/test_m09.py:604:         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+tests/v15/test_m08_golden.py:84:    pool = pd.DataFrame({"entity_id": [1], "fold_id": [1], "in_pool": [True], "investable": [True]})
+tests/v15/test_m08_golden.py:86:    folds = pd.DataFrame({"fold_id": [1], "train_start": [pd.Timestamp("2026-01-01")],
+tests/v15/test_m08_golden.py:87:                          "test_start": [pd.Timestamp("2026-02-12")]})
+tests/v15/test_slippage_calib.py:102:    # fold 1 test_start=50 -> only fills with time<=50 used. 25 early fills (covered) + 25 late (excluded).
+tests/v15/test_m03.py:23:        assert f.train_start < f.val_start < f.test_start
+tests/v15/test_m03.py:24:        assert (f.train_end_excl - f.train_start).days == 42
+tests/v15/test_m03.py:26:        assert (f.test_end_excl - f.test_start).days == 14
+tests/v15/test_m03.py:29:        assert f.val_end_excl == f.test_start
+tests/v15/test_m03.py:30:        # pretest = [train_start, test_start)
+tests/v15/test_m03.py:31:        assert f.pretest_start == f.train_start
+tests/v15/test_m03.py:32:        assert f.pretest_end_excl == f.test_start
+tests/v15/test_m03.py:38:        assert folds[i].test_end_excl == folds[i + 1].test_start
+tests/v15/test_m03.py:43:    assert folds[0].test_start == date(2026, 1, 26)
+tests/v15/test_m03.py:45:    span = (folds[-1].test_end_excl - folds[0].test_start).days
+tests/v15/test_m03.py:62:        assert (f.train_start, f.val_start, f.test_start, f.test_end_excl) == (ts, vs, tst, te)
+tests/v15/test_m03.py:86:            {"wallet": "0xa", "ts": mid_ms(f1.test_start), "action_type": "ENTRY"},
+tests/v15/test_m03.py:87:            {"wallet": "0xa", "ts": mid_ms(f3.test_start), "action_type": "ENTRY"},
+tests/v15/test_m03.py:88:            {"wallet": "0xb", "ts": mid_ms(folds[0].train_start), "action_type": "ENTRY"},
+tests/v15/test_m03.py:93:            {"wallet": "0xa", "entry_ts": mid_ms(f1.test_start), "exit_ts": mid_ms(f1.test_start) + 3600000},
+tests/v15/test_m03.py:94:            {"wallet": "0xa", "entry_ts": mid_ms(f3.test_start), "exit_ts": np.nan},  # open journey
+tests/v15/test_m03.py:95:            {"wallet": "0xb", "entry_ts": mid_ms(folds[0].train_start), "exit_ts": mid_ms(folds[0].train_start) + 3600000},
+tests/v15/test_m03.py:127:    boundary_ms = m03._ms(f1.test_end_excl)  # == f2.test_start
+tests/v15/test_m03.py:150:    ts = m03._ms(folds[0].test_start) + 1
+tests/v15/test_m07.py:422:def test_start_state_open_position_advances_risk_with_no_actions():
+research/v15/v15_forward_select.py:6:trailing features at fold k (all known at test_start[k]):
+research/v15/v15_forward_select.py:9:- pre_roe_k / pre_dd_k : the wallet's PRETEST (in-sample, as-of test_start[k]) M7 result for fold k.
+research/v15/v15_forward_select.py:30:    oos = pd.read_parquet(DATA / "m07_test_final" / "m07_summary.parquet")[
+research/v15/v15_forward_select.py:32:    pre = pd.read_parquet(DATA / "m07_pretest_final" / "m07_summary.parquet")[
+research/v15/v15_forward_select.py:39:    """Build the fold-k feature frame from ONLY data known at test_start[k] (no look-ahead)."""
+research/v15/v15_m06b_ranking.py:4:2026-06-01). This module is the ONLY ranking that locks the V15 investable pool. It re-ranks the
+research/v15/v15_m06b_ranking.py:6:[train_start[k], test_start[k]) -- no OOS leak -- via a fully pre-registered spec, and emits the
+research/v15/v15_m06b_ranking.py:14:fee_unversioned True on its M7 input) is stamped investable=False (pipeline dry-run only). The FINAL
+research/v15/v15_m06b_ranking.py:15:investable pool reruns AFTER cost calibration, recording fee_schedule_version +
+research/v15/v15_m06b_ranking.py:16:slippage_calibration_version in the manifest.
+research/v15/v15_m06b_ranking.py:72:    # consistency sub-split geometry (design §3): consecutive 14d blocks FROM train_start; trailing
+research/v15/v15_m06b_ranking.py:94:    slippage_calibration_version: Optional[str] = None
+research/v15/v15_m06b_ranking.py:129:    know each fold's test_start.
+research/v15/v15_m06b_ranking.py:133:    m07_summary = _read_parquet_maybe_parts(m07_dir / "m07_summary.parquet")
+research/v15/v15_m06b_ranking.py:164:        "m07_summary": m07_summary,
+research/v15/v15_m06b_ranking.py:188:# CONSISTENCY (design §3): per-sub-split (14d block from train_start) ENGINE after-cost ROE.
+research/v15/v15_m06b_ranking.py:190:# flagged non-final; provisional outputs are investable=False anyway).
+research/v15/v15_m06b_ranking.py:196:    14d windows FROM train_start within the pretest [train_start, test_start); trailing partial
+research/v15/v15_m06b_ranking.py:205:    fold_win = [(int(r.fold_id), pd.Timestamp(r.train_start).value // 1_000_000,
+research/v15/v15_m06b_ranking.py:206:                 pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()]
+research/v15/v15_m06b_ranking.py:286:    fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
+research/v15/v15_m06b_ranking.py:287:                                 pd.Timestamp(r.test_start).value // 1_000_000)
+research/v15/v15_m06b_ranking.py:325:        # consecutive 14d blocks FROM train_start; drop trailing partial (<14d). The ACTIVE
+research/v15/v15_m06b_ranking.py:365:    non-final: provisional M6b is investable=False, so this never reaches LP/live evidence."""
+research/v15/v15_m06b_ranking.py:396:    summ = inputs["m07_summary"].copy()
+research/v15/v15_m06b_ranking.py:402:    #     test_start[k] (fixes r1#9 -- no inherited survivor bias / no leak). ---
+research/v15/v15_m06b_ranking.py:403:    fold_test_start_ms = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000
+research/v15/v15_m06b_ranking.py:420:        ts_start = df["fold_id"].map(fold_test_start_ms)
+research/v15/v15_m06b_ranking.py:426:                provenance_fail.append(f"{nm}:{int(bad.sum())}_rows_as_of_not_equal_test_start")
+research/v15/v15_m06b_ranking.py:430:                provenance_fail.append(f"{nm}:{int(bad.sum())}_rows_post_test_start")
+research/v15/v15_m06b_ranking.py:432:    # were generated for the fold's PRETEST window [train_start, test_start), not a stale/test-window run. Every
+research/v15/v15_m06b_ranking.py:433:    # m07_summary row must carry window_start_ms == train_start and window_end_ms == test_start for its fold.
+research/v15/v15_m06b_ranking.py:434:    fold_train_start_ms = {int(r.fold_id): pd.Timestamp(r.train_start).value // 1_000_000 for r in folds.itertuples()}
+research/v15/v15_m06b_ranking.py:435:    if "window_start_ms" not in summ.columns or "window_end_ms" not in summ.columns:
+research/v15/v15_m06b_ranking.py:436:        provenance_fail.append("m07_summary:no_window_provenance(regenerate with current m07 engine)")
+research/v15/v15_m06b_ranking.py:438:        _ws = pd.to_numeric(summ["window_start_ms"], errors="coerce")
+research/v15/v15_m06b_ranking.py:439:        _we = pd.to_numeric(summ["window_end_ms"], errors="coerce")
+research/v15/v15_m06b_ranking.py:440:        _ews = summ["fold_id"].map(fold_train_start_ms).astype("float64")
+research/v15/v15_m06b_ranking.py:441:        _ewe = summ["fold_id"].map(fold_test_start_ms).astype("float64")
+research/v15/v15_m06b_ranking.py:444:            provenance_fail.append(f"m07_summary:{int(_bad.sum())}_rows_window!=[train_start,test_start) "
+research/v15/v15_m06b_ranking.py:506:    #     active_test_folds (post-test_start info -> look-ahead). G5 uses active_pretest_folds. ---
+research/v15/v15_m06b_ranking.py:732:    # --- investable flag (provisional vs FINAL). FINAL (investable=True) requires ALL of:
+research/v15/v15_m06b_ranking.py:736:    #     non-investable (the proxies are gameable / not after-our-cost). ---
+research/v15/v15_m06b_ranking.py:759:    # AUDIT 2026-07-10 (codex P0#2): FINAL/investable additionally REQUIRES fold-pure M4. The global
+research/v15/v15_m06b_ranking.py:761:    # that fell back to it must NEVER be stamped investable (it could admit an entity not copyable at test_start,
+research/v15/v15_m06b_ranking.py:764:    # AUDIT 2026-07-10 (codex P1#4): the CLI-claimed slippage_calibration_version must be CROSS-CHECKED against
+research/v15/v15_m06b_ranking.py:765:    # what M7 actually priced. Require every RANKABLE m07 row to carry slippage_calibration_version equal to the
+research/v15/v15_m06b_ranking.py:766:    # manifest version -> a run stamped with a version M7 did not use (None/mixed) cannot be marked investable.
+research/v15/v15_m06b_ranking.py:767:    if rk_mask.any() and "slippage_calibration_version" in out.columns:
+research/v15/v15_m06b_ranking.py:769:            out.loc[rk_mask, "slippage_calibration_version"].eq(m.slippage_calibration_version).all())
+research/v15/v15_m06b_ranking.py:772:    investable = (
+research/v15/v15_m06b_ranking.py:774:        and (m.slippage_calibration_version is not None)
+research/v15/v15_m06b_ranking.py:782:    out["investable"] = bool(investable)
+research/v15/v15_m06b_ranking.py:789:    manifest["investable"] = bool(investable)
+research/v15/v15_m06b_ranking.py:794:    if not investable:
+research/v15/v15_m06b_ranking.py:798:        if m.slippage_calibration_version is None:
+research/v15/v15_m06b_ranking.py:799:            reasons.append("no_slippage_calibration_version")
+research/v15/v15_m06b_ranking.py:811:            reasons.append("slippage_version_mismatch(m07 rows != claimed calibration)")
+research/v15/v15_m06b_ranking.py:812:        manifest["non_investable_reasons"] = reasons
+research/v15/v15_m06b_ranking.py:826:    "quality_weight", "excluded_reason", "slippage_uncalibrated", "investable",
+research/v15/v15_m06b_ranking.py:840:    return {"pool_rows": len(out), "pooled": n_pooled, "investable": manifest["investable"]}
+research/v15/v15_m06b_ranking.py:847:                    help="M7 PRETEST-window run dir (m07_summary/fills/[equity].parquet)")
+research/v15/v15_m06b_ranking.py:859:                    slippage_calibration_version=args.slippage_calibration_version)
+research/v15/v15_m03_fold_geometry.py:12:      [train_start, test_start) is the look-ahead-safe SELECTION field for downstream.
+research/v15/v15_m03_fold_geometry.py:62:    train_start: date
+research/v15/v15_m03_fold_geometry.py:66:    test_start: date
+research/v15/v15_m03_fold_geometry.py:68:    # pretest = [train_start, test_start) = train+val combined (look-ahead-safe selection window)
+research/v15/v15_m03_fold_geometry.py:69:    pretest_start: date
+research/v15/v15_m03_fold_geometry.py:74:            return self.train_start, self.train_end_excl
+research/v15/v15_m03_fold_geometry.py:78:            return self.test_start, self.test_end_excl
+research/v15/v15_m03_fold_geometry.py:80:            return self.pretest_start, self.pretest_end_excl
+research/v15/v15_m03_fold_geometry.py:98:        train_start = s
+research/v15/v15_m03_fold_geometry.py:102:        test_start = val_end_excl
+research/v15/v15_m03_fold_geometry.py:103:        test_end_excl = test_start + timedelta(days=TEST_DAYS)
+research/v15/v15_m03_fold_geometry.py:107:                train_start=train_start,
+research/v15/v15_m03_fold_geometry.py:111:                test_start=test_start,
+research/v15/v15_m03_fold_geometry.py:113:                pretest_start=train_start,
+research/v15/v15_m03_fold_geometry.py:114:                pretest_end_excl=test_start,
+research/v15/v15_m03_fold_geometry.py:151:    """Regime tags at test_start. market_data_fn(date)->{btc_price,hl_price,btc_dvol} or None.
+research/v15/v15_m03_fold_geometry.py:153:    30d trend lookback uses [test_start-30d, test_start) (NOT train_start; V13 m09 r1 bug).
+research/v15/v15_m03_fold_geometry.py:154:    DVOL percentiles computed over the train window [train_start, train_end_excl).
+research/v15/v15_m03_fold_geometry.py:169:    test_start = fold.test_start
+research/v15/v15_m03_fold_geometry.py:170:    lb = test_start - timedelta(days=30)
+research/v15/v15_m03_fold_geometry.py:171:    btc_trend = classify_trend(_get(test_start, "btc_price"), _get(lb, "btc_price"))
+research/v15/v15_m03_fold_geometry.py:172:    hl_trend = classify_trend(_get(test_start, "hl_price"), _get(lb, "hl_price"))
+research/v15/v15_m03_fold_geometry.py:175:    d = fold.train_start
+research/v15/v15_m03_fold_geometry.py:181:    dvol_bucket = classify_vol(_get(test_start, "btc_dvol"), dvol_series)
+research/v15/v15_m03_fold_geometry.py:196:                "train_start": pd.Timestamp(f.train_start),
+research/v15/v15_m03_fold_geometry.py:200:                "test_start": pd.Timestamp(f.test_start),
+research/v15/v15_m03_fold_geometry.py:202:                "pretest_start": pd.Timestamp(f.pretest_start),
+research/v15/v15_m03_fold_geometry.py:369:    # the G5 gate, but it held active_TEST_folds (post-test_start = look-ahead) — a footgun. The ENFORCED G5 lives
+research/v15/v15_m03_fold_geometry.py:397:                f"{folds[0].test_start} .. {folds[-1].test_end_excl})")
+research/v15/v15_m04_authenticity.py:18:M3 test_start[k] (fold-pure). A full-window run (--as-of END) = ex-post universe curation (live).
+research/v15/v15_two_regime_test.py:16:     --m07-test app/data/v15/m07_test_final/m07_summary.parquet \
+research/v15/v15_two_regime_test.py:112:    ap.add_argument("--m07-test", default="app/data/v15/m07_test_final/m07_summary.parquet")
+research/v15/v15_m05_eligibility.py:7:(its primary wallet), per M3 fold, computed ON THE PRETEST WINDOW [train_start_k, test_start_k)
+research/v15/v15_m05_eligibility.py:17:  6. accessible coins >= 0.80 by notional, judged as-of test_start_k (unknown -> don't fire, flag)
+research/v15/v15_m05_eligibility.py:151:    OPEN at test_start (exit missing OR exit >= hi_ms) is invisible to median_hold_s. Its CENSORED
+research/v15/v15_m05_eligibility.py:162:    # censored open-at-test_start holds: opened in pretest, not closed inside pretest (still open at
+research/v15/v15_m05_eligibility.py:247:    # test_start whose CENSORED hold already exceeds the swing cap is a week-holder invisible to the
+research/v15/v15_m05_eligibility.py:251:        f.append(f"hold_too_long_censored (>{SWING_MAX_HOLD_S:.0f}s, open-at-test_start {cmh:.0f}s)")
+research/v15/v15_m05_eligibility.py:322:        lo_ms, hi_ms = _ms(fr["train_start"]), _ms(fr["test_start"])  # pretest = [train_start, test_start)
+research/v15/v15_m08_survival.py:57:    # activity within the last N days BEFORE the fold decision (test_start) to be eligible to survive; else KILL.
+research/v15/v15_m08_survival.py:105:    # action is > staleness_max_days before the decision (t1 = test_start) went dark and is NOT copyable -> KILL,
+research/v15/v15_m08_survival.py:188:def tier_attribution(tiers: pd.DataFrame, m07_summary: pd.DataFrame) -> pd.DataFrame:
+research/v15/v15_m08_survival.py:197:    df = tiers.merge(m07_summary[["entity_id", "fold_id", "roe_engine", "ruin"]],
+research/v15/v15_m08_survival.py:235:    """Load M4 entity tiers. Fold-pure mode requires exact as_of_ms == fold test_start."""
+research/v15/v15_m08_survival.py:242:    fold_test_start_ms = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000
+research/v15/v15_m08_survival.py:245:    for fid in sorted(fold_test_start_ms):
+research/v15/v15_m08_survival.py:256:        expected = float(fold_test_start_ms[fid])
+research/v15/v15_m08_survival.py:260:                             f"with as_of_ms != fold {fid} test_start ({int(expected)})")
+research/v15/v15_m08_survival.py:277:    if "investable" not in pool.columns or not pd.api.types.is_bool_dtype(pool["investable"]) \
+research/v15/v15_m08_survival.py:278:            or not bool(pool["investable"].all()):
+research/v15/v15_m08_survival.py:280:            "M8 requires an investable M6b pool with a boolean `investable` column all True; "
+research/v15/v15_m08_survival.py:294:    fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
+research/v15/v15_m08_survival.py:295:                                 pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()}
+research/v15/v15_m08_survival.py:391:    summ = _read_m07_summary(m07_dir)
+research/v15/v15_m08_survival.py:404:def _read_m07_summary(m07_dir: Path) -> pd.DataFrame:
+research/v15/v15_m08_survival.py:405:    p = m07_dir / "m07_summary.parquet"
+research/v15/v15_m08_survival.py:406:    parts = m07_dir / "m07_summary.parquet.parts"
+research/v15/v15_m07_engine.py:628:    summary["window_start_ms"] = int(_win_lo)
+research/v15/v15_m07_engine.py:629:    summary["window_end_ms"] = int(end_ts_ms)
+research/v15/v15_m07_engine.py:833:        "slippage_calibration_version": None,
+research/v15/v15_m07_engine.py:984:        summary["slippage_calibration_version"] = md.slip_calib_version
+research/v15/v15_m07_engine.py:1705:    # window selects the simulated span per fold: "test" = OOS [test_start,test_end) (M9 eval input);
+research/v15/v15_m07_engine.py:1706:    # "pretest" = [train_start,test_start) (M6b fold-pure ranking input). Same shipped engine; only the
+research/v15/v15_m07_engine.py:1709:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+research/v15/v15_m07_engine.py:1710:                                     int(pd.Timestamp(r.test_start).timestamp() * 1000))
+research/v15/v15_m07_engine.py:1713:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
+research/v15/v15_m07_engine.py:1770:    sw = ShardedParquetWriter(out_dir / "m07_summary.parquet", flush_rows=200_000)
+
+codex
+The new checks are in the right neighborhood: they execute before any M7 merge or score derivation, and the slippage check is late enough to use the final rankable mask. I’m reading the investability tail now for exact bypass conditions.
+exec
+/bin/zsh -lc "sed -n '1,140p' tests/v15/test_m06b_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m06b_ranking trust-audit fixes (2026-07-10).
+
+Locks two provenance fail-closed behaviours:
+- P0#2: a run on NON-fold-pure (global, look-ahead) M4 is never stamped investable.
+- P0#3: a duplicate (entity_id, fold_id) row in any fold-keyed input fails closed (merge validate) instead of
+  silently handing one entity two pool slots.
+Reuses the fixture helper from test_m06b.
+"""
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m06b_ranking as M
+from test_m06b import _make_inputs, _equity_all_active, _folds, _patch_exposure  # noqa: E402,F401
+
+
+def test_p0_2_global_m04_not_investable(_patch_exposure):
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    # SAME inputs that are investable with fold-pure M4, but here fold_pure=False (global look-ahead M4).
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=False)
+    out, manifest = M.build_ranking(inp, m)
+    assert manifest["investable"] is False
+    assert any("m04_not_fold_pure" in r for r in manifest["non_investable_reasons"])
+
+
+def test_p0_3_duplicate_entity_fold_fails_closed(_patch_exposure):
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=True)
+    # inject a duplicate (entity_id, fold_id) into the M7 summary
+    inp["m07_summary"] = pd.concat([inp["m07_summary"], inp["m07_summary"].iloc[[0]]], ignore_index=True)
+    with pytest.raises((ValueError, Exception)):
+        M.build_ranking(inp, m)
+
+
+def test_p1_5_nonfinite_score_component_excluded_not_silent(_patch_exposure):
+    import numpy as np
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=True)
+    summ = inp["m07_summary"]
+    col = "n_backstop_transfer" if "n_backstop_transfer" in summ.columns else "capacity_capped_frac"
+    ent = int(summ["entity_id"].iloc[0])
+    summ.loc[summ["entity_id"] == ent, col] = np.nan  # NaN a score input for one entity
+    out, _ = M.build_ranking(inp, m)
+    row = out[out["entity_id"] == ent].iloc[0]
+    assert bool(row["in_pool"]) is False                       # must not silently sit in the pool
+    assert "nonfinite_score_component" in str(row["excluded_reason"])  # explicit reason, not blank
+
+
+def test_p0_1_m07_window_mismatch_fails_closed(_patch_exposure):
+    # m07 rows stamped with a window != the fold's [train_start,test_start) (e.g. a stale TEST run) -> fail closed.
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=True)
+    inp["m07_summary"]["window_end_ms"] = inp["m07_summary"]["window_end_ms"] + 14 * 86_400_000  # shove into test window
+    with pytest.raises(ValueError, match="window"):
+        M.build_ranking(inp, m)
+
+
+def test_p1_4_slippage_version_mismatch_not_investable(_patch_exposure):
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=True)
+    inp["m07_summary"]["slippage_calibration_version"] = "SOME-OTHER-VERSION"  # not what the manifest claims
+    _out, manifest = M.build_ranking(inp, m)
+    assert manifest["investable"] is False
+    assert any("slippage_version_mismatch" in r for r in manifest["non_investable_reasons"])
+
+
+exec
+/bin/zsh -lc "sed -n '620,880p' research/v15/v15_m06b_ranking.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    for fid, g in df.groupby("fold_id"):
+        g = g.copy()
+        rk = g[g["m6b_rankable"]].copy()
+        if rk.empty:
+            g["m6b_score"] = np.nan
+            out_parts.append(g)
+            continue
+        rk["roe_adj_w"] = _winsorize(rk["roe_adj"], m.winsor_lo_pct, m.winsor_hi_pct)
+        rk["calmar_w"] = _winsorize(rk["calmar"], m.winsor_lo_pct, m.winsor_hi_pct)
+        rk["z_realized_roe"] = _zscore(rk["roe_adj_w"])
+        rk["z_calmar"] = _zscore(rk["calmar_w"])
+        # win-rate term (v2): z-scored per fold like the others. Unknown win-rate -> fold mean
+        # (z=0, neutral) so a missing-realized row neither gains nor loses on this term.
+        wr = pd.to_numeric(rk["round_trip_win_rate"], errors="coerce")
+        wr = wr.fillna(wr.mean())
+        rk["z_win_rate"] = _zscore(wr) if wr.notna().any() else 0.0
+        rk["m6b_score"] = (
+            m.w_realized_roe * rk["z_realized_roe"]
+            + m.w_calmar * rk["z_calmar"]
+            + m.w_win_rate * rk["z_win_rate"]
+            + m.w_consistency * rk["consistency"]
+            + m.w_capacity_health * rk["capacity_health"]
+            + m.w_fidelity * rk["fidelity"]
+            - m.w_survivability_penalty * rk["survivability_penalty"]
+        )
+        g = g.merge(rk[["entity_id", "fold_id", "z_realized_roe", "z_calmar", "z_win_rate",
+                        "roe_adj_w", "calmar_w", "m6b_score"]],
+                    on=["entity_id", "fold_id"], how="left")
+        out_parts.append(g)
+    df = pd.concat(out_parts, ignore_index=True)
+
+    # --- POOL SELECTION + G5 (design §4) + allocation buckets (design §5) ---
+    pool_parts = []
+    for fid, g in df.groupby("fold_id"):
+        g = g.copy()
+        g["rank_in_fold"] = np.nan
+        g["in_pool"] = False
+        g["bucket"] = np.nan
+        g["quality_weight"] = 0.0
+        rk = g[g["m6b_rankable"] & g["m6b_score"].notna()].copy()
+        if rk.empty:
+            pool_parts.append(g)
+            continue
+        # deterministic ordering: score desc, then tie-break consistency desc, n_fills desc, entity asc
+        rk = rk.sort_values(
+            ["m6b_score", "consistency", "n_fills", "entity_id"],
+            ascending=[False, False, False, True]).reset_index(drop=True)
+        rk["rank_in_fold"] = np.arange(1, len(rk) + 1)
+        # G5 enforced HERE: active_pretest_folds>=3 AND n_journeys_pretest>=5 (pretest-only; no leak)
+        g5 = (rk["active_pretest_folds"].fillna(0) >= m.g5_min_active_pretest_folds) & \
+             (rk["n_journeys_pretest"].fillna(0) >= m.g5_min_journeys_pretest)
+        rk_g5 = rk[g5].copy()
+        pooled = rk_g5.head(m.n_pool).copy()
+        pooled["in_pool"] = True
+        # quintile buckets by score (equal-count). bucket 1 = top.
+        n = len(pooled)
+        if n > 0:
+            # qcut into n_buckets equal-count groups; labels 1..5 with 1 = highest score.
+            try:
+                q = pd.qcut(pooled["m6b_score"].rank(method="first"), m.n_buckets,
+                            labels=list(range(m.n_buckets, 0, -1)))
+                pooled["bucket"] = q.astype(int)
+            except ValueError:
+                # too few distinct -> linear split
+                pooled["bucket"] = (np.floor(
+                    (pooled["rank_in_fold"].rank(method="first") - 1) / max(n / m.n_buckets, 1)
+                ).astype(int) + 1).clip(1, m.n_buckets)
+            # TOP-BUCKET CONSISTENCY GATE: bucket-1 entity with consistency < gate -> demote 1 bucket
+            # (to 2). No backfill of bucket 1; no boundary recompute (deterministic, non-circular).
+            demote = (pooled["bucket"] == 1) & (pooled["consistency"] < m.top_bucket_consistency_gate)
+            pooled.loc[demote, "bucket"] = 2
+            # bucket weights [5,4,3,2,1] -> normalized to sum 1
+            bw = {i + 1: m.bucket_weights[i] for i in range(m.n_buckets)}
+            pooled["raw_w"] = pooled["bucket"].map(bw).astype(float)
+            tot = pooled["raw_w"].sum()
+            pooled["quality_weight"] = pooled["raw_w"] / tot if tot > 0 else 0.0
+            # per-entity ceiling = 10% of pool total; clip + renormalize remaining mass. For small
+            # pools where n * ceiling < 1 the nominal 10% is INFEASIBLE (weights could never sum to
+            # 1) -> use an effective ceiling = max(ceiling, 1/n) so a normalized solution always
+            # exists. Flagged in the manifest when the ceiling was relaxed.
+            ceil = max(m.per_entity_quality_ceiling, 1.0 / n)
+            ceiling_relaxed = ceil > m.per_entity_quality_ceiling + 1e-12
+            qw = np.array(pooled["quality_weight"].to_numpy(dtype=float), copy=True)
+            for _ in range(200):
+                over = qw > ceil + 1e-12
+                if not over.any():
+                    break
+                excess = (qw[over] - ceil).sum()
+                qw[over] = ceil
+                under = ~over
+                if qw[under].sum() <= 0:
+                    break
+                qw[under] += excess * qw[under] / qw[under].sum()
+            pooled["quality_weight"] = qw
+            # invariants: normalized to 1 and no weight exceeds the effective ceiling.
+            assert abs(qw.sum() - 1.0) < 1e-6, f"fold {fid}: quality_weight sum {qw.sum()} != 1"
+            assert qw.max() <= ceil + 1e-9, f"fold {fid}: weight {qw.max()} > ceiling {ceil}"
+            pooled["ceiling_relaxed"] = bool(ceiling_relaxed)
+        # merge pooled fields back
+        keep = ["entity_id", "fold_id", "rank_in_fold", "in_pool", "bucket", "quality_weight"]
+        g = g.drop(columns=["rank_in_fold", "in_pool", "bucket", "quality_weight"]).merge(
+            pooled[keep], on=["entity_id", "fold_id"], how="left")
+        g["in_pool"] = g["in_pool"].fillna(False)
+        g["quality_weight"] = g["quality_weight"].fillna(0.0)
+        # rank_in_fold for non-pooled rankable: keep from rk
+        g = g.merge(rk[["entity_id", "fold_id", "rank_in_fold"]].rename(
+            columns={"rank_in_fold": "_rk2"}), on=["entity_id", "fold_id"], how="left")
+        g["rank_in_fold"] = g["rank_in_fold"].fillna(g["_rk2"])
+        g = g.drop(columns=["_rk2"])
+        pool_parts.append(g)
+    out = pd.concat(pool_parts, ignore_index=True)
+
+    # --- investable flag (provisional vs FINAL). FINAL (investable=True) requires ALL of:
+    #     calibrated costs (no uncalibrated flags) + fee/slippage calibration versions set +
+    #     REAL fidelity from M7 tracking_error (no neutral default) + REAL consistency from M7
+    #     after-cost equity block ROE (no M6a source-persistence proxy). Any provisional input ->
+    #     non-investable (the proxies are gameable / not after-our-cost). ---
+    # source flags gate FINAL on a PER-ROW basis over the RANKABLE rows (mode is fragile: a few
+    # provisional rows must still block). FINAL requires EVERY rankable row to carry real M7 sources.
+    rk_mask = out["m6b_rankable"].fillna(False)
+    # report the source over RANKABLE rows (the rows that gate FINAL); the global mode is dominated by
+    # non-rankable rows (no M7 row -> provisional default) and is misleading.
+    _src_rows = out.loc[rk_mask] if rk_mask.any() else out
+    consistency_source = _src_rows["consistency_source"].mode().iat[0] if len(_src_rows) else "unknown"
+    fidelity_source = _src_rows["fidelity_source"].mode().iat[0] if len(_src_rows) else "unknown"
+    fidelity_final = bool(rk_mask.any() and out.loc[rk_mask, "fidelity_source"].eq("m07_tracking_error").all())
+    consistency_final = bool(rk_mask.any() and out.loc[rk_mask, "consistency_source"].eq("m07_equity_block_roe").all())
+    # v2: FINAL additionally requires the REALIZED round-trip metrics to be present on every rankable
+    #     row -- a realized_roe (no roe_engine fallback) AND a finite round_trip_win_rate AND a
+    #     non-null n_round_trips. The rank now depends on realized round-trips; a fallback/missing
+    #     basis means the pool was not locked on the after-cost realized return.
+    if rk_mask.any():
+        realized_final = bool(
+            out.loc[rk_mask, "return_basis"].eq("realized_roe").all()
+            and pd.to_numeric(out.loc[rk_mask, "round_trip_win_rate"], errors="coerce").notna().all()
+            and pd.to_numeric(out.loc[rk_mask, "n_round_trips"], errors="coerce").notna().all()
+        )
+    else:
+        realized_final = False
+    # AUDIT 2026-07-10 (codex P0#2): FINAL/investable additionally REQUIRES fold-pure M4. The global
+    # m04_entities.parquet maps entity->copyable with FULL-history (post-decision) knowledge = look-ahead; a run
+    # that fell back to it must NEVER be stamped investable (it could admit an entity not copyable at test_start,
+    # or drop a historically-valid one). Fold-pure per-fold M4 (--m04-dir, provenance-checked in load_inputs) only.
+    m04_fold_pure = bool(inputs.get("m04_fold_pure"))
+    # AUDIT 2026-07-10 (codex P1#4): the CLI-claimed slippage_calibration_version must be CROSS-CHECKED against
+    # what M7 actually priced. Require every RANKABLE m07 row to carry slippage_calibration_version equal to the
+    # manifest version -> a run stamped with a version M7 did not use (None/mixed) cannot be marked investable.
+    if rk_mask.any() and "slippage_calibration_version" in out.columns:
+        slippage_version_final = bool(
+            out.loc[rk_mask, "slippage_calibration_version"].eq(m.slippage_calibration_version).all())
+    else:
+        slippage_version_final = False
+    investable = (
+        (not uncalibrated)
+        and (m.slippage_calibration_version is not None)
+        and (m.fee_schedule_version is not None)
+        and fidelity_final
+        and consistency_final
+        and realized_final
+        and m04_fold_pure
+        and slippage_version_final
+    )
+    out["investable"] = bool(investable)
+    out["slippage_uncalibrated"] = summ["slippage_uncalibrated"].any() if "slippage_uncalibrated" in summ else True
+
+    return_basis = _src_rows["return_basis"].mode().iat[0] if (
+        "return_basis" in _src_rows and len(_src_rows)) else "unknown"
+    manifest = asdict(m)
+    manifest["uncalibrated_input"] = uncalibrated
+    manifest["investable"] = bool(investable)
+    manifest["consistency_source"] = consistency_source
+    manifest["fidelity_source"] = fidelity_source
+    manifest["return_basis"] = return_basis
+    manifest["return_basis_fallback"] = bool(return_basis_fallback)
+    if not investable:
+        reasons = []
+        if uncalibrated:
+            reasons.append("uncalibrated_costs")
+        if m.slippage_calibration_version is None:
+            reasons.append("no_slippage_calibration_version")
+        if m.fee_schedule_version is None:
+            reasons.append("no_fee_schedule_version")
+        if not fidelity_final:
+            reasons.append(f"fidelity_provisional({fidelity_source})")
+        if not consistency_final:
+            reasons.append(f"consistency_provisional({consistency_source})")
+        if not realized_final:
+            reasons.append(f"realized_metrics_missing({return_basis})")
+        if not m04_fold_pure:
+            reasons.append("m04_not_fold_pure(look_ahead_global_m04)")
+        if not slippage_version_final:
+            reasons.append("slippage_version_mismatch(m07 rows != claimed calibration)")
+        manifest["non_investable_reasons"] = reasons
+    return out, manifest
+
+
+# --------------------------------------------------------------------------- #
+# OUTPUT
+# --------------------------------------------------------------------------- #
+OUT_COLS = [
+    "entity_id", "fold_id", "m6b_score", "roe_adj", "return_basis", "round_trip_win_rate",
+    "n_round_trips", "calmar", "consistency", "n_active_subsplits",
+    "consistency_source", "capacity_health", "capacity_capped_frac", "fidelity", "fidelity_source",
+    "survivability_penalty", "max_dd_pretest", "n_fills", "exposure_days", "n_journeys_pretest",
+    "n_backstop_transfer", "account_ruin", "m4_tier", "entity_alloc_weight",
+    "m5_eligible", "entity_copyable", "m6b_rankable", "rank_in_fold", "bucket", "in_pool",
+    "quality_weight", "excluded_reason", "slippage_uncalibrated", "investable",
+]
+
+
+def write_outputs(out: pd.DataFrame, manifest: dict, out_dir: Path) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cols = [c for c in OUT_COLS if c in out.columns]
+    pool_path = out_dir / "m06b_pool.parquet"
+    out[cols].to_parquet(pool_path, index=False)
+    man_path = out_dir / "m06b_manifest.json"
+    man_path.write_text(json.dumps(manifest, indent=2, default=str))
+    n_pooled = int(out["in_pool"].sum())
+    logger.info("M6b wrote %d rows (%d pooled across folds) -> %s; manifest -> %s",
+                len(out), n_pooled, pool_path, man_path)
+    return {"pool_rows": len(out), "pooled": n_pooled, "investable": manifest["investable"]}
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--m07-dir", default=str(DATA_DIR / "m07_pretest"),
+                    help="M7 PRETEST-window run dir (m07_summary/fills/[equity].parquet)")
+    ap.add_argument("--out", default=str(DATA_DIR))
+    ap.add_argument(
+        "--data-dir", default=str(DATA_DIR),
+        help="Directory containing this lane's M2-M6a artifacts.",
+    )
+    ap.add_argument("--m04-dir", default=None,
+                    help="directory with m04_authenticity_f{fold_id}.parquet and m04_entities_f{fold_id}.parquet")
+    ap.add_argument("--fee-schedule-version", default=None)
+    ap.add_argument("--slippage-calibration-version", default=None)
+    args = ap.parse_args()
+    m = M6bManifest(fee_schedule_version=args.fee_schedule_version,
+                    slippage_calibration_version=args.slippage_calibration_version)
+    inputs = load_inputs(
+        Path(args.m07_dir), data_dir=Path(args.data_dir),
+        m04_dir=Path(args.m04_dir) if args.m04_dir else None,
+    )
+    out, manifest = build_ranking(inputs, m)
+    res = write_outputs(out, manifest, Path(args.out))
+    logger.info("M6b done: %s", res)
+
+
+if __name__ == "__main__":
+    main()
+
+exec
+/bin/zsh -lc "sed -n '1,130p' tests/v15/test_m06b.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M6b ranking tests -- frozen-spec mechanics on synthetic inputs.
+
+Design: brain projects/quant/v15/modules/m06b. Run:
+  /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m06b.py -q
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m06b_ranking as M  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic input builder
+# --------------------------------------------------------------------------- #
+def _folds(n_folds=1):
+    rows = []
+    base = pd.Timestamp("2025-12-01")
+    for k in range(1, n_folds + 1):
+        train_start = base + pd.Timedelta(days=14 * (k - 1))
+        test_start = train_start + pd.Timedelta(days=56)   # 42 train + 14 val = 4 x 14d blocks
+        rows.append({
+            "fold_id": k, "train_start": train_start, "test_start": test_start,
+            "test_end_excl": test_start + pd.Timedelta(days=14),
+        })
+    return pd.DataFrame(rows)
+
+
+def _make_inputs(n_entities=120, fold_id=1, *, uncalibrated=True, equity=None,
+                 eligible_all=True, copyable_all=True, n_fills=100, exposure_days=10.0,
+                 n_journeys=10, active_pretest_folds=3, consistency_active=3,
+                 tracking_error=None, realized=False, fold_pure=False):
+    folds = _folds(1)
+    ts_asof = pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000 - 1000
+    ids = list(range(n_entities))
+    wallets = [f"0x{i:040x}" for i in ids]
+    rng = np.random.default_rng(0)
+    summ = pd.DataFrame({
+        "entity_id": ids, "fold_id": fold_id,
+        "start_equity": 10000.0,
+        "n_actions": 200, "n_fills": n_fills, "n_capacity_capped": 10,
+        "n_backstop_transfer": 0, "total_fees": 50.0, "total_funding": 0.0,
+        "max_dd": rng.uniform(0.05, 0.4, n_entities),
+        "outcome_states": "survived",
+        "ruin": False,
+        "final_equity": 12000.0,
+        "roe_engine": rng.normal(0.2, 0.5, n_entities),
+        "slippage_uncalibrated": uncalibrated, "fee_unversioned": uncalibrated,
+        "metadata_uncertain": False, "mode_uncertain": False,
+        # m07 window provenance (audit P0#1): must match the fold's [train_start, test_start).
+        "window_start_ms": pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000,
+        "window_end_ms": pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000,
+        # slippage version provenance (audit P1#4): calibrated runs carry the version M7 priced with.
+        "slippage_calibration_version": (None if uncalibrated else "v11-fills-v1"),
+    })
+    if tracking_error is not None:
+        summ["tracking_error"] = float(tracking_error)
+    if realized:
+        # M7 v2 realized round-trip keys. realized_roe is the rank basis; round_trip_win_rate is the
+        # new win-rate term. Make them deterministic + distinct from roe_engine so tests can assert
+        # the score consumes the realized basis.
+        summ["realized_roe"] = rng.normal(0.15, 0.4, n_entities)
+        summ["n_round_trips"] = rng.integers(5, 50, n_entities)
+        summ["n_round_trip_wins"] = (summ["n_round_trips"] * rng.uniform(0.3, 0.8, n_entities)).astype(int)
+        summ["round_trip_win_rate"] = summ["n_round_trip_wins"] / summ["n_round_trips"].clip(lower=1)
+        summ["realized_pnl_total"] = summ["realized_roe"] * summ["start_equity"]
+    m06a = pd.DataFrame({
+        "entity_id": ids, "fold_id": fold_id, "primary_wallet": wallets,
+        "copyable": copyable_all, "rankable": True,
+        "n_journeys_pretest": n_journeys,
+        "max_dd_pretest": summ["max_dd"].values,
+        "m4_tier": "CLEAN", "entity_alloc_weight": 1.0,
+        # active_blocks IS active_pretest_folds (pretest sub-split activity, no look-ahead)
+        "active_blocks": active_pretest_folds, "possible_blocks": 4,
+        "g5_pool_candidate_pass": True,
+        "as_of_ms": ts_asof,
+    })
+    m05 = pd.DataFrame({
+        "entity_id": ids, "fold_id": fold_id,
+        "eligible": eligible_all, "as_of_ms": ts_asof,
+    })
+    m04e = pd.DataFrame({"entity_id": ids, "copyable": copyable_all})
+    m04_auth = pd.DataFrame({"wallet": wallets, "entity_id": ids})
+    if fold_pure:
+        # fold-pure per-fold M4 carries fold_id + as_of_ms == test_start (m06b provenance requirement).
+        test_start_ms = pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000
+        for _d in (m04e, m04_auth):
+            _d["fold_id"] = fold_id
+            _d["as_of_ms"] = test_start_ms
+    t0 = pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000
+    if equity is not None:
+        # derive fills + journeys from the equity samples so per-block activeness (>=5 fills AND
+        # >=1 journey) matches the equity coverage. One fill per equity sample; one journey per
+        # (entity, 14d-block) present in equity.
+        fills = equity.rename(columns={"ts": "our_ts"})[["entity_id", "fold_id", "our_ts"]].copy()
+        blk = ((equity["ts"] - t0) // (M.MS_PER_DAY * 14)).astype(int)
+        je = equity.assign(block_idx=blk).drop_duplicates(["entity_id", "block_idx"])
+        w_of = {i: w for i, w in zip(ids, wallets)}
+        journeys = pd.DataFrame({
+            "wallet": je["entity_id"].map(w_of).values,
+            "entry_ts": (t0 + je["block_idx"].values * M.MS_PER_DAY * 14 + 1000),
+        })
+    else:
+        fills = pd.DataFrame({
+            "entity_id": np.repeat(ids, 2), "fold_id": fold_id,
+            "our_ts": np.tile([t0, t0 + int(exposure_days * M.MS_PER_DAY)], n_entities),
+        })
+        journeys = pd.DataFrame(columns=["wallet", "entry_ts"])
+    return {
+        "folds": folds, "m07_summary": summ, "m07_fills_path": fills,  # path slots hold DFs for tests
+        "m06a": m06a, "m05": m05, "m04_entities": m04e, "m04_auth": m04_auth,
+        "m04_fold_pure": fold_pure,  # audit 2026-07-10 P0#2: investable requires fold-pure M4
+        "m02_journeys_path": journeys, "m07_equity": equity,
+    }
+
+
+@pytest.fixture(autouse=True)
+def _patch_exposure(monkeypatch):
+    """In tests the fills 'path' slot holds a DataFrame; patch the reader to consume it directly."""
+    def fake_exposure(fills_obj, _m07_dir):
+        df = fills_obj if isinstance(fills_obj, pd.DataFrame) else pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame(columns=["entity_id", "fold_id", "exposure_days"])
+        g = df.groupby(["entity_id", "fold_id"])["our_ts"].agg(["min", "max"]).reset_index()
+        g["exposure_days"] = (g["max"] - g["min"]) / M.MS_PER_DAY
+        return g[["entity_id", "fold_id", "exposure_days"]]
+
+exec
+/bin/zsh -lc "sed -n '620,650p' research/v15/v15_m07_engine.py && sed -n '1698,1718p' research/v15/v15_m07_engine.py && sed -n '976,988p' research/v15/v15_m07_engine.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    rows = actions.sort_values(["ts", "event_order"]).to_dict("records") if not actions.empty else []
+    # AUDIT 2026-07-10 (codex P0#1): WINDOW PURITY. Defensively drop any SOURCE action outside [win_lo, end)
+    # so a mis-scoped input can't pollute the metrics with test-window data (the runner filters, but M8/M9
+    # call step_subaccount directly). The latency-pushed our_ts >= end guard is enforced in the loop below.
+    _win_lo = int(start_ts_ms) if start_ts_ms is not None else _bstart
+    rows = [r for r in rows if _win_lo <= int(r["ts"]) < int(end_ts_ms)]
+    # AUDIT 2026-07-10 (codex P0#2): emit window provenance on the summary so a consumer (m06b) can PROVE the
+    # row was generated for its fold's window, not a stale test run. window_end is the half-open exclusive bound.
+    summary["window_start_ms"] = int(_win_lo)
+    summary["window_end_ms"] = int(end_ts_ms)
+    # count of COPYABLE (perp, non-spot) actions whose latency-pushed our_ts lands at/after the fold end
+    # (codex P0#1 minor; spot rows are skipped by the loop so they must not inflate this reject count).
+    summary["n_late_copy_skipped"] = sum(
+        1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
+    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+    # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+    # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
+    # until ADL is implemented or the stress model is accepted without it (Alberto decision).
+    summary["adl_stress_requested"] = bool(params.adl_stress)
+    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+    if params.adl_stress:
+        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
+    # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
+    # zero actions (codex code-r2 #2). Falls back to the first action time, then end_ts.
+    if start_ts_ms is not None:
+        prev_ts = int(start_ts_ms)
+    elif rows:
+        prev_ts = int(rows[0]["ts"]) + params.copy_latency_ms
+    else:
+        prev_ts = end_ts_ms
+    from _streaming_io import ShardedParquetWriter, install_memory_guard
+    import pyarrow.dataset as ds
+
+    install_memory_guard(soft_gb=12, label="m07")
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    folds = pd.read_parquet(folds_path)
+    # window selects the simulated span per fold: "test" = OOS [test_start,test_end) (M9 eval input);
+    # "pretest" = [train_start,test_start) (M6b fold-pure ranking input). Same shipped engine; only the
+    # window differs. start_ts_ms anchors risk at the window start.
+    if window == "pretest":
+        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+                                     int(pd.Timestamp(r.test_start).timestamp() * 1000))
+                    for r in folds.itertuples()}
+    else:
+        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
+                                     int(pd.Timestamp(r.test_end_excl).timestamp() * 1000))
+                    for r in folds.itertuples()}
+
+    sl = pd.read_parquet(shortlist_path, columns=["entity_id", "primary_wallet", "fold_id", "in_shortlist"])
+    sl = sl[sl.in_shortlist].copy()
+    liq = md.liquidity(coin, our_ts)
+    if liq.get("adv_unavailable") and not force_close:
+        summary["adv_unavailable"] = True
+        summary["n_rejected"] += 1
+        return
+    if liq.get("uncalibrated"):
+        summary["slippage_uncalibrated"] = True
+    elif getattr(md, "slip_calib_version", None) is not None:
+        summary["slippage_calibration_version"] = md.slip_calib_version
+    adv = liq.get("adv", 0.0)
+    capacity_capped = False
+    if adv > 0 and not force_close:
+        max_notional = CAPACITY_PARTICIPATION_CAP * adv
+
+exec
+/bin/zsh -lc "python - <<'PY'
+import pandas as pd, time, os
+print(time.tzname)
+ts=pd.Timestamp('2025-12-01')
+print(ts.value//1_000_000)
+print(int(ts.timestamp()*1000))
+print(pd.Timestamp('2025-12-01', tz='UTC').value//1_000_000)
+print(int(pd.Timestamp('2025-12-01', tz='UTC').timestamp()*1000))
+PY" in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: command not found: python
+
+codex
+One thing I’m checking carefully is timestamp normalization. The m06b check uses pandas nanosecond values converted to milliseconds; the m07 runner appears to stamp windows with `Timestamp.timestamp() * 1000`, so the trust verdict depends on those two being identical for the fold parquet dtypes in this repo.
+exec
+/bin/zsh -lc "rg -n \"def run|window == \\\"pretest\\\"|window_start_ms|timestamp\\(\\) \\* 1000|_ms\\(\" research/v15/v15_m07_engine.py research/v15/v15_m03_fold_geometry.py tests/v15/test_m07.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_m03_fold_geometry.py:54:def _ms(d: date) -> int:
+research/v15/v15_m03_fold_geometry.py:56:    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)
+research/v15/v15_m03_fold_geometry.py:79:        if window == "pretest":
+research/v15/v15_m07_engine.py:628:    summary["window_start_ms"] = int(_win_lo)
+research/v15/v15_m07_engine.py:1689:def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, out_dir: Path,
+research/v15/v15_m07_engine.py:1708:    if window == "pretest":
+research/v15/v15_m07_engine.py:1709:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+research/v15/v15_m07_engine.py:1710:                                     int(pd.Timestamp(r.test_start).timestamp() * 1000))
+research/v15/v15_m07_engine.py:1713:        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.test_start).timestamp() * 1000),
+research/v15/v15_m07_engine.py:1714:                                     int(pd.Timestamp(r.test_end_excl).timestamp() * 1000))
+
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import pandas as pd, time
+print(time.tzname)
+for x in ['2025-12-01', pd.Timestamp('2025-12-01')]:
+    ts=pd.Timestamp(x)
+    print(ts, ts.tzinfo, ts.value//1_000_000, int(ts.timestamp()*1000))
+for ts in [pd.Timestamp('2025-12-01', tz='UTC'), pd.Timestamp('2025-12-01', tz='Europe/Sofia')]:
+    print(ts, ts.tzinfo, ts.value//1_000_000, int(ts.timestamp()*1000))
+PY" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+from pathlib import Path
+import pandas as pd
+p=Path('app/data/v15/m03_folds.parquet')
+if p.exists():
+    f=pd.read_parquet(p)
+    print(f.dtypes)
+    print(f.head())
+    r=f.iloc[0]
+    for col in ['train_start','test_start','pretest_start','pretest_end_excl']:
+        if col in f:
+            ts=pd.Timestamp(r[col])
+            print(col, repr(r[col]), ts, ts.tzinfo, ts.value//1_000_000, int(ts.timestamp()*1000), int(ts.timestamp()*1000)-(ts.value//1_000_000))
+else:
+    print('no m03_folds.parquet')
+PY" in /Users/hermes/quants-lab
+ succeeded in 508ms:
+('EET', 'EEST')
+2025-12-01 00:00:00 None 1764547200000 1764547200000
+2025-12-01 00:00:00 None 1764547200000 1764547200000
+2025-12-01 00:00:00+00:00 UTC 1764547200000 1764547200000
+2025-12-01 00:00:00+02:00 Europe/Sofia 1764540000000 1764540000000
+
+ succeeded in 556ms:
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l1dcachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l2cachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l3cachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.optional.neon'. Detail: [errno 1] Operation not permitted
+fold_id                       int64
+train_start          datetime64[ms]
+train_end_excl       datetime64[ms]
+val_start            datetime64[ms]
+val_end_excl         datetime64[ms]
+test_start           datetime64[ms]
+test_end_excl        datetime64[ms]
+pretest_start        datetime64[ms]
+pretest_end_excl     datetime64[ms]
+train_days                    int64
+val_days                      int64
+test_days                     int64
+step_days                     int64
+is_full_test_fold              bool
+oos_chain_order               int64
+btc_trend_bucket                str
+hl_trend_bucket                 str
+dvol_bucket                     str
+dtype: object
+   fold_id train_start  ... hl_trend_bucket dvol_bucket
+0        1  2025-12-01  ...         UNKNOWN     UNKNOWN
+1        2  2025-12-15  ...         UNKNOWN     UNKNOWN
+2        3  2025-12-29  ...         UNKNOWN     UNKNOWN
+3        4  2026-01-12  ...         UNKNOWN     UNKNOWN
+4        5  2026-01-26  ...         UNKNOWN     UNKNOWN
+
+[5 rows x 18 columns]
+train_start Timestamp('2025-12-01 00:00:00') 2025-12-01 00:00:00 None 1764547200000 1764547200000 0
+test_start Timestamp('2026-01-26 00:00:00') 2026-01-26 00:00:00 None 1769385600000 1769385600000 0
+pretest_start Timestamp('2025-12-01 00:00:00') 2025-12-01 00:00:00 None 1764547200000 1764547200000 0
+pretest_end_excl Timestamp('2026-01-26 00:00:00') 2026-01-26 00:00:00 None 1769385600000 1769385600000 0
+
+codex
+The timestamp check looks internally consistent for the checked fold parquet: `datetime64[ms]` naive fold times produce the same millisecond epochs via both m06b’s `.value // 1_000_000` and m07’s `.timestamp() * 1000`. I don’t see a timezone-induced false fail for the current artifact format.
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m06b.py tests/v15/test_m06b_golden.py -q' in /Users/hermes/quants-lab
+ succeeded in 3498ms:
+........................................                                 [100%]
+40 passed in 3.03s
+
+codex
+I reran the m06b focused suite locally as a sanity check: 40 tests passed. I’m doing one last line-number pass so the verdict can point at the exact checks.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m06b_ranking.py | sed -n '732,815p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   732	    # --- investable flag (provisional vs FINAL). FINAL (investable=True) requires ALL of:
+   733	    #     calibrated costs (no uncalibrated flags) + fee/slippage calibration versions set +
+   734	    #     REAL fidelity from M7 tracking_error (no neutral default) + REAL consistency from M7
+   735	    #     after-cost equity block ROE (no M6a source-persistence proxy). Any provisional input ->
+   736	    #     non-investable (the proxies are gameable / not after-our-cost). ---
+   737	    # source flags gate FINAL on a PER-ROW basis over the RANKABLE rows (mode is fragile: a few
+   738	    # provisional rows must still block). FINAL requires EVERY rankable row to carry real M7 sources.
+   739	    rk_mask = out["m6b_rankable"].fillna(False)
+   740	    # report the source over RANKABLE rows (the rows that gate FINAL); the global mode is dominated by
+   741	    # non-rankable rows (no M7 row -> provisional default) and is misleading.
+   742	    _src_rows = out.loc[rk_mask] if rk_mask.any() else out
+   743	    consistency_source = _src_rows["consistency_source"].mode().iat[0] if len(_src_rows) else "unknown"
+   744	    fidelity_source = _src_rows["fidelity_source"].mode().iat[0] if len(_src_rows) else "unknown"
+   745	    fidelity_final = bool(rk_mask.any() and out.loc[rk_mask, "fidelity_source"].eq("m07_tracking_error").all())
+   746	    consistency_final = bool(rk_mask.any() and out.loc[rk_mask, "consistency_source"].eq("m07_equity_block_roe").all())
+   747	    # v2: FINAL additionally requires the REALIZED round-trip metrics to be present on every rankable
+   748	    #     row -- a realized_roe (no roe_engine fallback) AND a finite round_trip_win_rate AND a
+   749	    #     non-null n_round_trips. The rank now depends on realized round-trips; a fallback/missing
+   750	    #     basis means the pool was not locked on the after-cost realized return.
+   751	    if rk_mask.any():
+   752	        realized_final = bool(
+   753	            out.loc[rk_mask, "return_basis"].eq("realized_roe").all()
+   754	            and pd.to_numeric(out.loc[rk_mask, "round_trip_win_rate"], errors="coerce").notna().all()
+   755	            and pd.to_numeric(out.loc[rk_mask, "n_round_trips"], errors="coerce").notna().all()
+   756	        )
+   757	    else:
+   758	        realized_final = False
+   759	    # AUDIT 2026-07-10 (codex P0#2): FINAL/investable additionally REQUIRES fold-pure M4. The global
+   760	    # m04_entities.parquet maps entity->copyable with FULL-history (post-decision) knowledge = look-ahead; a run
+   761	    # that fell back to it must NEVER be stamped investable (it could admit an entity not copyable at test_start,
+   762	    # or drop a historically-valid one). Fold-pure per-fold M4 (--m04-dir, provenance-checked in load_inputs) only.
+   763	    m04_fold_pure = bool(inputs.get("m04_fold_pure"))
+   764	    # AUDIT 2026-07-10 (codex P1#4): the CLI-claimed slippage_calibration_version must be CROSS-CHECKED against
+   765	    # what M7 actually priced. Require every RANKABLE m07 row to carry slippage_calibration_version equal to the
+   766	    # manifest version -> a run stamped with a version M7 did not use (None/mixed) cannot be marked investable.
+   767	    if rk_mask.any() and "slippage_calibration_version" in out.columns:
+   768	        slippage_version_final = bool(
+   769	            out.loc[rk_mask, "slippage_calibration_version"].eq(m.slippage_calibration_version).all())
+   770	    else:
+   771	        slippage_version_final = False
+   772	    investable = (
+   773	        (not uncalibrated)
+   774	        and (m.slippage_calibration_version is not None)
+   775	        and (m.fee_schedule_version is not None)
+   776	        and fidelity_final
+   777	        and consistency_final
+   778	        and realized_final
+   779	        and m04_fold_pure
+   780	        and slippage_version_final
+   781	    )
+   782	    out["investable"] = bool(investable)
+   783	    out["slippage_uncalibrated"] = summ["slippage_uncalibrated"].any() if "slippage_uncalibrated" in summ else True
+   784	
+   785	    return_basis = _src_rows["return_basis"].mode().iat[0] if (
+   786	        "return_basis" in _src_rows and len(_src_rows)) else "unknown"
+   787	    manifest = asdict(m)
+   788	    manifest["uncalibrated_input"] = uncalibrated
+   789	    manifest["investable"] = bool(investable)
+   790	    manifest["consistency_source"] = consistency_source
+   791	    manifest["fidelity_source"] = fidelity_source
+   792	    manifest["return_basis"] = return_basis
+   793	    manifest["return_basis_fallback"] = bool(return_basis_fallback)
+   794	    if not investable:
+   795	        reasons = []
+   796	        if uncalibrated:
+   797	            reasons.append("uncalibrated_costs")
+   798	        if m.slippage_calibration_version is None:
+   799	            reasons.append("no_slippage_calibration_version")
+   800	        if m.fee_schedule_version is None:
+   801	            reasons.append("no_fee_schedule_version")
+   802	        if not fidelity_final:
+   803	            reasons.append(f"fidelity_provisional({fidelity_source})")
+   804	        if not consistency_final:
+   805	            reasons.append(f"consistency_provisional({consistency_source})")
+   806	        if not realized_final:
+   807	            reasons.append(f"realized_metrics_missing({return_basis})")
+   808	        if not m04_fold_pure:
+   809	            reasons.append("m04_not_fold_pure(look_ahead_global_m04)")
+   810	        if not slippage_version_final:
+   811	            reasons.append("slippage_version_mismatch(m07 rows != claimed calibration)")
+   812	        manifest["non_investable_reasons"] = reasons
+   813	    return out, manifest
+   814	
+   815	
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m06b_ranking.py | sed -n '400,450p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   400	
+   401	    # --- provenance: per-fold pretest-pure. M6a/M5 carry as_of_ms; refuse any input stamped AFTER
+   402	    #     test_start[k] (fixes r1#9 -- no inherited survivor bias / no leak). ---
+   403	    fold_test_start_ms = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000
+   404	                          for r in folds.itertuples()}
+   405	    provenance_fail = []
+   406	    prov_inputs = [("m06a", m06a), ("m05", m05)]
+   407	    if inputs.get("m04_fold_pure"):
+   408	        prov_inputs.extend([("m04_entities", m04e), ("m04_auth", inputs["m04_auth"])])
+   409	    for nm, df in prov_inputs:
+   410	        if "as_of_ms" not in df.columns:
+   411	            provenance_fail.append(f"{nm}:no_as_of_ms_column")
+   412	            continue
+   413	        if nm.startswith("m04") and "fold_id" not in df.columns:
+   414	            provenance_fail.append(f"{nm}:no_fold_id_column")
+   415	            continue
+   416	        # require PRESENT + non-null as_of_ms for every row (missing provenance is not provenance-OK)
+   417	        n_null = int(df["as_of_ms"].isna().sum())
+   418	        if n_null:
+   419	            provenance_fail.append(f"{nm}:{n_null}_rows_null_as_of_ms")
+   420	        ts_start = df["fold_id"].map(fold_test_start_ms)
+   421	        if ts_start.isna().any():
+   422	            provenance_fail.append(f"{nm}:{int(ts_start.isna().sum())}_rows_unknown_fold")
+   423	        if nm.startswith("m04"):
+   424	            bad = (df["as_of_ms"].astype("float64") != ts_start.astype("float64")).fillna(False)
+   425	            if bad.any():
+   426	                provenance_fail.append(f"{nm}:{int(bad.sum())}_rows_as_of_not_equal_test_start")
+   427	        else:
+   428	            bad = (df["as_of_ms"].astype("float64") > ts_start.astype("float64")).fillna(False)
+   429	            if bad.any():
+   430	                provenance_fail.append(f"{nm}:{int(bad.sum())}_rows_post_test_start")
+   431	    # AUDIT 2026-07-10 (codex m06b P0#1, enabled by m07 P0#2 window metadata): PROVE the M7 metrics we rank on
+   432	    # were generated for the fold's PRETEST window [train_start, test_start), not a stale/test-window run. Every
+   433	    # m07_summary row must carry window_start_ms == train_start and window_end_ms == test_start for its fold.
+   434	    fold_train_start_ms = {int(r.fold_id): pd.Timestamp(r.train_start).value // 1_000_000 for r in folds.itertuples()}
+   435	    if "window_start_ms" not in summ.columns or "window_end_ms" not in summ.columns:
+   436	        provenance_fail.append("m07_summary:no_window_provenance(regenerate with current m07 engine)")
+   437	    else:
+   438	        _ws = pd.to_numeric(summ["window_start_ms"], errors="coerce")
+   439	        _we = pd.to_numeric(summ["window_end_ms"], errors="coerce")
+   440	        _ews = summ["fold_id"].map(fold_train_start_ms).astype("float64")
+   441	        _ewe = summ["fold_id"].map(fold_test_start_ms).astype("float64")
+   442	        _bad = ((_ws.astype("float64") != _ews) | (_we.astype("float64") != _ewe)).fillna(True)
+   443	        if _bad.any():
+   444	            provenance_fail.append(f"m07_summary:{int(_bad.sum())}_rows_window!=[train_start,test_start) "
+   445	                                   f"(test-window or stale m07 run -> look-ahead)")
+   446	    if provenance_fail:
+   447	        raise ValueError(f"M6b PROVENANCE FAIL-CLOSED: {provenance_fail}")
+   448	
+   449	    # --- engine after-cost results per (entity,fold) ---
+   450	    summ = summ.rename(columns={"max_dd": "max_dd_pretest"})
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '624,630p;1704,1711p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   624	    _win_lo = int(start_ts_ms) if start_ts_ms is not None else _bstart
+   625	    rows = [r for r in rows if _win_lo <= int(r["ts"]) < int(end_ts_ms)]
+   626	    # AUDIT 2026-07-10 (codex P0#2): emit window provenance on the summary so a consumer (m06b) can PROVE the
+   627	    # row was generated for its fold's window, not a stale test run. window_end is the half-open exclusive bound.
+   628	    summary["window_start_ms"] = int(_win_lo)
+   629	    summary["window_end_ms"] = int(end_ts_ms)
+   630	    # count of COPYABLE (perp, non-spot) actions whose latency-pushed our_ts lands at/after the fold end
+  1704	    folds = pd.read_parquet(folds_path)
+  1705	    # window selects the simulated span per fold: "test" = OOS [test_start,test_end) (M9 eval input);
+  1706	    # "pretest" = [train_start,test_start) (M6b fold-pure ranking input). Same shipped engine; only the
+  1707	    # window differs. start_ts_ms anchors risk at the window start.
+  1708	    if window == "pretest":
+  1709	        fold_win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+  1710	                                     int(pd.Timestamp(r.test_start).timestamp() * 1000))
+  1711	                    for r in folds.itertuples()}
+
+codex
+**Verdict**
+
+P0#1 window provenance: **fixed / trusted**. The equality check in [v15_m06b_ranking.py](/Users/hermes/quants-lab/research/v15/v15_m06b_ranking.py:431) is correct for the current fold artifact format. It checks every `m07_summary` row before merges, requires both columns, coerces bad values to fail, and unknown fold IDs also fail via `NaN != expected`. The ms basis matches m07’s emitted `window_start_ms/window_end_ms` for the repo’s `datetime64[ms]` fold parquet.
+
+P1#4 slippage version: **fixed / trusted**. The check in [v15_m06b_ranking.py](/Users/hermes/quants-lab/research/v15/v15_m06b_ranking.py:764) gates `investable=True` on every rankable row matching the manifest version. Missing column, `None`, mixed versions, or mismatch all make `slippage_version_final=False`, and the investable expression also still requires `m.slippage_calibration_version is not None` plus `not uncalibrated`. I don’t see a path where a rankable mismatched/None-version row can still yield `investable=True`.
+
+No new bug found in these two fixes. I also reran the focused m06b tests locally:
+
+`40 passed in 3.03s`
+
+OVERALL: with all 5 audit findings fixed, **m06b is TRUSTED for ranking + pool + investability**, assuming the passing full v15 suite you reported is from the same tree.
+tokens used
+45.308
+**Verdict**
+
+P0#1 window provenance: **fixed / trusted**. The equality check in [v15_m06b_ranking.py](/Users/hermes/quants-lab/research/v15/v15_m06b_ranking.py:431) is correct for the current fold artifact format. It checks every `m07_summary` row before merges, requires both columns, coerces bad values to fail, and unknown fold IDs also fail via `NaN != expected`. The ms basis matches m07’s emitted `window_start_ms/window_end_ms` for the repo’s `datetime64[ms]` fold parquet.
+
+P1#4 slippage version: **fixed / trusted**. The check in [v15_m06b_ranking.py](/Users/hermes/quants-lab/research/v15/v15_m06b_ranking.py:764) gates `investable=True` on every rankable row matching the manifest version. Missing column, `None`, mixed versions, or mismatch all make `slippage_version_final=False`, and the investable expression also still requires `m.slippage_calibration_version is not None` plus `not uncalibrated`. I don’t see a path where a rankable mismatched/None-version row can still yield `investable=True`.
+
+No new bug found in these two fixes. I also reran the focused m06b tests locally:
+
+`40 passed in 3.03s`
+
+OVERALL: with all 5 audit findings fixed, **m06b is TRUSTED for ranking + pool + investability**, assuming the passing full v15 suite you reported is from the same tree.

@@ -428,6 +428,21 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
             bad = (df["as_of_ms"].astype("float64") > ts_start.astype("float64")).fillna(False)
             if bad.any():
                 provenance_fail.append(f"{nm}:{int(bad.sum())}_rows_post_test_start")
+    # AUDIT 2026-07-10 (codex m06b P0#1, enabled by m07 P0#2 window metadata): PROVE the M7 metrics we rank on
+    # were generated for the fold's PRETEST window [train_start, test_start), not a stale/test-window run. Every
+    # m07_summary row must carry window_start_ms == train_start and window_end_ms == test_start for its fold.
+    fold_train_start_ms = {int(r.fold_id): pd.Timestamp(r.train_start).value // 1_000_000 for r in folds.itertuples()}
+    if "window_start_ms" not in summ.columns or "window_end_ms" not in summ.columns:
+        provenance_fail.append("m07_summary:no_window_provenance(regenerate with current m07 engine)")
+    else:
+        _ws = pd.to_numeric(summ["window_start_ms"], errors="coerce")
+        _we = pd.to_numeric(summ["window_end_ms"], errors="coerce")
+        _ews = summ["fold_id"].map(fold_train_start_ms).astype("float64")
+        _ewe = summ["fold_id"].map(fold_test_start_ms).astype("float64")
+        _bad = ((_ws.astype("float64") != _ews) | (_we.astype("float64") != _ewe)).fillna(True)
+        if _bad.any():
+            provenance_fail.append(f"m07_summary:{int(_bad.sum())}_rows_window!=[train_start,test_start) "
+                                   f"(test-window or stale m07 run -> look-ahead)")
     if provenance_fail:
         raise ValueError(f"M6b PROVENANCE FAIL-CLOSED: {provenance_fail}")
 
@@ -746,6 +761,14 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
     # that fell back to it must NEVER be stamped investable (it could admit an entity not copyable at test_start,
     # or drop a historically-valid one). Fold-pure per-fold M4 (--m04-dir, provenance-checked in load_inputs) only.
     m04_fold_pure = bool(inputs.get("m04_fold_pure"))
+    # AUDIT 2026-07-10 (codex P1#4): the CLI-claimed slippage_calibration_version must be CROSS-CHECKED against
+    # what M7 actually priced. Require every RANKABLE m07 row to carry slippage_calibration_version equal to the
+    # manifest version -> a run stamped with a version M7 did not use (None/mixed) cannot be marked investable.
+    if rk_mask.any() and "slippage_calibration_version" in out.columns:
+        slippage_version_final = bool(
+            out.loc[rk_mask, "slippage_calibration_version"].eq(m.slippage_calibration_version).all())
+    else:
+        slippage_version_final = False
     investable = (
         (not uncalibrated)
         and (m.slippage_calibration_version is not None)
@@ -754,6 +777,7 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         and consistency_final
         and realized_final
         and m04_fold_pure
+        and slippage_version_final
     )
     out["investable"] = bool(investable)
     out["slippage_uncalibrated"] = summ["slippage_uncalibrated"].any() if "slippage_uncalibrated" in summ else True
@@ -783,6 +807,8 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
             reasons.append(f"realized_metrics_missing({return_basis})")
         if not m04_fold_pure:
             reasons.append("m04_not_fold_pure(look_ahead_global_m04)")
+        if not slippage_version_final:
+            reasons.append("slippage_version_mismatch(m07 rows != claimed calibration)")
         manifest["non_investable_reasons"] = reasons
     return out, manifest
 

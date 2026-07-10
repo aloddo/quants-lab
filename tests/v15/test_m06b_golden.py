@@ -57,3 +57,27 @@ def test_p1_5_nonfinite_score_component_excluded_not_silent(_patch_exposure):
     assert bool(row["in_pool"]) is False                       # must not silently sit in the pool
     assert "nonfinite_score_component" in str(row["excluded_reason"])  # explicit reason, not blank
 
+
+def test_p0_1_m07_window_mismatch_fails_closed(_patch_exposure):
+    # m07 rows stamped with a window != the fold's [train_start,test_start) (e.g. a stale TEST run) -> fail closed.
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=True)
+    inp["m07_summary"]["window_end_ms"] = inp["m07_summary"]["window_end_ms"] + 14 * 86_400_000  # shove into test window
+    with pytest.raises(ValueError, match="window"):
+        M.build_ranking(inp, m)
+
+
+def test_p1_4_slippage_version_mismatch_not_investable(_patch_exposure):
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=True)
+    inp["m07_summary"]["slippage_calibration_version"] = "SOME-OTHER-VERSION"  # not what the manifest claims
+    _out, manifest = M.build_ranking(inp, m)
+    assert manifest["investable"] is False
+    assert any("slippage_version_mismatch" in r for r in manifest["non_investable_reasons"])
+
