@@ -240,9 +240,13 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
     pp = Path(pool_path) if pool_path else (data_dir / "m06b_pool.parquet")
     pool = pd.read_parquet(pp)
     pool = pool[pool["in_pool"]].copy()
-    if "investable" not in pool.columns or not pool["investable"].fillna(False).all():
+    # AUDIT 2026-07-10 (codex P1#5): require a real BOOLEAN dtype. `fillna(False).all()` treated truthy strings
+    # (e.g. the literal "False") as True, so a corrupted/provisional pool could be tiered for deployment.
+    if "investable" not in pool.columns or not pd.api.types.is_bool_dtype(pool["investable"]) \
+            or not bool(pool["investable"].all()):
         raise ValueError(
-            "M8 requires an investable M6b pool; provisional/uncalibrated ranking cannot be tiered for deployment"
+            "M8 requires an investable M6b pool with a boolean `investable` column all True; "
+            "provisional/uncalibrated ranking (or a non-bool column) cannot be tiered for deployment"
         )
     folds = pd.read_parquet(data_dir / "m03_folds.parquet")
     ent, m04_fold_pure = _load_m04_entities(data_dir, folds, m04_dir)
@@ -280,7 +284,11 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
     for r in seats:
         fid = int(r.fold_id)
         if fid not in fold_win:
-            continue
+            # AUDIT 2026-07-10 (codex P1#8): a pooled seat whose fold is absent from m03_folds is a provenance
+            # mismatch (stale/wrong artifact) — do NOT silently drop the seat (it would vanish from m08 output
+            # with no verdict). Fail closed.
+            raise ValueError(f"M8 provenance: pooled (entity {int(r.entity_id)}, fold {fid}) has no matching "
+                             f"m03_folds row (folds present: {sorted(fold_win)}). Rebuild m03/m06b consistently.")
         t0, t1 = fold_win[fid]
         md.set_slip_calib(per_fold.get(fid), cal.get("version") if slip_calib_path else None)
         filt = ((ds.field("wallet") == r.primary_wallet)
