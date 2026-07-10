@@ -1,0 +1,945 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4b6a-d358-7472-b29e-5a09467b910e
+--------
+user
+Round-3 Phase 3a. Your round-2 blocker was tests/v25 + tests/v26 importing archived v25/v26 research modules.
+FIXED: archived tests/v25 + tests/v26 -> archive/tests/ (they test the retired v25/v26 cohorts). Re-verified:
+NO remaining test imports any archived research module; all 34 research/v15 keep import OK; engine PID 85806 alive.
+Net 196 files archived this step (dead research one-offs + retired v13/v25/v26 tests). Confirm: is Phase 3a NOW
+safe to commit (consensus)? Name any file that still must move back, else confirm consensus.
+codex
+I’ll verify the import surface and current git state before answering. The key checks are whether active tests still import archived modules and whether any non-archived path references the moved v25/v26 cohorts.
+exec
+/bin/zsh -lc 'git status --short' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "rg -n \"(from research|import research|research/)\" tests --glob '"'!archive/**'"' --glob '"'!**/.git/**'"'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/test_phase1_m01_validate.py:5:from research.phase1_m01_validate import validate
+tests/test_phase1_data_audit.py:6:from research.phase1_data_audit import scan_enriched_fills, scan_wallet_partition_parity
+
+ succeeded in 0ms:
+R  research/v13/v13_anchor_state_fetcher.py -> archive/research/v13/v13_anchor_state_fetcher.py
+R  research/v13/v13_cold_start.py -> archive/research/v13/v13_cold_start.py
+R  research/v13/v13_concat_journey_chunks.py -> archive/research/v13/v13_concat_journey_chunks.py
+R  research/v13/v13_copy_backtest.py -> archive/research/v13/v13_copy_backtest.py
+R  research/v13/v13_copy_backtest_v2.py -> archive/research/v13/v13_copy_backtest_v2.py
+R  research/v13/v13_copy_ranker.py -> archive/research/v13/v13_copy_ranker.py
+R  research/v13/v13_copy_ranker_v2.py -> archive/research/v13/v13_copy_ranker_v2.py
+R  research/v13/v13_dec1_anchor.py -> archive/research/v13/v13_dec1_anchor.py
+R  research/v13/v13_entry_only_evaluate.py -> archive/research/v13/v13_entry_only_evaluate.py
+R  research/v13/v13_entry_only_null.py -> archive/research/v13/v13_entry_only_null.py
+R  research/v13/v13_equity_reconstruct.py -> archive/research/v13/v13_equity_reconstruct.py
+R  research/v13/v13_equity_reconstruct_parallel.py -> archive/research/v13/v13_equity_reconstruct_parallel.py
+R  research/v13/v13_equity_reconstruct_v8.py -> archive/research/v13/v13_equity_reconstruct_v8.py
+R  research/v13/v13_execution_realism.py -> archive/research/v13/v13_execution_realism.py
+R  research/v13/v13_extract_oracle_marks.py -> archive/research/v13/v13_extract_oracle_marks.py
+R  research/v13/v13_full_pool_sweep.py -> archive/research/v13/v13_full_pool_sweep.py
+R  research/v13/v13_journey_trace.py -> archive/research/v13/v13_journey_trace.py
+R  research/v13/v13_m03_v2.py -> archive/research/v13/v13_m03_v2.py
+R  research/v13/v13_marks_to_npz.py -> archive/research/v13/v13_marks_to_npz.py
+R  research/v13/v13_partition_fills_by_wallet.py -> archive/research/v13/v13_partition_fills_by_wallet.py
+R  research/v13/v13_pass_fail_gates.py -> archive/research/v13/v13_pass_fail_gates.py
+R  research/v13/v13_pool_evaluate.py -> archive/research/v13/v13_pool_evaluate.py
+R  research/v13/v13_pool_sweep_shard.py -> archive/research/v13/v13_pool_sweep_shard.py
+R  research/v13/v13_portfolio_anchor.py -> archive/research/v13/v13_portfolio_anchor.py
+R  research/v13/v13_portfolio_ledger.py -> archive/research/v13/v13_portfolio_ledger.py
+R  research/v13/v13_portfolio_simulator.py -> archive/research/v13/v13_portfolio_simulator.py
+R  research/v13/v13_preload_marks.py -> archive/research/v13/v13_preload_marks.py
+R  research/v13/v13_rank_copy_candidates.py -> archive/research/v13/v13_rank_copy_candidates.py
+R  research/v13/v13_reconstruct_1m_candles_from_fills.py -> archive/research/v13/v13_reconstruct_1m_candles_from_fills.py
+R  research/v13/v13_report.py -> archive/research/v13/v13_report.py
+R  research/v13/v13_single_wallet_eval.py -> archive/research/v13/v13_single_wallet_eval.py
+R  research/v13/v13_strict_random_null.py -> archive/research/v13/v13_strict_random_null.py
+R  research/v13/v13_universe_rebuild.py -> archive/research/v13/v13_universe_rebuild.py
+R  research/v13/v13_validate_funding_integration.py -> archive/research/v13/v13_validate_funding_integration.py
+R  research/v13/v13_validate_liquidation_label_semantics.py -> archive/research/v13/v13_validate_liquidation_label_semantics.py
+R  research/v13/v13_validate_reconstructed_candles.py -> archive/research/v13/v13_validate_reconstructed_candles.py
+R  research/v13/v13_walk_forward.py -> archive/research/v13/v13_walk_forward.py
+R  research/v13/v13_walk_forward_folds.py -> archive/research/v13/v13_walk_forward_folds.py
+R  research/v13/v13_wallet_metrics.py -> archive/research/v13/v13_wallet_metrics.py
+R  research/v13/v13_wf_pool_eval.py -> archive/research/v13/v13_wf_pool_eval.py
+R  research/v15/audit_mark_coverage.py -> archive/research/v15/audit_mark_coverage.py
+R  research/v15/backfill_edge_check.py -> archive/research/v15/backfill_edge_check.py
+R  research/v15/balanced_step1_perside_edge.py -> archive/research/v15/balanced_step1_perside_edge.py
+R  research/v15/balanced_step2_walkforward.py -> archive/research/v15/balanced_step2_walkforward.py
+R  research/v15/balanced_step3b_feb_attrib.py -> archive/research/v15/balanced_step3b_feb_attrib.py
+R  research/v15/build_half_life_surface.py -> archive/research/v15/build_half_life_surface.py
+R  research/v15/compare_fresh_vs_current_cohort.py -> archive/research/v15/compare_fresh_vs_current_cohort.py
+R  research/v15/consensus_conviction.py -> archive/research/v15/consensus_conviction.py
+R  research/v15/consensus_flow_signal.py -> archive/research/v15/consensus_flow_signal.py
+R  research/v15/consensus_signal_test.py -> archive/research/v15/consensus_signal_test.py
+R  research/v15/copyA_copyability_sim.py -> archive/research/v15/copyA_copyability_sim.py
+R  research/v15/copyA_cv.py -> archive/research/v15/copyA_cv.py
+R  research/v15/copyA_cv_rank.py -> archive/research/v15/copyA_cv_rank.py
+R  research/v15/copyA_local_screen.py -> archive/research/v15/copyA_local_screen.py
+R  research/v15/copyA_oos.py -> archive/research/v15/copyA_oos.py
+R  research/v15/copyA_rank.py -> archive/research/v15/copyA_rank.py
+R  research/v15/copyA_roc.py -> archive/research/v15/copyA_roc.py
+R  research/v15/copyA_roster.py -> archive/research/v15/copyA_roster.py
+R  research/v15/copyA_wallet_vetting.py -> archive/research/v15/copyA_wallet_vetting.py
+R  research/v15/copyA_wide_screen.py -> archive/research/v15/copyA_wide_screen.py
+R  research/v15/copy_builder_replay.py -> archive/research/v15/copy_builder_replay.py
+R  research/v15/copy_candidate_events.py -> archive/research/v15/copy_candidate_events.py
+R  research/v15/copy_consistent_winners_oos.py -> archive/research/v15/copy_consistent_winners_oos.py
+R  research/v15/copy_decile_spread_final.py -> archive/research/v15/copy_decile_spread_final.py
+R  research/v15/copy_edge_adversarial_audit.py -> archive/research/v15/copy_edge_adversarial_audit.py
+R  research/v15/copy_latency_markouts.py -> archive/research/v15/copy_latency_markouts.py
+R  research/v15/copy_multiwindow_hunter.py -> archive/research/v15/copy_multiwindow_hunter.py
+R  research/v15/copy_rolling_selection.py -> archive/research/v15/copy_rolling_selection.py
+R  research/v15/copy_rolling_selection_sweep.py -> archive/research/v15/copy_rolling_selection_sweep.py
+R  research/v15/copy_vol_conditioning.py -> archive/research/v15/copy_vol_conditioning.py
+R  research/v15/copy_walkforward_betaneutral.py -> archive/research/v15/copy_walkforward_betaneutral.py
+R  research/v15/copy_walkforward_fast.py -> archive/research/v15/copy_walkforward_fast.py
+R  research/v15/copy_walkforward_scan.py -> archive/research/v15/copy_walkforward_scan.py
+R  research/v15/entry_copy_betaneutral.py -> archive/research/v15/entry_copy_betaneutral.py
+R  research/v15/entry_copy_overlay_sim.py -> archive/research/v15/entry_copy_overlay_sim.py
+R  research/v15/entry_copy_overlay_sweep.py -> archive/research/v15/entry_copy_overlay_sweep.py
+R  research/v15/entry_copy_robustness.py -> archive/research/v15/entry_copy_robustness.py
+R  research/v15/entry_copy_robustness2.py -> archive/research/v15/entry_copy_robustness2.py
+R  research/v15/forward_validate_martingale_drop.py -> archive/research/v15/forward_validate_martingale_drop.py
+R  research/v15/leadlag_clean_rank_report.py -> archive/research/v15/leadlag_clean_rank_report.py
+R  research/v15/live_cohort_forward_portfolio.py -> archive/research/v15/live_cohort_forward_portfolio.py
+R  research/v15/live_cohort_forward_track.py -> archive/research/v15/live_cohort_forward_track.py
+R  research/v15/live_cohort_forward_track_v2.py -> archive/research/v15/live_cohort_forward_track_v2.py
+R  research/v15/live_cohort_forward_track_v3.py -> archive/research/v15/live_cohort_forward_track_v3.py
+R  research/v15/live_cohort_freeze_classify.py -> archive/research/v15/live_cohort_freeze_classify.py
+R  research/v15/maker_fill_sim.py -> archive/research/v15/maker_fill_sim.py
+R  research/v15/minute_drift_diagnostic.py -> archive/research/v15/minute_drift_diagnostic.py
+R  research/v15/rerank_consistency_eval.py -> archive/research/v15/rerank_consistency_eval.py
+R  research/v15/roster_correlation.py -> archive/research/v15/roster_correlation.py
+R  research/v15/v15_biweekly_selector.py -> archive/research/v15/v15_biweekly_selector.py
+R  research/v15/v15_forward_select_sweep.py -> archive/research/v15/v15_forward_select_sweep.py
+R  research/v15/v15_g5_filter.py -> archive/research/v15/v15_g5_filter.py
+R  research/v15/v15_prefetch_anchors.py -> archive/research/v15/v15_prefetch_anchors.py
+R  research/v15/v15_prefilter_rank.py -> archive/research/v15/v15_prefilter_rank.py
+R  research/v15/v15_probe_behavior_select.py -> archive/research/v15/v15_probe_behavior_select.py
+R  research/v15/v15_rank_composite.py -> archive/research/v15/v15_rank_composite.py
+R  research/v15/v15_source_roe_enrichment.py -> archive/research/v15/v15_source_roe_enrichment.py
+R  research/v16/antifreeze_netx_backtest.py -> archive/research/v16/antifreeze_netx_backtest.py
+R  research/v16/archetype_edge.py -> archive/research/v16/archetype_edge.py
+R  research/v16/archetype_weighted_replay.py -> archive/research/v16/archetype_weighted_replay.py
+R  research/v16/asymmetric_capture_test.py -> archive/research/v16/asymmetric_capture_test.py
+R  research/v16/blocked_trades_counterfactual.py -> archive/research/v16/blocked_trades_counterfactual.py
+R  research/v16/book_sim.py -> archive/research/v16/book_sim.py
+R  research/v16/build_cohort_equity_band.py -> archive/research/v16/build_cohort_equity_band.py
+R  research/v16/build_copy_edge_label.py -> archive/research/v16/build_copy_edge_label.py
+R  research/v16/build_markout_cohort.py -> archive/research/v16/build_markout_cohort.py
+R  research/v16/cap_level_sweep.py -> archive/research/v16/cap_level_sweep.py
+R  research/v16/cap_level_sweep_v2.py -> archive/research/v16/cap_level_sweep_v2.py
+R  research/v16/capital_ladder.py -> archive/research/v16/capital_ladder.py
+R  research/v16/coin_class_structural.py -> archive/research/v16/coin_class_structural.py
+R  research/v16/coin_concurrency.py -> archive/research/v16/coin_concurrency.py
+R  research/v16/consensus_event_backtest.py -> archive/research/v16/consensus_event_backtest.py
+R  research/v16/constrained_edge_backtest.py -> archive/research/v16/constrained_edge_backtest.py
+R  research/v16/conviction_check.py -> archive/research/v16/conviction_check.py
+R  research/v16/copy_adds_portfolio_replay.py -> archive/research/v16/copy_adds_portfolio_replay.py
+R  research/v16/copy_edge_score_fns.py -> archive/research/v16/copy_edge_score_fns.py
+R  research/v16/decoupled_exit_portfolio.py -> archive/research/v16/decoupled_exit_portfolio.py
+R  research/v16/engine_replay.py -> archive/research/v16/engine_replay.py
+R  research/v16/entry_style.py -> archive/research/v16/entry_style.py
+R  research/v16/entry_style_per_wallet.py -> archive/research/v16/entry_style_per_wallet.py
+R  research/v16/exit_capture_sim.py -> archive/research/v16/exit_capture_sim.py
+R  research/v16/exit_trail_v2_backtest.py -> archive/research/v16/exit_trail_v2_backtest.py
+R  research/v16/fade_crowd_test.py -> archive/research/v16/fade_crowd_test.py
+R  research/v16/freeze_and_leader_perf.py -> archive/research/v16/freeze_and_leader_perf.py
+R  research/v16/fulluniverse_capture_replay.py -> archive/research/v16/fulluniverse_capture_replay.py
+R  research/v16/funding_session_check.py -> archive/research/v16/funding_session_check.py
+R  research/v16/hold_profile_test.py -> archive/research/v16/hold_profile_test.py
+R  research/v16/knet_beta_residual.py -> archive/research/v16/knet_beta_residual.py
+R  research/v16/knet_derisk_replay.py -> archive/research/v16/knet_derisk_replay.py
+R  research/v16/knet_fix_backtest.py -> archive/research/v16/knet_fix_backtest.py
+R  research/v16/knet_null_test.py -> archive/research/v16/knet_null_test.py
+R  research/v16/leader_rerank_walkforward.py -> archive/research/v16/leader_rerank_walkforward.py
+R  research/v16/leader_skill_persistence.py -> archive/research/v16/leader_skill_persistence.py
+R  research/v16/long_short_regime.py -> archive/research/v16/long_short_regime.py
+R  research/v16/lowcrowd_capture_replay.py -> archive/research/v16/lowcrowd_capture_replay.py
+R  research/v16/lwr_controls.py -> archive/research/v16/lwr_controls.py
+R  research/v16/maker_entry_portfolio.py -> archive/research/v16/maker_entry_portfolio.py
+R  research/v16/markout_cohort_eval.py -> archive/research/v16/markout_cohort_eval.py
+R  research/v16/markout_study.py -> archive/research/v16/markout_study.py
+R  research/v16/mechanics_eval.py -> archive/research/v16/mechanics_eval.py
+R  research/v16/momentum_control.py -> archive/research/v16/momentum_control.py
+R  research/v16/nb_filter_analysis.py -> archive/research/v16/nb_filter_analysis.py
+R  research/v16/netx_sweep.py -> archive/research/v16/netx_sweep.py
+R  research/v16/our_dd_holdout.py -> archive/research/v16/our_dd_holdout.py
+R  research/v16/overlay_oos.py -> archive/research/v16/overlay_oos.py
+R  research/v16/overlay_sweep.py -> archive/research/v16/overlay_sweep.py
+R  research/v16/predict_from_features_step1.py -> archive/research/v16/predict_from_features_step1.py
+R  research/v16/predict_from_features_step2_negselect.py -> archive/research/v16/predict_from_features_step2_negselect.py
+R  research/v16/profit_loo_gate1.py -> archive/research/v16/profit_loo_gate1.py
+R  research/v16/re_feature_scan.py -> archive/research/v16/re_feature_scan.py
+R  research/v16/reeval_18k_step1.py -> archive/research/v16/reeval_18k_step1.py
+R  research/v16/reeval_18k_step2_mtmdd.py -> archive/research/v16/reeval_18k_step2_mtmdd.py
+R  research/v16/reeval_18k_step3_copyedge.py -> archive/research/v16/reeval_18k_step3_copyedge.py
+R  research/v16/reeval_both_directions.py -> archive/research/v16/reeval_both_directions.py
+R  research/v16/reeval_frontier.py -> archive/research/v16/reeval_frontier.py
+R  research/v16/run_markout_cohort_m07.py -> archive/research/v16/run_markout_cohort_m07.py
+R  research/v16/run_markout_mechanics_m07.py -> archive/research/v16/run_markout_mechanics_m07.py
+R  research/v16/run_w1_frozen_m07.py -> archive/research/v16/run_w1_frozen_m07.py
+R  research/v16/run_weekly_spike_m07.py -> archive/research/v16/run_weekly_spike_m07.py
+R  research/v16/scalein_priced_replay.py -> archive/research/v16/scalein_priced_replay.py
+R  research/v16/skill_deep_validation.py -> archive/research/v16/skill_deep_validation.py
+R  research/v16/skill_selector_forward_validate.py -> archive/research/v16/skill_selector_forward_validate.py
+R  research/v16/skill_slot_sweep.py -> archive/research/v16/skill_slot_sweep.py
+R  research/v16/tail_filter_controls.py -> archive/research/v16/tail_filter_controls.py
+R  research/v16/tail_filter_test.py -> archive/research/v16/tail_filter_test.py
+R  research/v16/w1_frozen_cohort.py -> archive/research/v16/w1_frozen_cohort.py
+R  research/v16/w1_individual_wallets.py -> archive/research/v16/w1_individual_wallets.py
+R  research/v16/walkforward_cluster.py -> archive/research/v16/walkforward_cluster.py
+R  research/v16/weekly_cadence_feasibility.py -> archive/research/v16/weekly_cadence_feasibility.py
+R  research/v16/weekly_spike_eval.py -> archive/research/v16/weekly_spike_eval.py
+R  tests/v13/conftest.py -> archive/tests/v13/conftest.py
+R  tests/v13/test_module_01_equity_reconstruct.py -> archive/tests/v13/test_module_01_equity_reconstruct.py
+R  tests/v13/test_module_02_journey_trace.py -> archive/tests/v13/test_module_02_journey_trace.py
+R  tests/v13/test_module_04_ranker_aggregation.py -> archive/tests/v13/test_module_04_ranker_aggregation.py
+R  tests/v13/test_module_05_execution_realism.py -> archive/tests/v13/test_module_05_execution_realism.py
+R  tests/v13/test_module_06_cold_start.py -> archive/tests/v13/test_module_06_cold_start.py
+R  tests/v13/test_module_07_portfolio_ledger.py -> archive/tests/v13/test_module_07_portfolio_ledger.py
+R  tests/v13/test_module_08_portfolio_simulator.py -> archive/tests/v13/test_module_08_portfolio_simulator.py
+R  tests/v13/test_module_09_walk_forward_folds.py -> archive/tests/v13/test_module_09_walk_forward_folds.py
+R  tests/v13/test_module_10_pass_fail_gates.py -> archive/tests/v13/test_module_10_pass_fail_gates.py
+R  tests/v13/test_module_11_strict_random_null.py -> archive/tests/v13/test_module_11_strict_random_null.py
+R  tests/v25/conftest.py -> archive/tests/v25/conftest.py
+R  tests/v25/test_bootstrap.py -> archive/tests/v25/test_bootstrap.py
+R  tests/v25/test_gates.py -> archive/tests/v25/test_gates.py
+R  tests/v25/test_journeys.py -> archive/tests/v25/test_journeys.py
+R  tests/v25/test_run_folds.py -> archive/tests/v25/test_run_folds.py
+R  tests/v25/test_sim.py -> archive/tests/v25/test_sim.py
+R  tests/v26/conftest.py -> archive/tests/v26/conftest.py
+R  tests/v26/test_corrections.py -> archive/tests/v26/test_corrections.py
+R  tests/v26/test_estimand.py -> archive/tests/v26/test_estimand.py
+R  tests/v26/test_families.py -> archive/tests/v26/test_families.py
+R  tests/v26/test_fees.py -> archive/tests/v26/test_fees.py
+R  tests/v26/test_freeze_labels.py -> archive/tests/v26/test_freeze_labels.py
+R  tests/v26/test_maker.py -> archive/tests/v26/test_maker.py
+R  tests/v26/test_overlays.py -> archive/tests/v26/test_overlays.py
+R  tests/v26/test_registry.py -> archive/tests/v26/test_registry.py
+
+exec
+/bin/zsh -lc "rg -n \"(archive/|archive\\.|from archive|import archive|research\\.v2[56]|research/v2[56]|from research\\.v2[56]|import research\\.v2[56]|research\\.v13|research/v13|from research\\.v13|import research\\.v13)\" tests research engine . --glob '"'!archive/**'"' --glob '"'!**/.git/**'"'" in /Users/hermes/quants-lab
+ exited 2 in 0ms:
+rg: engine: No such file or directory (os error 2)
+./research/v16/agents/agentC_l2_universe_calib.py:831:             "(archive/scripts/collect_hyperliquid_micro_1s.py pattern) to it for 3-5 days and "
+research/v16/agents/agentC_l2_universe_calib.py:831:             "(archive/scripts/collect_hyperliquid_micro_1s.py pattern) to it for 3-5 days and "
+research/v15/v15_m02_journey_trace.py:13:This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
+./research/v15/v15_m02_journey_trace.py:13:This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
+./research/v15/live_marks.py:5:replaces the ~10-day-lagging asset_ctxs archive. Same asof-backward contract as leadlag_clean_rank_sim.mark_at
+research/v15/live_marks.py:5:replaces the ~10-day-lagging asset_ctxs archive. Same asof-backward contract as leadlag_clean_rank_sim.mark_at
+./tools/rehydrate_brain_from_kb.sh:53:#   - Not under archive/ subdir
+./tools/rehydrate_brain_from_kb.sh:56:find_args=("$KB_DIR" -type f -name "*.md" -not -path "*/archive/*")
+./SYSTEM.md:26:- ✅ Two-killers resolved: `com.quantslab.v12-watchdog` (STATS-heartbeat content) is the SOLE sanctioned killer; the log-mtime `v17-stall-watchdog` is removed + archived (`ops/launchd/archive/`). Codex: log-mtime != loop health.
+./REPO_MAP.md:14:research/v13/       V13 infra V15 reuses (modules 1-5) + v13 research scripts
+./REPO_MAP.md:19:archive/scripts/    superseded / dead code (git history preserved, never deleted)
+./REPO_MAP.md:59:| M6 ranking (a cheap shortlist / b post-engine) | `research/v13/v13_copy_ranker_v2.py` (rewrite) | STUB. V15: M6a source_score shortlist (~3-5k); M6b copyability-adjusted final ranking post-M7. |
+./REPO_MAP.md:60:| M7-M10 | research/v13/v13_*.py (exec-realism, cold_start, portfolio_ledger, portfolio_simulator[+sizing], pass_fail_gates, strict_random_null) | EXIST (V13). V15 rebuild TODO (M7 engine, M8 survival, M9 sim, M10 gates+null). |
+./REPO_MAP.md:65:(equity_reconstruct v4/v5/v7) are in `archive/scripts/v13/`.
+./REPO_MAP.md:80:- `v15_*` -> research/v15/ ; `v13_*` -> research/v13/
+./REPO_MAP.md:82:- utilities -> tools/ ; everything dead/superseded -> archive/scripts/
+./REPO_MAP.md:89:- 11 research/v13 scripts had `ROOT=parent.parent` / `parents[1]`; bumped +1 level
+./REPO_MAP.md:90:  (now 2-deep under research/v13/).
+./data_pipeline/hl_s3_misc_daily_refresh.py:2:"""Daily HL FUNDING + LEDGER refresh for the 20K-wallet universe, from the S3 node archive.
+./data_pipeline/hl_s3_misc_daily_refresh.py:8:JSONL of block events). Reuses the battle-tested parser research/v13/v13_s3_ledger_downloader.stream_one_hour
+./ops/launchd/codex_review_r1.txt:1164:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:27:import logging
+./ops/launchd/codex_review_r1.txt:1165:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:69:logging.basicConfig(level=logging.INFO, format="%(asctime)s [v13_eval] %(message)s", stream=sys.stdout)
+./ops/launchd/codex_review_r1.txt:1166:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:70:logger = logging.getLogger("v13_eval")
+./ops/launchd/codex_review_r1.txt:1167:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:181:    logger.info(f"Sweep: {len(sweep)} wallets, {len(positives)} positive PASS")
+./ops/launchd/codex_review_r1.txt:1168:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:183:    logger.info(f"Top {len(top_candidates)} candidates for anti-corr selection")
+./ops/launchd/codex_review_r1.txt:1169:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:189:        logger.error(f"No journey chunks matched --journeys-glob={args.journeys_glob}")
+./ops/launchd/codex_review_r1.txt:1170:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:191:    logger.info(f"Loading {len(chunks)} chunks...")
+./ops/launchd/codex_review_r1.txt:1171:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:195:    logger.info(f"  {len(df_cand):,} journeys for {df_cand['wallet'].nunique()} candidates")
+./ops/launchd/codex_review_r1.txt:1172:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:206:    logger.info(f"Built {len(folds)} folds")
+./ops/launchd/codex_review_r1.txt:1173:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:208:        logger.info(f"  fold {f.n}: train {f.train_start}→{f.val_start}, "
+./ops/launchd/codex_review_r1.txt:1174:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:217:        logger.info(f"=== Fold {fold.n} ===")
+./ops/launchd/codex_review_r1.txt:1175:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:225:        logger.info(f"  test window {test_start_ms} → {test_end_ms} (incl test_end day)")
+./ops/launchd/codex_review_r1.txt:1176:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:239:                logger.warning(f"  daily returns failed for {w[:14]}: {e}")
+./ops/launchd/codex_review_r1.txt:1177:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:241:                logger.info(f"    daily returns: {i}/{len(top_candidates)} in {time.time()-t_dr:.0f}s")
+./ops/launchd/codex_review_r1.txt:1178:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:242:        logger.info(f"  daily returns done: {len(daily_returns_per_wallet)} wallets in {time.time()-t_dr:.0f}s")
+./ops/launchd/codex_review_r1.txt:1179:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:261:            logger.info(f"  anti-corr selected: {len(selected)}/{args.K_target} (pruned={anti_corr_pruned})")
+./ops/launchd/codex_review_r1.txt:1180:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:263:            logger.error(f"  anti-corr fill failed: {e}; falling back to top by copy_score")
+./ops/launchd/codex_review_r1.txt:1181:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:278:            logger.info(f"  pool sim done in {time.time()-t_sim:.0f}s: {summary}")
+./ops/launchd/codex_review_r1.txt:1182:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:280:            logger.error(f"  pool sim failed: {e}")
+./ops/launchd/codex_review_r1.txt:1183:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:299:            logger.warning(f"  regime tagging failed: {e}")
+./ops/launchd/codex_review_r1.txt:1184:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:312:    logger.info(f"")
+./ops/launchd/codex_review_r1.txt:1185:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:313:    logger.info(f"=== Module 10 Decision ===")
+./ops/launchd/codex_review_r1.txt:1186:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:314:    logger.info(f"  go: {decision.go}")
+./ops/launchd/codex_review_r1.txt:1187:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:315:    logger.info(f"  failures: {decision.failures}")
+./ops/launchd/codex_review_r1.txt:1188:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:316:    logger.info(f"  summary: {decision.summary}")
+./ops/launchd/codex_review_r1.txt:1189:.claude/worktrees/bundle2/research/v13/v13_pool_evaluate.py:337:    logger.info(f"Wrote {args.output}")
+./ops/launchd/codex_review_r1.txt:1190:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:12:import logging
+./ops/launchd/codex_review_r1.txt:1191:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:28:logging.basicConfig(level=logging.INFO, format="%(asctime)s [single_wallet] %(message)s")
+./ops/launchd/codex_review_r1.txt:1192:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:29:logger = logging.getLogger("single_wallet")
+./ops/launchd/codex_review_r1.txt:1193:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:50:    logger.info(f"Top {len(wallets)} wallets to evaluate individually")
+./ops/launchd/codex_review_r1.txt:1194:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:67:    logger.info(f"  {len(journeys_all):,} journeys (after prefix exclusion)")
+./ops/launchd/codex_review_r1.txt:1195:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:76:    logger.info(f"Built {len(folds)} folds")
+./ops/launchd/codex_review_r1.txt:1196:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:102:                logger.warning(f"  {w[:14]} fold {fold.n} fail: {e}")
+./ops/launchd/codex_review_r1.txt:1197:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:140:        logger.info(f"  {w[:18]}: sh={agg_sharpe:+.2f} active={active}/{args.n_folds} ent={total_entries} pnl=${total_pnl:.0f} dd={max_dd_overall:.1%}")
+./ops/launchd/codex_review_r1.txt:1198:.claude/worktrees/bundle2/research/v13/v13_single_wallet_eval.py:144:    logger.info(f"Wrote {args.output}")
+./research_notebooks/bot_orchestration/tf_pipeline.ipynb:327:   "source": "# Stop controllers that should be stopped - MULTI-BOT SUPPORT\nstopped_controllers = []\n\nif controllers_to_stop and CONFIG['auto_stop_controllers']:\n    print(f\"🛑 Stopping {len(controllers_to_stop)} controllers...\\n\")\n    \n    async with HummingbotAPIClient(base_url=f\"http://{CONFIG['hummingbot_host']}:8000\") as client:\n        for ctrl in controllers_to_stop:\n            ctrl_id = ctrl['controller_id']\n            bot_name = ctrl['bot_name']  # Use the bot_name from the controller\n            reason = stop_reasons.get(ctrl_id, 'Unknown')\n            \n            try:\n                # Update controller config to set manual_kill_switch = True\n                await client.controllers.update_bot_controller_config(\n                    bot_name=bot_name,  # Use the controller's specific bot\n                    controller_name=ctrl_id,\n                    config={'manual_kill_switch': True}\n                )\n                \n                stopped_controllers.append(ctrl)\n                print(f\"  ✅ Stopped {ctrl['trading_pair']:12s} {ctrl['direction']:5s} (bot: {bot_name}) - {reason}\")\n                \n            except Exception as e:\n                print(f\"  ❌ Failed to stop {ctrl['trading_pair']}: {e}\")\n    \n    print(f\"\\n✅ Successfully stopped {len(stopped_controllers)} controllers\")\nelif controllers_to_stop:\n    print(f\"⚠️  Auto-stop is disabled. Would stop {len(controllers_to_stop)} controllers:\")\n    for ctrl in controllers_to_stop:\n        print(f\"  - {ctrl['trading_pair']} {ctrl['direction']}: {stop_reasons.get(ctrl['controller_id'])}\")\nelse:\n    print(\"ℹ️  No controllers to stop\")\n\n# Archive bots that have no active controllers\nprint(\"\\n🔍 Checking for bots with all controllers stopped...\\n\")\n\n# Group all controllers (active + stopped) by bot\nall_controllers_by_bot = {}\nfor ctrl in bot_controllers:\n    bot = ctrl['bot_name']\n    if bot not in all_controllers_by_bot:\n        all_controllers_by_bot[bot] = {'active': [], 'stopped': []}\n    \n    if ctrl['manual_kill_switch']:\n        all_controllers_by_bot[bot]['stopped'].append(ctrl)\n    else:\n        all_controllers_by_bot[bot]['active'].append(ctrl)\n\nbots_to_archive = []\n\nfor bot_name, controllers in all_controllers_by_bot.items():\n    active_count = len(controllers['active'])\n    stopped_count = len(controllers['stopped'])\n    \n    if active_count == 0 and stopped_count > 0:\n        # All controllers are stopped - this bot should be archived\n        bots_to_archive.append(bot_name)\n        print(f\"  🗂️  {bot_name}: All {stopped_count} controllers stopped - will archive\")\n    else:\n        print(f\"  ✅ {bot_name}: {active_count} active, {stopped_count} stopped - keeping\")\n\nif bots_to_archive and CONFIG['auto_stop_controllers']:\n    print(f\"\\n📦 Archiving {len(bots_to_archive)} bot(s)...\\n\")\n    \n    async with HummingbotAPIClient(base_url=f\"http://{CONFIG['hummingbot_host']}:8000\") as client:\n        for bot_name in bots_to_archive:\n            try:\n                await client.bot_orchestration.stop_bot(bot_name=bot_name)\n                print(f\"  ✅ Archived bot: {bot_name}\")\n            except Exception as e:\n                print(f\"  ❌ Failed to archive {bot_name}: {e}\")\n    \n    print(f\"\\n✅ Successfully archived {len(bots_to_archive)} bot(s)\")\nelif bots_to_archive:\n    print(f\"\\n⚠️  Would archive {len(bots_to_archive)} bot(s) (auto-stop disabled)\")\nelse:\n    print(\"\\nℹ️  No bots to archive\")",
+./scripts/extract_asset_ctx_marks.py:5:trade. asset_ctxs (s3://hyperliquid-archive/asset_ctxs/YYYYMMDD.csv.lz4, requester-pays) carries the
+
+codex
+The first pass shows the v25/v26 active-test blocker is gone. I’m tightening the check now because some remaining hits are comments/docs, and one earlier search included a missing `engine` path that made `rg` return nonzero for the wrong reason.
+exec
+/bin/zsh -lc 'find tests -maxdepth 3 -type f | sort' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/__pycache__/test_phase1_data_audit.cpython-312-pytest-9.0.2.pyc
+tests/__pycache__/test_phase1_m01_validate.cpython-312-pytest-9.0.2.pyc
+tests/test_phase1_data_audit.py
+tests/test_phase1_m01_validate.py
+tests/tools/test_portfolio_snapshot.py
+tests/v15/__pycache__/test_equity_independent_actions.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_execution_model.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_fidelity_replay.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_fixed_notional_signals.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m02.cpython-311-pytest-9.0.3.pyc
+tests/v15/__pycache__/test_m02.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m02.cpython-312.pyc
+tests/v15/__pycache__/test_m03.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m04.cpython-311-pytest-9.0.3.pyc
+tests/v15/__pycache__/test_m04.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m05.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m06a.cpython-311-pytest-9.0.3.pyc
+tests/v15/__pycache__/test_m06a.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m06b.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m07.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m07.cpython-312.pyc
+tests/v15/__pycache__/test_m08.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m09.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_m09.cpython-312.pyc
+tests/v15/__pycache__/test_m10.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_mem_budget.cpython-312-pytest-9.0.2.pyc
+tests/v15/__pycache__/test_slippage_calib.cpython-312-pytest-9.0.2.pyc
+tests/v15/test_equity_independent_actions.py
+tests/v15/test_execution_model.py
+tests/v15/test_fidelity_replay.py
+tests/v15/test_fixed_notional_signals.py
+tests/v15/test_m02.py
+tests/v15/test_m03.py
+tests/v15/test_m04.py
+tests/v15/test_m05.py
+tests/v15/test_m06a.py
+tests/v15/test_m06b.py
+tests/v15/test_m07.py
+tests/v15/test_m08.py
+tests/v15/test_m09.py
+tests/v15/test_m10.py
+tests/v15/test_mem_budget.py
+tests/v15/test_slippage_calib.py
+
+exec
+/bin/zsh -lc "find research/v15 -maxdepth 1 -type f -name '*.py' | sort | wc -l" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+      34
+
+exec
+/bin/zsh -lc 'rg -n "''^'"\\s*(from|import)\\s+(archive|research\\.v13|research\\.v25|research\\.v26|research\\.v16)|research/(v13|v25|v26|v16)/\" tests research data_pipeline scripts tools --glob '"'!archive/**'"' --glob '"'!**/.git/**'"'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+scripts/sprint_forward_chain.sh:35:$P $R/research/v16/forward_test.py --forward --end "$END_DAY" \
+scripts/sprint_forward_chain.sh:38:$P $R/research/v16/sprint_analysis.py --in $R/app/data/v16/forward_trades.parquet --days "$DAYS"
+research/v16/sprint_decompose.py:20:Run: python research/v16/sprint_decompose.py        (~10-15 min both folds)
+data_pipeline/hl_s3_misc_daily_refresh.py:8:JSONL of block events). Reuses the battle-tested parser research/v13/v13_s3_ledger_downloader.stream_one_hour
+research/v16/our_dd_gate.py:38:  ~/miniforge3/envs/quants-lab/bin/python research/v16/our_dd_gate.py --smoke
+research/v16/mae_bag_measure.py:14:  ~/miniforge3/envs/quants-lab/bin/python research/v16/mae_bag_measure.py [--smoke]
+research/v16/build_skill_cohort.py:15:Run: ~/miniforge3/envs/quants-lab/bin/python research/v16/build_skill_cohort.py
+research/v16/rescreen_bag_gate.py:6:Extends (does NOT rebuild) research/v16/build_skill_cohort.py:
+research/v16/rescreen_bag_gate.py:18:Run: ~/miniforge3/envs/quants-lab/bin/python research/v16/rescreen_bag_gate.py
+research/v16/sprint_analysis.py:12:Run: python research/v16/sprint_analysis.py [--in app/data/v16/sprint_trades.parquet]
+research/v16/forward_test.py:18:  python research/v16/forward_test.py --validate
+research/v16/forward_test.py:19:  python research/v16/forward_test.py --forward --end 2026-06-10
+research/v16/forward_test.py:198:    print(f"\nANALYZE: python research/v16/sprint_analysis.py --in {out} --days {days:.1f}")
+research/v16/agents/agentM_5edge_oos.py:18:EXACT add_burst / add_prereturns functions from research/v16/sprint_analysis.py, against
+research/v16/agents/agentM_5edge_oos.py:24:  /Users/hermes/miniforge3/envs/quants-lab/bin/python research/v16/agents/agentM_5edge_oos.py
+research/v16/select_cohort.py:22:Run: python research/v16/select_cohort.py            # defaults: trailing 75d to m02 max
+research/v16/agents/agentB_v18_scout.py:459:    a("NOT a deployment verdict.** Run: `research/v16/agents/agentB_v18_scout.py`.")
+research/v15/our_drawdown_scorer.py:5:  The live mark-to-market DD gate (research/v16/build_skill_cohort.py::mtm_dd_exclude) reads the
+research/v16/agents/agentN_h17_e1_combined.py:21:  /Users/hermes/miniforge3/envs/quants-lab/bin/python research/v16/agents/agentN_h17_e1_combined.py
+research/v16/agents/agentC_l2_universe_calib.py:25:  /Users/hermes/miniforge3/envs/quants-lab/bin/python research/v16/agents/agentC_l2_universe_calib.py
+research/v15/v15_m02_journey_trace.py:13:This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
+
+codex
+Active `tests/` now contains only phase1, tools, and `tests/v15`; the v13/v25/v26 tests are no longer in the active tree. I also see 34 top-level `research/v15/*.py` files, so I’m checking those imports directly.
+exec
+/bin/zsh -lc "python - <<'PY'
+import importlib, pathlib, sys
+root = pathlib.Path('research/v15')
+mods = sorted(p.stem for p in root.glob('*.py') if p.name "'!= '"'__init__.py')
+failed = []
+for name in mods:
+    mod = f'research.v15.{name}'
+    try:
+        importlib.import_module(mod)
+    except Exception as e:
+        failed.append((mod, type(e).__name__, str(e)))
+print(f'imported={len(mods)-len(failed)} total={len(mods)} failed={len(failed)}')
+for item in failed:
+    print('FAIL', *item, sep=' | ')
+if failed:
+    sys.exit(1)
+PY" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "python - <<'PY'
+import ast, pathlib
+moved_roots = {'research.v13', 'research.v25', 'research.v26'}
+problems=[]
+for base in [pathlib.Path('tests'), pathlib.Path('research'), pathlib.Path('scripts'), pathlib.Path('data_pipeline'), pathlib.Path('tools')]:
+    if not base.exists():
+        continue
+    for p in base.rglob('*.py'):
+        if 'archive' in p.parts or '__pycache__' in p.parts:
+            continue
+        try:
+            tree=ast.parse(p.read_text())
+        except Exception as e:
+            problems.append((str(p),'PARSE',type(e).__name__,str(e)))
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if any(a.name == r or a.name.startswith(r+'.') for r in moved_roots) or a.name == 'archive' or a.name.startswith('archive.'):
+                        problems.append((str(p), n.lineno, 'import', a.name))
+            elif isinstance(n, ast.ImportFrom):
+                mod=n.module or ''
+                if any(mod == r or mod.startswith(r+'.') for r in moved_roots) or mod == 'archive' or mod.startswith('archive.'):
+                    problems.append((str(p), n.lineno, 'from', mod))
+print(f'problems={len(problems)}')
+for x in problems:
+    print(' | '.join(map(str,x)))
+raise SystemExit(1 if problems else 0)
+PY" in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: command not found: python
+
+ exited 127 in 0ms:
+zsh:1: command not found: python
+
+exec
+/bin/zsh -lc "find archive/tests -maxdepth 2 -type f -name 'test_*.py' | sort | sed -n '1,80p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+archive/tests/arb/test_v2_execution_engine.py
+archive/tests/arb_hlbb/test_live_readiness_fixes.py
+archive/tests/arb_hlbb/test_safety_fixes.py
+archive/tests/hl_mm/test_config_and_notifier.py
+archive/tests/hl_mm/test_ev_gate.py
+archive/tests/hl_mm/test_fill_tracker.py
+archive/tests/hl_mm/test_inventory_manager.py
+archive/tests/hl_mm/test_mm_tracker.py
+archive/tests/hl_mm/test_orchestrator.py
+archive/tests/hl_mm/test_pair_screener.py
+archive/tests/hl_mm/test_quote_engine.py
+archive/tests/hl_mm/test_risk_manager.py
+archive/tests/hl_mm/test_signal_engine.py
+archive/tests/hl_mm/test_state_machine.py
+archive/tests/hl_mm/test_wallet_scorer.py
+archive/tests/test_phase0_fixes.py
+archive/tests/test_phase1_strategy_factory.py
+archive/tests/v13/test_module_01_equity_reconstruct.py
+archive/tests/v13/test_module_02_journey_trace.py
+archive/tests/v13/test_module_04_ranker_aggregation.py
+archive/tests/v13/test_module_05_execution_realism.py
+archive/tests/v13/test_module_06_cold_start.py
+archive/tests/v13/test_module_07_portfolio_ledger.py
+archive/tests/v13/test_module_08_portfolio_simulator.py
+archive/tests/v13/test_module_09_walk_forward_folds.py
+archive/tests/v13/test_module_10_pass_fail_gates.py
+archive/tests/v13/test_module_11_strict_random_null.py
+archive/tests/v25/test_bootstrap.py
+archive/tests/v25/test_gates.py
+archive/tests/v25/test_journeys.py
+archive/tests/v25/test_run_folds.py
+archive/tests/v25/test_sim.py
+archive/tests/v26/test_corrections.py
+archive/tests/v26/test_estimand.py
+archive/tests/v26/test_families.py
+archive/tests/v26/test_fees.py
+archive/tests/v26/test_freeze_labels.py
+archive/tests/v26/test_maker.py
+archive/tests/v26/test_overlays.py
+archive/tests/v26/test_registry.py
+
+codex
+This environment does not have `python` on PATH, so I’m rerunning with `python3`. The archive-side listing confirms the retired v13/v25/v26 tests are under `archive/tests/`.
+exec
+/bin/zsh -lc 'rg -n "''^'"\\s*(from|import)\\s+research\\.(v13|v25|v26)|"'^'"\\s*(from|import)\\s+archive\" tests --glob '"'!archive/**'"' --glob '"'!**/__pycache__/**'"'" in /Users/hermes/quants-lab
+ exited 1 in 0ms:
+exec
+/bin/zsh -lc "python3 - <<'PY'
+import importlib, pathlib, sys
+root = pathlib.Path('research/v15')
+mods = sorted(p.stem for p in root.glob('*.py') if p.name "'!= '"'__init__.py')
+failed = []
+for name in mods:
+    mod = f'research.v15.{name}'
+    try:
+        importlib.import_module(mod)
+    except Exception as e:
+        failed.append((mod, type(e).__name__, str(e)))
+print(f'imported={len(mods)-len(failed)} total={len(mods)} failed={len(failed)}')
+for item in failed:
+    print('FAIL', *item, sep=' | ')
+if failed:
+    sys.exit(1)
+PY" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "python3 - <<'PY'
+import ast, pathlib
+moved_roots = {'research.v13', 'research.v25', 'research.v26'}
+problems=[]
+for base in [pathlib.Path('tests'), pathlib.Path('research'), pathlib.Path('scripts'), pathlib.Path('data_pipeline'), pathlib.Path('tools')]:
+    if not base.exists():
+        continue
+    for p in base.rglob('*.py'):
+        if 'archive' in p.parts or '__pycache__' in p.parts:
+            continue
+        try:
+            tree=ast.parse(p.read_text())
+        except Exception as e:
+            problems.append((str(p),'PARSE',type(e).__name__,str(e)))
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if any(a.name == r or a.name.startswith(r+'.') for r in moved_roots) or a.name == 'archive' or a.name.startswith('archive.'):
+                        problems.append((str(p), n.lineno, 'import', a.name))
+            elif isinstance(n, ast.ImportFrom):
+                mod=n.module or ''
+                if any(mod == r or mod.startswith(r+'.') for r in moved_roots) or mod == 'archive' or mod.startswith('archive.'):
+                    problems.append((str(p), n.lineno, 'from', mod))
+print(f'problems={len(problems)}')
+for x in problems:
+    print(' | '.join(map(str,x)))
+raise SystemExit(1 if problems else 0)
+PY" in /Users/hermes/quants-lab
+ exited 1 in 922ms:
+/Users/hermes/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+imported=1 total=34 failed=33
+FAIL | research.v15._streaming_io | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.balanced_step3_riskparity | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.balanced_step4_netted_sim | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.candle_marks | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.copyability_calib_share | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.fidelity_oos | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.fidelity_replay | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.forward_oos_hot | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.holdout_cluster_bootstrap | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.leadlag_clean_rank_sim | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.live_marks | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.our_drawdown_scorer | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.revalidate_api_execmodel | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.s3_taker_verify | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_equity_independent_actions | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_fixed_notional_signals | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_forward_select | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m01_equity_reconstruct | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m025_authenticity_gate | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m02_journey_trace | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m03_fold_geometry | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m04_authenticity | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m05_eligibility | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m06a_shortlist | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m06b_ranking | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m07_engine | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m08_survival | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m09_sim | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_m10_gates | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_slippage_calib | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.v15_two_regime_test | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.wallet_maker_scorer | ModuleNotFoundError | No module named 'pandas'
+FAIL | research.v15.wallet_persistence | ModuleNotFoundError | No module named 'pandas'
+
+ succeeded in 955ms:
+problems=0
+
+codex
+The AST import scan found zero active Python imports of `archive`, `research.v13`, `research.v25`, or `research.v26`. The system `python3` lacks project deps like pandas, so I’m using the repo’s quants-lab interpreter for the 34-module import check.
+exec
+/bin/zsh -lc 'git diff --summary -- tests/v25 tests/v26 archive/tests/v25 archive/tests/v26' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import importlib, pathlib, sys
+root = pathlib.Path('research/v15')
+mods = sorted(p.stem for p in root.glob('*.py') if p.name "'!= '"'__init__.py')
+failed = []
+for name in mods:
+    mod = f'research.v15.{name}'
+    try:
+        importlib.import_module(mod)
+    except Exception as e:
+        failed.append((mod, type(e).__name__, str(e)))
+print(f'imported={len(mods)-len(failed)} total={len(mods)} failed={len(failed)}')
+for item in failed:
+    print('FAIL', *item, sep=' | ')
+if failed:
+    sys.exit(1)
+PY" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest --collect-only -q tests' in /Users/hermes/quants-lab
+ succeeded in 2809ms:
+tests/test_phase1_data_audit.py::test_partition_alignment_is_utc_not_host_timezone
+tests/test_phase1_data_audit.py::test_wallet_fast_path_matches_daily_source
+tests/test_phase1_m01_validate.py::test_m01_validator_accepts_consistent_pair
+tests/test_phase1_m01_validate.py::test_m01_validator_detects_quarantine_rule_mismatch
+tests/test_phase1_m01_validate.py::test_m01_validator_requires_two_inter_anchor_checks
+tests/tools/test_portfolio_snapshot.py::test_hl_equity_is_spot_usdc_only
+tests/tools/test_portfolio_snapshot.py::test_perp_account_value_never_enters_equity
+tests/tools/test_portfolio_snapshot.py::test_hl_spot_sums_multiple_usdc_entries
+tests/tools/test_portfolio_snapshot.py::test_perp_positions_are_counts_only
+tests/tools/test_portfolio_snapshot.py::test_empty_position_list_returns_zero_not_failure
+tests/tools/test_portfolio_snapshot.py::test_missing_assetPositions_signals_failure_not_silent_zero
+tests/tools/test_portfolio_snapshot.py::test_bybit_fails_loud_when_creds_missing
+tests/tools/test_portfolio_snapshot.py::test_combined_is_spot_plus_bybit_no_recompute
+tests/tools/test_portfolio_snapshot.py::test_source_never_reads_perp_account_value
+tests/v15/test_equity_independent_actions.py::test_burst_action_uses_position_chain_without_equity
+tests/v15/test_equity_independent_actions.py::test_cross_burst_gap_resync_is_explicit_but_current_signal_valid
+tests/v15/test_equity_independent_actions.py::test_live_open_candidate_uses_one_dollar_dust_boundary
+tests/v15/test_equity_independent_actions.py::test_atomic_actions_preserve_intraburst_entry_add_and_exit
+tests/v15/test_equity_independent_actions.py::test_atomic_gap_fails_one_signal_then_reseeds
+tests/v15/test_execution_model.py::test_fee_schedule_honors_effective_subaccount_rate
+tests/v15/test_execution_model.py::test_fee_schedule_can_apply_discount_when_explicit
+tests/v15/test_execution_model.py::test_hip3_fee_uses_market_override_or_multiplier
+tests/v15/test_fidelity_replay.py::test_roundtrip_reversal_closes_old_and_opens_residual_leg
+tests/v15/test_fixed_notional_signals.py::test_tracks_adds_and_exits_only_after_close_fraction
+tests/v15/test_fixed_notional_signals.py::test_stream_gap_invalidates_open_copy_lifecycle
+tests/v15/test_fixed_notional_signals.py::test_same_ms_causal_chain_preserves_open_add_exit_contract
+tests/v15/test_fixed_notional_signals.py::test_reverse_on_uncopied_position_never_becomes_entry
+tests/v15/test_fixed_notional_signals.py::test_full_quantity_reverse_below_dollar_threshold_stays_unresolved
+tests/v15/test_m02.py::test_core_m02_does_not_reconstruct_equity
+tests/v15/test_m02.py::test_event_order_strictly_monotone
+tests/v15/test_m02.py::test_anchor_ts_strictly_before_ts
+tests/v15/test_m02.py::test_equity_ts_and_mark_ts_le_ts
+tests/v15/test_m02.py::test_no_anchor_implies_null_target
+tests/v15/test_m02.py::test_entry_addon_trim_exit_sequence
+tests/v15/test_m02.py::test_fill_fee_components_are_not_double_counted
+tests/v15/test_m02.py::test_liquidation_ledger_summary_is_recognized_as_non_cash
+tests/v15/test_m02.py::test_hip4_outcome_fills_are_not_perp_actions_or_cash_flows
+tests/v15/test_m02.py::test_named_spot_pair_is_not_a_perp
+tests/v15/test_m02.py::test_reverse_two_journey_ids
+tests/v15/test_m02.py::test_causal_carry_in_via_startposition
+tests/v15/test_m02.py::test_liquidation_flags_involuntary_exit
+tests/v15/test_m02.py::test_target_exposure_pct_sane
+tests/v15/test_m02.py::test_partial_mtm_on_unmarkable
+tests/v15/test_m02.py::test_future_coin_does_not_affect_earlier_equity
+tests/v15/test_m02.py::test_daily_walk_gross_notional_does_not_net_opposing_coins
+tests/v15/test_m02.py::test_inter_anchor_drift_validates_causal_not_future_snapshot_seed
+tests/v15/test_m02.py::test_daily_causal_walk_folds_carry_when_first_revealed
+tests/v15/test_m02.py::test_segment_reconcile_does_not_double_count_closed_pnl
+tests/v15/test_m02.py::test_same_ms_fills_distinct_correct_actions
+tests/v15/test_m02.py::test_same_ms_tid_is_identity_not_causal_order
+tests/v15/test_m02.py::test_position_gap_resyncs_and_invalidates_interrupted_journey
+tests/v15/test_m02.py::test_m01_spot_collateral_invariant
+tests/v15/test_m02.py::test_spot_fill_cannot_create_perp_equity_or_ranking_action
+tests/v15/test_m02.py::test_wallet_fill_loader_excludes_spot_fast_path
+tests/v15/test_m02.py::test_perp_ledger_transfer_scope_is_flow_neutralized
+tests/v15/test_m02.py::test_non_usdc_hip3_collateral_send_uses_usdc_value
+tests/v15/test_m02.py::test_snapshot_seed_independent_of_future_fills
+tests/v15/test_m03.py::test_i1_ordering_and_lengths
+tests/v15/test_m03.py::test_i2_test_windows_contiguous
+tests/v15/test_m03.py::test_i3_chained_oos_exact
+tests/v15/test_m03.py::test_exact_calendar_dates
+tests/v15/test_m03.py::test_i6_no_forbidden_fields
+tests/v15/test_m03.py::test_activity_g5_counts_open_journeys
+tests/v15/test_m03.py::test_i5_g5_equals_test_folds
+tests/v15/test_m03.py::test_i4_half_open_no_boundary_leak
+tests/v15/test_m03.py::test_pretest_is_train_plus_val
+tests/v15/test_m03.py::test_activity_excludes_unreplayable_actions_and_journeys
+tests/v15/test_m04.py::test_anchor_returns_neutralize_external_capital_flows
+tests/v15/test_m04.py::test_clean
+tests/v15/test_m04.py::test_kill_wash
+tests/v15/test_m04.py::test_kill_delta_neutral_requires_both
+tests/v15/test_m04.py::test_kill_carry
+tests/v15/test_m04.py::test_uncertain_thin
+tests/v15/test_m04.py::test_uncertain_nan
+tests/v15/test_m04.py::test_suspicious_wash_borderline
+tests/v15/test_m04.py::test_uncertain_dominates_suspicious
+tests/v15/test_m04.py::test_weight_order_differs_from_precedence
+tests/v15/test_m04.py::test_kill_dominates_all
+tests/v15/test_m04.py::test_run_single_wallet_clean
+tests/v15/test_m04.py::test_run_kill_not_copyable
+tests/v15/test_m04.py::test_run_entity_dedup_fragment
+tests/v15/test_m04.py::test_run_fragment_clean_low_confidence_is_valid
+tests/v15/test_m04.py::test_run_internal_hedge_entity_kill
+tests/v15/test_m04.py::test_run_member_kill_taints_whole_entity
+tests/v15/test_m04.py::test_run_too_big_entity_uncertain_no_primary
+tests/v15/test_m05.py::test_twr_positive_and_dd
+tests/v15/test_m05.py::test_twr_flow_stripped
+tests/v15/test_m05.py::test_twr_maxdd_counts_first_drop
+tests/v15/test_m05.py::test_twr_structural_ruin
+tests/v15/test_m05.py::test_twr_excludes_incomplete_reconstruction_days
+tests/v15/test_m05.py::test_leverage_uses_gross_notional_not_signed_position_value
+tests/v15/test_m05.py::test_floor_pass
+tests/v15/test_m05.py::test_copyability_lane_does_not_require_m01_equity
+tests/v15/test_m05.py::test_floor_fail_negative_pnl
+tests/v15/test_m05.py::test_floor_fail_dd
+tests/v15/test_m05.py::test_floor_fail_thin_journeys
+tests/v15/test_m05.py::test_floor_fail_hft_holdtime
+tests/v15/test_m05.py::test_floor_fail_share_below_latency
+tests/v15/test_m05.py::test_floor_fail_week_holder
+tests/v15/test_m05.py::test_floor_fail_tiny_equity
+tests/v15/test_m05.py::test_floor_fast_wallet_still_passes
+tests/v15/test_m05.py::test_floor_fail_boundary_straddling_week_holder
+tests/v15/test_m05.py::test_journey_metrics_censored_hold_for_open_position
+tests/v15/test_m05.py::test_journey_metrics_excludes_invalid_lifecycle
+tests/v15/test_m05.py::test_data_gap_account_not_falsely_failed
+tests/v15/test_m05.py::test_median_equity_emitted_in_elig_rows
+tests/v15/test_m05.py::test_m01_quarantine_hard_excludes_wallet
+tests/v15/test_m05.py::test_floor_accessibility_unknown_does_not_fail
+tests/v15/test_m05.py::test_floor_accessibility_known_low_fails
+tests/v15/test_m05.py::test_floor_structural_ruin_fails
+tests/v15/test_m05.py::test_run_fold_pure_and_entity_unit
+tests/v15/test_m05.py::test_run_g5_pool_candidate_reported_not_gated
+tests/v15/test_m06a.py::test_persistence_action_coverage_and_recency
+tests/v15/test_m06a.py::test_persistence_partial_and_stale
+tests/v15/test_m06a.py::test_persistence_no_future_leak_and_bounds
+tests/v15/test_m06a.py::test_persistence_block_boundary
+tests/v15/test_m06a.py::test_full_window_fields_do_not_change_shortlist
+tests/v15/test_m06a.py::test_only_copyable_eligible_primaries_ranked
+tests/v15/test_m06a.py::test_monotonic_in_roe
+tests/v15/test_m06a.py::test_eligible_nonpositive_roe_hardfails
+tests/v15/test_m06a.py::test_eligible_nan_metric_hardfails
+tests/v15/test_m06a.py::test_activity_only_shortlist_does_not_require_equity_metrics
+tests/v15/test_m06a.py::test_recency_gate_drops_stale_holder
+tests/v15/test_m06a.py::test_budget_and_conservation
+tests/v15/test_m06a.py::test_budget_caps_at_eligible_when_small
+tests/v15/test_m06a.py::test_determinism
+tests/v15/test_m06a.py::test_within_fold_independence
+tests/v15/test_m06a.py::test_rankable_contract_hardfail_noncopyable
+tests/v15/test_m06a.py::test_rank_only_purity
+tests/v15/test_m06a.py::test_persistence_partial_blocks
+tests/v15/test_m06a.py::test_ineligible_na_metrics_retained_not_ranked
+tests/v15/test_m06a.py::test_primary_wallet_mismatch_hardfails
+tests/v15/test_m06a.py::test_na_primary_wallet_hardfails
+tests/v15/test_m06a.py::test_eligible_inf_njourneys_hardfails
+tests/v15/test_m06a.py::test_invalid_N_rejected[-1]
+tests/v15/test_m06a.py::test_invalid_N_rejected[0]
+tests/v15/test_m06a.py::test_invalid_N_rejected[3.5]
+tests/v15/test_m06a.py::test_invalid_N_rejected[True]
+tests/v15/test_m06a.py::test_recency_disable_requires_noncleanoos
+tests/v15/test_m06a.py::test_na_copyable_hardfails
+tests/v15/test_m06b.py::test_winsorize_clips_tails
+tests/v15/test_m06b.py::test_zscore_zero_variance
+tests/v15/test_m06b.py::test_score_formula_uses_frozen_weights
+tests/v15/test_m06b.py::test_pool_caps_at_n_pool_and_g5
+tests/v15/test_m06b.py::test_g5_journeys_floor
+tests/v15/test_m06b.py::test_quality_weight_normalized_and_ceiling
+tests/v15/test_m06b.py::test_bucket_weights_monotone
+tests/v15/test_m06b.py::test_min_support_excludes_low_fills
+tests/v15/test_m06b.py::test_min_support_excludes_short_exposure
+tests/v15/test_m06b.py::test_ineligible_and_noncopyable_excluded
+tests/v15/test_m06b.py::test_provenance_fail_closed
+tests/v15/test_m06b.py::test_provisional_when_uncalibrated
+tests/v15/test_m06b.py::test_final_requires_calibration_AND_real_fidelity_AND_real_consistency
+tests/v15/test_m06b.py::test_final_blocked_without_equity_even_if_calibrated
+tests/v15/test_m06b.py::test_final_blocked_when_tracking_error_column_has_nan
+tests/v15/test_m06b.py::test_final_blocked_when_tracking_error_is_inf
+tests/v15/test_m06b.py::test_d4_block_roe_uses_boundary_anchors_not_midblock
+tests/v15/test_m06b.py::test_consistency_active_no_equity_is_failclosed
+tests/v15/test_m06b.py::test_final_blocked_without_tracking_error
+tests/v15/test_m06b.py::test_consistency_provisional_source_when_no_equity
+tests/v15/test_m06b.py::test_consistency_from_equity_block_roe
+tests/v15/test_m06b.py::test_top_bucket_demotion_no_backfill
+tests/v15/test_m06b.py::test_missing_m07_row_excluded
+tests/v15/test_m06b.py::test_absent_m07_row_preserved_as_excluded
+tests/v15/test_m06b.py::test_provenance_null_as_of_fails_closed
+tests/v15/test_m06b.py::test_small_pool_ceiling_feasible
+tests/v15/test_m06b.py::test_manifest_has_frozen_constants
+tests/v15/test_m06b.py::test_score_weight_vector_v2
+tests/v15/test_m06b.py::test_ranking_uses_realized_roe_not_engine
+tests/v15/test_m06b.py::test_realized_roe_fallback_flagged_when_absent
+tests/v15/test_m06b.py::test_win_rate_term_changes_ranking
+tests/v15/test_m06b.py::test_investable_requires_realized_metrics
+tests/v15/test_m06b.py::test_nan_fidelity_filled_with_fold_mean_not_one
+tests/v15/test_m06b.py::test_zero_round_trip_entity_excluded_from_pool
+tests/v15/test_m06b.py::test_active_test_folds_not_in_output
+tests/v15/test_m07.py::test_coin_dex_scope
+tests/v15/test_m07.py::test_fixed_position_sizing_runs_without_leader_equity
+tests/v15/test_m07.py::test_m7_rejects_stale_m2_schema_without_stream_validity
+tests/v15/test_m07.py::test_margin_mode_inference
+tests/v15/test_m07.py::test_hlmeta_maint_rate_from_real_cache
+tests/v15/test_m07.py::test_m7_fee_schedule_uses_effective_subaccount_rate
+tests/v15/test_m07.py::test_liquidity_adv_is_trailing_dollar_volume_not_price_proxy
+tests/v15/test_m07.py::test_liquidity_adv_uses_24h_wall_clock_for_sparse_bars
+tests/v15/test_m07.py::test_missing_adv_rejects_new_exposure_fail_closed
+tests/v15/test_m07.py::test_market_data_mark_rejects_stale_asof_bar
+tests/v15/test_m07.py::test_account_equity_derivation
+tests/v15/test_m07.py::test_round_trip_costs_money
+tests/v15/test_m07.py::test_min_order_skip
+tests/v15/test_m07.py::test_survived_state_on_flat
+tests/v15/test_m07.py::test_backstop_on_crash_isolation_invariant
+tests/v15/test_m07.py::test_im_admissibility_rejects_on_tier_jump
+tests/v15/test_m07.py::test_market_liquidation_path_produces_liq_fill
+tests/v15/test_m07.py::test_market_liquidation_charges_full_order_adv_impact_above_floor
+tests/v15/test_m07.py::test_isolated_position_posts_margin_and_can_liquidate
+tests/v15/test_m07.py::test_funding_sign_long_pays_positive_rate
+tests/v15/test_m07.py::test_final_horizon_risk_seen_after_last_action
+tests/v15/test_m07.py::test_determinism
+tests/v15/test_m07.py::test_causal_fill_uses_prior_minute_not_future
+tests/v15/test_m07.py::test_pure_does_not_mutate_caller_state
+tests/v15/test_m07.py::test_start_state_open_position_advances_risk_with_no_actions
+tests/v15/test_m07.py::test_funding_stops_after_liquidation
+tests/v15/test_m07.py::test_post_funding_boundary_liquidation
+tests/v15/test_m07.py::test_liquidation_cooldown_no_same_ts_double_fill
+tests/v15/test_m07.py::test_no_same_ts_double_when_funding_at_fold_end
+tests/v15/test_m07.py::test_carry_in_seeds_short_not_long
+tests/v15/test_m07.py::test_empty_actions_survives_flat
+tests/v15/test_m07.py::test_ending_account_state_returned
+tests/v15/test_m07.py::test_streaming_writer_multipart
+tests/v15/test_m07.py::test_change1_boundary_equity_samples_emitted
+tests/v15/test_m07.py::test_change1_boundary_anchor_count_matches_blocks
+tests/v15/test_m07.py::test_change2_te_zero_when_tracking_well
+tests/v15/test_m07.py::test_te_l1_helper_signed_additive
+tests/v15/test_m07.py::test_d2_wipeout_emits_zero_equity_anchors
+tests/v15/test_m07.py::test_follower_trail_fires_flattens_and_halts
+tests/v15/test_m07.py::test_follower_trail_disabled_is_byte_identical
+tests/v15/test_m07.py::test_follower_trail_fires_at_fold_end_no_action
+tests/v15/test_m07.py::test_follower_trail_force_close_ignores_min_notional_and_capacity
+tests/v15/test_m07.py::test_change_a_round_trip_aggregates_two_round_trips
+tests/v15/test_m07.py::test_change_a_losing_round_trip_not_counted_as_win
+tests/v15/test_m07.py::test_change_a_open_position_not_counted
+tests/v15/test_m07.py::test_finding1_liquidated_round_trip_is_a_loss
+tests/v15/test_m07.py::test_finding1_ruined_round_trip_is_a_loss
+tests/v15/test_m07.py::test_ruin_final_equity_and_roe_not_stale
+tests/v15/test_m07.py::test_finding2_flip_fee_split_across_round_trips
+tests/v15/test_m07.py::test_finding3_latency_drift_uses_prior_bar_not_containing_bar
+tests/v15/test_m07.py::test_finding4_latency_drift_in_slip_diagnostic
+tests/v15/test_m07.py::test_change_b_higher_latency_worse_fill
+tests/v15/test_m07.py::test_change_b_higher_volatility_worse_fill
+tests/v15/test_m07.py::test_change_b_flat_bar_no_haircut_byte_identical
+tests/v15/test_m07.py::test_change_b_latency_model_flag_present
+tests/v15/test_m07.py::test_follower_trail_records_ruin_if_flatten_nonpositive
+tests/v15/test_m08.py::test_survival_full_weight_on_benign_source
+tests/v15/test_m08.py::test_survival_kill_when_ruins_at_min_size
+tests/v15/test_m08.py::test_copyability_survives_smaller_stays_full_weight
+tests/v15/test_m08.py::test_smaller_probe_never_below_min
+tests/v15/test_m08.py::test_kill_only_when_min_also_wipes
+tests/v15/test_m08.py::test_indeterminate_heavy_caps_uncertain
+tests/v15/test_m08.py::test_entity_pre_m8_max_is_raw_formula
+tests/v15/test_m08.py::test_entity_pre_m8_max_uses_configured_nominal_capital
+tests/v15/test_m08.py::test_attribution_flags_missing_m07_rows
+tests/v15/test_m08.py::test_worst_tier_inferential_downgrades_never_kills
+tests/v15/test_m08.py::test_inferential_scorers_phase2_stub
+tests/v15/test_m08.py::test_tier_attribution_by_m4_and_m8
+tests/v15/test_m09.py::test_unimplemented_matched_null_provider_fails_closed
+tests/v15/test_m09.py::test_sizing_chain_is_product
+tests/v15/test_m09.py::test_anti_corr_keeps_higher_ranked
+tests/v15/test_m09.py::test_anti_corr_keeps_negative_correlation
+tests/v15/test_m09.py::test_anti_corr_respects_target_count_ceiling
+tests/v15/test_m09.py::test_min_notional_feasibility_at_capital
+tests/v15/test_m09.py::test_waterfill_respects_per_entity_cap_no_overflow
+tests/v15/test_m09.py::test_waterfill_redistributes_freed_cash_to_headroom
+tests/v15/test_m09.py::test_waterfill_carried_exposure_reduces_residual
+tests/v15/test_m09.py::test_effective_caps_min_of_g7_and_m8
+tests/v15/test_m09.py::test_portfolio_path_merges_subaccounts_stepwise
+tests/v15/test_m09.py::test_portfolio_path_order_independent
+tests/v15/test_m09.py::test_portfolio_path_same_ts_duplicate_takes_min_deterministic
+tests/v15/test_m09.py::test_global_dd_derisk_trigger
+tests/v15/test_m09.py::test_g4_kill_no_hindsight_recovery
+tests/v15/test_m09.py::test_g4_pass_when_never_breaches
+tests/v15/test_m09.py::test_apply_gross_budget_caps_aggregate_notional
+tests/v15/test_m09.py::test_apply_gross_budget_carried_consumes_budget_no_force_trim
+tests/v15/test_m09.py::test_expected_leverage_fixed_position_counts_concurrent_open_coins
+tests/v15/test_m09.py::test_apply_gross_budget_under_budget_passthrough
+tests/v15/test_m09.py::test_expected_leverage_uses_abs_target_exposure
+tests/v15/test_m09.py::test_chained_aggregate_gross_notional_within_budget
+tests/v15/test_m09.py::test_chained_anti_corr_pruning_applied
+tests/v15/test_m09.py::test_chained_unrunnable_entity_cash_returned
+tests/v15/test_m09.py::test_manifest_frozen_knobs
+tests/v15/test_m09.py::test_expected_leverage_uses_pretest_not_test_actions
+tests/v15/test_m09.py::test_chained_carried_topup_cash_conserved
+tests/v15/test_m09.py::test_chained_uses_fold_pure_primary_wallet
+tests/v15/test_m09.py::test_dropped_entity_pays_boundary_exit_cost
+tests/v15/test_m09.py::test_gross_budget_fixed_at_b0_across_folds
+tests/v15/test_m09.py::test_g4_kill_flattens_carried_to_cash
+tests/v15/test_m09.py::test_global_dd_before_g4_does_not_report_g4_kill
+tests/v15/test_m10.py::test_percentile_ladder_and_pvalue
+tests/v15/test_m10.py::test_percentile_ladder_uses_raw_not_rounded_for_logic
+tests/v15/test_m10.py::test_clean_null_drops_none_nan_pdNA
+tests/v15/test_m10.py::test_g6_fails_closed_on_insufficient_null
+tests/v15/test_m10.py::test_g6_bivariate_requires_both_roe_and_calmar
+tests/v15/test_m10.py::test_g7_evaluates_ablation_g1_g3_g6
+tests/v15/test_m10.py::test_evaluate_gates_all_pass_dev_greenlight_live_small
+tests/v15/test_m10.py::test_evaluate_gates_g1_fail_blocks
+tests/v15/test_m10.py::test_holdout_uses_p99_and_confirmatory
+tests/v15/test_m10.py::test_g7_over_cap_blocks_without_ablation
+tests/v15/test_m10.py::test_holdout_requires_5000_null_dev_requires_1000
+tests/v15/test_m10.py::test_g3_dd_and_g2_folds_gate
+tests/v15/test_m10.py::test_manifest_frozen_gates
+tests/v15/test_mem_budget.py::test_ample_budget_honors_request
+tests/v15/test_mem_budget.py::test_intermediate_budget_partial_cap
+tests/v15/test_mem_budget.py::test_invariant_holds_when_capped
+tests/v15/test_mem_budget.py::test_infeasible_aborts_by_default
+tests/v15/test_mem_budget.py::test_infeasible_negative_budget_aborts
+tests/v15/test_mem_budget.py::test_main_soft_never_above_grantable
+tests/v15/test_mem_budget.py::test_main_soft_capped_when_ram_huge
+tests/v15/test_mem_budget.py::test_worker_guard_tracks_footprint
+tests/v15/test_mem_budget.py::test_requested_is_ceiling_not_floor
+tests/v15/test_mem_budget.py::test_requested_procs_zero_raises
+tests/v15/test_mem_budget.py::test_invalid_per_worker_raises
+tests/v15/test_mem_budget.py::test_invalid_worker_margin_raises
+tests/v15/test_mem_budget.py::test_negative_headroom_raises
+tests/v15/test_mem_budget.py::test_single_process_model_main_reserve_zero
+tests/v15/test_slippage_calib.py::test_robust_base_nonneg_floor
+tests/v15/test_slippage_calib.py::test_robust_base_winsorizes_outliers
+tests/v15/test_slippage_calib.py::test_shrinkage_toward_prior
+tests/v15/test_slippage_calib.py::test_realized_slip_sign_and_causal_ref
+tests/v15/test_slippage_calib.py::test_realized_slip_drops_missing_ref
+tests/v15/test_slippage_calib.py::test_coin_class_by_adv
+tests/v15/test_slippage_calib.py::test_calibrate_own_empirical_and_class_comp
+tests/v15/test_slippage_calib.py::test_calibrate_asof_purity
+tests/v15/test_slippage_calib.py::test_all_nan_slips_get_no_own_empirical
+tests/v15/test_slippage_calib.py::test_missing_ref_coin_gets_global_or_prior_not_vanish
+tests/v15/test_slippage_calib.py::test_manifest_fields_frozen
+
+313 tests collected in 1.78s
+
+ succeeded in 3649ms:
+2026-07-10 12:46:29,810 [leadlag] INFO: [exec] fees from hl_fee_schedule.json: taker_rt=9.00bps maker_rt=3.00bps
+imported=34 total=34 failed=0
+
+codex
+The quants-lab interpreter imports all 34 retained `research.v15` modules cleanly, and pytest collection sees 313 active tests with no v13/v25/v26 collection. I’m doing one last commit hygiene check for whitespace/conflict markers.
+exec
+/bin/zsh -lc 'git diff --check' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+exec
+/bin/zsh -lc "find tests -type d \\( -name v13 -o -name v25 -o -name v26 \\) -print" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+exec
+/bin/zsh -lc 'git status --short | wc -l' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     195
+
+codex
+Consensus: Phase 3a is safe to commit.
+
+I found no file that must move back. Verification:
+
+- Active `tests/` has no `v13`, `v25`, or `v26` dirs.
+- AST import scan: `problems=0` for active imports of `archive`, `research.v13`, `research.v25`, or `research.v26`.
+- Retained `research/v15`: `imported=34 total=34 failed=0`.
+- `pytest --collect-only -q tests`: 313 active tests collected successfully.
+- `git diff --check`: clean.
+
+Only caveat: sandbox denied `ps`, so I could not independently confirm PID `85806`; I’m relying on your engine-alive check. Current `git status --short | wc -l` shows 195 rename/status lines here, not 196, but that does not indicate anything needing restoration.
+tokens used
+43.802
+Consensus: Phase 3a is safe to commit.
+
+I found no file that must move back. Verification:
+
+- Active `tests/` has no `v13`, `v25`, or `v26` dirs.
+- AST import scan: `problems=0` for active imports of `archive`, `research.v13`, `research.v25`, or `research.v26`.
+- Retained `research/v15`: `imported=34 total=34 failed=0`.
+- `pytest --collect-only -q tests`: 313 active tests collected successfully.
+- `git diff --check`: clean.
+
+Only caveat: sandbox denied `ps`, so I could not independently confirm PID `85806`; I’m relying on your engine-alive check. Current `git status --short | wc -l` shows 195 rename/status lines here, not 196, but that does not indicate anything needing restoration.
