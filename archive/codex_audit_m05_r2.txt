@@ -1,0 +1,1359 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c7a-e7bf-7522-b537-4af534b78cde
+--------
+user
+# Round-2 m05 — comprehensive strict fail-closed + run() enforcement
+
+Your r1 required: strict must finite-check ALL blocking floor inputs (np.isfinite, catch inf), and run(strict=True)
+must enforce fold-pure M4 (not just CLI). Applied. Read research/v15/v15_m05_eligibility.py + tests/v15/test_m05_golden.py.
+
+## Fixes
+- apply_floors: in strict, a comprehensive finite guard over EVERY blocking floor input (net_pnl, median_hold_s,
+  share_below_latency, censored_max_hold_s; + roe, median_equity, max_dd, median_leverage, frac_days_green when
+  equity_required) via np.isfinite -> "nonfinite_<k>(strict)". A PRESENT NaN/inf fails closed; an ABSENT key is
+  skipped (gates use .get(default) or KeyError loudly -> not a silent fail-open). Loose mode byte-identical.
+- run(): strict=True now RAISES unless m04_by_fold (fold-pure) is provided AND accessible_by_fold is present.
+- (kept) the specific NaN accessibility + hold + NaN-notional fixes from r1.
+Golden: strict NaN-accessibility/hold -> fail; present-inf median_leverage -> fail; run(strict) w/o fold-pure M4 ->
+raises; loose unchanged. 33 m05 + full v15 (350) pass.
+
+## Questions
+- Is strict now GENERALLY fail-closed (no blocking floor input can be skipped on NaN/inf)? Any blocking input I
+  missed (structural_ruin bool, n_journeys/n_active_days ints, max_dd cap, etc.)?
+- Is "absent key -> skip" correct (vs fail), given the gates use .get(default) for the optional ones and [] for
+  required ones (which KeyError, not silent-pass)?
+- run(strict=True) enforcement correct + complete? Any API path to a loose/look-ahead result under strict?
+- Any new bug.
+
+## Output
+Verdict. End OVERALL: are the 4 targeted m05 P0s now correctly + completely fixed (with only P0#2 COPYABILITY_ONLY
+design decision remaining), or what still must change.
+codex
+I’ll review this as a code review: first inspect the eligibility implementation and golden tests, then trace strict call paths for run/apply_floors and compare against the stated gates.
+exec
+/bin/zsh -lc "sed -n '1,260p' tests/v15/test_m05_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m05_eligibility trust-audit fixes (2026-07-10).
+
+Locks the STRICT fail-closed behaviour so a wallet cannot slip through eligibility on missing/NaN copyability
+data (the loose default is unchanged = byte-identical to the prior pipeline):
+- P0#3: unknown (NaN) accessibility FAILS closed in strict mode,
+- P0#5: non-finite hold FAILS closed in strict mode,
+- P0#4: NaN/absent notional makes accessible_frac_notional unreliable (NaN) -> strict fails it,
+- loose mode: NaN accessibility/hold still pass (unchanged).
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m05_eligibility as m5
+from test_m05 import _good_eqm, _good_jm  # noqa: E402
+
+
+def test_strict_nan_accessibility_fails_closed():
+    jm = _good_jm(); jm["accessible_frac_notional"] = float("nan")   # unknown accessibility
+    ok_loose, _ = m5.apply_floors(_good_eqm(), jm, strict=False)
+    ok_strict, reasons = m5.apply_floors(_good_eqm(), jm, strict=True)
+    assert ok_loose is True                                          # loose: unchanged (does not fire)
+    assert ok_strict is False and any("accessible_frac_unknown" in r for r in reasons)
+
+
+def test_strict_nonfinite_hold_fails_closed():
+    jm = _good_jm(); jm["median_hold_s"] = float("nan")
+    ok_loose, _ = m5.apply_floors(_good_eqm(), jm, strict=False)
+    ok_strict, reasons = m5.apply_floors(_good_eqm(), jm, strict=True)
+    assert ok_loose is True
+    assert ok_strict is False and any("median_hold_nonfinite" in r for r in reasons)
+
+
+def test_loose_default_unchanged():
+    # a fully-good wallet is eligible in both modes; the strict gates only bite on NaN/unknown.
+    assert m5.apply_floors(_good_eqm(), _good_jm(), strict=False)[0] is True
+    assert m5.apply_floors(_good_eqm(), _good_jm(), strict=True)[0] is True
+
+
+def test_strict_present_inf_fails_closed():
+    # a PRESENT non-finite (inf) blocking input fails closed in strict; loose is unchanged.
+    eqm = _good_eqm(); eqm["max_dd"] = float("inf")
+    ok_loose, _ = m5.apply_floors(eqm, _good_jm(), strict=False)   # inf > cap already fails loose here, fine
+    ok_strict, reasons = m5.apply_floors(_good_eqm() | {"median_leverage": float("inf")}, _good_jm(), strict=True)
+    assert ok_strict is False and any("nonfinite_median_leverage" in r for r in reasons)
+
+
+def test_run_strict_requires_fold_pure_m04(_folds_and_min_inputs=None):
+    import pandas as pd
+    folds = pd.DataFrame({"fold_id": [1], "train_start": [pd.Timestamp("2026-01-01")],
+                          "test_start": [pd.Timestamp("2026-02-12")]})
+    empty_j = pd.DataFrame(columns=["wallet", "entity_id", "coin", "entry_ts", "exit_ts",
+                                    "lifecycle_valid", "stream_replay_valid", "net_realized_pnl", "duration_h"])
+    m04 = pd.DataFrame({"entity_id": [1], "primary_wallet": ["0xa"], "copyable": [True]})
+    import pytest
+    with pytest.raises(ValueError, match="fold-pure"):
+        m5.run(folds, empty_j, pd.DataFrame(), m04, {1: {"BTC"}}, equity_required=False, strict=True)
+
+
+def test_p0_4_nan_notional_makes_accessibility_unreliable():
+    # 4 tiny BTC journeys + 1 huge EXOTIC journey with NaN notional -> the exotic must NOT vanish from the
+    # denominator and inflate accessible_frac toward 1.0; it becomes NaN (unreliable) -> strict fails it.
+    ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
+    lo, hi = ms("2026-01-01"), ms("2026-02-01")
+    jr = pd.DataFrame({
+        "coin": ["BTC", "BTC", "BTC", "BTC", "XYZEXOTIC"],
+        "entry_ts": [lo + i for i in range(5)],
+        "exit_ts": [lo + 3600_000 + i for i in range(5)],
+        "max_position_notional": [10.0, 10.0, 10.0, 10.0, float("nan")],  # huge exotic notional is NaN
+        "net_realized_pnl": [5.0, 5.0, 5.0, 5.0, 5.0],
+        "duration_h": [1.0, 1.0, 1.0, 1.0, 1.0],
+        "lifecycle_valid": True, "stream_replay_valid": True,
+    })
+    jm = m5.journey_metrics(jr, lo, hi, accessible={"BTC"})
+    assert not (jm["accessible_frac_notional"] == jm["accessible_frac_notional"])  # NaN, not a fake 1.0
+    # and strict fails it closed
+    eqm = _good_eqm()
+    ok, reasons = m5.apply_floors(eqm, {**_good_jm(), "accessible_frac_notional": jm["accessible_frac_notional"]},
+                                  strict=True)
+    assert ok is False and any("accessible_frac_unknown" in r for r in reasons)
+
+exec
+/bin/zsh -lc "sed -n '1,260p' research/v15/v15_m05_eligibility.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""V15 M5 — Eligibility + Copyability floors (fold-pure, aligned to G5).
+
+Design codex-SHIP: projects/quant/v15/modules/m05. LAYER 2 cheap selection, after M4.
+
+A pass/fail FLOOR (NOT ranking, NOT danger, NOT survival). For each M4-non-KILL copyable entity
+(its primary wallet), per M3 fold, computed ON THE PRETEST WINDOW [train_start_k, test_start_k)
+(fold-pure: only data before fold k's OOS test). LOOSE by design ("keep when in doubt").
+
+Floors (per entity, per fold, pretest window):
+  1. net realized PnL (incl fees+funding) > 0
+  2. flow-adjusted TWR ROE > 0 (+ structural ruin guard)         [50% is full-window @ pool, not here]
+  3. max drawdown <= 0.80
+  4. n_journeys_pretest >= 3
+  5. copyability: median hold > HOLD_FLOOR (60s, measured from V11 copy-path latency) AND
+     share of journeys closing faster than our p95 copy latency <= 0.25
+  6. accessible coins >= 0.80 by notional, judged as-of test_start_k (unknown -> don't fire, flag)
+Cross-fold G5 (active_test_folds>=3, total n_journeys>=5, source_6m_ROE>=50%) is REPORTED here as
+g5_pool_candidate_pass, ENFORCED at pool assembly (M6/M9) — never suppresses per-fold eligibility.
+
+CLI:
+    python v15_m05_eligibility.py --folds m03_folds.parquet --journeys m02_journeys.parquet \
+        --equity m01_universe_20k_series.parquet --m01-audit m01_universe_20k_series.audit.parquet \
+        --m04 m04_authenticity.parquet \
+        --outdir app/data/v15 [--accessible-coins accessible.json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [v15_m05] %(message)s", stream=sys.stdout)
+logger = logging.getLogger("v15_m05")
+
+# Floors (design modules/m05) ------------------------------------------------- #
+MAXDD_CAP = 0.80
+MIN_JOURNEYS_PRETEST = 3
+HOLD_FLOOR_S = 60.0                 # measured from V11 copy-path latency (p95~15s -> max(2*15,60)=60)
+SWING_MAX_HOLD_S = 48 * 3600.0      # upper hold gate: V15 copies FAST directional (minutes-to-hours);
+                                    # reject multi-day/week holders (median hold > 48h)
+P95_COPY_LATENCY_S = 2.0            # Alberto 2026-06-09: real copy latency is max ~2s (not 15s). The 15s
+                                    # gate was rejecting wallets whose edge lands in the 2-15s window, which
+                                    # we CAN copy at 2s. M7's sim already uses copy_latency_ms=2000.
+SHARE_BELOW_LATENCY_CAP = 0.25
+ACCESSIBLE_FRAC_MIN = 0.80
+ROE_FULL_FLOOR_G5 = 0.50            # full-window pool gate only
+RUIN_EQUITY_FLOOR = 1.0            # equity path collapse / invalid-base guard ($)
+MIN_EQUITY_USD = 2000.0            # absolute pretest equity floor: drop tiny degen accounts that merely survived
+# --- Alberto 2026-06-04 copy spec (aligned on Telegram; see handoffs/2026-06-04) ----------------- #
+LEVERAGE_CAP = 10.0               # copy HIGH but NOT ultra-high leverage. Gate median daily notional/equity <= 10x.
+DAYS_GREEN_MIN = 0.80            # consistency: >= 80% of active days flow-adjusted-positive
+MIN_ACTIVE_DAYS_GREEN = 20       # only enforce the days-green gate when >= this many active days exist (else
+                                 # the fold window is too short to judge consistency; other gates handle thin history)
+
+
+def _ms(ts) -> int:
+    return int(pd.Timestamp(ts, tz="UTC").timestamp() * 1000)
+
+
+def _prim_from_m04(m04: pd.DataFrame) -> pd.DataFrame:
+    """M4 copyable primary predicate, shared by single-file and per-fold M4 paths."""
+    return m04[(m04["copyable"] == True)  # noqa: E712
+               & (m04.get("is_entity_primary", True) == True)  # noqa: E712
+               & (m04["tier"] != "KILL")].copy()
+
+
+def _load_m04_by_fold(m04_dir: Path, folds: pd.DataFrame) -> dict[int, pd.DataFrame]:
+    # AUDIT 2026-07-10 (codex P0#1): fold-pure M4 must be PROVENANCE-CHECKED. Every fold-k M4 row must carry
+    # as_of_ms == test_start_k, else it is post-decision (look-ahead) data that could mark a KILL-at-test_start
+    # wallet copyable. Fail closed on a missing/mismatched as_of_ms.
+    fold_test_start = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000 for r in folds.itertuples()}
+    out = {}
+    for fid in sorted(folds["fold_id"].astype(int).unique()):
+        p = m04_dir / f"m04_authenticity_f{fid}.parquet"
+        if not p.exists():
+            raise FileNotFoundError(f"missing fold-pure M4 file for fold {fid}: {p}")
+        df = pd.read_parquet(p)
+        if "as_of_ms" not in df.columns:
+            raise ValueError(f"M5 M4 provenance: {p} has no as_of_ms column (regenerate fold-pure M4)")
+        exp = float(fold_test_start[int(fid)])
+        bad = (pd.to_numeric(df["as_of_ms"], errors="coerce").astype("float64") != exp).fillna(True)
+        if bad.any():
+            raise ValueError(f"M5 M4 provenance FAIL-CLOSED: fold {fid} has {int(bad.sum())} rows with "
+                             f"as_of_ms != test_start ({int(exp)}) -> look-ahead")
+        out[int(fid)] = df
+    return out
+
+
+def flow_adjusted_twr(eq: pd.DataFrame) -> dict:
+    """Flow-adjusted time-weighted return + maxDD over an equity-day frame (M1 series cols).
+
+    eq: rows with `date`, `equity_usd`, `ext_flow_cum` (cumulative external deposits/withdrawals).
+    r_t = (eq_t - eq_{t-1} - flow_t) / eq_{t-1}; ROE = prod(1+r)-1; maxDD on cumprod.
+    structural_ruin = equity base unusable (no day with eq_prev > RUIN_EQUITY_FLOOR) or terminal
+    collapse to ~0 from a real base.
+    """
+    d = eq.sort_values("date").reset_index(drop=True)
+    n_incomplete_excluded = 0
+    if "recon_incomplete" in d.columns:
+        bad = d["recon_incomplete"].fillna(True).astype(bool)
+        n_incomplete_excluded = int(bad.sum())
+        d = d.loc[~bad].reset_index(drop=True)
+    # median_equity (codex finding b): computed from RAW NON-NULL equity values -- NOT the 0.0-filled
+    # series used for TWR. A data gap (missing equity_usd day) filled with 0.0 would drag the median
+    # down and falsely fail the $2k floor. Median of an all-null/empty series is 0.0 (fails, correct).
+    raw_eq = d["equity_usd"].astype(float).dropna() if len(d) else pd.Series(dtype=float)
+    med_eq = float(raw_eq.median()) if len(raw_eq) else 0.0
+    if len(d) < 2:
+        return {"roe": 0.0, "max_dd": 0.0, "n_days": len(d), "structural_ruin": True,
+                "median_equity": med_eq, "frac_days_green": 0.0, "n_active_days": 0,
+                "median_leverage": 0.0, "n_incomplete_excluded": n_incomplete_excluded}
+    e = d["equity_usd"].astype(float).fillna(0.0)
+    flow = d["ext_flow_cum"].astype(float).ffill().fillna(0.0).diff().fillna(0.0)
+    e_prev = e.shift(1)
+    denom = e_prev.where(e_prev > RUIN_EQUITY_FLOOR, np.nan)   # need >$1 base to define a return
+    r = ((e - e_prev - flow) / denom).replace([np.inf, -np.inf], np.nan).dropna()
+    # LEVERAGE (Alberto spec): median daily gross notional / equity over days with a real (>$1) base.
+    if "gross_position_notional_usd" in d.columns:
+        pv = d["gross_position_notional_usd"].astype(float)
+        lev = (pv / e.where(e > RUIN_EQUITY_FLOOR, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+        median_leverage = float(lev.median()) if len(lev) else 0.0
+    elif "position_value_usd" in d.columns:
+        # Compatibility for unit fixtures only. Production CLI rejects an M1
+        # artifact without the gross field below.
+        pv = d["position_value_usd"].astype(float).abs()
+        lev = (pv / e.where(e > RUIN_EQUITY_FLOOR, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+        median_leverage = float(lev.median()) if len(lev) else 0.0
+    else:
+        median_leverage = 0.0
+    if len(r) == 0:
+        return {"roe": 0.0, "max_dd": 0.0, "n_days": len(d), "structural_ruin": True,
+                "median_equity": med_eq, "frac_days_green": 0.0, "n_active_days": 0,
+                "median_leverage": median_leverage, "n_incomplete_excluded": n_incomplete_excluded}
+    # CONSISTENCY (Alberto spec): share of ACTIVE days (a real flow-adjusted return defined) that are green.
+    # "active" excludes flat/no-base days (r is already dropna'd to days with a >$1 prior base).
+    active = r[r != 0.0]
+    n_active = int(len(active))
+    frac_green = float((active > 0).mean()) if n_active else 0.0
+    # codex code-r1 #3: prepend baseline 1.0 so a first-day drop is counted in maxDD.
+    cum = pd.concat([pd.Series([1.0]), (1 + r).cumprod()], ignore_index=True)
+    peak = cum.cummax()
+    max_dd = float(abs(((cum - peak) / peak).min()))
+    roe = float(cum.iloc[-1] - 1)
+    # terminal collapse: started with a real base but ended ~0
+    start_eq = float(e[e > RUIN_EQUITY_FLOOR].iloc[0]) if (e > RUIN_EQUITY_FLOOR).any() else 0.0
+    ruin = (start_eq <= RUIN_EQUITY_FLOOR) or (float(e.iloc[-1]) <= RUIN_EQUITY_FLOOR and start_eq > 100)
+    return {"roe": roe, "max_dd": max_dd, "n_days": len(d), "structural_ruin": bool(ruin),
+            "median_equity": med_eq, "frac_days_green": frac_green, "n_active_days": n_active,
+            "median_leverage": median_leverage, "n_incomplete_excluded": n_incomplete_excluded}
+
+
+def journey_metrics(jr: pd.DataFrame, lo_ms: int, hi_ms: int, accessible: set | None) -> dict:
+    """Pretest journey metrics. CLOSED-in-pretest journeys (entry & exit in [lo,hi)) for
+    PnL/hold/count; accessibility by notional over those journeys.
+
+    Boundary-straddling week-holder guard (codex finding a): a position OPENED in pretest but still
+    OPEN at test_start (exit missing OR exit >= hi_ms) is invisible to median_hold_s. Its CENSORED
+    hold = (hi_ms - entry_ts) -- using only info up to hi_ms (no future exit, no look-ahead) -- is
+    surfaced as censored_max_hold_s so a multi-day/week hold straddling the boundary is rejected."""
+    if jr is None or len(jr) == 0:
+        return _empty_jm()
+    if "lifecycle_valid" in jr.columns:
+        jr = jr[jr["lifecycle_valid"].fillna(False)].copy()
+    if "stream_replay_valid" in jr.columns:
+        jr = jr[jr["stream_replay_valid"].fillna(False)].copy()
+        if len(jr) == 0:
+            return _empty_jm()
+    # censored open-at-test_start holds: opened in pretest, not closed inside pretest (still open at
+    # hi_ms). Censored hold = hi_ms - entry_ts (info only up to hi_ms). Used ONLY for the upper hold
+    # (week-holder) gate; never enters PnL/count/median.
+    opened = jr[(jr["entry_ts"] >= lo_ms) & (jr["entry_ts"] < hi_ms)]
+    straddling = opened[opened["exit_ts"].isna() | (opened["exit_ts"] >= hi_ms)]
+    censored_max_hold_s = (float((hi_ms - straddling["entry_ts"].astype("int64")).max()) / 1000.0
+                           if len(straddling) else 0.0)
+    # codex code-r1 #4: closed-in-pretest = entry AND exit both inside [lo, hi).
+    j = jr[(jr["entry_ts"] >= lo_ms) & (jr["entry_ts"] < hi_ms)
+           & jr["exit_ts"].notna() & (jr["exit_ts"] >= lo_ms) & (jr["exit_ts"] < hi_ms)].copy()
+    if len(j) == 0:
+        jm = _empty_jm()
+        jm["censored_max_hold_s"] = censored_max_hold_s
+        return jm
+    net_pnl = float(j["net_realized_pnl"].sum())
+    n_j = int(len(j))
+    dur_s = (j["duration_h"].astype(float) * 3600.0)   # m02 emits duration_h (not duration_hours)
+    median_hold_s = float(dur_s.median())
+    share_below = float((dur_s < P95_COPY_LATENCY_S).mean())
+    # accessibility by notional (max_position_notional proxy for journey size)
+    # codex code-r1 #5: index-aligned fallback (j.index) so the in_acc boolean mask aligns.
+    if "max_position_notional" in j.columns:
+        notional = j["max_position_notional"].astype(float).abs()
+    else:
+        notional = pd.Series(1.0, index=j.index)
+    if accessible is None:
+        acc_notional = float("nan"); acc_count = float("nan")  # unknown
+    elif "max_position_notional" not in j.columns or bool(notional.isna().any()):
+        # AUDIT 2026-07-10 (codex P0#4): a NaN/absent notional would be DROPPED by .sum() -> an inaccessible
+        # exotic journey with NaN notional silently vanishes from the denominator, inflating accessible_frac
+        # toward 1.0. Notional-weighted accessibility is UNRELIABLE here -> NaN (strict mode fails it closed).
+        acc_notional = float("nan")
+        acc_count = float(j["coin"].isin(accessible).mean())
+    else:
+        in_acc = j["coin"].isin(accessible)
+        tot = notional.sum()
+        acc_notional = float(notional[in_acc].sum() / tot) if tot > 0 else 1.0
+        acc_count = float(in_acc.mean())
+    return {"net_pnl": net_pnl, "n_journeys": n_j, "median_hold_s": median_hold_s,
+            "share_below_latency": share_below, "accessible_frac_notional": acc_notional,
+            "accessible_frac_count": acc_count, "censored_max_hold_s": censored_max_hold_s}
+
+
+def _empty_jm() -> dict:
+    return {"net_pnl": 0.0, "n_journeys": 0, "median_hold_s": 0.0, "share_below_latency": 1.0,
+            "accessible_frac_notional": float("nan"), "accessible_frac_count": float("nan"),
+            "censored_max_hold_s": 0.0}
+
+
+# Alberto 2026-06-09: M5 was doing TWO jobs -- copyability filtering (legit) AND performance pre-judging
+# (net_pnl/roe/days_green), which starves M6b ranking (only ~20 already-profitable wallets reach it) and
+# makes the pool artificially negative-mean OOS. COPYABILITY_ONLY mode (env M5_COPYABILITY_ONLY=1) keeps the
+# copyability/risk gates but does NOT let the performance gates block eligibility (they're still RECORDED in
+# fail_reasons for audit). This widens the eligible pool ~175 -> ~2,383 entity-folds so M6b can RANK
+# performance instead of M5 pre-gating it. Default OFF -> byte-identical to the strict pipeline.
+import os as _os
+COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+# performance fails (judged by ranking, not eligibility) vs risk/copyability fails (hard exclusions)
+_PERF_FAIL_PREFIXES = ("net_pnl<=0", "roe<=0", "days_green<")
+
+
+def apply_floors(
+    eqm: dict, jm: dict, *, equity_required: bool = True, strict: bool = False,
+) -> tuple[bool, list[str]]:
+    """Per-fold pretest floors. Returns (eligible, fail_reasons).
+
+    In COPYABILITY_ONLY mode, performance fails (net_pnl/roe/days_green) are recorded in fail_reasons but do
+    NOT block eligibility -- only risk/copyability fails do. structural_ruin STAYS a hard risk gate.
+    """
+    f = []
+    # AUDIT 2026-07-10 (codex m05 fix r2): STRICT = deployable fail-closed. EVERY blocking floor input must be
+    # FINITE (np.isfinite catches NaN AND inf); a non-finite value would make its `<`/`>` comparison silently
+    # not fire. Fail closed here so no gate can be skipped on bad data. (Loose mode is unchanged.)
+    if strict:
+        _fin_checks = [("net_pnl", jm.get("net_pnl")), ("median_hold_s", jm.get("median_hold_s")),
+                       ("share_below_latency", jm.get("share_below_latency")),
+                       ("censored_max_hold_s", jm.get("censored_max_hold_s"))]
+        if equity_required:
+            _fin_checks += [("roe", eqm.get("roe")), ("median_equity", eqm.get("median_equity")),
+                            ("max_dd", eqm.get("max_dd")), ("median_leverage", eqm.get("median_leverage")),
+                            ("frac_days_green", eqm.get("frac_days_green"))]
+        for _k, _v in _fin_checks:
+            if _v is None:
+                continue   # absent key: gates use .get(default) or KeyError loudly; not a silent fail-open
+            try:
+                _ok = np.isfinite(float(_v))
+            except (TypeError, ValueError):
+
+exec
+/bin/zsh -lc 'rg -n "def run|apply_floors|strict|m04_by_fold|accessible_by_fold|structural_ruin|n_journeys|n_active_days|max_dd|COPYABILITY|copyability" research/v15/v15_m05_eligibility.py tests/v15/test_m05_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_m05_eligibility.py:14:  4. n_journeys_pretest >= 3
+research/v15/v15_m05_eligibility.py:15:  5. copyability: median hold > HOLD_FLOOR (60s, measured from V11 copy-path latency) AND
+research/v15/v15_m05_eligibility.py:18:Cross-fold G5 (active_test_folds>=3, total n_journeys>=5, source_6m_ROE>=50%) is REPORTED here as
+research/v15/v15_m05_eligibility.py:73:def _load_m04_by_fold(m04_dir: Path, folds: pd.DataFrame) -> dict[int, pd.DataFrame]:
+research/v15/v15_m05_eligibility.py:100:    structural_ruin = equity base unusable (no day with eq_prev > RUIN_EQUITY_FLOOR) or terminal
+research/v15/v15_m05_eligibility.py:115:        return {"roe": 0.0, "max_dd": 0.0, "n_days": len(d), "structural_ruin": True,
+research/v15/v15_m05_eligibility.py:116:                "median_equity": med_eq, "frac_days_green": 0.0, "n_active_days": 0,
+research/v15/v15_m05_eligibility.py:137:        return {"roe": 0.0, "max_dd": 0.0, "n_days": len(d), "structural_ruin": True,
+research/v15/v15_m05_eligibility.py:138:                "median_equity": med_eq, "frac_days_green": 0.0, "n_active_days": 0,
+research/v15/v15_m05_eligibility.py:148:    max_dd = float(abs(((cum - peak) / peak).min()))
+research/v15/v15_m05_eligibility.py:153:    return {"roe": roe, "max_dd": max_dd, "n_days": len(d), "structural_ruin": bool(ruin),
+research/v15/v15_m05_eligibility.py:154:            "median_equity": med_eq, "frac_days_green": frac_green, "n_active_days": n_active,
+research/v15/v15_m05_eligibility.py:204:        # toward 1.0. Notional-weighted accessibility is UNRELIABLE here -> NaN (strict mode fails it closed).
+research/v15/v15_m05_eligibility.py:212:    return {"net_pnl": net_pnl, "n_journeys": n_j, "median_hold_s": median_hold_s,
+research/v15/v15_m05_eligibility.py:218:    return {"net_pnl": 0.0, "n_journeys": 0, "median_hold_s": 0.0, "share_below_latency": 1.0,
+research/v15/v15_m05_eligibility.py:223:# Alberto 2026-06-09: M5 was doing TWO jobs -- copyability filtering (legit) AND performance pre-judging
+research/v15/v15_m05_eligibility.py:225:# makes the pool artificially negative-mean OOS. COPYABILITY_ONLY mode (env M5_COPYABILITY_ONLY=1) keeps the
+research/v15/v15_m05_eligibility.py:226:# copyability/risk gates but does NOT let the performance gates block eligibility (they're still RECORDED in
+research/v15/v15_m05_eligibility.py:228:# performance instead of M5 pre-gating it. Default OFF -> byte-identical to the strict pipeline.
+research/v15/v15_m05_eligibility.py:230:COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+research/v15/v15_m05_eligibility.py:231:# performance fails (judged by ranking, not eligibility) vs risk/copyability fails (hard exclusions)
+research/v15/v15_m05_eligibility.py:235:def apply_floors(
+research/v15/v15_m05_eligibility.py:236:    eqm: dict, jm: dict, *, equity_required: bool = True, strict: bool = False,
+research/v15/v15_m05_eligibility.py:240:    In COPYABILITY_ONLY mode, performance fails (net_pnl/roe/days_green) are recorded in fail_reasons but do
+research/v15/v15_m05_eligibility.py:241:    NOT block eligibility -- only risk/copyability fails do. structural_ruin STAYS a hard risk gate.
+research/v15/v15_m05_eligibility.py:247:    if strict:
+research/v15/v15_m05_eligibility.py:253:                            ("max_dd", eqm.get("max_dd")), ("median_leverage", eqm.get("median_leverage")),
+research/v15/v15_m05_eligibility.py:263:                f.append(f"nonfinite_{_k}(strict)")   # PRESENT but NaN/inf -> fail closed
+research/v15/v15_m05_eligibility.py:267:        if eqm["structural_ruin"]:
+research/v15/v15_m05_eligibility.py:268:            f.append("structural_ruin")
+research/v15/v15_m05_eligibility.py:275:        if eqm["max_dd"] > MAXDD_CAP:
+research/v15/v15_m05_eligibility.py:276:            f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
+research/v15/v15_m05_eligibility.py:277:    if jm["n_journeys"] < MIN_JOURNEYS_PRETEST:
+research/v15/v15_m05_eligibility.py:278:        f.append(f"n_journeys<{MIN_JOURNEYS_PRETEST} ({jm['n_journeys']})")
+research/v15/v15_m05_eligibility.py:281:    # floor silently doesn't fire. In strict mode a non-finite hold FAILS closed (no usable copyability evidence).
+research/v15/v15_m05_eligibility.py:282:    if (strict and not (_mh == _mh)) or _mh <= HOLD_FLOOR_S:
+research/v15/v15_m05_eligibility.py:301:    nad = int(eqm.get("n_active_days", 0))
+research/v15/v15_m05_eligibility.py:309:    if (strict and not (af == af)) or (af == af and af < ACCESSIBLE_FRAC_MIN):
+research/v15/v15_m05_eligibility.py:311:                 else "accessible_frac_unknown(strict)")
+research/v15/v15_m05_eligibility.py:318:    if COPYABILITY_ONLY:
+research/v15/v15_m05_eligibility.py:319:        # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
+research/v15/v15_m05_eligibility.py:325:def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: pd.DataFrame | None,
+research/v15/v15_m05_eligibility.py:326:        accessible_by_fold: dict | None = None,
+research/v15/v15_m05_eligibility.py:328:        m04_by_fold: dict[int, pd.DataFrame] | None = None,
+research/v15/v15_m05_eligibility.py:330:        equity_required: bool = True, strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+research/v15/v15_m05_eligibility.py:337:    # AUDIT 2026-07-10 (codex m05 fix r2): enforce fold-pure M4 INSIDE run() for strict/deployable callers, not
+research/v15/v15_m05_eligibility.py:339:    if strict and m04_by_fold is None:
+research/v15/v15_m05_eligibility.py:340:        raise ValueError("run(strict=True) requires fold-pure m04_by_fold; the global single-M4 path is look-ahead-prone")
+research/v15/v15_m05_eligibility.py:341:    if strict and (accessible_by_fold is None or not accessible_by_fold):
+research/v15/v15_m05_eligibility.py:342:        raise ValueError("run(strict=True) requires accessible_by_fold (else accessibility fails open on unknown)")
+research/v15/v15_m05_eligibility.py:344:    if m04_by_fold is None:
+research/v15/v15_m05_eligibility.py:346:            raise ValueError("run() requires either m04 or m04_by_fold")
+research/v15/v15_m05_eligibility.py:353:        prim_by_fold = {int(fid): _prim_from_m04(df) for fid, df in m04_by_fold.items()}
+research/v15/v15_m05_eligibility.py:373:        acc = (accessible_by_fold or {}).get(fid)            # set or None(unknown)
+research/v15/v15_m05_eligibility.py:383:                eqm = {"roe": 0.0, "max_dd": 0.0, "n_days": 0, "structural_ruin": True,
+research/v15/v15_m05_eligibility.py:384:                       "median_equity": 0.0, "frac_days_green": 0.0, "n_active_days": 0,
+research/v15/v15_m05_eligibility.py:387:            elig, fails = apply_floors(eqm, jm, equity_required=equity_required, strict=strict)
+research/v15/v15_m05_eligibility.py:398:                "max_dd_pretest": eqm["max_dd"], "structural_ruin_flag": eqm["structural_ruin"],
+research/v15/v15_m05_eligibility.py:403:                "n_active_days_pretest": eqm.get("n_active_days", 0),
+research/v15/v15_m05_eligibility.py:404:                "n_journeys_pretest": jm["n_journeys"], "median_hold_s_pretest": jm["median_hold_s"],
+research/v15/v15_m05_eligibility.py:412:                "selection_lane": "equity" if equity_required else "copyability",
+research/v15/v15_m05_eligibility.py:438:            "active_test_folds": active_tf, "total_n_journeys": total_nj,
+research/v15/v15_m05_eligibility.py:442:            "selection_lane": "equity" if equity_required else "copyability",
+research/v15/v15_m05_eligibility.py:451:    ap.add_argument("--mode", choices=("equity", "copyability"), default="equity")
+research/v15/v15_m05_eligibility.py:464:    ap.add_argument("--strict", action="store_true",
+research/v15/v15_m05_eligibility.py:466:                         "require fold-pure --m04-dir + --accessible-coins (no fail-open on missing copyability data)")
+research/v15/v15_m05_eligibility.py:468:    # AUDIT 2026-07-10 (codex P0#1/#3): a strict/deployable m05 run must not fail open on missing copyability data.
+research/v15/v15_m05_eligibility.py:469:    if args.strict:
+research/v15/v15_m05_eligibility.py:471:            raise ValueError("--strict requires --m04-dir (fold-pure M4); global --m04 is look-ahead-prone")
+research/v15/v15_m05_eligibility.py:473:            raise ValueError("--strict requires --accessible-coins (else accessibility fails open on unknown)")
+research/v15/v15_m05_eligibility.py:499:        m04_by_fold = _load_m04_by_fold(Path(args.m04_dir), folds)
+research/v15/v15_m05_eligibility.py:505:        m04_by_fold = None
+research/v15/v15_m05_eligibility.py:514:    m04_rows = sum(len(v) for v in m04_by_fold.values()) if m04_by_fold is not None else len(m04)
+research/v15/v15_m05_eligibility.py:518:        folds, journeys, equity, m04, acc, atf, m04_by_fold=m04_by_fold,
+research/v15/v15_m05_eligibility.py:519:        quarantined_wallets=quarantined_wallets, equity_required=equity_required, strict=args.strict,
+tests/v15/test_m05_golden.py:3:Locks the STRICT fail-closed behaviour so a wallet cannot slip through eligibility on missing/NaN copyability
+tests/v15/test_m05_golden.py:5:- P0#3: unknown (NaN) accessibility FAILS closed in strict mode,
+tests/v15/test_m05_golden.py:6:- P0#5: non-finite hold FAILS closed in strict mode,
+tests/v15/test_m05_golden.py:7:- P0#4: NaN/absent notional makes accessible_frac_notional unreliable (NaN) -> strict fails it,
+tests/v15/test_m05_golden.py:21:def test_strict_nan_accessibility_fails_closed():
+tests/v15/test_m05_golden.py:23:    ok_loose, _ = m5.apply_floors(_good_eqm(), jm, strict=False)
+tests/v15/test_m05_golden.py:24:    ok_strict, reasons = m5.apply_floors(_good_eqm(), jm, strict=True)
+tests/v15/test_m05_golden.py:26:    assert ok_strict is False and any("accessible_frac_unknown" in r for r in reasons)
+tests/v15/test_m05_golden.py:29:def test_strict_nonfinite_hold_fails_closed():
+tests/v15/test_m05_golden.py:31:    ok_loose, _ = m5.apply_floors(_good_eqm(), jm, strict=False)
+tests/v15/test_m05_golden.py:32:    ok_strict, reasons = m5.apply_floors(_good_eqm(), jm, strict=True)
+tests/v15/test_m05_golden.py:34:    assert ok_strict is False and any("median_hold_nonfinite" in r for r in reasons)
+tests/v15/test_m05_golden.py:38:    # a fully-good wallet is eligible in both modes; the strict gates only bite on NaN/unknown.
+tests/v15/test_m05_golden.py:39:    assert m5.apply_floors(_good_eqm(), _good_jm(), strict=False)[0] is True
+tests/v15/test_m05_golden.py:40:    assert m5.apply_floors(_good_eqm(), _good_jm(), strict=True)[0] is True
+tests/v15/test_m05_golden.py:43:def test_strict_present_inf_fails_closed():
+tests/v15/test_m05_golden.py:44:    # a PRESENT non-finite (inf) blocking input fails closed in strict; loose is unchanged.
+tests/v15/test_m05_golden.py:45:    eqm = _good_eqm(); eqm["max_dd"] = float("inf")
+tests/v15/test_m05_golden.py:46:    ok_loose, _ = m5.apply_floors(eqm, _good_jm(), strict=False)   # inf > cap already fails loose here, fine
+tests/v15/test_m05_golden.py:47:    ok_strict, reasons = m5.apply_floors(_good_eqm() | {"median_leverage": float("inf")}, _good_jm(), strict=True)
+tests/v15/test_m05_golden.py:48:    assert ok_strict is False and any("nonfinite_median_leverage" in r for r in reasons)
+tests/v15/test_m05_golden.py:51:def test_run_strict_requires_fold_pure_m04(_folds_and_min_inputs=None):
+tests/v15/test_m05_golden.py:60:        m5.run(folds, empty_j, pd.DataFrame(), m04, {1: {"BTC"}}, equity_required=False, strict=True)
+tests/v15/test_m05_golden.py:65:    # denominator and inflate accessible_frac toward 1.0; it becomes NaN (unreliable) -> strict fails it.
+tests/v15/test_m05_golden.py:79:    # and strict fails it closed
+tests/v15/test_m05_golden.py:81:    ok, reasons = m5.apply_floors(eqm, {**_good_jm(), "accessible_frac_notional": jm["accessible_frac_notional"]},
+tests/v15/test_m05_golden.py:82:                                  strict=True)
+
+codex
+I’ve got the main shape. Now I’m reading the exact floor predicates and run loop, because the interesting edge cases are mostly in “present but bad” values versus missing keys and per-fold availability.
+exec
+/bin/zsh -lc "sed -n '250,540p' research/v15/v15_m05_eligibility.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '1,240p' tests/v15/test_m05.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M5 eligibility tests. Asserts the codex-SHIP design contract (modules/m05)."""
+import sys
+from datetime import date, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "research" / "v15"))
+import v15_m03_fold_geometry as m03  # noqa: E402
+import v15_m05_eligibility as m5  # noqa: E402
+
+FOLDS = m03.folds_to_frame(m03.build_folds(), market_data_fn=None)
+F1 = m03.build_folds()[0]  # train Dec01, val Jan12, test Jan26
+
+
+def ms(d):
+    return m5._ms(d)
+
+
+# === flow_adjusted_twr ===
+def test_twr_positive_and_dd():
+    # equity 1000 -> 1100 -> 990 (no flows): roe ~ -1%? build a clean +10% then -10%
+    df = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=3, freq="D").date,
+                       "equity_usd": [1000.0, 1100.0, 1100.0], "ext_flow_cum": [0.0, 0.0, 0.0]})
+    r = m5.flow_adjusted_twr(df)
+    assert r["roe"] > 0 and not r["structural_ruin"]
+
+
+def test_twr_flow_stripped():
+    # equity jumps 1000->2000 purely from a 1000 deposit -> ROE ~0, not +100%
+    df = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=2, freq="D").date,
+                       "equity_usd": [1000.0, 2000.0], "ext_flow_cum": [0.0, 1000.0]})
+    r = m5.flow_adjusted_twr(df)
+    assert abs(r["roe"]) < 1e-6
+
+
+def test_twr_maxdd_counts_first_drop():
+    # codex code-r1 #3: 1000 -> 500 -> 500 must report ~50% DD (baseline prepended), not 0.
+    df = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=3, freq="D").date,
+                       "equity_usd": [1000.0, 500.0, 500.0], "ext_flow_cum": [0.0, 0.0, 0.0]})
+    r = m5.flow_adjusted_twr(df)
+    assert abs(r["max_dd"] - 0.5) < 1e-6
+
+
+def test_twr_structural_ruin():
+    df = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=3, freq="D").date,
+                       "equity_usd": [1000.0, 500.0, 0.2], "ext_flow_cum": [0.0, 0.0, 0.0]})
+    assert m5.flow_adjusted_twr(df)["structural_ruin"] is True
+
+
+def test_twr_excludes_incomplete_reconstruction_days():
+    df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=3, freq="D").date,
+        "equity_usd": [1000.0, 1_000_000.0, 1100.0],
+        "ext_flow_cum": [0.0, 0.0, 0.0],
+        "recon_incomplete": [False, True, False],
+    })
+    r = m5.flow_adjusted_twr(df)
+    assert r["roe"] == pytest.approx(0.10)
+    assert r["n_incomplete_excluded"] == 1
+
+
+def test_leverage_uses_gross_notional_not_signed_position_value():
+    df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=3, freq="D").date,
+        "equity_usd": [100.0, 100.0, 100.0],
+        "ext_flow_cum": [0.0, 0.0, 0.0],
+        "position_value_usd": [0.0, 0.0, 0.0],
+        "gross_position_notional_usd": [2000.0, 2000.0, 2000.0],
+    })
+    assert m5.flow_adjusted_twr(df)["median_leverage"] == pytest.approx(20.0)
+
+
+# === journey_metrics + floors ===
+def _jr(wallet, entry_d, exit_d, pnl, coin="BTC", notional=1000.0):
+    return {"wallet": wallet, "coin": coin,
+            "entry_ts": ms(entry_d), "exit_ts": ms(exit_d),
+            "duration_h": (ms(exit_d) - ms(entry_d)) / 3.6e6,
+            "net_realized_pnl": pnl, "max_position_notional": notional}
+
+
+def _good_eqm():
+    return {"roe": 0.2, "max_dd": 0.3, "n_days": 50, "structural_ruin": False,
+            "median_equity": 10000.0}
+
+
+def _good_jm():
+    return {"net_pnl": 500.0, "n_journeys": 5, "median_hold_s": 3600.0,
+            "share_below_latency": 0.0, "accessible_frac_notional": 1.0, "accessible_frac_count": 1.0}
+
+
+def test_floor_pass():
+    ok, f = m5.apply_floors(_good_eqm(), _good_jm())
+    assert ok and not f
+
+
+def test_copyability_lane_does_not_require_m01_equity():
+    unavailable = {
+        "roe": float("nan"), "max_dd": float("nan"), "n_days": 0,
+        "structural_ruin": True, "median_equity": 0.0,
+        "median_leverage": float("nan"), "n_active_days": 0,
+        "frac_days_green": float("nan"),
+    }
+    ok, reasons = m5.apply_floors(
+        unavailable, _good_jm(), equity_required=False
+    )
+    assert ok
+    assert not any("equity" in reason or "structural_ruin" in reason for reason in reasons)
+
+
+def test_floor_fail_negative_pnl():
+    jm = _good_jm(); jm["net_pnl"] = -10
+    assert not m5.apply_floors(_good_eqm(), jm)[0]
+
+
+def test_floor_fail_dd():
+    e = _good_eqm(); e["max_dd"] = 0.9
+    assert not m5.apply_floors(e, _good_jm())[0]
+
+
+def test_floor_fail_thin_journeys():
+    jm = _good_jm(); jm["n_journeys"] = 2
+    assert not m5.apply_floors(_good_eqm(), jm)[0]
+
+
+def test_floor_fail_hft_holdtime():
+    jm = _good_jm(); jm["median_hold_s"] = 30.0  # < 60s HOLD_FLOOR
+    assert not m5.apply_floors(_good_eqm(), jm)[0]
+
+
+def test_floor_fail_share_below_latency():
+    jm = _good_jm(); jm["share_below_latency"] = 0.4  # > 0.25
+    assert not m5.apply_floors(_good_eqm(), jm)[0]
+
+
+def test_floor_fail_week_holder():
+    # median hold > 48h SWING_MAX_HOLD_S -> reject multi-day/week holder
+    jm = _good_jm(); jm["median_hold_s"] = 7 * 24 * 3600.0  # 7-day hold
+    ok, f = m5.apply_floors(_good_eqm(), jm)
+    assert not ok
+    assert any("hold_too_long" in x for x in f)
+
+
+def test_floor_fail_tiny_equity():
+    # pretest equity below MIN_EQUITY_USD ($2000) -> drop tiny degen account
+    e = _good_eqm(); e["median_equity"] = 276.0  # $276 degen account
+    ok, f = m5.apply_floors(e, _good_jm())
+    assert not ok
+    assert any("equity_too_small" in x for x in f)
+
+
+def test_floor_fast_wallet_still_passes():
+    # valid fast directional wallet: hours-scale hold, ample equity -> passes
+    jm = _good_jm(); jm["median_hold_s"] = 4 * 3600.0  # 4h hold (minutes-to-hours thesis)
+    e = _good_eqm(); e["median_equity"] = 8000.0
+    ok, f = m5.apply_floors(e, jm)
+    assert ok and not f
+
+
+def test_floor_fail_boundary_straddling_week_holder():
+    # codex finding a: a position OPENED in pretest still OPEN at test_start with a censored hold
+    # exceeding the swing cap is a week-holder, even though it's invisible to median_hold_s.
+    jm = _good_jm(); jm["censored_max_hold_s"] = 5 * 24 * 3600.0  # 5-day open straddle
+    ok, f = m5.apply_floors(_good_eqm(), jm)
+    assert not ok
+    assert any("hold_too_long_censored" in x for x in f)
+
+
+def test_journey_metrics_censored_hold_for_open_position():
+    # an open position (exit_ts NaN) opened in pretest -> censored_max_hold_s = hi - entry.
+    lo = ms(date(2025, 12, 1)); hi = ms(date(2025, 12, 30))
+    jr = pd.DataFrame([{
+        "wallet": "0xw", "coin": "BTC",
+        "entry_ts": ms(date(2025, 12, 2)), "exit_ts": np.nan,
+        "duration_h": np.nan, "net_realized_pnl": 0.0, "max_position_notional": 1000.0,
+    }])
+    jm = m5.journey_metrics(jr, lo, hi, None)
+    expected = (hi - ms(date(2025, 12, 2))) / 1000.0
+    assert abs(jm["censored_max_hold_s"] - expected) < 1.0
+    # straddling position (exit AFTER hi) also counts as censored.
+    jr2 = pd.DataFrame([{
+        "wallet": "0xw", "coin": "BTC",
+        "entry_ts": ms(date(2025, 12, 2)), "exit_ts": ms(date(2026, 1, 15)),
+        "duration_h": 1000.0, "net_realized_pnl": 50.0, "max_position_notional": 1000.0,
+    }])
+    jm2 = m5.journey_metrics(jr2, lo, hi, None)
+    assert abs(jm2["censored_max_hold_s"] - expected) < 1.0
+    assert jm2["n_journeys"] == 0  # not closed-in-pretest -> excluded from count/PnL
+
+
+def test_journey_metrics_excludes_invalid_lifecycle():
+    lo = ms(date(2025, 12, 1)); hi = ms(date(2025, 12, 30))
+    rows = [
+        {**_jr("0xw", date(2025, 12, 2), date(2025, 12, 3), 100), "lifecycle_valid": True},
+        {**_jr("0xw", date(2025, 12, 4), date(2025, 12, 5), 9999), "lifecycle_valid": False},
+    ]
+    jm = m5.journey_metrics(pd.DataFrame(rows), lo, hi, None)
+    assert jm["n_journeys"] == 1
+    assert jm["net_pnl"] == pytest.approx(100.0)
+
+
+def test_data_gap_account_not_falsely_failed():
+    # codex finding b: a data gap (missing equity_usd day) must NOT drag median_equity to 0 via the
+    # 0.0-fill. Raw non-null median stays well above the $2k floor.
+    df = pd.DataFrame({
+        "date": pd.date_range("2026-01-01", periods=5, freq="D").date,
+        "equity_usd": [10000.0, np.nan, 10000.0, np.nan, 10000.0],
+        "ext_flow_cum": [0.0, 0.0, 0.0, 0.0, 0.0],
+    })
+    r = m5.flow_adjusted_twr(df)
+    # raw non-null median = 10000 (NOT the 0-filled median ~10000 dragged down by zeros)
+    assert r["median_equity"] == 10000.0
+    ok, f = m5.apply_floors(r, _good_jm())
+    assert not any("equity_too_small" in x for x in f)
+
+
+def test_median_equity_emitted_in_elig_rows():
+    # codex finding c: median_equity_pretest is a column in elig_df for auditability.
+    journeys = pd.DataFrame([
+        _jr("0xg", date(2025, 12, 5), date(2025, 12, 6), 100),
+        _jr("0xg", date(2025, 12, 10), date(2025, 12, 11), 100),
+        _jr("0xg", date(2026, 1, 2), date(2026, 1, 3), 100),
+        _jr("0xg", date(2026, 1, 8), date(2026, 1, 9), 100),
+    ])
+    eq = pd.DataFrame({"wallet": "0xg",
+                       "date": pd.date_range("2025-12-01", "2026-01-25", freq="D").date,
+                       "equity_usd": np.linspace(10000, 13000, 56), "ext_flow_cum": 0.0})
+    elig, pool, wf = m5.run(FOLDS, journeys, eq, _m04(["0xg"]))
+    assert "median_equity_pretest" in elig.columns
+    f1 = elig[(elig["primary_wallet"] == "0xg") & (elig["fold_id"] == 1)].iloc[0]
+    assert f1["median_equity_pretest"] > 2000.0
+
+
+def test_m01_quarantine_hard_excludes_wallet():
+    journeys = pd.DataFrame([
+        _jr("0xg", date(2025, 12, 5), date(2025, 12, 6), 100),
+        _jr("0xg", date(2025, 12, 10), date(2025, 12, 11), 100),
+        _jr("0xg", date(2026, 1, 2), date(2026, 1, 3), 100),
+
+ succeeded in 0ms:
+                       ("censored_max_hold_s", jm.get("censored_max_hold_s"))]
+        if equity_required:
+            _fin_checks += [("roe", eqm.get("roe")), ("median_equity", eqm.get("median_equity")),
+                            ("max_dd", eqm.get("max_dd")), ("median_leverage", eqm.get("median_leverage")),
+                            ("frac_days_green", eqm.get("frac_days_green"))]
+        for _k, _v in _fin_checks:
+            if _v is None:
+                continue   # absent key: gates use .get(default) or KeyError loudly; not a silent fail-open
+            try:
+                _ok = np.isfinite(float(_v))
+            except (TypeError, ValueError):
+                _ok = False
+            if not _ok:
+                f.append(f"nonfinite_{_k}(strict)")   # PRESENT but NaN/inf -> fail closed
+    if jm["net_pnl"] <= 0:
+        f.append(f"net_pnl<=0 ({jm['net_pnl']:.1f})")
+    if equity_required:
+        if eqm["structural_ruin"]:
+            f.append("structural_ruin")
+        elif eqm["roe"] <= 0:
+            f.append(f"roe<=0 ({eqm['roe']:.2%})")
+        # absolute pretest equity floor: drop tiny degen accounts that merely survived (fold-pure)
+        me = eqm.get("median_equity", 0.0)
+        if me < MIN_EQUITY_USD:
+            f.append(f"equity_too_small (${me:.0f}<{MIN_EQUITY_USD:.0f})")
+        if eqm["max_dd"] > MAXDD_CAP:
+            f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
+    if jm["n_journeys"] < MIN_JOURNEYS_PRETEST:
+        f.append(f"n_journeys<{MIN_JOURNEYS_PRETEST} ({jm['n_journeys']})")
+    _mh = jm["median_hold_s"]
+    # AUDIT 2026-07-10 (codex P0#5): NaN hold (bad/missing durations) makes `NaN <= floor` False -> the hold
+    # floor silently doesn't fire. In strict mode a non-finite hold FAILS closed (no usable copyability evidence).
+    if (strict and not (_mh == _mh)) or _mh <= HOLD_FLOOR_S:
+        f.append(f"median_hold<={HOLD_FLOOR_S:.0f}s ({_mh:.0f}s)" if _mh == _mh else "median_hold_nonfinite")
+    # upper hold gate: V15 copies fast directional; reject multi-day/week holders
+    if jm["median_hold_s"] > SWING_MAX_HOLD_S:
+        f.append(f"hold_too_long (>{SWING_MAX_HOLD_S:.0f}s, {jm['median_hold_s']:.0f}s)")
+    # boundary-straddling week-holder (codex finding a): a position opened in pretest still OPEN at
+    # test_start whose CENSORED hold already exceeds the swing cap is a week-holder invisible to the
+    # median (the close lands after the boundary). Reject on the censored lower-bound alone.
+    cmh = jm.get("censored_max_hold_s", 0.0)
+    if cmh > SWING_MAX_HOLD_S:
+        f.append(f"hold_too_long_censored (>{SWING_MAX_HOLD_S:.0f}s, open-at-test_start {cmh:.0f}s)")
+    if jm["share_below_latency"] > SHARE_BELOW_LATENCY_CAP:
+        f.append(f"share_below_latency>{SHARE_BELOW_LATENCY_CAP:.0%} ({jm['share_below_latency']:.0%})")
+    # LEVERAGE gate (Alberto spec): copy high but not ultra-high; reject median daily leverage > 10x.
+    mlev = eqm.get("median_leverage", 0.0)
+    if equity_required and mlev > LEVERAGE_CAP:
+        f.append(f"leverage>{LEVERAGE_CAP:.0f}x ({mlev:.1f}x)")
+    # CONSISTENCY gate (Alberto spec): >=80% of active days green, enforced only when enough active days
+    # exist to judge it (short fold windows can't prove consistency; thin history caught by other gates).
+    nad = int(eqm.get("n_active_days", 0))
+    fdg = eqm.get("frac_days_green", 0.0)
+    if equity_required and nad >= MIN_ACTIVE_DAYS_GREEN and fdg < DAYS_GREEN_MIN:
+        f.append(f"days_green<{DAYS_GREEN_MIN:.0%} ({fdg:.0%} over {nad}d)")
+    # accessibility (codex P0#3/#4): loose mode = unknown (NaN) does NOT fire; STRICT mode = unknown/unreliable
+    # accessibility (no --accessible-coins for this fold, or NaN notional weighting) FAILS closed -> a wallet
+    # trading exotic/unavailable coins can't slip through on missing data.
+    af = jm["accessible_frac_notional"]
+    if (strict and not (af == af)) or (af == af and af < ACCESSIBLE_FRAC_MIN):
+        f.append(f"accessible_frac<{ACCESSIBLE_FRAC_MIN:.0%} ({af:.0%})" if af == af
+                 else "accessible_frac_unknown(strict)")
+    if not equity_required:
+        # Fixed-notional/direction-only lane: M1-derived equity, DD, leverage,
+        # and consistency are intentionally absent. Source net PnL is recorded
+        # but final performance judgment belongs to after-cost M7/M6b.
+        blocking = [x for x in f if not x.startswith("net_pnl<=0")]
+        return (len(blocking) == 0, f)
+    if COPYABILITY_ONLY:
+        # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
+        blocking = [x for x in f if not x.startswith(_PERF_FAIL_PREFIXES)]
+        return (len(blocking) == 0, f)
+    return (len(f) == 0, f)
+
+
+def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: pd.DataFrame | None,
+        accessible_by_fold: dict | None = None,
+        active_test_folds_by_wallet: dict | None = None,
+        m04_by_fold: dict[int, pd.DataFrame] | None = None,
+        quarantined_wallets: set[str] | None = None,
+        equity_required: bool = True, strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    quarantined_wallets = {w.lower() for w in (quarantined_wallets or set())}
+    if len(journeys) and {"lifecycle_valid", "stream_replay_valid"}.issubset(journeys.columns):
+        journeys = journeys[
+            journeys["lifecycle_valid"].fillna(False).astype(bool)
+            & journeys["stream_replay_valid"].fillna(False).astype(bool)
+        ].copy()
+    # AUDIT 2026-07-10 (codex m05 fix r2): enforce fold-pure M4 INSIDE run() for strict/deployable callers, not
+    # just the CLI -- an API caller must not accidentally get the look-ahead-prone global M4 path.
+    if strict and m04_by_fold is None:
+        raise ValueError("run(strict=True) requires fold-pure m04_by_fold; the global single-M4 path is look-ahead-prone")
+    if strict and (accessible_by_fold is None or not accessible_by_fold):
+        raise ValueError("run(strict=True) requires accessible_by_fold (else accessibility fails open on unknown)")
+    # entities to evaluate: M4 copyable primaries — defensive filter on all three (codex code-r1 #2).
+    if m04_by_fold is None:
+        if m04 is None:
+            raise ValueError("run() requires either m04 or m04_by_fold")
+        prim = _prim_from_m04(m04)
+        prim_by_fold = None
+        logger.warning("LOUD WARNING: using a single M4 authenticity file for all folds; "
+                       "M5 selection is not fold-pure. Pass --m04-dir for fold-pure M4.")
+        logger.info(f"M4 copyable primaries: {len(prim)} entities")
+    else:
+        prim_by_fold = {int(fid): _prim_from_m04(df) for fid, df in m04_by_fold.items()}
+        prim = (pd.concat(prim_by_fold.values(), ignore_index=True).drop_duplicates("entity_id")
+                if prim_by_fold else pd.DataFrame())
+        logger.info("fold-pure M4 enabled: copyable primaries per fold = %s",
+                    {fid: len(df) for fid, df in prim_by_fold.items()})
+    jr_by = {w: g for w, g in journeys.groupby("wallet")} if len(journeys) else {}
+    # codex code-r1 #6: precompute date_ms ONCE (no per-entity per-fold .apply(_ms)).
+    eq_by = {}
+    if len(equity):
+        eq = equity.copy()
+        # Force ms resolution then int64 = epoch ms (consistent with _ms). pandas 2.x infers
+        # datetime64[s] from date objects, so a bare astype(int64) yields SECONDS — wrong by 10^6.
+        eq["date_ms"] = pd.to_datetime(eq["date"]).astype("datetime64[ms]").astype("int64")
+        eq_by = {w: g for w, g in eq.groupby("wallet")}
+
+    rows = []
+    waterfall = {"folds": {}}
+    for _, fr in folds.sort_values("fold_id").iterrows():
+        fid = int(fr["fold_id"])
+        lo_ms, hi_ms = _ms(fr["train_start"]), _ms(fr["test_start"])  # pretest = [train_start, test_start)
+        acc = (accessible_by_fold or {}).get(fid)            # set or None(unknown)
+        acc_as_of = hi_ms if acc is not None else None
+        n_eval = n_elig = 0
+        fold_prim = prim_by_fold.get(fid, pd.DataFrame()) if prim_by_fold is not None else prim
+        for _, p in fold_prim.iterrows():
+            w = p["wallet"]
+            if w in eq_by:
+                g = eq_by[w]
+                eqm = flow_adjusted_twr(g[(g["date_ms"] >= lo_ms) & (g["date_ms"] < hi_ms)])
+            else:
+                eqm = {"roe": 0.0, "max_dd": 0.0, "n_days": 0, "structural_ruin": True,
+                       "median_equity": 0.0, "frac_days_green": 0.0, "n_active_days": 0,
+                       "median_leverage": 0.0}
+            jm = journey_metrics(jr_by.get(w), lo_ms, hi_ms, acc)
+            elig, fails = apply_floors(eqm, jm, equity_required=equity_required, strict=strict)
+            recon_quarantined = equity_required and w.lower() in quarantined_wallets
+            if recon_quarantined:
+                elig = False
+                fails.append("reconstruction_quarantined")
+            n_eval += 1; n_elig += int(elig)
+            rows.append({
+                "entity_id": int(p["entity_id"]), "primary_wallet": w, "fold_id": fid,
+                "eligible": elig, "fail_reasons": "|".join(fails),
+                "net_pnl_pretest": jm["net_pnl"], "roe_pretest_flow_adj": eqm["roe"],
+                "median_equity_pretest": eqm.get("median_equity", 0.0),  # codex finding c: auditability
+                "max_dd_pretest": eqm["max_dd"], "structural_ruin_flag": eqm["structural_ruin"],
+                "median_leverage_pretest": eqm.get("median_leverage", 0.0),
+                "n_incomplete_equity_days_excluded": eqm.get("n_incomplete_excluded", 0),
+                "reconstruction_quarantined": recon_quarantined,
+                "frac_days_green_pretest": eqm.get("frac_days_green", 0.0),
+                "n_active_days_pretest": eqm.get("n_active_days", 0),
+                "n_journeys_pretest": jm["n_journeys"], "median_hold_s_pretest": jm["median_hold_s"],
+                "share_dur_below_latency": jm["share_below_latency"],
+                "accessible_frac_notional": jm["accessible_frac_notional"],
+                "accessible_frac_count": jm["accessible_frac_count"],
+                "accessibility_unknown": acc is None,
+                "accessible_set_as_of_ms": acc_as_of,
+                "m4_tier": p["tier"], "q_codes": ",".join(c for c in str(p["reason_codes"]).split(",") if c.startswith("q:")),
+                "as_of_ms": hi_ms,
+                "selection_lane": "equity" if equity_required else "copyability",
+            })
+        waterfall["folds"][fid] = {"evaluated": n_eval, "eligible": n_elig}
+        logger.info(f"  fold {fid}: {n_eval} evaluated -> {n_elig} eligible")
+    elig_df = pd.DataFrame(rows)
+
+    # pool summary (cross-fold DIAGNOSTIC; G5 enforced downstream at M6/M9, not here)
+    # codex code-r1 #6: eligible_folds via one groupby, not a per-entity scan.
+    elig_folds_by_eid = (elig_df.groupby("entity_id")["eligible"].sum().astype(int).to_dict()
+                         if len(elig_df) else {})
+    atf = active_test_folds_by_wallet or {}
+    pool_rows = []
+    for _, p in prim.iterrows():
+        w = p["wallet"]; eid = int(p["entity_id"])
+        full_jr = jr_by.get(w)
+        total_nj = int((full_jr["exit_ts"].notna()).sum()) if full_jr is not None else 0
+        full_roe = flow_adjusted_twr(eq_by[w])["roe"] if w in eq_by else 0.0
+        active_tf = atf.get(w, np.nan)
+        active_tf_known = bool(pd.notna(active_tf))   # codex code-r2: PER-WALLET, not global
+        # codex code-r1 #1: G5 candidate REQUIRES active_test_folds>=3 too (from M3).
+        recon_quarantined = w.lower() in quarantined_wallets
+        g5 = bool(equity_required and not recon_quarantined and active_tf_known and active_tf >= 3
+                  and total_nj >= 5 and full_roe >= ROE_FULL_FLOOR_G5)
+        pool_rows.append({
+            "entity_id": eid, "primary_wallet": w,
+            "eligible_folds": elig_folds_by_eid.get(eid, 0),
+            "active_test_folds": active_tf, "total_n_journeys": total_nj,
+            "source_6m_roe_full": full_roe,
+            "g5_pool_candidate_pass": g5,
+            "g5_incomplete": (not equity_required) or not active_tf_known,
+            "selection_lane": "equity" if equity_required else "copyability",
+            "reconstruction_quarantined": recon_quarantined,
+        })
+    pool_df = pd.DataFrame(pool_rows)
+    return elig_df, pool_df, waterfall
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("equity", "copyability"), default="equity")
+    ap.add_argument("--folds", required=True)
+    ap.add_argument("--journeys", required=True)
+    ap.add_argument("--equity")
+    ap.add_argument("--m01-audit",
+                    help="M1 audit parquet; wallets with quarantined=true fail closed")
+    ap.add_argument("--m04", default=None, help="single m04_authenticity.parquet (compatibility mode)")
+    ap.add_argument("--m04-dir", default=None,
+                    help="directory with m04_authenticity_f{fold_id}.parquet for fold-pure M4")
+    ap.add_argument("--m03-activity", default=None,
+                    help="m03_wallet_activity_summary.parquet (for active_test_folds in the G5 pool flag)")
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--accessible-coins", default=None, help="JSON {fold_id: [coins]} or omit (unknown)")
+    ap.add_argument("--strict", action="store_true",
+                    help="TRUSTED/deployable run: fail closed on unknown accessibility, non-finite holds, and "
+                         "require fold-pure --m04-dir + --accessible-coins (no fail-open on missing copyability data)")
+    args = ap.parse_args()
+    # AUDIT 2026-07-10 (codex P0#1/#3): a strict/deployable m05 run must not fail open on missing copyability data.
+    if args.strict:
+        if not args.m04_dir:
+            raise ValueError("--strict requires --m04-dir (fold-pure M4); global --m04 is look-ahead-prone")
+        if not args.accessible_coins:
+            raise ValueError("--strict requires --accessible-coins (else accessibility fails open on unknown)")
+
+    folds = pd.read_parquet(args.folds)
+    journeys = pd.read_parquet(args.journeys)
+    if not {"lifecycle_valid", "stream_replay_valid"}.issubset(journeys.columns):
+        raise ValueError(
+            "M2 journeys lack lifecycle/stream replay validity; rebuild M2"
+        )
+    equity_required = args.mode == "equity"
+    if equity_required:
+        if not args.equity or not args.m01_audit:
+            raise ValueError("--mode equity requires --equity and --m01-audit")
+        equity = pd.read_parquet(args.equity)
+        if "gross_position_notional_usd" not in equity.columns:
+            raise ValueError(
+                "M1 equity artifact lacks gross_position_notional_usd; rebuild M1 before M5 "
+                "(signed position_value_usd can net hedged legs and understate leverage)"
+            )
+        m01_audit = pd.read_parquet(args.m01_audit, columns=["wallet", "quarantined"])
+        quarantined_wallets = set(
+            m01_audit.loc[m01_audit["quarantined"].fillna(True), "wallet"].astype(str).str.lower()
+        )
+    else:
+        equity = pd.DataFrame()
+        quarantined_wallets = set()
+    if args.m04_dir:
+        m04_by_fold = _load_m04_by_fold(Path(args.m04_dir), folds)
+        m04 = None
+    else:
+        if not args.m04:
+            raise ValueError("provide --m04-dir for fold-pure M4 or --m04 for compatibility mode")
+        m04 = pd.read_parquet(args.m04)
+        m04_by_fold = None
+    acc = None
+    if args.accessible_coins:
+        raw = json.loads(Path(args.accessible_coins).read_text())
+        acc = {int(k): set(v) for k, v in raw.items()}
+    atf = None
+    if args.m03_activity:
+        a = pd.read_parquet(args.m03_activity)
+        atf = dict(zip(a["key"], a["active_test_folds"]))
+    m04_rows = sum(len(v) for v in m04_by_fold.values()) if m04_by_fold is not None else len(m04)
+    logger.info(f"folds={len(folds)} journeys={len(journeys):,} equity_rows={len(equity):,} m04_rows={m04_rows}")
+
+    elig_df, pool_df, waterfall = run(
+        folds, journeys, equity, m04, acc, atf, m04_by_fold=m04_by_fold,
+        quarantined_wallets=quarantined_wallets, equity_required=equity_required, strict=args.strict,
+    )
+
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    elig_df.to_parquet(outdir / "m05_eligibility.parquet", index=False)
+    pool_df.to_parquet(outdir / "m05_pool_summary.parquet", index=False)
+    (outdir / "m05_waterfall.json").write_text(json.dumps(waterfall, indent=2))
+    elig_any = elig_df.groupby("entity_id")["eligible"].any().sum() if len(elig_df) else 0
+    logger.info(f"eligible-entity-folds: {int(elig_df['eligible'].sum()) if len(elig_df) else 0}; "
+                f"entities eligible in >=1 fold: {int(elig_any)}; "
+                f"g5_pool_candidates: {int(pool_df['g5_pool_candidate_pass'].sum()) if len(pool_df) else 0}")
+
+
+if __name__ == "__main__":
+    main()
+
+exec
+/bin/zsh -lc "rg -n \"run\\(|apply_floors\\(|--strict|m04_by_fold|accessible_by_fold|M5_COPYABILITY_ONLY\" -S ." in /Users/hermes/quants-lab
+ succeeded in 273ms:
+codex
+Two issues are emerging: the finite guard omits at least one direct blocking scalar, and strict `run()` still trusts API-supplied per-fold M4 without proving coverage/provenance. I’m going to pin those to exact line references and check whether tests currently cover them.
+exec
+/bin/zsh -lc "nl -ba tests/v15/test_m05_golden.py | sed -n '1,130p'" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m05_eligibility.py | sed -n '235,390p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	"""GOLDEN regression test for v15_m05_eligibility trust-audit fixes (2026-07-10).
+     2	
+     3	Locks the STRICT fail-closed behaviour so a wallet cannot slip through eligibility on missing/NaN copyability
+     4	data (the loose default is unchanged = byte-identical to the prior pipeline):
+     5	- P0#3: unknown (NaN) accessibility FAILS closed in strict mode,
+     6	- P0#5: non-finite hold FAILS closed in strict mode,
+     7	- P0#4: NaN/absent notional makes accessible_frac_notional unreliable (NaN) -> strict fails it,
+     8	- loose mode: NaN accessibility/hold still pass (unchanged).
+     9	"""
+    10	import sys
+    11	from pathlib import Path
+    12	
+    13	import numpy as np
+    14	import pandas as pd
+    15	
+    16	sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+    17	import v15_m05_eligibility as m5
+    18	from test_m05 import _good_eqm, _good_jm  # noqa: E402
+    19	
+    20	
+    21	def test_strict_nan_accessibility_fails_closed():
+    22	    jm = _good_jm(); jm["accessible_frac_notional"] = float("nan")   # unknown accessibility
+    23	    ok_loose, _ = m5.apply_floors(_good_eqm(), jm, strict=False)
+    24	    ok_strict, reasons = m5.apply_floors(_good_eqm(), jm, strict=True)
+    25	    assert ok_loose is True                                          # loose: unchanged (does not fire)
+    26	    assert ok_strict is False and any("accessible_frac_unknown" in r for r in reasons)
+    27	
+    28	
+    29	def test_strict_nonfinite_hold_fails_closed():
+    30	    jm = _good_jm(); jm["median_hold_s"] = float("nan")
+    31	    ok_loose, _ = m5.apply_floors(_good_eqm(), jm, strict=False)
+    32	    ok_strict, reasons = m5.apply_floors(_good_eqm(), jm, strict=True)
+    33	    assert ok_loose is True
+    34	    assert ok_strict is False and any("median_hold_nonfinite" in r for r in reasons)
+    35	
+    36	
+    37	def test_loose_default_unchanged():
+    38	    # a fully-good wallet is eligible in both modes; the strict gates only bite on NaN/unknown.
+    39	    assert m5.apply_floors(_good_eqm(), _good_jm(), strict=False)[0] is True
+    40	    assert m5.apply_floors(_good_eqm(), _good_jm(), strict=True)[0] is True
+    41	
+    42	
+    43	def test_strict_present_inf_fails_closed():
+    44	    # a PRESENT non-finite (inf) blocking input fails closed in strict; loose is unchanged.
+    45	    eqm = _good_eqm(); eqm["max_dd"] = float("inf")
+    46	    ok_loose, _ = m5.apply_floors(eqm, _good_jm(), strict=False)   # inf > cap already fails loose here, fine
+    47	    ok_strict, reasons = m5.apply_floors(_good_eqm() | {"median_leverage": float("inf")}, _good_jm(), strict=True)
+    48	    assert ok_strict is False and any("nonfinite_median_leverage" in r for r in reasons)
+    49	
+    50	
+    51	def test_run_strict_requires_fold_pure_m04(_folds_and_min_inputs=None):
+    52	    import pandas as pd
+    53	    folds = pd.DataFrame({"fold_id": [1], "train_start": [pd.Timestamp("2026-01-01")],
+    54	                          "test_start": [pd.Timestamp("2026-02-12")]})
+    55	    empty_j = pd.DataFrame(columns=["wallet", "entity_id", "coin", "entry_ts", "exit_ts",
+    56	                                    "lifecycle_valid", "stream_replay_valid", "net_realized_pnl", "duration_h"])
+    57	    m04 = pd.DataFrame({"entity_id": [1], "primary_wallet": ["0xa"], "copyable": [True]})
+    58	    import pytest
+    59	    with pytest.raises(ValueError, match="fold-pure"):
+    60	        m5.run(folds, empty_j, pd.DataFrame(), m04, {1: {"BTC"}}, equity_required=False, strict=True)
+    61	
+    62	
+    63	def test_p0_4_nan_notional_makes_accessibility_unreliable():
+    64	    # 4 tiny BTC journeys + 1 huge EXOTIC journey with NaN notional -> the exotic must NOT vanish from the
+    65	    # denominator and inflate accessible_frac toward 1.0; it becomes NaN (unreliable) -> strict fails it.
+    66	    ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
+    67	    lo, hi = ms("2026-01-01"), ms("2026-02-01")
+    68	    jr = pd.DataFrame({
+    69	        "coin": ["BTC", "BTC", "BTC", "BTC", "XYZEXOTIC"],
+    70	        "entry_ts": [lo + i for i in range(5)],
+    71	        "exit_ts": [lo + 3600_000 + i for i in range(5)],
+    72	        "max_position_notional": [10.0, 10.0, 10.0, 10.0, float("nan")],  # huge exotic notional is NaN
+    73	        "net_realized_pnl": [5.0, 5.0, 5.0, 5.0, 5.0],
+    74	        "duration_h": [1.0, 1.0, 1.0, 1.0, 1.0],
+    75	        "lifecycle_valid": True, "stream_replay_valid": True,
+    76	    })
+    77	    jm = m5.journey_metrics(jr, lo, hi, accessible={"BTC"})
+    78	    assert not (jm["accessible_frac_notional"] == jm["accessible_frac_notional"])  # NaN, not a fake 1.0
+    79	    # and strict fails it closed
+    80	    eqm = _good_eqm()
+    81	    ok, reasons = m5.apply_floors(eqm, {**_good_jm(), "accessible_frac_notional": jm["accessible_frac_notional"]},
+    82	                                  strict=True)
+    83	    assert ok is False and any("accessible_frac_unknown" in r for r in reasons)
+
+ succeeded in 0ms:
+   235	def apply_floors(
+   236	    eqm: dict, jm: dict, *, equity_required: bool = True, strict: bool = False,
+   237	) -> tuple[bool, list[str]]:
+   238	    """Per-fold pretest floors. Returns (eligible, fail_reasons).
+   239	
+   240	    In COPYABILITY_ONLY mode, performance fails (net_pnl/roe/days_green) are recorded in fail_reasons but do
+   241	    NOT block eligibility -- only risk/copyability fails do. structural_ruin STAYS a hard risk gate.
+   242	    """
+   243	    f = []
+   244	    # AUDIT 2026-07-10 (codex m05 fix r2): STRICT = deployable fail-closed. EVERY blocking floor input must be
+   245	    # FINITE (np.isfinite catches NaN AND inf); a non-finite value would make its `<`/`>` comparison silently
+   246	    # not fire. Fail closed here so no gate can be skipped on bad data. (Loose mode is unchanged.)
+   247	    if strict:
+   248	        _fin_checks = [("net_pnl", jm.get("net_pnl")), ("median_hold_s", jm.get("median_hold_s")),
+   249	                       ("share_below_latency", jm.get("share_below_latency")),
+   250	                       ("censored_max_hold_s", jm.get("censored_max_hold_s"))]
+   251	        if equity_required:
+   252	            _fin_checks += [("roe", eqm.get("roe")), ("median_equity", eqm.get("median_equity")),
+   253	                            ("max_dd", eqm.get("max_dd")), ("median_leverage", eqm.get("median_leverage")),
+   254	                            ("frac_days_green", eqm.get("frac_days_green"))]
+   255	        for _k, _v in _fin_checks:
+   256	            if _v is None:
+   257	                continue   # absent key: gates use .get(default) or KeyError loudly; not a silent fail-open
+   258	            try:
+   259	                _ok = np.isfinite(float(_v))
+   260	            except (TypeError, ValueError):
+   261	                _ok = False
+   262	            if not _ok:
+   263	                f.append(f"nonfinite_{_k}(strict)")   # PRESENT but NaN/inf -> fail closed
+   264	    if jm["net_pnl"] <= 0:
+   265	        f.append(f"net_pnl<=0 ({jm['net_pnl']:.1f})")
+   266	    if equity_required:
+   267	        if eqm["structural_ruin"]:
+   268	            f.append("structural_ruin")
+   269	        elif eqm["roe"] <= 0:
+   270	            f.append(f"roe<=0 ({eqm['roe']:.2%})")
+   271	        # absolute pretest equity floor: drop tiny degen accounts that merely survived (fold-pure)
+   272	        me = eqm.get("median_equity", 0.0)
+   273	        if me < MIN_EQUITY_USD:
+   274	            f.append(f"equity_too_small (${me:.0f}<{MIN_EQUITY_USD:.0f})")
+   275	        if eqm["max_dd"] > MAXDD_CAP:
+   276	            f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
+   277	    if jm["n_journeys"] < MIN_JOURNEYS_PRETEST:
+   278	        f.append(f"n_journeys<{MIN_JOURNEYS_PRETEST} ({jm['n_journeys']})")
+   279	    _mh = jm["median_hold_s"]
+   280	    # AUDIT 2026-07-10 (codex P0#5): NaN hold (bad/missing durations) makes `NaN <= floor` False -> the hold
+   281	    # floor silently doesn't fire. In strict mode a non-finite hold FAILS closed (no usable copyability evidence).
+   282	    if (strict and not (_mh == _mh)) or _mh <= HOLD_FLOOR_S:
+   283	        f.append(f"median_hold<={HOLD_FLOOR_S:.0f}s ({_mh:.0f}s)" if _mh == _mh else "median_hold_nonfinite")
+   284	    # upper hold gate: V15 copies fast directional; reject multi-day/week holders
+   285	    if jm["median_hold_s"] > SWING_MAX_HOLD_S:
+   286	        f.append(f"hold_too_long (>{SWING_MAX_HOLD_S:.0f}s, {jm['median_hold_s']:.0f}s)")
+   287	    # boundary-straddling week-holder (codex finding a): a position opened in pretest still OPEN at
+   288	    # test_start whose CENSORED hold already exceeds the swing cap is a week-holder invisible to the
+   289	    # median (the close lands after the boundary). Reject on the censored lower-bound alone.
+   290	    cmh = jm.get("censored_max_hold_s", 0.0)
+   291	    if cmh > SWING_MAX_HOLD_S:
+   292	        f.append(f"hold_too_long_censored (>{SWING_MAX_HOLD_S:.0f}s, open-at-test_start {cmh:.0f}s)")
+   293	    if jm["share_below_latency"] > SHARE_BELOW_LATENCY_CAP:
+   294	        f.append(f"share_below_latency>{SHARE_BELOW_LATENCY_CAP:.0%} ({jm['share_below_latency']:.0%})")
+   295	    # LEVERAGE gate (Alberto spec): copy high but not ultra-high; reject median daily leverage > 10x.
+   296	    mlev = eqm.get("median_leverage", 0.0)
+   297	    if equity_required and mlev > LEVERAGE_CAP:
+   298	        f.append(f"leverage>{LEVERAGE_CAP:.0f}x ({mlev:.1f}x)")
+   299	    # CONSISTENCY gate (Alberto spec): >=80% of active days green, enforced only when enough active days
+   300	    # exist to judge it (short fold windows can't prove consistency; thin history caught by other gates).
+   301	    nad = int(eqm.get("n_active_days", 0))
+   302	    fdg = eqm.get("frac_days_green", 0.0)
+   303	    if equity_required and nad >= MIN_ACTIVE_DAYS_GREEN and fdg < DAYS_GREEN_MIN:
+   304	        f.append(f"days_green<{DAYS_GREEN_MIN:.0%} ({fdg:.0%} over {nad}d)")
+   305	    # accessibility (codex P0#3/#4): loose mode = unknown (NaN) does NOT fire; STRICT mode = unknown/unreliable
+   306	    # accessibility (no --accessible-coins for this fold, or NaN notional weighting) FAILS closed -> a wallet
+   307	    # trading exotic/unavailable coins can't slip through on missing data.
+   308	    af = jm["accessible_frac_notional"]
+   309	    if (strict and not (af == af)) or (af == af and af < ACCESSIBLE_FRAC_MIN):
+   310	        f.append(f"accessible_frac<{ACCESSIBLE_FRAC_MIN:.0%} ({af:.0%})" if af == af
+   311	                 else "accessible_frac_unknown(strict)")
+   312	    if not equity_required:
+   313	        # Fixed-notional/direction-only lane: M1-derived equity, DD, leverage,
+   314	        # and consistency are intentionally absent. Source net PnL is recorded
+   315	        # but final performance judgment belongs to after-cost M7/M6b.
+   316	        blocking = [x for x in f if not x.startswith("net_pnl<=0")]
+   317	        return (len(blocking) == 0, f)
+   318	    if COPYABILITY_ONLY:
+   319	        # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
+   320	        blocking = [x for x in f if not x.startswith(_PERF_FAIL_PREFIXES)]
+   321	        return (len(blocking) == 0, f)
+   322	    return (len(f) == 0, f)
+   323	
+   324	
+   325	def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: pd.DataFrame | None,
+   326	        accessible_by_fold: dict | None = None,
+   327	        active_test_folds_by_wallet: dict | None = None,
+   328	        m04_by_fold: dict[int, pd.DataFrame] | None = None,
+   329	        quarantined_wallets: set[str] | None = None,
+   330	        equity_required: bool = True, strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+   331	    quarantined_wallets = {w.lower() for w in (quarantined_wallets or set())}
+   332	    if len(journeys) and {"lifecycle_valid", "stream_replay_valid"}.issubset(journeys.columns):
+   333	        journeys = journeys[
+   334	            journeys["lifecycle_valid"].fillna(False).astype(bool)
+   335	            & journeys["stream_replay_valid"].fillna(False).astype(bool)
+   336	        ].copy()
+   337	    # AUDIT 2026-07-10 (codex m05 fix r2): enforce fold-pure M4 INSIDE run() for strict/deployable callers, not
+   338	    # just the CLI -- an API caller must not accidentally get the look-ahead-prone global M4 path.
+   339	    if strict and m04_by_fold is None:
+   340	        raise ValueError("run(strict=True) requires fold-pure m04_by_fold; the global single-M4 path is look-ahead-prone")
+   341	    if strict and (accessible_by_fold is None or not accessible_by_fold):
+   342	        raise ValueError("run(strict=True) requires accessible_by_fold (else accessibility fails open on unknown)")
+   343	    # entities to evaluate: M4 copyable primaries — defensive filter on all three (codex code-r1 #2).
+   344	    if m04_by_fold is None:
+   345	        if m04 is None:
+   346	            raise ValueError("run() requires either m04 or m04_by_fold")
+   347	        prim = _prim_from_m04(m04)
+   348	        prim_by_fold = None
+   349	        logger.warning("LOUD WARNING: using a single M4 authenticity file for all folds; "
+   350	                       "M5 selection is not fold-pure. Pass --m04-dir for fold-pure M4.")
+   351	        logger.info(f"M4 copyable primaries: {len(prim)} entities")
+   352	    else:
+   353	        prim_by_fold = {int(fid): _prim_from_m04(df) for fid, df in m04_by_fold.items()}
+   354	        prim = (pd.concat(prim_by_fold.values(), ignore_index=True).drop_duplicates("entity_id")
+   355	                if prim_by_fold else pd.DataFrame())
+   356	        logger.info("fold-pure M4 enabled: copyable primaries per fold = %s",
+   357	                    {fid: len(df) for fid, df in prim_by_fold.items()})
+   358	    jr_by = {w: g for w, g in journeys.groupby("wallet")} if len(journeys) else {}
+   359	    # codex code-r1 #6: precompute date_ms ONCE (no per-entity per-fold .apply(_ms)).
+   360	    eq_by = {}
+   361	    if len(equity):
+   362	        eq = equity.copy()
+   363	        # Force ms resolution then int64 = epoch ms (consistent with _ms). pandas 2.x infers
+   364	        # datetime64[s] from date objects, so a bare astype(int64) yields SECONDS — wrong by 10^6.
+   365	        eq["date_ms"] = pd.to_datetime(eq["date"]).astype("datetime64[ms]").astype("int64")
+   366	        eq_by = {w: g for w, g in eq.groupby("wallet")}
+   367	
+   368	    rows = []
+   369	    waterfall = {"folds": {}}
+   370	    for _, fr in folds.sort_values("fold_id").iterrows():
+   371	        fid = int(fr["fold_id"])
+   372	        lo_ms, hi_ms = _ms(fr["train_start"]), _ms(fr["test_start"])  # pretest = [train_start, test_start)
+   373	        acc = (accessible_by_fold or {}).get(fid)            # set or None(unknown)
+   374	        acc_as_of = hi_ms if acc is not None else None
+   375	        n_eval = n_elig = 0
+   376	        fold_prim = prim_by_fold.get(fid, pd.DataFrame()) if prim_by_fold is not None else prim
+   377	        for _, p in fold_prim.iterrows():
+   378	            w = p["wallet"]
+   379	            if w in eq_by:
+   380	                g = eq_by[w]
+   381	                eqm = flow_adjusted_twr(g[(g["date_ms"] >= lo_ms) & (g["date_ms"] < hi_ms)])
+   382	            else:
+   383	                eqm = {"roe": 0.0, "max_dd": 0.0, "n_days": 0, "structural_ruin": True,
+   384	                       "median_equity": 0.0, "frac_days_green": 0.0, "n_active_days": 0,
+   385	                       "median_leverage": 0.0}
+   386	            jm = journey_metrics(jr_by.get(w), lo_ms, hi_ms, acc)
+   387	            elig, fails = apply_floors(eqm, jm, equity_required=equity_required, strict=strict)
+   388	            recon_quarantined = equity_required and w.lower() in quarantined_wallets
+   389	            if recon_quarantined:
+   390	                elig = False
+
+exec
+/bin/zsh -lc 'pytest -q tests/v15/test_m05_golden.py' in /Users/hermes/quants-lab
+ succeeded in 1294ms:
+......                                                                   [100%]
+6 passed in 0.81s
+
+codex
+Verdict: **not fully fixed yet**.
+
+**Findings**
+
+1. **P0: strict finite guard still misses blocking inputs.**  
+   [v15_m05_eligibility.py](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:247) checks many scalars, but omits:
+   - `accessible_frac_notional`: `inf` passes strict because [line 309](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:309) only treats NaN as unknown and `< 0.80` as fail.
+   - `n_journeys`: `NaN` or `inf` can skip the `< 3` gate at [line 277](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:277).
+
+   These should be added to strict finite checks. For accessibility, I would also bounds-check `0 <= accessible_frac_notional <= 1` in strict.
+
+2. **P0: `run(strict=True)` still does not prove API-supplied M4 is fold-pure.**  
+   The CLI loader checks `as_of_ms == test_start` in `_load_m04_by_fold`, but direct API callers can pass any `m04_by_fold` dict and strict accepts it at [line 339](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:339). That can still be a duplicated/global/look-ahead M4 under a per-fold-shaped dict.
+
+   Strict `run()` should validate:
+   - every fold id in `folds` exists in `m04_by_fold`;
+   - each fold M4 has `as_of_ms`;
+   - every row has `as_of_ms == fold.test_start`;
+   - probably no extra/mismatched fold ids unless explicitly tolerated.
+
+3. **Test gap: current golden does not cover the remaining holes.**  
+   [test_m05_golden.py](/Users/hermes/quants-lab/tests/v15/test_m05_golden.py:43) tests `median_leverage=inf`, but not `accessible_frac_notional=inf`, `n_journeys=NaN/inf`, or API-supplied `m04_by_fold` without/mismatched `as_of_ms`.
+
+**Answers**
+
+- Strict is **not generally fail-closed** yet. Add `accessible_frac_notional` and `n_journeys`; consider `n_active_days` too if you want clean fail reasons instead of possible coercion errors.
+- “Absent key -> skip” is mostly correct for genuinely optional gates. Required gate inputs using `[]` loudly KeyError, which is fine. But optional defaults like `median_leverage=0` and `censored_max_hold_s=0` are a design choice: absence means “no evidence to fire.”
+- `run(strict=True)` enforcement is **not complete**. It requires `m04_by_fold` shape, not fold-pure provenance. There is still an API path to look-ahead M4 under strict.
+- New bug: no obvious loose-mode regression in the reviewed code. The issue is incomplete strict hardening.
+
+Verification: `pytest -q tests/v15/test_m05_golden.py` passes: `6 passed`.
+
+OVERALL: the 4 targeted m05 P0s are **not yet completely fixed**. P0#3/#4/#5 are mostly fixed for NaN cases, but strict finite coverage still has holes; P0#1/run fold-pure enforcement is still incomplete for API callers. P0#2 remains the stated `COPYABILITY_ONLY` design decision.
+tokens used
+44.578
+Verdict: **not fully fixed yet**.
+
+**Findings**
+
+1. **P0: strict finite guard still misses blocking inputs.**  
+   [v15_m05_eligibility.py](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:247) checks many scalars, but omits:
+   - `accessible_frac_notional`: `inf` passes strict because [line 309](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:309) only treats NaN as unknown and `< 0.80` as fail.
+   - `n_journeys`: `NaN` or `inf` can skip the `< 3` gate at [line 277](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:277).
+
+   These should be added to strict finite checks. For accessibility, I would also bounds-check `0 <= accessible_frac_notional <= 1` in strict.
+
+2. **P0: `run(strict=True)` still does not prove API-supplied M4 is fold-pure.**  
+   The CLI loader checks `as_of_ms == test_start` in `_load_m04_by_fold`, but direct API callers can pass any `m04_by_fold` dict and strict accepts it at [line 339](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:339). That can still be a duplicated/global/look-ahead M4 under a per-fold-shaped dict.
+
+   Strict `run()` should validate:
+   - every fold id in `folds` exists in `m04_by_fold`;
+   - each fold M4 has `as_of_ms`;
+   - every row has `as_of_ms == fold.test_start`;
+   - probably no extra/mismatched fold ids unless explicitly tolerated.
+
+3. **Test gap: current golden does not cover the remaining holes.**  
+   [test_m05_golden.py](/Users/hermes/quants-lab/tests/v15/test_m05_golden.py:43) tests `median_leverage=inf`, but not `accessible_frac_notional=inf`, `n_journeys=NaN/inf`, or API-supplied `m04_by_fold` without/mismatched `as_of_ms`.
+
+**Answers**
+
+- Strict is **not generally fail-closed** yet. Add `accessible_frac_notional` and `n_journeys`; consider `n_active_days` too if you want clean fail reasons instead of possible coercion errors.
+- “Absent key -> skip” is mostly correct for genuinely optional gates. Required gate inputs using `[]` loudly KeyError, which is fine. But optional defaults like `median_leverage=0` and `censored_max_hold_s=0` are a design choice: absence means “no evidence to fire.”
+- `run(strict=True)` enforcement is **not complete**. It requires `m04_by_fold` shape, not fold-pure provenance. There is still an API path to look-ahead M4 under strict.
+- New bug: no obvious loose-mode regression in the reviewed code. The issue is incomplete strict hardening.
+
+Verification: `pytest -q tests/v15/test_m05_golden.py` passes: `6 passed`.
+
+OVERALL: the 4 targeted m05 P0s are **not yet completely fixed**. P0#3/#4/#5 are mostly fixed for NaN cases, but strict finite coverage still has holes; P0#1/run fold-pure enforcement is still incomplete for API callers. P0#2 remains the stated `COPYABILITY_ONLY` design decision.
