@@ -299,8 +299,8 @@ def _chained_inputs(extra_wallet=None):
         {"entity_id": 2, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
     ])
     m04 = pd.DataFrame([
-        {"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
-        {"entity_id": 2, "primary_wallet": "0xbbb" if extra_wallet is None else extra_wallet,
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+        {"entity_id": 2, "fold_id": 0, "primary_wallet": "0xbbb" if extra_wallet is None else extra_wallet,
          "entity_tier": "CLEAN"},
     ])
     return m06b, m08, m04, folds
@@ -415,8 +415,9 @@ def test_chained_carried_topup_cash_conserved(tmp_path):
         {"entity_id": 2, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
     ])
     m04 = pd.DataFrame([
-        {"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
-        {"entity_id": 2, "primary_wallet": "0xbbb", "entity_tier": "CLEAN"},
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+        {"entity_id": 2, "fold_id": 1, "primary_wallet": "0xbbb", "entity_tier": "CLEAN"},
     ])
     eng = _StateCheckingEng(ret_by_eid={1: 0.0, 2: 0.0})  # checks state-level conservation too
     out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
@@ -506,7 +507,7 @@ def test_dropped_entity_pays_boundary_exit_cost(tmp_path):
          "tier": "ok", "max_survivable_slice": np.inf},
     ])
     m04 = pd.DataFrame([
-        {"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
     ])
     out = M9.run_m09_chained(
         m06b, m08, m04, folds, ExitCostEngine(), md=None,
@@ -533,7 +534,8 @@ def test_gross_budget_fixed_at_b0_across_folds(tmp_path):
         {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
         {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
     ])
-    m04 = pd.DataFrame([{"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+                        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
     eng = _FakeEng(ret_by_eid={1: 1.0})                   # +100% fold-0: equity doubles going into fold 1
     m = M9.M9Manifest(per_entity_cap=1.0)
     out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
@@ -561,7 +563,8 @@ def test_g4_kill_flattens_carried_to_cash(tmp_path):
         {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
         {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
     ])
-    m04 = pd.DataFrame([{"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+                        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
 
     class _DipEng(_FakeEng):
         def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
@@ -606,7 +609,8 @@ def test_global_dd_before_g4_does_not_report_g4_kill(tmp_path):
     m06b = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5}])
     m08 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok",
                          "max_survivable_slice": np.inf}])
-    m04 = pd.DataFrame([{"entity_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+                        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
 
     class _GddThenG4Eng(_FakeEng):
         def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,

@@ -1,0 +1,1699 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4cc2-00cf-7960-93aa-230afbe23141
+--------
+user
+# Round-5 m09 — top_entity_pnl_share finite (final)
+
+Your r4 found the last leak: top_entity_pnl_share=inf on a losing/flat strategy. Fixed. Read
+research/v15/v15_m09_sim.py (~L797-810) + tests/v15/test_m09_golden.py.
+
+## Applied
+- Losing/flat strategy: top_entity_pnl_share now = 1.0 (finite MAX-concentration sentinel, in [0,1]) instead of
+  inf. 1.0 > g7 cap (0.40) -> G7 still FAILS (conservative), AND it passes m10's finite/[0,1] input validation
+  (inf made m10 reject the strat as malformed). Confirmed m10 (TRUSTED) requires _fin() and 0<=x<=1 at
+  v15_m10_gates.py:126, and no test relied on the inf sentinel.
+- max_chained_calmar finite-gated to 0.0 as a belt-and-braces on the output contract.
+Golden: strengthened the chained-NaN test to assert final_equity, max_chained_dd, chained_roe, chained_calmar,
+top_entity_pnl_share ALL finite; added a losing-strategy test asserting top_share finite & in [0,1].
+15 golden + 32 existing m09 + 400 full v15 pass.
+
+## Verify
+- Is EVERY scalar output of run_m09_chained now finite for BOTH a NaN/inf engine path AND a normal
+  finite (winning / flat / losing) path? Any remaining non-finite output?
+- Does emitting 1.0 (not inf) for a losing strategy preserve the conservative G7-fails semantics through m10?
+- Any NEW bug or regression.
+
+## Output
+Verdict. End OVERALL: is m09 now fail-CLOSED, look-ahead-safe, every output finite, and ready to mark TRUSTED
+(yes/no + exactly what remains).
+codex
+I’ll verify the implementation and tests directly, then run the focused and broader test targets if the repo supports them. I’m going to inspect the scalar output construction first so the verdict is grounded in the actual contract.
+exec
+/bin/zsh -lc "sed -n '760,835p' research/v15/v15_m09_sim.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            _pe = pd.to_numeric(fold_port["portfolio_equity"], errors="coerce")
+            fold_port["portfolio_equity"] = _pe.where(np.isfinite(_pe), 0.0)
+            fold_end_equity = breach_equity
+            new_carried = {}                               # flattened: no positions carried past the breach
+            cash = breach_equity                           # all equity -> cash (de-risked)
+        else:
+            fold_end_equity = g4["fold_end_equity"]
+
+        per_fold.append({"fold_id": fid, "fold_initial": fold_initial, "fold_end_equity": fold_end_equity,
+                         "fold_pnl": fold_end_equity - fold_initial, "g4_killed": g4_killed_causal,
+                         "g4_pass": g4["g4_pass"], "n_selected": len(selected),
+                         "intervention": intervention_kind, "intervention_ts": intervention_ts})
+        fold_writer.add({"fold_id": fid, "fold_initial": float(fold_initial),
+                         "fold_end_equity": float(fold_end_equity),
+                         "fold_pnl": float(fold_end_equity - fold_initial), "g4_killed": bool(g4_killed_causal),
+                         "g4_pass": bool(g4["g4_pass"]), "n_selected": int(len(selected)),
+                         "intervention": str(intervention_kind)})
+        # STREAM the fold's portfolio equity rows to disk + fold the running-DD pass inline (bounded RAM).
+        if len(fold_port):
+            for ts, eq in zip(fold_port["ts"].to_numpy(), fold_port["portfolio_equity"].to_numpy()):
+                eqf = float(eq)
+                run_peak = max(run_peak, eqf)
+                if run_peak > 0:
+                    max_dd = max(max_dd, (run_peak - eqf) / run_peak)
+                last_equity = eqf
+                eq_writer.add({"fold_id": fid, "ts": int(ts), "portfolio_equity": eqf,
+                               "running_peak": float(run_peak),
+                               "dd_from_peak": float((run_peak - eqf) / run_peak) if run_peak > 0 else 0.0})
+        carried = new_carried
+        # cash already net of funded; carried holds the rest of equity (flattened to cash on intervention)
+
+    n_equity_rows = eq_writer.close()
+    fold_writer.close()
+    final_equity = sum(c["equity"] for c in carried.values()) + cash
+    chained_roe = final_equity / b0 - 1.0 if b0 > 0 else 0.0
+    n_pos = sum(1 for f in per_fold if f["fold_pnl"] > 0)
+    total_pnl = sum(entity_pnl.values())
+    if total_pnl > 0:
+        top_share = max((max(v, 0.0) / total_pnl for v in entity_pnl.values()), default=0.0)
+    else:
+        # A losing/flat strategy cannot satisfy a positive-PnL concentration gate. codex m09 r4: emit a
+        # FINITE, in-[0,1] MAX-concentration sentinel (1.0), NOT inf -- inf failed m10's finite/[0,1] input
+        # validation as "malformed" instead of failing G7 as "too concentrated". 1.0 > g7 cap -> G7 fails
+        # (conservative) AND every run_m09_chained output stays finite.
+        top_share = 1.0 if entity_pnl else 0.0
+    # codex m09 r4: guard the calmar ratio finite (chained_roe is finite by the sanitizers above; max_dd is a
+    # streamed finite accumulator, but keep the output contract explicit).
+    max_chained_calmar = chained_roe / max(max_dd, 1e-9)
+    if not np.isfinite(max_chained_calmar):
+        max_chained_calmar = 0.0
+    if _tmp is not None:                                   # temp output: clean up the streamed parts
+        import shutil
+        shutil.rmtree(_tmp, ignore_errors=True)
+        equity_path = None
+    else:
+        equity_path = str(base / "m09_chained_equity.parquet")
+    return {
+        "b0": b0, "pool_provider": pool_provider, "seed": seed,
+        "chained_roe": chained_roe, "max_chained_dd": max_dd, "chained_calmar": max_chained_calmar,
+        "final_equity": final_equity, "n_positive_folds": n_pos, "n_equity_rows": n_equity_rows,
+        "g4_no_kill": all(not f["g4_killed"] for f in per_fold),
+        "g4_all_folds_above_floor": all(f["fold_end_equity"] >= m.g4_intrafold_kill * f["fold_initial"] for f in per_fold),
+        "n_g4_kills": sum(1 for f in per_fold if f.get("intervention") == "g4_kill"),
+        "n_global_dd_derisks": sum(1 for f in per_fold if f.get("intervention") == "global_dd_derisk"),
+        "any_intervention": any(f.get("intervention") for f in per_fold),
+        "top_entity_pnl_share": top_share, "per_fold": per_fold, "fold_caps_applied": fold_caps_applied,
+        "equity_path": equity_path,
+        "_simplifications": "dropped entities exit through M7 at fold boundary; "
+                            "G4/global-DD breach uses marked breach equity because historical "
+                            "per-subaccount state snapshots are not yet emitted",
+    }
+
+
+def effective_caps(entities: pd.DataFrame, m: M9Manifest, portfolio_equity: float) -> dict:
+    """Per-entity absolute-notional cap = min(G7 40% x equity, M8 max_survivable_slice). Bucket/gross
+    residuals are applied in the v2 chained sim (need live state); here we set the allocation-time
+
+exec
+/bin/zsh -lc "sed -n '1,260p' tests/v15/test_m09_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m09_sim trust-audit fixes (2026-07-10).
+
+Locks the fail-CLOSED allocation-engine behaviours from the codex m09 audit:
+- P0: a non-finite portfolio equity can NOT bypass the global-DD de-risk or the G4 intra-fold kill.
+- P1: min_notional_feasible fails closed on non-finite inputs; the check is wired into allocation.
+- P1: anti_corr drops the lower-ranked entity on an explicit non-finite correlation (+ deterministic ties).
+- P1: cap_aware_waterfill / apply_gross_budget / effective_caps fail closed on non-finite weights/caps/lev/eq.
+- P2: cap-aware water-fill never reports cash_funded above the residual cap (floored, not rounded up).
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m09_sim as M9  # noqa: E402
+
+M = M9.M9Manifest()
+
+
+# ---- P0: DD / G4 kill can't be bypassed by non-finite equity ----
+def test_g4_kill_fails_closed_on_nan_equity():
+    df = pd.DataFrame({"ts": [1, 2], "portfolio_equity": [100.0, np.nan]})
+    out = M9.g4_intrafold_kill(df, 100.0, M)
+    assert out["killed"] is True and out["g4_pass"] is False and out["kill_ts"] == 2
+    assert np.isfinite(out["fold_end_equity"])
+
+
+def test_g4_kill_fails_closed_on_inf_equity():
+    df = pd.DataFrame({"ts": [1, 2], "portfolio_equity": [100.0, np.inf]})
+    out = M9.g4_intrafold_kill(df, 100.0, M)
+    assert out["killed"] is True and out["g4_pass"] is False   # inf must NOT make g4_pass True
+
+
+def test_global_dd_fails_closed_on_nonfinite_equity():
+    df = pd.DataFrame({"ts": [1, 2], "portfolio_equity": [100.0, np.nan]})
+    assert M9.detect_global_dd_derisk(df, M) == 2   # non-finite -> immediate de-risk breach
+
+
+def test_g4_normal_finite_path_unchanged():
+    df = pd.DataFrame({"ts": [1, 2, 3], "portfolio_equity": [100.0, 40.0, 90.0]})
+    out = M9.g4_intrafold_kill(df, 100.0, M)   # 40 <= 50% of 100 -> kill at ts 2, frozen at 40
+    assert out["killed"] is True and out["kill_ts"] == 2 and out["fold_end_equity"] == 40.0
+
+
+# ---- P1: min_notional_feasible fail-closed on non-finite ----
+def test_min_notional_nonfinite_inputs_fail_closed():
+    assert M9.min_notional_feasible(0.1, 1.0, np.nan, M)[0] is False       # nan slice
+    assert M9.min_notional_feasible(0.1, np.inf, 100.0, M)[0] is False     # inf accessible
+    assert M9.min_notional_feasible(np.inf, 1.0, 1.0, M)[0] is False       # inf frac
+    assert M9.min_notional_feasible(0.1, 1.5, 100.0, M)[0] is False        # accessible out of range
+    assert M9.min_notional_feasible(0.05, 0.9, 500.0, M)[0] is True        # good case still passes
+
+
+# ---- P1: anti-corr NaN corr + deterministic ties ----
+def test_anti_corr_nonfinite_corr_drops_lower_ranked():
+    cand = pd.DataFrame({"entity_id": [1, 2], "select_priority": [2.0, 1.0]})
+    out = M9.anti_corr_select(cand, {(2, 1): np.nan}, M)
+    sel = set(out[out["anti_corr_selected"]]["entity_id"])
+    assert sel == {1}   # higher-ranked kept, lower dropped on corrupt corr (not both selected)
+
+
+def test_anti_corr_tie_deterministic():
+    a = M9.anti_corr_select(pd.DataFrame({"entity_id": [1, 2], "select_priority": [1.0, 1.0]}), {(1, 2): 0.9}, M)
+    b = M9.anti_corr_select(pd.DataFrame({"entity_id": [2, 1], "select_priority": [1.0, 1.0]}), {(1, 2): 0.9}, M)
+    keep_a = set(a[a["anti_corr_selected"]]["entity_id"])
+    keep_b = set(b[b["anti_corr_selected"]]["entity_id"])
+    assert keep_a == keep_b == {1}   # entity_id asc tie-break -> both orders keep entity 1
+
+
+# ---- P1: allocation arithmetic fail-closed ----
+def test_waterfill_nonfinite_weight_dropped():
+    out = M9.cap_aware_waterfill({1: np.inf, 2: 1.0}, {}, {1: 100.0, 2: 100.0}, M, 100.0, 100.0)
+    assert 1 not in out["per_entity"]                       # inf desired weight dropped
+    assert np.isfinite(out["cash_funded_total"])
+
+
+def test_waterfill_nonfinite_cash_raises():
+    with pytest.raises(ValueError, match="non-finite"):
+        M9.cap_aware_waterfill({1: 1.0}, {}, {1: 100.0}, M, np.nan, 100.0)
+
+
+def test_waterfill_cap_not_exceeded_by_rounding():
+    out = M9.cap_aware_waterfill({1: 1.0}, {}, {1: 0.0000006}, M, 1.0, 1.0)
+    assert out["per_entity"][1]["cash_funded"] <= 0.0000006   # floored, not rounded up past the cap
+
+
+def test_gross_budget_nan_leverage_zeroes_entity():
+    scaled, returned, gross = M9.apply_gross_budget({1: 100.0}, {}, {1: np.nan}, 1500.0)
+    assert scaled[1] == 0.0 and np.isfinite(returned) and np.isfinite(gross)
+
+
+def test_gross_budget_mixed_nan_leverage_finite_gross():
+    # codex m09 r2: one NaN-lev entity (zeroed) + a valid entity that triggers scaling must NOT return NaN gross.
+    scaled, returned, gross = M9.apply_gross_budget({1: 100.0, 2: 1000.0}, {}, {1: np.nan, 2: 10.0}, 100.0)
+    assert scaled[1] == 0.0
+    assert np.isfinite(returned) and np.isfinite(gross)
+    assert gross <= 100.0 + 1e-6                            # budget binds, finite
+
+
+def test_effective_caps_nonfinite_equity_raises():
+    with pytest.raises(ValueError, match="non-finite"):
+        M9.effective_caps(pd.DataFrame([{"entity_id": 1, "max_survivable_slice": np.inf}]), M, np.inf)
+
+
+# ---- P0 (chained): a NaN in the engine equity path is killed + never leaks into finite outputs ----
+from test_m09 import _FakeEng  # noqa: E402
+
+
+class _NaNPathEng(_FakeEng):
+    def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                        start_state=None, entity_id=None, fold_id=None):
+        mid = (start_ts_ms + end_ts_ms) // 2
+        return {  # equity path goes NaN mid-fold -> corrupt state
+            "equity": [{"ts": start_ts_ms, "subaccount_equity": start_equity},
+                       {"ts": mid, "subaccount_equity": float("nan")},
+                       {"ts": end_ts_ms, "subaccount_equity": start_equity}],
+            "ending_account_state": {"cross_collateral": {"USDC": start_equity},
+                                     "cooldown_until_ms": 0, "positions": {}},
+            "summary": {"final_equity": float("nan")},
+        }
+
+
+def test_chained_nan_equity_path_killed_and_finite(tmp_path):
+    folds = pd.DataFrame([{"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+                           "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+                           "test_start": "2025-01-01", "test_end_excl": "2025-01-02"}])
+    m06b = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0}])
+    m08 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok",
+                         "max_survivable_slice": np.inf}])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+
+    def _acts(wallet, t0, t1):
+        return None if wallet is None else pd.DataFrame({"target_exposure_pct": [1.0, 1.0]})
+
+    out = M9.run_m09_chained(m06b, m08, m04, folds, _NaNPathEng(), md=None, acts_loader=_acts,
+                             m=M9.M9Manifest(per_entity_cap=1.0), b0=500.0, out_dir=str(tmp_path))
+    # a corrupt (NaN) equity path must fire an intervention AND leave EVERY reported scalar output finite
+    for k in ("final_equity", "max_chained_dd", "chained_roe", "chained_calmar", "top_entity_pnl_share"):
+        assert np.isfinite(out[k]), f"{k} non-finite: {out[k]}"
+    assert out["any_intervention"] is True
+
+
+def test_chained_losing_strategy_top_share_finite(tmp_path):
+    # codex m09 r4: a losing strategy must yield a FINITE, in-[0,1] top_entity_pnl_share (max-concentration
+    # sentinel 1.0), NOT inf -- else m10's finite/[0,1] validation rejects it as malformed instead of failing G7.
+    folds = pd.DataFrame([{"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+                           "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+                           "test_start": "2025-01-01", "test_end_excl": "2025-01-02"}])
+    m06b = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0}])
+    m08 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok",
+                         "max_survivable_slice": np.inf}])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+
+    def _acts(wallet, t0, t1):
+        return None if wallet is None else pd.DataFrame({"target_exposure_pct": [1.0, 1.0]})
+
+    eng = _FakeEng(ret_by_eid={1: -0.5})   # -50% -> losing strategy
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts,
+                             m=M9.M9Manifest(per_entity_cap=1.0), b0=500.0, out_dir=str(tmp_path))
+    ts = out["top_entity_pnl_share"]
+    assert np.isfinite(ts) and 0.0 <= ts <= 1.0
+
+exec
+/bin/zsh -lc 'rg -n "run_m09_chained|top_entity_pnl_share|max_chained_calmar|chained_calmar|final_equity|max_chained_dd|chained_roe" research/v15/v15_m09_sim.py tests/v15/test_m09_golden.py research/v15/v15_m10_gates.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m09_golden.py:122:            "summary": {"final_equity": float("nan")},
+tests/v15/test_m09_golden.py:138:    out = M9.run_m09_chained(m06b, m08, m04, folds, _NaNPathEng(), md=None, acts_loader=_acts,
+tests/v15/test_m09_golden.py:141:    for k in ("final_equity", "max_chained_dd", "chained_roe", "chained_calmar", "top_entity_pnl_share"):
+tests/v15/test_m09_golden.py:147:    # codex m09 r4: a losing strategy must yield a FINITE, in-[0,1] top_entity_pnl_share (max-concentration
+tests/v15/test_m09_golden.py:161:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts,
+tests/v15/test_m09_golden.py:163:    ts = out["top_entity_pnl_share"]
+research/v15/v15_m09_sim.py:405:def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entities: pd.DataFrame,
+research/v15/v15_m09_sim.py:506:        fe = float(res["summary"]["final_equity"])
+research/v15/v15_m09_sim.py:688:            # codex m09 r3: finite-gate the engine's reported final_equity before it enters carried state /
+research/v15/v15_m09_sim.py:690:            # into next-fold carried equity + final_equity. Fail CLOSED to 0.0 (untrustworthy -> total loss).
+research/v15/v15_m09_sim.py:691:            end_eq = float(res["summary"]["final_equity"])
+research/v15/v15_m09_sim.py:793:    final_equity = sum(c["equity"] for c in carried.values()) + cash
+research/v15/v15_m09_sim.py:794:    chained_roe = final_equity / b0 - 1.0 if b0 > 0 else 0.0
+research/v15/v15_m09_sim.py:803:        # (conservative) AND every run_m09_chained output stays finite.
+research/v15/v15_m09_sim.py:805:    # codex m09 r4: guard the calmar ratio finite (chained_roe is finite by the sanitizers above; max_dd is a
+research/v15/v15_m09_sim.py:807:    max_chained_calmar = chained_roe / max(max_dd, 1e-9)
+research/v15/v15_m09_sim.py:808:    if not np.isfinite(max_chained_calmar):
+research/v15/v15_m09_sim.py:809:        max_chained_calmar = 0.0
+research/v15/v15_m09_sim.py:818:        "chained_roe": chained_roe, "max_chained_dd": max_dd, "chained_calmar": max_chained_calmar,
+research/v15/v15_m09_sim.py:819:        "final_equity": final_equity, "n_positive_folds": n_pos, "n_equity_rows": n_equity_rows,
+research/v15/v15_m09_sim.py:825:        "top_entity_pnl_share": top_share, "per_fold": per_fold, "fold_caps_applied": fold_caps_applied,
+research/v15/v15_m10_gates.py:26:    g1_chained_roe: float = 0.5302         # 2^(112/182.5)-1 (2x/6mo pace over the 112d OOS)
+research/v15/v15_m10_gates.py:29:    g3_max_chained_dd: float = 0.50
+research/v15/v15_m10_gates.py:92:def gate_g7(top_entity_pnl_share: float, ablation: Optional[dict], null_roe, null_calmar,
+research/v15/v15_m10_gates.py:96:    G1/G3/G6 on the ablation metrics here (not a stale caller boolean). `ablation` keys: chained_roe,
+research/v15/v15_m10_gates.py:97:    max_chained_dd, chained_calmar (+ uses the same nulls/manifest/pct)."""
+research/v15/v15_m10_gates.py:98:    under_cap = top_entity_pnl_share <= m.g7_max_top_entity_pnl
+research/v15/v15_m10_gates.py:102:        a_g1 = ablation["chained_roe"] >= m.g1_chained_roe
+research/v15/v15_m10_gates.py:103:        a_g3 = ablation["max_chained_dd"] <= m.g3_max_chained_dd
+research/v15/v15_m10_gates.py:104:        a_g6 = gate_g6_bivariate(ablation["chained_roe"], ablation["chained_calmar"],
+research/v15/v15_m10_gates.py:109:            "top_entity_pnl_share": float(top_entity_pnl_share), "under_cap": bool(under_cap),
+research/v15/v15_m10_gates.py:121:    for k in ("chained_roe", "chained_calmar"):
+research/v15/v15_m10_gates.py:124:    if not _fin(strat.get("max_chained_dd")) or not (0.0 <= strat["max_chained_dd"] <= 1.0):
+research/v15/v15_m10_gates.py:125:        return f"max_chained_dd out of [0,1] ({strat.get('max_chained_dd')!r})"
+research/v15/v15_m10_gates.py:126:    if not _fin(strat.get("top_entity_pnl_share")) or not (0.0 <= strat["top_entity_pnl_share"] <= 1.0):
+research/v15/v15_m10_gates.py:127:        return f"top_entity_pnl_share out of [0,1] ({strat.get('top_entity_pnl_share')!r})"
+research/v15/v15_m10_gates.py:138:        for k in ("chained_roe", "chained_calmar"):
+research/v15/v15_m10_gates.py:141:        if not _fin(ablation.get("max_chained_dd")) or not (0.0 <= ablation["max_chained_dd"] <= 1.0):
+research/v15/v15_m10_gates.py:142:            return f"ablation.max_chained_dd out of [0,1] ({ablation.get('max_chained_dd')!r})"
+research/v15/v15_m10_gates.py:148:    """Evaluate G1-G7 on the M9 chained result + null distributions. `strat` keys: chained_roe,
+research/v15/v15_m10_gates.py:149:    n_positive_folds, max_chained_dd, g4_no_kill, g4_all_folds_above_floor, g5_pool_ok, chained_calmar,
+research/v15/v15_m10_gates.py:150:    top_entity_pnl_share. `ablation` (conservative, top-entity-removed) keys: chained_roe,
+research/v15/v15_m10_gates.py:151:    max_chained_dd, chained_calmar. holdout=True -> stricter p99 + n_null=5000 + CONFIRMATORY verdict."""
+research/v15/v15_m10_gates.py:161:    g1 = {"gate": "G1", "pass": bool(strat["chained_roe"] >= m.g1_chained_roe),
+research/v15/v15_m10_gates.py:162:          "value": strat["chained_roe"], "threshold": m.g1_chained_roe}
+research/v15/v15_m10_gates.py:168:    g3 = {"gate": "G3", "pass": bool(strat["max_chained_dd"] <= m.g3_max_chained_dd),
+research/v15/v15_m10_gates.py:169:          "value": strat["max_chained_dd"], "threshold": m.g3_max_chained_dd}
+research/v15/v15_m10_gates.py:176:    g6 = gate_g6_bivariate(strat["chained_roe"], strat["chained_calmar"], null_roe, null_calmar, m,
+research/v15/v15_m10_gates.py:178:    g7 = gate_g7(strat["top_entity_pnl_share"], ablation, null_roe, null_calmar, m, pct=pct,
+
+codex
+The patched block matches the stated intent: losing/flat with entity PnL now emits `1.0`, while no-entity cases still emit `0.0`. I’m checking the upstream carried/cash/DD paths now, because the remaining risk is any non-finite scalar entering before that final return.
+exec
+/bin/zsh -lc "sed -n '112,185p' research/v15/v15_m10_gates.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '405,760p' research/v15/v15_m09_sim.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+
+def _validate_strat(strat: dict, ablation: Optional[dict], m: M10Manifest) -> Optional[str]:
+    """Return an error string if the strategy/ablation inputs are unsafe to gate (fail closed), else None.
+    Guards codex P0#1 (literal bools), P0#2 (finite + valid domains), P0#3 (verified fold denominator)."""
+    def _fin(x):
+        try:
+            return isinstance(x, (int, float)) and not isinstance(x, bool) and np.isfinite(x)
+        except TypeError:
+            return False
+    for k in ("chained_roe", "chained_calmar"):
+        if k not in strat or not _fin(strat[k]):
+            return f"{k} not finite ({strat.get(k)!r})"
+    if not _fin(strat.get("max_chained_dd")) or not (0.0 <= strat["max_chained_dd"] <= 1.0):
+        return f"max_chained_dd out of [0,1] ({strat.get('max_chained_dd')!r})"
+    if not _fin(strat.get("top_entity_pnl_share")) or not (0.0 <= strat["top_entity_pnl_share"] <= 1.0):
+        return f"top_entity_pnl_share out of [0,1] ({strat.get('top_entity_pnl_share')!r})"
+    if "n_folds" not in strat or strat["n_folds"] != m.expected_n_folds:
+        return f"n_folds != expected {m.expected_n_folds} ({strat.get('n_folds')!r}) — G2 denominator unverified"
+    npf = strat.get("n_positive_folds")
+    if not isinstance(npf, (int, np.integer)) or isinstance(npf, bool) or not (0 <= npf <= m.expected_n_folds):
+        return f"n_positive_folds out of [0,{m.expected_n_folds}] ({npf!r})"
+    for k in ("g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"):
+        # require an actual bool TYPE (int 1 == True in Python, so `in (True, False)` would wrongly admit 1).
+        if not isinstance(strat.get(k), (bool, np.bool_)):
+            return f"{k} must be a literal bool, got {strat.get(k)!r}"
+    if ablation is not None:
+        for k in ("chained_roe", "chained_calmar"):
+            if not _fin(ablation.get(k)):
+                return f"ablation.{k} not finite ({ablation.get(k)!r})"
+        if not _fin(ablation.get("max_chained_dd")) or not (0.0 <= ablation["max_chained_dd"] <= 1.0):
+            return f"ablation.max_chained_dd out of [0,1] ({ablation.get('max_chained_dd')!r})"
+    return None
+
+
+def evaluate_gates(strat: dict, null_roe, null_calmar, m: M10Manifest, holdout: bool = False,
+                   ablation: Optional[dict] = None) -> dict:
+    """Evaluate G1-G7 on the M9 chained result + null distributions. `strat` keys: chained_roe,
+    n_positive_folds, max_chained_dd, g4_no_kill, g4_all_folds_above_floor, g5_pool_ok, chained_calmar,
+    top_entity_pnl_share. `ablation` (conservative, top-entity-removed) keys: chained_roe,
+    max_chained_dd, chained_calmar. holdout=True -> stricter p99 + n_null=5000 + CONFIRMATORY verdict."""
+    pct = m.g6_holdout_pct if holdout else m.g6_gate_pct
+    required_n = m.n_null_holdout if holdout else m.n_null_dev
+    # AUDIT 2026-07-10 (codex P0#1,#2,#3): FAIL CLOSED on invalid inputs BEFORE gating. bool(np.nan) is True, so a
+    # missing/NaN kill/floor/pool status would silently PASS G4/G5; inf ROE would pass G1/G6; a partial <8-fold run
+    # would pass G2 "6 of 8". Require literal bools, finite metrics, valid domains, and the verified fold denominator.
+    err = _validate_strat(strat, ablation, m)
+    if err:
+        return {"gates": {}, "all_pass": False, "verdict_kind": "invalid_input",
+                "greenlight": "no", "required_n": required_n, "validation_error": err}
+    g1 = {"gate": "G1", "pass": bool(strat["chained_roe"] >= m.g1_chained_roe),
+          "value": strat["chained_roe"], "threshold": m.g1_chained_roe}
+    # G2: n_positive_folds >= min AND the denominator is verified == expected_n_folds (codex P0#3).
+    g2 = {"gate": "G2", "pass": bool(strat["n_positive_folds"] >= m.g2_min_positive_folds
+                                     and strat["n_folds"] == m.expected_n_folds),
+          "value": strat["n_positive_folds"], "n_folds": strat["n_folds"],
+          "threshold": m.g2_min_positive_folds, "expected_n_folds": m.expected_n_folds}
+    g3 = {"gate": "G3", "pass": bool(strat["max_chained_dd"] <= m.g3_max_chained_dd),
+          "value": strat["max_chained_dd"], "threshold": m.g3_max_chained_dd}
+    # G4/G5: _validate_strat has ALREADY rejected any non-bool (np.nan/1/"yes"/None) -> the field is now a real
+    # bool type (python bool OR np.bool_). bool() normalizes np.bool_(True) correctly (np.True_ is NOT the python
+    # True singleton, so `is True` would false-negative it). Safe here precisely because validation ran first.
+    g4 = {"gate": "G4", "pass": bool(strat["g4_no_kill"]) and bool(strat["g4_all_folds_above_floor"]),
+          "no_kill": bool(strat["g4_no_kill"]), "all_folds_above_floor": bool(strat["g4_all_folds_above_floor"])}
+    g5 = {"gate": "G5", "pass": bool(strat["g5_pool_ok"])}
+    g6 = gate_g6_bivariate(strat["chained_roe"], strat["chained_calmar"], null_roe, null_calmar, m,
+                           pct=pct, required_n=required_n)
+    g7 = gate_g7(strat["top_entity_pnl_share"], ablation, null_roe, null_calmar, m, pct=pct,
+                 required_n=required_n)
+    gates = [g1, g2, g3, g4, g5, g6, g7]
+    all_pass = all(g["pass"] for g in gates)
+    return {
+        "gates": {g["gate"]: g for g in gates},
+        "all_pass": bool(all_pass),
+        "verdict_kind": ("confirmatory" if holdout else "development_verdict"),
+
+ succeeded in 0ms:
+def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entities: pd.DataFrame,
+                    folds: pd.DataFrame, eng, md, acts_loader, m: M9Manifest, b0: float,
+                    pool_provider: str = "ranked", seed: Optional[int] = None,
+                    corr: Optional[dict] = None, out_dir: Optional[str] = None,
+                    flush_rows: int = 1_000_000, mem_soft_gb: float = 12.0,
+                    allow_global_m04: bool = False) -> dict:
+    """M9-v2 fixed-bankroll CHAINED portfolio sim over the 8 contiguous test folds. Per fold: select
+    (M6b in_pool, drop M8 KILL), size via the sizing chain, run M7 per subaccount on that fold's TEST
+    actions (carried state for continuing entities = winners compound untouched; new entities cold-start
+    from cash), aggregate on the event clock, apply global-DD/G4, chain ending states to the next fold.
+    Returns the chained ROE/DD path + per-fold PnL + G4 + top-entity share (the M10 inputs).
+
+    MEMORY-SAFETY (CLAUDE.md Rule 8): install_memory_guard() at entry; the chained portfolio-equity
+    series + per-fold ledger stream to disk via ShardedParquetWriter in bounded chunks (NO giant in-RAM
+    frame + final pd.concat). running-DD is computed on a single streamed pass over the equity parts. If
+    `out_dir` is None a temp dir is used (cleaned up). acts_loader(wallet, t0, t1) -> actions.
+
+    ALLOCATION (wired here, not just defined): per fold -> M6b in_pool, drop M8 KILL -> anti-corr prune
+    (rho_max, KEEP higher-ranked) -> target_count ceiling -> sizing chain -> cap-aware water-fill into
+    effective_caps (G7 40% + M8 max_survivable_slice) -> SUSPICIOUS-cohort cap (<=10% of equity) ->
+    AGGREGATE levered-margin / gross cap (total resulting notional <= bankroll x gross_cap; per-leader
+    leverage copied untouched). Cash from selected-but-unrunnable entities (no wallet / funded<=0) is
+    RETURNED to cash (no leak). Fixed bankroll, no-hindsight rebalance, causal, G4-DD-kill intact."""
+    # Matched-null pool construction is not wired yet. Previously the argument
+    # was ignored, so a caller could request ``matched_null`` and receive the
+    # ranked strategy path mislabeled as a null sample. Fail closed until M10's
+    # quality-matched provider is implemented and tested.
+    if pool_provider != "ranked":
+        raise NotImplementedError(f"unsupported M9 pool_provider: {pool_provider!r}")
+    install_memory_guard(soft_gb=mem_soft_gb, label="m09_chained")
+    conf_map = {"CLEAN": 1.0, "UNCERTAIN": 0.25, "SUSPICIOUS": 0.10, "KILL": 0.0}
+    corr = corr or {}
+    if "fold_id" in m04_entities.columns:
+        ent_fold = m04_entities.set_index(["entity_id", "fold_id"])[
+            ["primary_wallet", "entity_tier"]
+        ].to_dict("index")
+        ent_global = None
+    else:
+        # codex m09 P1: a single global M4 map is LOOK-AHEAD -- an entity SUSPICIOUS in fold 0 but globally
+        # CLEAN (from later folds' data) would get confidence 1.0 instead of 0.10 in fold 0. Fail CLOSED:
+        # require fold-pure M4 unless the caller explicitly opts in to an audited point-in-time global snapshot.
+        if not allow_global_m04:
+            raise ValueError("M9 requires fold-pure M4 (a 'fold_id' column). A single global M4 map is "
+                             "look-ahead; pass allow_global_m04=True only for an audited point-in-time snapshot.")
+        logger.warning(
+            "M9 received a single global M4 entity map; this is not fold-pure and is provisional"
+        )
+        ent_global = m04_entities.set_index("entity_id")[[
+            "primary_wallet", "entity_tier"
+        ]].to_dict("index")
+        ent_fold = None
+
+    def _entity(eid: int, fid: int) -> dict:
+        if ent_fold is not None:
+            return ent_fold.get((int(eid), int(fid)), {})
+        return ent_global.get(int(eid), {}) if ent_global is not None else {}
+    tiers = m08_tiers.set_index(["entity_id", "fold_id"]).to_dict("index")
+    fold_rows = folds.sort_values("oos_chain_order")
+    pool = m06b_pool[m06b_pool["in_pool"]]
+
+    _tmp = tempfile.mkdtemp(prefix="m09_") if out_dir is None else None
+    base = Path(out_dir) if out_dir is not None else Path(_tmp)
+    base.mkdir(parents=True, exist_ok=True)
+    eq_writer = ShardedParquetWriter(base / "m09_chained_equity.parquet", flush_rows=flush_rows)
+    fold_writer = ShardedParquetWriter(base / "m09_per_fold.parquet", flush_rows=max(1, flush_rows))
+
+    carried: dict = {}            # entity_id -> {"state": AccountState, "equity": float, "wallet": str}
+    cash = float(b0)
+    per_fold = []                 # bounded (<= n_folds rows) summary kept in RAM for the M10-input return
+    entity_pnl = {}               # entity_id -> cumulative realized+unrealized PnL contribution
+    # streamed running-DD accumulators (NO in-RAM equity concat): causal peak + max DD across the chain.
+    run_peak = 0.0
+    max_dd = 0.0
+    last_equity = float(b0)
+    fold_caps_applied = []        # diagnostics: which aggregate constraints bound, per fold
+
+    def _flatten_at_boundary(eid: int, record: dict, ts_ms: int, fid: int) -> float:
+        """Close a dropped carried state through M7 execution mechanics."""
+        state = record["state"]
+        if not getattr(state, "positions", None):
+            return float(record["equity"])
+        rows = []
+        for order, (coin, pos) in enumerate(sorted(state.positions.items())):
+            rows.append({
+                "coin": coin, "ts": int(ts_ms), "event_order": order,
+                "action_type": "EXIT", "signed_size": -float(pos.szi),
+                "position_after": 0.0, "target_exposure_pct": 0.0,
+                "is_liquidation": False, "carry_in_status": "SEEDED",
+                "lifecycle_valid": True, "stream_replay_valid": True,
+            })
+        params = eng.EngineParams(slippage_band="base", start_policy="future_delta_only")
+        params.copy_latency_ms = 0
+        params.sizing_mode = m.sizing_mode
+        params.fixed_target_exposure = m.fixed_target_exposure
+        res = eng.step_subaccount(
+            pd.DataFrame(rows), md, float(record["equity"]), params,
+            end_ts_ms=int(ts_ms), start_ts_ms=int(ts_ms),
+            start_state=state, entity_id=eid, fold_id=fid,
+        )
+        # codex m09 r3: finite-gate the flatten proceeds before they re-enter cash (a non-finite exit equity
+        # must not corrupt the ledger). Fail closed to 0.0.
+        fe = float(res["summary"]["final_equity"])
+        return fe if np.isfinite(fe) else 0.0
+
+    for fr in fold_rows.itertuples():
+        fid = int(fr.fold_id)
+        t0 = pd.Timestamp(fr.test_start).value // 1_000_000
+        t1 = pd.Timestamp(fr.test_end_excl).value // 1_000_000
+        # PRETEST (causal) window [train_start_k, test_start_k) -- the SAME look-ahead-safe window M5/M6
+        # use. Allocation/sizing decisions may ONLY use data known at test_start_k; never the test fold.
+        pt0 = pd.Timestamp(getattr(fr, "pretest_start", fr.train_start)).value // 1_000_000
+        pt1 = pd.Timestamp(getattr(fr, "pretest_end_excl", fr.test_start)).value // 1_000_000
+        fold_pool = pool[pool["fold_id"] == fid]
+        # desired weights (drop KILL) + select_priority for anti-corr (m6b quality x survival).
+        desired = {}
+        eweight = {}
+        tier_of = {}
+        prio_rows = []
+        accessible_frac_of = {}   # codex m09 P1: M5 accessibility per entity for min-notional feasibility
+        for r in fold_pool.itertuples():
+            eid = int(r.entity_id)
+            tk = tiers.get((eid, fid), {})
+            surv = float(tk.get("survival_multiplier", 1.0))
+            if surv <= 0 or tk.get("tier") == "kill":
+                continue
+            etier = str(_entity(eid, fid).get("entity_tier", "UNCERTAIN"))
+            conf = conf_map.get(etier, 0.25)
+            w = sizing_chain_weight(r.quality_weight, conf, surv)
+            if w > 0:
+                desired[eid] = w
+                eweight[eid] = {"max_surv": tk.get("max_survivable_slice", np.inf)}
+                tier_of[eid] = etier
+                prio_rows.append({"entity_id": eid, "select_priority": float(r.quality_weight) * surv})
+                _af = getattr(r, "accessible_frac_notional", getattr(r, "accessible_frac", None))
+                accessible_frac_of[eid] = (float(_af) if _af is not None and _af == _af else None)
+
+        # ANTI-CORR prune + target_count ceiling (design §4): drop lower-ranked of a >rho_max pair.
+        if prio_rows:
+            ac = anti_corr_select(pd.DataFrame(prio_rows), corr, m)
+            keep_ids = set(int(e) for e in ac[ac["anti_corr_selected"]]["entity_id"])
+            for eid in list(desired):
+                if eid not in keep_ids:
+                    desired.pop(eid, None); eweight.pop(eid, None); tier_of.pop(eid, None)
+        selected = set(desired)
+
+        # DROP: carried entities not reselected (incl. anti-corr-pruned) -> flatten to cash at carried eq.
+        for eid in list(carried):
+            if eid not in selected:
+                before = float(carried[eid]["equity"])
+                after = _flatten_at_boundary(eid, carried[eid], t0, fid)
+                cash += after
+                entity_pnl[eid] = entity_pnl.get(eid, 0.0) + (after - before)
+                del carried[eid]
+
+        # SIZE new/top-up via cap-aware water-filling against the running portfolio equity.
+        kept_equity = sum(c["equity"] for c in carried.values())
+        portfolio_equity = kept_equity + cash
+        cap_df = pd.DataFrame([{"entity_id": e, "max_survivable_slice": eweight[e]["max_surv"]} for e in selected])
+        caps = effective_caps(cap_df, m, portfolio_equity) if len(cap_df) else {}
+        # SUSPICIOUS-cohort cap: the SUSPICIOUS tier's combined NEW margin <= suspicious_cohort_cap x
+        # equity. Enforced as a per-entity ceiling tightened so the cohort's residual sums to the cap.
+        susp = [e for e in selected if tier_of.get(e) == "SUSPICIOUS"]
+        if susp:
+            cohort_budget = m.suspicious_cohort_cap * portfolio_equity
+            susp_carried = sum(carried[e]["equity"] for e in susp if e in carried)
+            cohort_new_room = max(0.0, cohort_budget - susp_carried)
+            cohort_resid = sum(max(0.0, caps.get(e, 0.0) - carried.get(e, {}).get("equity", 0.0)) for e in susp)
+            if cohort_resid > cohort_new_room + 1e-9 and cohort_resid > 0:
+                shrink = cohort_new_room / cohort_resid          # scale each SUSPICIOUS cap's residual
+                for e in susp:
+                    ce = carried.get(e, {}).get("equity", 0.0)
+                    caps[e] = ce + max(0.0, caps.get(e, 0.0) - ce) * shrink
+        carried_exposure = {e: carried[e]["equity"] for e in selected if e in carried}
+        wf = cap_aware_waterfill(desired, carried_exposure, caps, m, cash, portfolio_equity)
+        funded = {e: wf["per_entity"].get(e, {}).get("cash_funded", 0.0) for e in selected}
+
+        # AGGREGATE LEVERED-MARGIN / GROSS CAP: total resulting NOTIONAL <= bankroll x gross_cap. Build
+        # per-entity expected leverage (leader's copied target_exposure) STRICTLY from the PRETEST/causal
+        # window (data known at test_start_k); NEVER from the test fold (that would be OOS look-ahead --
+        # sizing the fold off the fold's own future behavior). The TEST-fold actions are loaded separately
+        # below ONLY to RUN M7; they never feed an allocation decision.
+        adf_cache = {}
+        lev = {}
+        min_frac = {}    # codex m09 P1: min-notional feasibility needs a "typical SMALL action" exposure
+        for eid in selected:
+            wallet = _entity(eid, fid).get("primary_wallet")
+            test_adf = acts_loader(wallet, t0, t1) if wallet is not None else None
+            adf_cache[eid] = (wallet, test_adf)
+            pre_adf = acts_loader(wallet, pt0, pt1) if wallet is not None else None
+            lev[eid] = expected_leverage(
+                pre_adf, m.sizing_mode, m.fixed_target_exposure
+            )  # causal: pretest leverage, no look-ahead
+            # A low percentile of |target_exposure_pct| over the PRETEST window = a representative SMALL
+            # action; its notional must clear HL $10 for the entity to be tradeably copyable at this slice.
+            mf = None
+            if pre_adf is not None and len(pre_adf) and "target_exposure_pct" in pre_adf.columns:
+                _te = pd.to_numeric(pre_adf["target_exposure_pct"], errors="coerce").abs()
+                _te = _te[np.isfinite(_te) & (_te > 0)]
+                if len(_te):
+                    mf = float(_te.quantile(0.25))
+            min_frac[eid] = mf
+        # FIXED-BANKROLL thesis: the gross budget keys off the FIXED bankroll b0, NOT live portfolio
+        # equity -- winners must NOT expand portfolio capacity fold-to-fold (no equity-following leverage).
+        gross_budget = m.gross_cap * float(b0)
+        funded, gross_returned, implied_gross = apply_gross_budget(funded, carried_exposure, lev, gross_budget)
+        # MIN-NOTIONAL FEASIBILITY (codex m09 P1: wire the defined+tested helper into allocation). A NEW
+        # entity whose funded slice cannot clear HL $10 for a representative small pretest action is
+        # UNTRADEABLE at this capital -> zero its funding (the freed margin stays cash; the debit below is on
+        # the reduced funded, so no leak). Applies to NEW entities only (carried winners are already live).
+        # The ACCESSIBILITY leg fires only when M5 accessible_frac is threaded into the pool; otherwise it is
+        # counted as unchecked and LOUDLY flagged (no silent cap) -- the SLICE leg still binds.
+        # codex m09 r2: distinguish a PIPELINE gap (the whole pool lacks the accessibility column -> a
+        # version limitation, flagged loudly, keep on the accessibility leg while the SLICE leg still binds)
+        # from a PER-ENTITY data hole (column present but this entity's value missing/bad -> FAIL CLOSED).
+        pool_has_accessible = ("accessible_frac_notional" in fold_pool.columns) or \
+                              ("accessible_frac" in fold_pool.columns)
+        n_min_notional_dropped = 0
+        n_accessible_unchecked = 0
+        for eid in list(selected):
+            if eid in carried or funded.get(eid, 0.0) <= 0:
+                continue
+            mf = min_frac.get(eid)
+            if mf is None:
+                # no derivable representative small action -> can't PROVE min-notional -> FAIL CLOSED (drop).
+                funded[eid] = 0.0
+                n_min_notional_dropped += 1
+                continue
+            af = accessible_frac_of.get(eid)
+            if af is None:
+                if pool_has_accessible:
+                    # column exists but this entity has no finite in-range value -> fail closed.
+                    funded[eid] = 0.0
+                    n_min_notional_dropped += 1
+                    continue
+                n_accessible_unchecked += 1
+                af_for_check = m.min_accessible_frac   # pipeline gap only: don't fail the accessibility leg
+            else:
+                af_for_check = af
+            feasible, _viable, _reason = min_notional_feasible(mf, af_for_check, funded[eid], m)
+            if not feasible:
+                funded[eid] = 0.0                       # untradeable slice -> freed margin stays cash
+                n_min_notional_dropped += 1
+        cash -= sum(funded.values())                       # only the gross/cap-trimmed margin leaves cash
+        fold_caps_applied.append({"fold_id": fid, "gross_budget": gross_budget,
+                                  "implied_gross_notional": implied_gross,
+                                  "gross_trimmed_cash": gross_returned, "n_suspicious": len(susp),
+                                  "n_min_notional_dropped": n_min_notional_dropped,
+                                  "n_accessible_unchecked": n_accessible_unchecked})
+
+        # RUN M7 per selected subaccount on this fold's TEST actions (carried or new).
+        params = eng.EngineParams(slippage_band="base", start_policy="causal_carry_in")
+        params.sizing_mode = m.sizing_mode
+        params.fixed_target_exposure = m.fixed_target_exposure
+        sub_eq = {}
+        new_carried = {}
+        deployed_new = 0.0                                 # NEW margin that actually reached the engine
+        for eid in selected:
+            wallet, adf = adf_cache[eid]
+            if wallet is None:                             # unrunnable: RETURN any funded cash (no leak)
+                cash += funded.get(eid, 0.0)
+                continue
+            if eid in carried:                         # continuing winner: carried state + any top-up
+                start_state = copy.deepcopy(carried[eid]["state"])
+                # CASH CONSERVATION: a carried entity can receive a water-fill TOP-UP (funded[eid]); that
+                # margin was already debited from cash, so it MUST enter the carried subaccount's starting
+                # equity. Dropping it (start from old equity only) silently vanishes that cash.
+                topup = funded.get(eid, 0.0)
+                start_state.cross_collateral["main"] = (
+                    start_state.cross_collateral.get("main", 0.0) + topup
+                )
+                start_eq = carried[eid]["equity"] + topup
+                deployed_new += topup
+            else:                                       # new entity: cold-start from the funded slice
+                if funded.get(eid, 0.0) <= 0:
+                    cash += funded.get(eid, 0.0)           # RETURN unfunded-but-selected cash (no leak)
+                    continue
+                start_state = None; start_eq = funded[eid]
+                deployed_new += funded[eid]
+            res = eng.step_subaccount(adf, md, start_eq, params, end_ts_ms=t1, start_ts_ms=t0,
+                                      start_state=start_state, entity_id=eid, fold_id=fid)
+            eqdf = pd.DataFrame(res["equity"])
+            if not eqdf.empty:
+                sub_eq[eid] = eqdf[["ts", "subaccount_equity"]].rename(columns={"subaccount_equity": "equity"})
+            # codex m09 r3: finite-gate the engine's reported final_equity before it enters carried state /
+            # portfolio accounting. A non-finite summary (path empty or inconsistent) would otherwise survive
+            # into next-fold carried equity + final_equity. Fail CLOSED to 0.0 (untrustworthy -> total loss).
+            end_eq = float(res["summary"]["final_equity"])
+            if not np.isfinite(end_eq):
+                end_eq = 0.0
+            new_carried[eid] = {"state": _reconstruct_account_state(eng, res["ending_account_state"]),
+                                "equity": end_eq, "wallet": wallet}
+            entity_pnl[eid] = entity_pnl.get(eid, 0.0) + (end_eq - start_eq)
+
+        # AGGREGATE this fold on the event clock + add cash -> chained portfolio equity.
+        fold_port = portfolio_path(sub_eq) if sub_eq else pd.DataFrame(columns=["ts", "portfolio_equity"])
+        fold_port = fold_port.copy()
+        if len(fold_port):
+            fold_port["portfolio_equity"] = fold_port["portfolio_equity"] + cash      # idle cash (earns 0)
+        fold_initial = kept_equity + cash + deployed_new   # cash now holds returned (unrunnable) margin
+        g4 = g4_intrafold_kill(fold_port, fold_initial, m) if len(fold_port) else \
+            {"killed": False, "kill_ts": None, "fold_end_equity": fold_initial, "g4_pass": True}
+
+        # GLOBAL-DD circuit breaker (design §6): causal running-DD on the CHAINED equity (this fold's
+        # portfolio path concatenated after the prior peak). If DD from the running peak breaches the
+        # de-risk threshold intra-fold, that is a portfolio-level intervention. Detect on the chained
+        # series so the breaker sees the carried peak, not just this fold.
+        gdd_ts = None
+        if len(fold_port):
+            chained_fp = fold_port[["ts", "portfolio_equity"]].copy()
+            ddf = running_dd(chained_fp)
+            ddf["running_peak"] = np.maximum(ddf["running_peak"], run_peak)   # carry the chain peak in
+            ddf["dd_from_peak"] = np.where(ddf["running_peak"] > 0,
+                                           (ddf["running_peak"] - ddf["portfolio_equity"]) / ddf["running_peak"], 0.0)
+            gbreach = ddf[ddf["dd_from_peak"] > m.global_dd_derisk]
+            if len(gbreach):
+                gdd_ts = int(gbreach["ts"].iloc[0])
+            # codex m09 P0: a non-finite chained equity is a corrupt state -> fail closed (immediate de-risk).
+            nf_ts = _first_nonfinite_equity_ts(chained_fp)
+            if nf_ts is not None:
+                gdd_ts = nf_ts if gdd_ts is None else min(gdd_ts, nf_ts)
+
+        # APPLY the interventions (Fix: previously recorded but never enforced). On the FIRST of {G4 kill,
+        # global-DD breach}, FLATTEN every carried position to cash at the breach equity -- NO post-kill
+        # recovery is carried forward, and the chained equity is truncated at the breach ts (causal).
+        intervention_ts = None
+        intervention_kind = ""
+        if g4["killed"] and gdd_ts is not None:
+            if g4["kill_ts"] <= gdd_ts:
+                intervention_ts, intervention_kind = g4["kill_ts"], "g4_kill"
+            else:
+                intervention_ts, intervention_kind = gdd_ts, "global_dd_derisk"
+        elif g4["killed"]:
+            intervention_ts, intervention_kind = g4["kill_ts"], "g4_kill"
+        elif gdd_ts is not None:
+            intervention_ts, intervention_kind = gdd_ts, "global_dd_derisk"
+
+        # CAUSAL G4 diagnostic: g4["killed"] is computed on the FULL untruncated fold path, so it can flag
+        # a G4 breach that occurs AFTER an earlier global-DD flatten (which would have already exited -- so
+        # that G4 event never causally happens). The diagnostic must reflect ONLY the causal path up to the
+        # first intervention: G4 is "killed" iff it is the intervention that fires first.
+        g4_killed_causal = (intervention_kind == "g4_kill")
+
+        if intervention_ts is not None and len(fold_port):
+            # portfolio equity at-or-before the breach ts (already includes idle cash); FLATTEN to cash.
+            at = fold_port[fold_port["ts"] <= intervention_ts]
+            breach_equity = float(at["portfolio_equity"].iloc[-1]) if len(at) else fold_initial
+            # codex m09 r2 P0: a non-finite breach equity (the intervention that fired BECAUSE equity went
+            # corrupt) must NOT become live cash. Fail CLOSED to 0.0 -- a corrupt equity is untrustworthy, so
+            # the most conservative de-risk is a total-loss mark (never carry NaN/inf cash into the next fold).
+            if not np.isfinite(breach_equity):
+                breach_equity = 0.0
+            fold_port = at.copy()                          # truncate the streamed/DD path at the breach
+            # codex m09 r3: the truncated path may still contain the non-finite breach row -> sanitize ALL
+            # streamed portfolio_equity to finite (non-finite -> 0.0) so the streamed DD accumulators + parquet
+            # never carry NaN/inf. (cash/fold_end already sanitized above.)
+            _pe = pd.to_numeric(fold_port["portfolio_equity"], errors="coerce")
+
+exec
+/bin/zsh -lc "rg -n \"np\\.inf|float\\(\\\"inf\\\"\\)|inf\\)|top_entity_pnl_share|chained_calmar|run_m09_chained\\(\" tests/v15 research/v15 | head -200" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_m09_sim.py:71:        # corrupt -> fail CLOSED as maximally correlated (+inf) so the lower-ranked entity is dropped.
+research/v15/v15_m09_sim.py:75:        return float(v) if np.isfinite(v) else float("inf")
+research/v15/v15_m09_sim.py:98:    frac<=0 -> infeasible (inf). codex r1#3: missing/non-finite accessible_frac -> infeasible (can't
+research/v15/v15_m09_sim.py:105:        return False, float("inf"), "min_action_frac<=0_or_nonfinite"
+research/v15/v15_m09_sim.py:405:def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entities: pd.DataFrame,
+research/v15/v15_m09_sim.py:535:                eweight[eid] = {"max_surv": tk.get("max_survivable_slice", np.inf)}
+research/v15/v15_m09_sim.py:807:    max_chained_calmar = chained_roe / max(max_dd, 1e-9)
+research/v15/v15_m09_sim.py:808:    if not np.isfinite(max_chained_calmar):
+research/v15/v15_m09_sim.py:809:        max_chained_calmar = 0.0
+research/v15/v15_m09_sim.py:818:        "chained_roe": chained_roe, "max_chained_dd": max_dd, "chained_calmar": max_chained_calmar,
+research/v15/v15_m09_sim.py:825:        "top_entity_pnl_share": top_share, "per_fold": per_fold, "fold_caps_applied": fold_caps_applied,
+research/v15/v15_m09_sim.py:848:            m8 = np.inf
+research/v15/v15_forward_select.py:109:                           "max_survivable_slice": np.inf} for fd, e in zip(pool.fold_id, pool.entity_id)])
+research/v15/v15_forward_select.py:110:    res = M9.run_m09_chained(pool, tiers, ent, folds, E, md, loader, M9.M9Manifest(), b0)
+tests/v15/test_m06b.py:304:    inp["m07_summary"].loc[inp["m07_summary"].entity_id == 0, "tracking_error"] = np.inf
+research/v15/v15_m01_equity_reconstruct.py:1956:    gap_h = (anchor.fetched_ms - last_fill_ms) / 3_600_000 if last_fill_ms else float("inf")
+research/v15/v15_m06a_shortlist.py:294:            # FINITENESS before any int()/log (np.inf must not crash before the contract assert).
+research/v15/v15_fixed_notional_signals.py:128:                    else float("inf")
+research/v15/leadlag_clean_rank_sim.py:576:                                     if (len(nets) >= min_rank_lots and nets.std() > 0) else -np.inf)
+research/v15/leadlag_clean_rank_sim.py:579:                    rank_score[w] = float((nets > 0).mean()) if len(nets) >= min_rank_lots else -np.inf
+research/v15/leadlag_clean_rank_sim.py:584:                    rank_score[w] = float(np.median(holds)) if len(holds) >= min_rank_lots else -np.inf
+research/v15/leadlag_clean_rank_sim.py:605:                # rank by chosen causal metric; drop below-min-lots wallets (score -inf) from selection.
+research/v15/leadlag_clean_rank_sim.py:606:                ranked = sorted([w for w in rank_score if rank_score[w] > -np.inf],
+tests/v15/test_m10.py:48:    nd = M10._clean_null([0.1, None, 0.2, np.nan, pd.NA, 0.3, float("inf")])
+tests/v15/test_m10.py:78:    good_abl = {"chained_roe": 0.7, "max_chained_dd": 0.3, "chained_calmar": 2.0}
+tests/v15/test_m10.py:81:    bad_abl = {"chained_roe": 0.2, "max_chained_dd": 0.3, "chained_calmar": 2.0}
+tests/v15/test_m10.py:87:                g4_all_folds_above_floor=True, g5_pool_ok=True, chained_calmar=2.3,
+tests/v15/test_m10.py:88:                top_entity_pnl_share=0.2)
+tests/v15/test_m10.py:118:    res = M10.evaluate_gates(_strat(top_entity_pnl_share=0.6), nr, nc, M, ablation=None)
+tests/v15/test_m10_golden.py:27:             g4_all_folds_above_floor=True, g5_pool_ok=True, chained_calmar=2.3, top_entity_pnl_share=0.2)
+tests/v15/test_m10_golden.py:45:    ("chained_roe", np.inf), ("chained_calmar", np.inf), ("chained_roe", np.nan),
+tests/v15/test_m10_golden.py:46:    ("max_chained_dd", -0.1), ("max_chained_dd", 1.5), ("top_entity_pnl_share", -2.0),
+tests/v15/test_m10_golden.py:47:    ("top_entity_pnl_share", 1.2), ("n_positive_folds", 9),
+tests/v15/test_m09_golden.py:32:    df = pd.DataFrame({"ts": [1, 2], "portfolio_equity": [100.0, np.inf]})
+tests/v15/test_m09_golden.py:51:    assert M9.min_notional_feasible(0.1, np.inf, 100.0, M)[0] is False     # inf accessible
+tests/v15/test_m09_golden.py:52:    assert M9.min_notional_feasible(np.inf, 1.0, 1.0, M)[0] is False       # inf frac
+tests/v15/test_m09_golden.py:75:    out = M9.cap_aware_waterfill({1: np.inf, 2: 1.0}, {}, {1: 100.0, 2: 100.0}, M, 100.0, 100.0)
+tests/v15/test_m09_golden.py:105:        M9.effective_caps(pd.DataFrame([{"entity_id": 1, "max_survivable_slice": np.inf}]), M, np.inf)
+tests/v15/test_m09_golden.py:132:                         "max_survivable_slice": np.inf}])
+tests/v15/test_m09_golden.py:138:    out = M9.run_m09_chained(m06b, m08, m04, folds, _NaNPathEng(), md=None, acts_loader=_acts,
+tests/v15/test_m09_golden.py:141:    for k in ("final_equity", "max_chained_dd", "chained_roe", "chained_calmar", "top_entity_pnl_share"):
+tests/v15/test_m09_golden.py:147:    # codex m09 r4: a losing strategy must yield a FINITE, in-[0,1] top_entity_pnl_share (max-concentration
+tests/v15/test_m09_golden.py:154:                         "max_survivable_slice": np.inf}])
+tests/v15/test_m09_golden.py:161:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts,
+tests/v15/test_m09_golden.py:163:    ts = out["top_entity_pnl_share"]
+tests/v15/test_m02_golden.py:57:    bad = _fill(1000, "BTC", "B", 1, 100, 0, tid=1); bad["price"] = float("inf")
+tests/v15/test_m02_golden.py:69:    c["fee"] = float("inf")
+tests/v15/test_m02_golden.py:79:    c["closedPnl"] = float("inf")
+tests/v15/test_m02_golden.py:105:    funding = [{"time": 3000, "delta": {"type": "funding", "coin": "BTC", "usdc": float("inf")}}]
+tests/v15/test_m02_golden.py:144:    for bad in (float("nan"), float("inf")):
+tests/v15/test_m02_golden.py:152:    equity_post = float("inf")          # M01 emitted a non-finite equity
+tests/v15/test_m02_golden.py:153:    anchor_equity = float("inf")
+tests/v15/test_m025_golden.py:6:  (denom~0, funding present -> funding_frac=inf) -> EXCLUDE.
+tests/v15/test_m025_golden.py:47:    s = _clean(); s.funding_frac = float("inf")    # funding-dominated (denom~0, funding present)
+tests/v15/test_m09.py:20:        M9.run_m09_chained(
+tests/v15/test_m09.py:81:    assert not bad5 and need5 == float("inf") and "<=0" in r5
+tests/v15/test_m09.py:117:        {"entity_id": 2, "max_survivable_slice": np.inf},   # G7 binds
+tests/v15/test_m09.py:121:    assert caps[2] == pytest.approx(400.0)                   # min(400, inf)
+tests/v15/test_m09.py:298:        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:299:        {"entity_id": 2, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:324:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(8.0),
+tests/v15/test_m09.py:338:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:349:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:387:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=loader,
+tests/v15/test_m09.py:413:        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:414:        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:415:        {"entity_id": 2, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:423:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:443:         "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:445:         "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:457:    M9.run_m09_chained(
+tests/v15/test_m09.py:507:         "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:512:    out = M9.run_m09_chained(
+tests/v15/test_m09.py:534:        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:535:        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:541:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:563:        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:564:        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+tests/v15/test_m09.py:588:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:611:                         "max_survivable_slice": np.inf}])
+tests/v15/test_m09.py:632:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+research/v15/v15_m10_gates.py:92:def gate_g7(top_entity_pnl_share: float, ablation: Optional[dict], null_roe, null_calmar,
+research/v15/v15_m10_gates.py:97:    max_chained_dd, chained_calmar (+ uses the same nulls/manifest/pct)."""
+research/v15/v15_m10_gates.py:98:    under_cap = top_entity_pnl_share <= m.g7_max_top_entity_pnl
+research/v15/v15_m10_gates.py:104:        a_g6 = gate_g6_bivariate(ablation["chained_roe"], ablation["chained_calmar"],
+research/v15/v15_m10_gates.py:109:            "top_entity_pnl_share": float(top_entity_pnl_share), "under_cap": bool(under_cap),
+research/v15/v15_m10_gates.py:121:    for k in ("chained_roe", "chained_calmar"):
+research/v15/v15_m10_gates.py:126:    if not _fin(strat.get("top_entity_pnl_share")) or not (0.0 <= strat["top_entity_pnl_share"] <= 1.0):
+research/v15/v15_m10_gates.py:127:        return f"top_entity_pnl_share out of [0,1] ({strat.get('top_entity_pnl_share')!r})"
+research/v15/v15_m10_gates.py:138:        for k in ("chained_roe", "chained_calmar"):
+research/v15/v15_m10_gates.py:149:    n_positive_folds, max_chained_dd, g4_no_kill, g4_all_folds_above_floor, g5_pool_ok, chained_calmar,
+research/v15/v15_m10_gates.py:150:    top_entity_pnl_share. `ablation` (conservative, top-entity-removed) keys: chained_roe,
+research/v15/v15_m10_gates.py:151:    max_chained_dd, chained_calmar. holdout=True -> stricter p99 + n_null=5000 + CONFIRMATORY verdict."""
+research/v15/v15_m10_gates.py:176:    g6 = gate_g6_bivariate(strat["chained_roe"], strat["chained_calmar"], null_roe, null_calmar, m,
+research/v15/v15_m10_gates.py:178:    g7 = gate_g7(strat["top_entity_pnl_share"], ablation, null_roe, null_calmar, m, pct=pct,
+research/v15/v15_m05_eligibility.py:122:    r = ((e - e_prev - flow) / denom).replace([np.inf, -np.inf], np.nan).dropna()
+research/v15/v15_m05_eligibility.py:126:        lev = (pv / e.where(e > RUIN_EQUITY_FLOOR, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+research/v15/v15_m05_eligibility.py:132:        lev = (pv / e.where(e > RUIN_EQUITY_FLOOR, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+research/v15/v15_m05_eligibility.py:245:    # FINITE (np.isfinite catches NaN AND inf); a non-finite value would make its `<`/`>` comparison silently
+tests/v15/test_m05_golden.py:44:    # a PRESENT non-finite (inf) blocking input fails closed in strict; loose is unchanged.
+tests/v15/test_m05_golden.py:45:    eqm = _good_eqm(); eqm["max_dd"] = float("inf")
+tests/v15/test_m05_golden.py:47:    ok_strict, reasons = m5.apply_floors(_good_eqm() | {"median_leverage": float("inf")}, _good_jm(), strict=True)
+tests/v15/test_m05_golden.py:53:    ok, reasons = m5.apply_floors(_good_eqm(), _good_jm() | {"accessible_frac_notional": float("inf")}, strict=True)
+research/v15/v15_m025_authenticity_gate.py:377:            s.funding_frac = float("inf")   # funding-dominated, trade+funding nets to ~0 -> funding_farm EXCLUDE
+tests/v15/test_m06a.py:320:    elig = pd.DataFrame([_elig_row(1, 1)]); elig["n_journeys_pretest"] = elig["n_journeys_pretest"].astype(float); elig.loc[0, "n_journeys_pretest"] = np.inf
+
+codex
+The m10 side is clear: validation accepts finite `1.0` in range, then G7 compares it to the 0.40 cap and fails. I’m going to run the focused tests and a couple of direct smoke checks for winning/flat/losing scalar finiteness rather than relying only on the new losing test.
+exec
+/bin/zsh -lc "sed -n '1,140p' tests/v15/test_m09.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M9 allocation-core tests: sizing chain, anti-corr, min-notional feasibility, cap-aware water-fill.
+
+Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m09.py -q
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m09_sim as M9  # noqa: E402
+
+M = M9.M9Manifest()
+
+
+def test_unimplemented_matched_null_provider_fails_closed():
+    with pytest.raises(NotImplementedError, match="matched_null"):
+        M9.run_m09_chained(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+            eng=None, md=None, acts_loader=None, m=M, b0=500.0,
+            pool_provider="matched_null",
+        )
+
+
+def test_sizing_chain_is_product():
+    assert M9.sizing_chain_weight(0.5, 0.25, 0.1) == pytest.approx(0.0125)
+    assert M9.sizing_chain_weight(1.0, 1.0, 1.0) == 1.0
+
+
+def test_anti_corr_keeps_higher_ranked():
+    # entities 1 (priority 10) and 2 (priority 5) correlate >0.7 -> keep 1, drop 2. 3 uncorrelated kept.
+    cand = pd.DataFrame([
+        {"entity_id": 1, "select_priority": 10.0},
+        {"entity_id": 2, "select_priority": 5.0},
+        {"entity_id": 3, "select_priority": 7.0},
+    ])
+    corr = {(1, 2): 0.9, (1, 3): 0.1, (2, 3): 0.1}
+    out = M9.anti_corr_select(cand, corr, M)
+    sel = set(out[out.anti_corr_selected].entity_id)
+    assert sel == {1, 3}                    # 2 dropped (correlated with higher-ranked 1)
+    assert out[out.entity_id == 2].iloc[0]["dropped_reason"].startswith("corr>")
+
+
+def test_anti_corr_keeps_negative_correlation():
+    # codex r1#1: a strongly NEGATIVE correlation (-0.9) is diversifying -> KEEP both; +0.9 drops.
+    cand = pd.DataFrame([{"entity_id": 1, "select_priority": 10.0}, {"entity_id": 2, "select_priority": 5.0}])
+    out_neg = M9.anti_corr_select(cand, {(1, 2): -0.9}, M)
+    assert set(out_neg[out_neg.anti_corr_selected].entity_id) == {1, 2}
+    out_pos = M9.anti_corr_select(cand, {(1, 2): 0.9}, M)
+    assert set(out_pos[out_pos.anti_corr_selected].entity_id) == {1}
+
+
+def test_anti_corr_respects_target_count_ceiling():
+    m = M9.M9Manifest()
+    object.__setattr__(m, "target_count", 2) if False else None
+    m2 = M9.M9Manifest(target_count=2)
+    cand = pd.DataFrame([{"entity_id": i, "select_priority": 10 - i} for i in range(5)])
+    out = M9.anti_corr_select(cand, {}, m2)
+    assert int(out.anti_corr_selected.sum()) == 2   # only top-2 by priority
+
+
+def test_min_notional_feasibility_at_capital():
+    # action exposure 5% of slice; at $500 slice a 5% action = $25 >= $10 -> feasible.
+    ok, need, _ = M9.min_notional_feasible(0.05, 0.9, 500.0, M)
+    assert ok and need == pytest.approx(200.0)         # 10/0.05
+    # at $100 slice a 5% action = $5 < $10 -> NOT feasible
+    bad, need2, reason = M9.min_notional_feasible(0.05, 0.9, 100.0, M)
+    assert not bad and "min_notional" in reason
+    # low accessible_frac -> infeasible even if slice ok
+    bad2, _, r2 = M9.min_notional_feasible(0.05, 0.2, 500.0, M)
+    assert not bad2 and "accessible_frac" in r2
+    # codex r1#3: UNKNOWN accessible_frac (None/NaN) -> infeasible (can't prove min-notional clearance)
+    bad3, _, r3 = M9.min_notional_feasible(0.05, None, 500.0, M)
+    assert not bad3 and r3 == "accessible_frac_unknown"
+    bad4, _, _ = M9.min_notional_feasible(0.05, float("nan"), 500.0, M)
+    assert not bad4
+    # codex r1#2: frac<=0 -> infeasible with inf viable slice
+    bad5, need5, r5 = M9.min_notional_feasible(0.0, 0.9, 500.0, M)
+    assert not bad5 and need5 == float("inf") and "<=0" in r5
+
+
+def test_waterfill_respects_per_entity_cap_no_overflow():
+    # two entities, equal desire, cash 100, each capped at 30 residual -> 30+30 funded, 40 stays cash.
+    res = M9.cap_aware_waterfill(
+        desired={1: 0.5, 2: 0.5}, carried_exposure={1: 0.0, 2: 0.0},
+        caps={1: 30.0, 2: 30.0}, m=M, cash_available=100.0, portfolio_equity=100.0)
+    assert res["per_entity"][1]["cash_funded"] == pytest.approx(30.0)
+    assert res["per_entity"][2]["cash_funded"] == pytest.approx(30.0)
+    assert res["cash_funded_total"] == pytest.approx(60.0)
+    assert res["cash_shortfall"] == pytest.approx(40.0)   # un-fundable due to caps -> stays cash
+
+
+def test_waterfill_redistributes_freed_cash_to_headroom():
+    # entity 1 wants more but capped at 10; entity 2 has headroom -> freed cash flows to 2.
+    res = M9.cap_aware_waterfill(
+        desired={1: 0.5, 2: 0.5}, carried_exposure={},
+        caps={1: 10.0, 2: 1000.0}, m=M, cash_available=100.0, portfolio_equity=100.0)
+    assert res["per_entity"][1]["cash_funded"] == pytest.approx(10.0)   # capped
+    assert res["per_entity"][2]["cash_funded"] == pytest.approx(90.0)   # got the rest
+    assert res["cash_shortfall"] == pytest.approx(0.0)
+
+
+def test_waterfill_carried_exposure_reduces_residual():
+    # entity 1 cap 50 but already carries 45 -> only 5 residual; winner untouched gets little new.
+    res = M9.cap_aware_waterfill(
+        desired={1: 1.0}, carried_exposure={1: 45.0},
+        caps={1: 50.0}, m=M, cash_available=100.0, portfolio_equity=100.0)
+    assert res["per_entity"][1]["cash_funded"] == pytest.approx(5.0)
+    assert res["cash_shortfall"] == pytest.approx(95.0)
+
+
+def test_effective_caps_min_of_g7_and_m8():
+    ent = pd.DataFrame([
+        {"entity_id": 1, "max_survivable_slice": 50.0},     # M8 clamp tighter than G7
+        {"entity_id": 2, "max_survivable_slice": np.inf},   # G7 binds
+    ])
+    caps = M9.effective_caps(ent, M, portfolio_equity=1000.0)
+    assert caps[1] == pytest.approx(50.0)                    # min(0.4*1000=400, 50)
+    assert caps[2] == pytest.approx(400.0)                   # min(400, inf)
+    # codex r1#4: M8 max_survivable_slice=0 (capped out) -> cap 0 (NOT G7); negative clamps to 0.
+    ent2 = pd.DataFrame([{"entity_id": 3, "max_survivable_slice": 0.0},
+                         {"entity_id": 4, "max_survivable_slice": -5.0}])
+    caps2 = M9.effective_caps(ent2, M, portfolio_equity=1000.0)
+    assert caps2[3] == 0.0 and caps2[4] == 0.0
+
+
+def test_portfolio_path_merges_subaccounts_stepwise():
+    # entity 1: 100@t0, 120@t2; entity 2: 50@t1. Portfolio = forward-filled sum on the merged clock.
+    sub = {
+        1: pd.DataFrame({"ts": [0, 2], "equity": [100.0, 120.0]}),
+        2: pd.DataFrame({"ts": [1], "equity": [50.0]}),
+    }
+    pp = M9.portfolio_path(sub).set_index("ts")["portfolio_equity"]
+    assert pp[0] == pytest.approx(100.0)         # only entity 1 active
+    assert pp[1] == pytest.approx(150.0)         # 100 (held) + 50
+    assert pp[2] == pytest.approx(170.0)         # 120 + 50 (held)
+
+
+
+exec
+/bin/zsh -lc 'pytest -q tests/v15/test_m09_golden.py tests/v15/test_m09.py tests/v15/test_m10.py tests/v15/test_m10_golden.py' in /Users/hermes/quants-lab
+ exited 2 in 1834ms:
+
+==================================== ERRORS ====================================
+________________ ERROR collecting tests/v15/test_m09_golden.py _________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m09_golden.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m09_golden.py:18: in <module>
+    import v15_m09_sim as M9  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m09_sim.py:27: in <module>
+    from _streaming_io import ShardedParquetWriter, install_memory_guard
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+____________________ ERROR collecting tests/v15/test_m09.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m09.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m09.py:13: in <module>
+    import v15_m09_sim as M9  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m09_sim.py:27: in <module>
+    from _streaming_io import ShardedParquetWriter, install_memory_guard
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+=========================== short test summary info ============================
+ERROR tests/v15/test_m09_golden.py
+ERROR tests/v15/test_m09.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!
+2 errors in 1.17s
+
+codex
+The default Python environment is missing `pyarrow`, so collection failed before running M9 tests. The repo’s own test header points to `/Users/hermes/miniforge3/envs/quants-lab/bin/python`; I’m switching to that environment for verification.
+exec
+/bin/zsh -lc "sed -n '140,680p' tests/v15/test_m09.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+
+def test_portfolio_path_order_independent():
+    sub = {1: pd.DataFrame({"ts": [0, 5], "equity": [100.0, 90.0]}),
+           2: pd.DataFrame({"ts": [3], "equity": [40.0]})}
+    a = M9.portfolio_path(sub)
+    b = M9.portfolio_path({2: sub[2], 1: sub[1]})   # reversed iteration
+    pd.testing.assert_frame_equal(a.sort_values("ts").reset_index(drop=True),
+                                  b.sort_values("ts").reset_index(drop=True))
+
+
+def test_portfolio_path_same_ts_duplicate_takes_min_deterministic():
+    # codex r1#1: same-ts duplicate samples within a subaccount collapse to MIN (conservative, never
+    # hides a dip) and are order-independent. entity 1 has 100 AND 40 at t1 -> uses 40.
+    sub_a = {1: pd.DataFrame({"ts": [0, 1, 1, 2], "equity": [100.0, 100.0, 40.0, 110.0]})}
+    sub_b = {1: pd.DataFrame({"ts": [0, 1, 1, 2], "equity": [100.0, 40.0, 100.0, 110.0]})}  # rows reordered
+    pa = M9.portfolio_path(sub_a).set_index("ts")["portfolio_equity"]
+    pb = M9.portfolio_path(sub_b).set_index("ts")["portfolio_equity"]
+    assert pa[1] == pytest.approx(40.0) and pb[1] == pytest.approx(40.0)   # min, regardless of order
+    # the same-ts dip is now VISIBLE to G4 (would be hidden if the 100 sample won)
+    g4 = M9.g4_intrafold_kill(M9.portfolio_path(sub_a), fold_initial_equity=100.0, m=M)
+    assert g4["killed"] is True and g4["kill_ts"] == 1
+
+
+def test_global_dd_derisk_trigger():
+    # peak 100 then drops to 60 (40% DD > 35%) -> de-risk fires at that ts.
+    pdf = pd.DataFrame({"ts": [0, 1, 2], "portfolio_equity": [100.0, 80.0, 60.0]})
+    ts = M9.detect_global_dd_derisk(pdf, M)
+    assert ts == 2                                # 80 is 20% DD (no), 60 is 40% (yes)
+    # never breaches -> None
+    assert M9.detect_global_dd_derisk(pd.DataFrame({"ts": [0, 1], "portfolio_equity": [100.0, 80.0]}), M) is None
+
+
+def test_g4_kill_no_hindsight_recovery():
+    # dips to 45 (< 50% of 100) at t2 then "recovers" to 120 -> STILL fails G4 (kill froze at t2).
+    pdf = pd.DataFrame({"ts": [0, 1, 2, 3], "portfolio_equity": [100.0, 70.0, 45.0, 120.0]})
+    r = M9.g4_intrafold_kill(pdf, fold_initial_equity=100.0, m=M)
+    assert r["killed"] is True and r["kill_ts"] == 2
+    assert r["fold_end_equity"] == pytest.approx(45.0)   # frozen at kill, NOT the 120 recovery
+    assert r["g4_pass"] is False
+
+
+def test_g4_pass_when_never_breaches():
+    pdf = pd.DataFrame({"ts": [0, 1, 2], "portfolio_equity": [100.0, 80.0, 90.0]})
+    r = M9.g4_intrafold_kill(pdf, fold_initial_equity=100.0, m=M)
+    assert r["killed"] is False and r["g4_pass"] is True and r["fold_end_equity"] == pytest.approx(90.0)
+
+
+# --------------------------------------------------------------------------- #
+# Gross-cap / levered-margin budget + chained-sim wiring (anti-corr, cash conservation)
+# --------------------------------------------------------------------------- #
+def test_apply_gross_budget_caps_aggregate_notional():
+    # two entities, 2x leverage each, funded 100 each -> 400 notional. Budget = 300 -> trim NEW to 300.
+    funded = {1: 100.0, 2: 100.0}
+    lev = {1: 2.0, 2: 2.0}
+    out, returned, gross = M9.apply_gross_budget(funded, carried_exposure={}, lev=lev,
+                                                 gross_budget_notional=300.0)
+    assert gross == pytest.approx(300.0)                       # aggregate notional == budget exactly
+    assert sum(out.values()) == pytest.approx(150.0)           # 300 notional / 2x lev = 150 margin
+    assert returned == pytest.approx(50.0)                     # 200 funded - 150 deployed
+    # per-leader leverage is NOT capped: each still funded pro-rata (75 each), lev untouched.
+    assert out[1] == pytest.approx(75.0) and out[2] == pytest.approx(75.0)
+
+
+def test_apply_gross_budget_carried_consumes_budget_no_force_trim():
+    # carried 100 @ 3x = 300 notional already at the budget -> NO new margin funded, carried untouched.
+    out, returned, gross = M9.apply_gross_budget(
+        funded={2: 100.0}, carried_exposure={1: 100.0}, lev={1: 3.0, 2: 1.0},
+        gross_budget_notional=300.0)
+    assert out[2] == pytest.approx(0.0)                        # no room for new
+    assert returned == pytest.approx(100.0)                    # all new margin returned to cash
+    assert gross == pytest.approx(300.0)                       # carried notional preserved (not trimmed)
+
+
+def test_expected_leverage_fixed_position_counts_concurrent_open_coins():
+    actions = pd.DataFrame([
+        {"ts": 1, "event_order": 0, "coin": "BTC", "position_after": 1.0},
+        {"ts": 2, "event_order": 1, "coin": "ETH", "position_after": -2.0},
+        {"ts": 3, "event_order": 2, "coin": "BTC", "position_after": 0.0},
+    ])
+    assert M9.expected_leverage(actions, "fixed_position", 0.25) == pytest.approx(0.50)
+
+
+def test_apply_gross_budget_under_budget_passthrough():
+    out, returned, gross = M9.apply_gross_budget(
+        funded={1: 50.0}, carried_exposure={}, lev={1: 2.0}, gross_budget_notional=1000.0)
+    assert out[1] == pytest.approx(50.0) and returned == pytest.approx(0.0) and gross == pytest.approx(100.0)
+
+
+def test_expected_leverage_uses_abs_target_exposure():
+    adf = pd.DataFrame({"target_exposure_pct": [2.0, -3.0, 4.0, -1.0]})
+    lev = M9.expected_leverage(adf)
+    assert lev >= 1.0 and lev == pytest.approx(pd.Series([2, 3, 4, 1]).quantile(0.75))
+    assert M9.expected_leverage(None) == 1.0                   # no actions -> unlevered budgeting
+    assert M9.expected_leverage(pd.DataFrame({"x": [1]})) == 1.0   # missing col -> 1.0
+
+
+# ---- chained-sim integration with a tiny fake engine (exercises wiring end-to-end) ----
+class _FakePos:
+    def __init__(self, szi, entry_px):
+        self.szi = szi; self.entry_px = entry_px; self.mode = "cross"
+
+
+class _FakeState:
+    def __init__(self, cross_collateral=None, cooldown_until_ms=0):
+        self.cross_collateral = dict(cross_collateral or {})
+        self.cooldown_until_ms = cooldown_until_ms
+        self.positions = {}
+
+
+class _FakeEng:
+    """Minimal engine stub: each subaccount ends flat at start_eq x (1 + ret). target_exposure_pct in
+    the actions drives expected_leverage; the engine itself just returns a deterministic equity path."""
+    AccountState = _FakeState
+    Position = _FakePos
+
+    def __init__(self, ret_by_eid=None):
+        self.ret_by_eid = ret_by_eid or {}
+
+    class EngineParams:
+        def __init__(self, slippage_band="base", start_policy="causal_carry_in"):
+            self.slippage_band = slippage_band; self.start_policy = start_policy
+
+    def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                        start_state=None, entity_id=None, fold_id=None):
+        ret = self.ret_by_eid.get(entity_id, 0.0)
+        end_eq = start_equity * (1.0 + ret)
+        return {
+            "equity": [{"ts": start_ts_ms, "subaccount_equity": start_equity},
+                       {"ts": end_ts_ms, "subaccount_equity": end_eq}],
+            "ending_account_state": {"cross_collateral": {"USDC": end_eq}, "cooldown_until_ms": 0,
+                                     "positions": {}},
+            "summary": {"final_equity": end_eq},
+        }
+
+
+class _StateCheckingEng(_FakeEng):
+    """Flat fake that verifies carried top-ups reach AccountState, not only a scalar."""
+
+    def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                        start_state=None, entity_id=None, fold_id=None):
+        if start_state is not None and not start_state.positions:
+            assert sum(start_state.cross_collateral.values()) == pytest.approx(start_equity)
+        return super().step_subaccount(
+            adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+            start_state=start_state, entity_id=entity_id, fold_id=fold_id,
+        )
+
+
+def _chained_inputs(extra_wallet=None):
+    folds = pd.DataFrame([{"fold_id": 0, "oos_chain_order": 0,
+                           "train_start": "2024-12-01", "test_start": "2025-01-01",
+                           "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+                           "test_end_excl": "2025-01-02"}])
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+        {"entity_id": 2, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+        {"entity_id": 2, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+        {"entity_id": 2, "fold_id": 0, "primary_wallet": "0xbbb" if extra_wallet is None else extra_wallet,
+         "entity_tier": "CLEAN"},
+    ])
+    return m06b, m08, m04, folds
+
+
+def _acts(target_exp=1.0):
+    def loader(wallet, t0, t1):
+        if wallet is None:
+            return None
+        return pd.DataFrame({"target_exposure_pct": [target_exp, target_exp]})
+    return loader
+
+
+def test_chained_aggregate_gross_notional_within_budget(tmp_path):
+    # High leverage so the AGGREGATE gross cap BINDS (not just the per-entity caps). b0=500,
+    # gross_cap=3 -> notional budget 1500. With per_entity_cap=1.0 the water-fill would deploy ~500
+    # margin; at 8x that is 4000 notional >> 1500 -> the gross trim MUST bind and clamp to 1500.
+    m06b, m08, m04, folds = _chained_inputs()
+    eng = _FakeEng()
+    m = M9.M9Manifest(per_entity_cap=1.0)                   # relax per-entity so gross is the binding cap
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(8.0),
+                             m=m, b0=500.0, out_dir=str(tmp_path))
+    fc = out["fold_caps_applied"][0]
+    assert fc["implied_gross_notional"] <= m.gross_cap * 500.0 + 1e-6
+    assert fc["implied_gross_notional"] == pytest.approx(1500.0)   # gross cap binds exactly
+    assert fc["gross_trimmed_cash"] > 0                            # trim actually fired
+
+
+def test_chained_anti_corr_pruning_applied(tmp_path):
+    # entities 1 & 2 correlate 0.9 -> only the higher select_priority is funded (n_selected == 1).
+    m06b, m08, m04, folds = _chained_inputs()
+    m06b.loc[m06b.entity_id == 1, "quality_weight"] = 0.8   # higher priority -> kept
+    m06b.loc[m06b.entity_id == 2, "quality_weight"] = 0.2   # pruned
+    eng = _FakeEng()
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+                             m=M9.M9Manifest(), b0=500.0, corr={(1, 2): 0.9}, out_dir=str(tmp_path))
+    assert out["per_fold"][0]["n_selected"] == 1            # entity 2 anti-corr pruned
+
+
+def test_chained_unrunnable_entity_cash_returned(tmp_path):
+    # entity 2 has no wallet (None) -> its funded slice must be RETURNED to cash (conservation). With a
+    # flat (0 return) engine and no leverage, final equity must equal b0 (nothing lost to the leak).
+    m06b, m08, m04, folds = _chained_inputs(extra_wallet=None)
+    m04.loc[m04.entity_id == 2, "primary_wallet"] = None
+    eng = _FakeEng(ret_by_eid={1: 0.0})
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+                             m=M9.M9Manifest(), b0=500.0, out_dir=str(tmp_path))
+    assert out["final_equity"] == pytest.approx(500.0)      # no cash leaked by the unrunnable entity
+
+
+def test_manifest_frozen_knobs():
+    m = M9.M9Manifest()
+    assert m.b0 == 500.0 and m.gross_cap == 3.0 and m.global_dd_derisk == 0.35
+    assert m.rho_max == 0.70 and m.per_entity_cap == 0.40 and m.suspicious_cohort_cap == 0.10
+    assert m.idle_cash_return == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Codex-flagged fixes: (a) no OOS look-ahead in leverage, (b) carried top-up cash conservation,
+# (c) gross budget = b0 x gross_cap fixed across folds, (d) G4 kill flattens carried.
+# --------------------------------------------------------------------------- #
+def test_expected_leverage_uses_pretest_not_test_actions(tmp_path):
+    # (a) NO LOOK-AHEAD: the allocation leverage must come from the PRETEST window [train_start,test_start)
+    # only. Loader returns lev=1.0 over pretest but a huge lev over the test fold; the gross budget must
+    # be sized off the pretest (1.0), so a single 500-margin position implies ~500 notional (1x), well
+    # under the 1500 budget -> NO gross trim. If the test-fold leverage (50x) had leaked in, the budget
+    # would bind hard and trim fire.
+    m06b, m08, m04, folds = _chained_inputs()
+    # keep just one entity so sizing is unambiguous
+    m06b = m06b[m06b.entity_id == 1].copy()
+    m08 = m08[m08.entity_id == 1].copy()
+    m04 = m04[m04.entity_id == 1].copy()
+    test_start_ms = pd.Timestamp("2025-01-01").value // 1_000_000
+
+    def loader(wallet, t0, t1):
+        if wallet is None:
+            return None
+        # t0 < test_start => pretest window (causal). t0 >= test_start => test fold.
+        exp = 1.0 if t0 < test_start_ms else 50.0
+        return pd.DataFrame({"target_exposure_pct": [exp, exp]})
+
+    eng = _FakeEng()
+    m = M9.M9Manifest(per_entity_cap=1.0)
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=loader,
+                             m=m, b0=500.0, out_dir=str(tmp_path))
+    fc = out["fold_caps_applied"][0]
+    # pretest leverage 1.0 -> implied gross ~= margin deployed (<=500) << 1500 budget -> NO trim.
+    assert fc["gross_trimmed_cash"] == pytest.approx(0.0)
+    assert fc["implied_gross_notional"] <= 500.0 + 1e-6
+    # sanity: had the 50x test-fold leverage leaked in, implied gross would be ~25000 and trim would fire.
+
+
+def test_chained_carried_topup_cash_conserved(tmp_path):
+    # (b) CASH CONSERVATION with a carried top-up across two folds. A winner carried into fold 1 may get a
+    # water-fill top-up; that margin must enter the carried subaccount (not vanish). With a flat (0-return)
+    # engine and no leverage, total equity must be conserved exactly == b0 every step, across BOTH folds.
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02", "pretest_start": "2024-12-02",
+         "pretest_end_excl": "2025-01-02", "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+    ])
+    # entity 1 in both folds (carried); entity 2 only in fold 1 (so fold-1 water-fill re-runs + tops up 1).
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+        {"entity_id": 2, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+        {"entity_id": 2, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+        {"entity_id": 2, "fold_id": 1, "primary_wallet": "0xbbb", "entity_tier": "CLEAN"},
+    ])
+    eng = _StateCheckingEng(ret_by_eid={1: 0.0, 2: 0.0})  # checks state-level conservation too
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+                             m=M9.M9Manifest(per_entity_cap=1.0), b0=500.0, out_dir=str(tmp_path))
+    assert out["final_equity"] == pytest.approx(500.0)    # no cash leaked by the carried top-up
+
+
+def test_chained_uses_fold_pure_primary_wallet(tmp_path):
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+         "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+         "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02",
+         "pretest_start": "2024-12-02", "pretest_end_excl": "2025-01-02",
+         "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+    ])
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0},
+        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 1.0},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0,
+         "tier": "ok", "max_survivable_slice": np.inf},
+        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0,
+         "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xfold0", "entity_tier": "CLEAN"},
+        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xfold1", "entity_tier": "CLEAN"},
+    ])
+    seen = []
+
+    def loader(wallet, t0, t1):
+        seen.append(wallet)
+        return pd.DataFrame({"target_exposure_pct": [1.0]})
+
+    M9.run_m09_chained(
+        m06b, m08, m04, folds, _FakeEng(), md=None, acts_loader=loader,
+        m=M9.M9Manifest(per_entity_cap=1.0), b0=500.0, out_dir=str(tmp_path),
+    )
+    assert "0xfold0" in seen and "0xfold1" in seen
+
+
+def test_dropped_entity_pays_boundary_exit_cost(tmp_path):
+    class Pos:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class ExitCostEngine(_FakeEng):
+        Position = Pos
+
+        def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                            start_state=None, entity_id=None, fold_id=None):
+            if start_state is not None and len(adf):
+                end_eq = start_equity - 10.0
+                return {
+                    "equity": [{"ts": end_ts_ms, "subaccount_equity": end_eq}],
+                    "ending_account_state": {"cross_collateral": {"main": end_eq},
+                                             "cooldown_until_ms": 0, "positions": {}},
+                    "summary": {"final_equity": end_eq},
+                }
+            return {
+                "equity": [{"ts": start_ts_ms, "subaccount_equity": start_equity},
+                           {"ts": end_ts_ms, "subaccount_equity": start_equity}],
+                "ending_account_state": {
+                    "cross_collateral": {"main": start_equity}, "cooldown_until_ms": 0,
+                    "positions": {"BTC": {"coin": "BTC", "szi": 1.0, "entry_px": 100.0,
+                                              "mode": "cross", "leverage": 10.0,
+                                              "cum_funding": 0.0, "isolated_margin": 0.0}},
+                },
+                "summary": {"final_equity": start_equity},
+            }
+
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01",
+         "pretest_start": "2024-12-01", "pretest_end_excl": "2025-01-01",
+         "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02",
+         "pretest_start": "2024-12-02", "pretest_end_excl": "2025-01-02",
+         "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+    ])
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0,
+         "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+    ])
+    out = M9.run_m09_chained(
+        m06b, m08, m04, folds, ExitCostEngine(), md=None,
+        acts_loader=_acts(1.0), m=M9.M9Manifest(per_entity_cap=1.0),
+        b0=500.0, out_dir=str(tmp_path),
+    )
+    assert out["final_equity"] == pytest.approx(490.0)
+
+
+def test_gross_budget_fixed_at_b0_across_folds(tmp_path):
+    # (c) gross budget must key off the FIXED bankroll b0, NOT live portfolio equity. A fold-0 winner that
+    # doubles equity must NOT enlarge the fold-1 gross budget. Both folds report gross_budget == b0*gross_cap.
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02", "pretest_start": "2024-12-02",
+         "pretest_end_excl": "2025-01-02", "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+    ])
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+                        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+    eng = _FakeEng(ret_by_eid={1: 1.0})                   # +100% fold-0: equity doubles going into fold 1
+    m = M9.M9Manifest(per_entity_cap=1.0)
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+                             m=m, b0=500.0, out_dir=str(tmp_path))
+    budgets = [fc["gross_budget"] for fc in out["fold_caps_applied"]]
+    assert budgets[0] == pytest.approx(1500.0)            # b0(500) * gross_cap(3)
+    assert budgets[1] == pytest.approx(1500.0)            # STILL b0-based despite equity now ~1000+
+
+
+def test_g4_kill_flattens_carried_to_cash(tmp_path):
+    # (d) On a G4 intra-fold breach (<=50% of fold-initial), carried positions are FLATTENED to cash at the
+    # breach -- NO post-kill recovery carried to the next fold. Engine returns a path that dips to 40% then
+    # recovers; the kill must freeze fold-end at the breach equity and carry NOTHING forward.
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+        {"fold_id": 1, "oos_chain_order": 1, "train_start": "2024-12-02", "pretest_start": "2024-12-02",
+         "pretest_end_excl": "2025-01-02", "test_start": "2025-01-02", "test_end_excl": "2025-01-03"},
+    ])
+    m06b = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+    ])
+    m08 = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+        {"entity_id": 1, "fold_id": 1, "survival_multiplier": 1.0, "tier": "ok", "max_survivable_slice": np.inf},
+    ])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+                        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+
+    class _DipEng(_FakeEng):
+        def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                            start_state=None, entity_id=None, fold_id=None):
+            if fold_id == 0:
+                # dip to 30% of start (breach) at mid then "recover" to 110% at end
+                mid = (start_ts_ms + end_ts_ms) // 2
+                return {
+                    "equity": [{"ts": start_ts_ms, "subaccount_equity": start_equity},
+                               {"ts": mid, "subaccount_equity": start_equity * 0.30},
+                               {"ts": end_ts_ms, "subaccount_equity": start_equity * 1.10}],
+                    "ending_account_state": {"cross_collateral": {"USDC": start_equity * 1.10},
+                                             "cooldown_until_ms": 0, "positions": {}},
+                    "summary": {"final_equity": start_equity * 1.10},
+                }
+            return super().step_subaccount(adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                                           start_state, entity_id, fold_id)
+
+    eng = _DipEng(ret_by_eid={1: 0.0})
+    m = M9.M9Manifest(per_entity_cap=1.0)
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+                             m=m, b0=500.0, out_dir=str(tmp_path))
+    f0 = out["per_fold"][0]
+    assert f0["g4_killed"] is True
+    assert f0["intervention"] == "g4_kill"
+    # fold-end frozen at the ~30% breach, NOT the 110% recovery
+    assert f0["fold_end_equity"] == pytest.approx(0.30 * f0["fold_initial"], rel=1e-6)
+    assert out["n_g4_kills"] == 1
+    # carried flattened to cash: fold 1 starts from the breach equity (~150), not the 550 recovery.
+    assert out["per_fold"][1]["fold_initial"] == pytest.approx(0.30 * f0["fold_initial"], rel=1e-6)
+
+
+def test_global_dd_before_g4_does_not_report_g4_kill(tmp_path):
+    # CAUSAL G4 DIAGNOSTIC (codex regression): global-DD (35%) breaches BEFORE a later (would-be) G4
+    # level (50%) in the same fold. The fold flattens at the EARLIER global-DD ts, so the deeper G4 dip
+    # never causally happens. intervention must be global_dd_derisk AND g4_killed must be False -- the
+    # post-flatten G4 must NOT be reported on the diagnostic (it is evaluated only on the causal path).
+    folds = pd.DataFrame([
+        {"fold_id": 0, "oos_chain_order": 0, "train_start": "2024-12-01", "pretest_start": "2024-12-01",
+         "pretest_end_excl": "2025-01-01", "test_start": "2025-01-01", "test_end_excl": "2025-01-02"},
+    ])
+    m06b = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5}])
+    m08 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok",
+                         "max_survivable_slice": np.inf}])
+    m04 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"},
+                        {"entity_id": 1, "fold_id": 1, "primary_wallet": "0xaaa", "entity_tier": "CLEAN"}])
+
+    class _GddThenG4Eng(_FakeEng):
+        def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                            start_state=None, entity_id=None, fold_id=None):
+            # peak at start; drop to 64% (36% DD > 35% -> global-DD fires) BEFORE the deeper drop to 40%
+            # (< 50% of fold-initial -> would be G4). global-DD ts is EARLIER -> it is the intervention.
+            mid = (start_ts_ms + end_ts_ms) // 2
+            return {
+                "equity": [{"ts": start_ts_ms, "subaccount_equity": start_equity},
+                           {"ts": mid, "subaccount_equity": start_equity * 0.64},        # global-DD breach
+                           {"ts": end_ts_ms, "subaccount_equity": start_equity * 0.40}],  # later G4 level
+                "ending_account_state": {"cross_collateral": {"USDC": start_equity * 0.40},
+                                         "cooldown_until_ms": 0, "positions": {}},
+                "summary": {"final_equity": start_equity * 0.40},
+            }
+
+    eng = _GddThenG4Eng(ret_by_eid={1: 0.0})
+    m = M9.M9Manifest(per_entity_cap=1.0)
+    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+                             m=m, b0=500.0, out_dir=str(tmp_path))
+    f0 = out["per_fold"][0]
+    assert f0["intervention"] == "global_dd_derisk"          # global-DD fired first
+    assert f0["g4_killed"] is False                          # post-flatten G4 NOT reported (causal)
+    assert out["n_g4_kills"] == 0
+    assert out["n_global_dd_derisks"] == 1
+    # diagnostics reflect only the causal path: G4 floor never causally breached
+    assert out["g4_no_kill"] is True
+    # fold frozen at the global-DD breach (~64%), NOT the deeper 40% G4 level
+    assert f0["fold_end_equity"] == pytest.approx(0.64 * f0["fold_initial"], rel=1e-6)
+
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15/test_m09_golden.py tests/v15/test_m09.py tests/v15/test_m10.py tests/v15/test_m10_golden.py' in /Users/hermes/quants-lab
+ succeeded in 2293ms:
+........................................................................ [ 80%]
+.................                                                        [100%]
+89 passed in 1.60s
+
+codex
+Focused tests pass in the project environment: 89 tests across M9/M10. I’m doing one direct runtime probe now that prints all top-level scalar values for NaN-path, winning, flat, and losing cases, plus the exact m10 verdict for `top_entity_pnl_share=1.0`.
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import sys, tempfile, math
+from pathlib import Path
+sys.path.insert(0, str(Path('research/v15').resolve()))
+sys.path.insert(0, str(Path('tests/v15').resolve()))
+import numpy as np, pandas as pd
+import v15_m09_sim as M9
+import v15_m10_gates as M10
+from test_m09 import _FakeEng
+
+class _NaNPathEng(_FakeEng):
+    def step_subaccount(self, adf, md, start_equity, params, end_ts_ms, start_ts_ms,
+                        start_state=None, entity_id=None, fold_id=None):
+        mid = (start_ts_ms + end_ts_ms) // 2
+        return {
+            'equity': [{'ts': start_ts_ms, 'subaccount_equity': start_equity},
+                       {'ts': mid, 'subaccount_equity': float('nan')},
+                       {'ts': end_ts_ms, 'subaccount_equity': start_equity}],
+            'ending_account_state': {'cross_collateral': {'USDC': start_equity}, 'cooldown_until_ms': 0, 'positions': {}},
+            'summary': {'final_equity': float('nan')},
+        }
+
+def inputs():
+    folds = pd.DataFrame([{'fold_id': 0, 'oos_chain_order': 0, 'train_start': '2024-12-01',
+                           'pretest_start': '2024-12-01', 'pretest_end_excl': '2025-01-01',
+                           'test_start': '2025-01-01', 'test_end_excl': '2025-01-02'}])
+    m06b = pd.DataFrame([{'entity_id': 1, 'fold_id': 0, 'in_pool': True, 'quality_weight': 1.0}])
+    m08 = pd.DataFrame([{'entity_id': 1, 'fold_id': 0, 'survival_multiplier': 1.0, 'tier': 'ok',
+                         'max_survivable_slice': np.inf}])
+    m04 = pd.DataFrame([{'entity_id': 1, 'fold_id': 0, 'primary_wallet': '0xaaa', 'entity_tier': 'CLEAN'}])
+    return m06b, m08, m04, folds
+
+def acts(wallet, t0, t1):
+    return None if wallet is None else pd.DataFrame({'target_exposure_pct': [1.0, 1.0]})
+
+numeric_scalar_keys = ('b0','chained_roe','max_chained_dd','chained_calmar','final_equity',
+                       'n_positive_folds','n_equity_rows','n_g4_kills','n_global_dd_derisks','top_entity_pnl_share')
+for name, eng in [('nan_path', _NaNPathEng()), ('winning', _FakeEng({1: 0.5})), ('flat', _FakeEng({1: 0.0})), ('losing', _FakeEng({1: -0.5}))]:
+    with tempfile.TemporaryDirectory() as d:
+        out = M9.run_m09_chained(*inputs(), eng, md=None, acts_loader=acts,
+                                 m=M9.M9Manifest(per_entity_cap=1.0), b0=500.0, out_dir=d)
+    vals = {k: out[k] for k in numeric_scalar_keys}
+    bad = {k: v for k, v in vals.items() if isinstance(v, (int,float,np.integer,np.floating)) and not np.isfinite(v)}
+    print(name, vals, 'nonfinite=', bad)
+
+m = M10.M10Manifest(expected_n_folds=1, n_null_dev=3)
+strat = dict(chained_roe=0.0, chained_calmar=0.0, max_chained_dd=0.0, top_entity_pnl_share=1.0,
+             n_folds=1, n_positive_folds=0, g4_no_kill=True, g4_all_folds_above_floor=True, g5_pool_ok=True)
+res = M10.evaluate_gates(strat, [0,0,0], [0,0,0], m)
+print('m10', res['verdict_kind'], res['greenlight'], res['gates']['G7'])
+PY" in /Users/hermes/quants-lab
+ succeeded in 672ms:
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l1dcachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l2cachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l3cachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.optional.neon'. Detail: [errno 1] Operation not permitted
+nan_path {'b0': 500.0, 'chained_roe': -1.0, 'max_chained_dd': 1.0, 'chained_calmar': -1.0, 'final_equity': 0.0, 'n_positive_folds': 0, 'n_equity_rows': 2, 'n_g4_kills': 1, 'n_global_dd_derisks': 0, 'top_entity_pnl_share': 1.0} nonfinite= {}
+winning {'b0': 500.0, 'chained_roe': 0.5, 'max_chained_dd': 0.0, 'chained_calmar': 499999999.99999994, 'final_equity': 750.0, 'n_positive_folds': 1, 'n_equity_rows': 2, 'n_g4_kills': 0, 'n_global_dd_derisks': 0, 'top_entity_pnl_share': 1.0} nonfinite= {}
+flat {'b0': 500.0, 'chained_roe': 0.0, 'max_chained_dd': 0.0, 'chained_calmar': 0.0, 'final_equity': 500.0, 'n_positive_folds': 0, 'n_equity_rows': 2, 'n_g4_kills': 0, 'n_global_dd_derisks': 0, 'top_entity_pnl_share': 1.0} nonfinite= {}
+losing {'b0': 500.0, 'chained_roe': -0.5, 'max_chained_dd': 0.5, 'chained_calmar': -1.0, 'final_equity': 250.0, 'n_positive_folds': 0, 'n_equity_rows': 2, 'n_g4_kills': 1, 'n_global_dd_derisks': 0, 'top_entity_pnl_share': 1.0} nonfinite= {}
+m10 development_verdict no {'gate': 'G7', 'pass': False, 'top_entity_pnl_share': 1.0, 'under_cap': False, 'conservative_ablation_passes_g1_g3_g6': False, 'ablation_detail': None}
+
+codex
+The direct probe found no non-finite numeric top-level scalars in any of the four exercised paths. One expected note: single-entity winning also has top share `1.0`, so it is finite but still maximally concentrated for G7.
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest -q tests/v15' in /Users/hermes/quants-lab
+ succeeded in 5835ms:
+........................................................................ [ 18%]
+........................................................................ [ 36%]
+........................................................................ [ 54%]
+........................................................................ [ 72%]
+........................................................................ [ 90%]
+........................................                                 [100%]
+400 passed in 5.34s
+
+codex
+Verdict: PASS.
+
+I verified [v15_m09_sim.py](/Users/hermes/quants-lab/research/v15/v15_m09_sim.py:793) and [test_m09_golden.py](/Users/hermes/quants-lab/tests/v15/test_m09_golden.py:136). The `top_entity_pnl_share` leak is closed: losing/flat with entity PnL now emits finite `1.0`, not `inf`; no-entity still emits `0.0`.
+
+Checks run:
+- Focused M9/M10 tests: `89 passed`
+- Full v15 suite: `400 passed`
+- Direct smoke for NaN-engine path, winning, flat, losing: no non-finite numeric top-level scalar outputs.
+- m10 with `top_entity_pnl_share=1.0`: validation accepts it, then G7 fails because `1.0 > 0.40`.
+
+No new bug or regression found. The only caveat is conceptual: `1.0` means “max concentration sentinel,” so a single-entity winner is also G7-concentrated, which is expected.
+
+OVERALL: yes, m09 is fail-CLOSED, look-ahead-safe, every relevant numeric output finite, and ready to mark TRUSTED. Nothing remains from this audit round.
+tokens used
+51.867
+Verdict: PASS.
+
+I verified [v15_m09_sim.py](/Users/hermes/quants-lab/research/v15/v15_m09_sim.py:793) and [test_m09_golden.py](/Users/hermes/quants-lab/tests/v15/test_m09_golden.py:136). The `top_entity_pnl_share` leak is closed: losing/flat with entity PnL now emits finite `1.0`, not `inf`; no-entity still emits `0.0`.
+
+Checks run:
+- Focused M9/M10 tests: `89 passed`
+- Full v15 suite: `400 passed`
+- Direct smoke for NaN-engine path, winning, flat, losing: no non-finite numeric top-level scalar outputs.
+- m10 with `top_entity_pnl_share=1.0`: validation accepts it, then G7 fails because `1.0 > 0.40`.
+
+No new bug or regression found. The only caveat is conceptual: `1.0` means “max concentration sentinel,” so a single-entity winner is also G7-concentrated, which is expected.
+
+OVERALL: yes, m09 is fail-CLOSED, look-ahead-safe, every relevant numeric output finite, and ready to mark TRUSTED. Nothing remains from this audit round.
