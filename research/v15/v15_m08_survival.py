@@ -99,6 +99,13 @@ def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dic
     big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
     base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
             "stress_max_dd": big["max_dd"]}
+    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
+    # happens when the action stream is empty / fully filtered, OR when every action has NaN/invalid sizing so
+    # M7 skips it. Such a wallet must NOT come out "survived / full_weight" on unchanged start equity. Fail
+    # closed to KILL (data-gap) so it is excluded from the live cohort.
+    if int(big.get("n_fills", 0)) == 0:
+        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
+                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
     heavy = big["indeterminate_frac"] > m.indeterminate_heavy_frac
     if not big["wiped"]:
         return {"tier": "uncertain" if heavy else "full_weight", "survival_outcome": "survived",
@@ -106,8 +113,11 @@ def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dic
     # wiped at pre_m8_max -> the MIN-size probe decides KILL vs copyability (codex r1#2: KILL only when
     # even the smallest positive slice fails -- min is the smallest, so min-wipe == no slice survives).
     mn = _run_stress(actions, md, m.min_slice_capital, t0, t1, m)
-    if mn["wiped"]:
-        return {"tier": "kill", "survival_outcome": "ruin_at_min_size",
+    # codex completion (2026-07-10): the min probe must also have EVIDENCE. `wiped=False` on a zero-fill min run
+    # is evidence-less "survival" -> KILL, not copyability_fail (which would leak a 0.25/1.0 multiplier).
+    if mn["wiped"] or int(mn.get("n_fills", 0)) == 0:
+        return {"tier": "kill",
+                "survival_outcome": ("ruin_at_min_size" if mn["wiped"] else "no_fills_at_min_data_gap"),
                 "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
     # survives at min -> copyability SIZING signal, tier stays survival-OK (codex r1#1: NOT downgraded).
     # refine max_survivable with a smaller-slice probe ONLY if it sits ABOVE min (codex r2#1: never
@@ -116,7 +126,7 @@ def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dic
     surv_slice = m.min_slice_capital
     if smaller > m.min_slice_capital:
         small = _run_stress(actions, md, smaller, t0, t1, m)
-        if not small["wiped"]:
+        if not small["wiped"] and int(small.get("n_fills", 0)) > 0:  # codex: only raise the slice on real evidence
             surv_slice = smaller
     return {"tier": "uncertain" if heavy else "full_weight",
             "survival_outcome": "copyability_fail_at_stress",
@@ -233,7 +243,7 @@ def _load_m04_entities(data_dir: Path, folds: pd.DataFrame, m04_dir: Optional[Pa
 
 def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optional[str] = None,
             limit: Optional[int] = None, pool_path: Optional[Path] = None,
-            m04_dir: Optional[Path] = None) -> dict:
+            m04_dir: Optional[Path] = None, allow_global_m04: bool = False) -> dict:
     """Tier the M6b INVESTABLE POOL: per pooled (entity, fold) run the counterfactual-survival
     primitive (M7 stress) + inferential scorers (phase-2 stub) -> tier; emit m08_tiers + attribution."""
     import pyarrow.dataset as ds
@@ -249,6 +259,15 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
             "provisional/uncalibrated ranking (or a non-bool column) cannot be tiered for deployment"
         )
     folds = pd.read_parquet(data_dir / "m03_folds.parquet")
+    # AUDIT 2026-07-10 (codex P0#3): the global m04_entities.parquet maps entity->primary_wallet using
+    # FULL-history (post-decision) knowledge = look-ahead. A deployable M8 must use fold-pure per-fold M4
+    # (--m04-dir, provenance-checked below). Fail closed unless the caller EXPLICITLY opts into the global
+    # diagnostic path (allow_global_m04=True), which must never feed a live cohort.
+    if m04_dir is None and not allow_global_m04:
+        raise ValueError(
+            "M8 look-ahead guard: --m04-dir (fold-pure M4) is REQUIRED for a deployable/trusted run. The global "
+            "m04_entities.parquet uses future entity->wallet knowledge. Pass fold-pure per-fold M4, or set "
+            "allow_global_m04=True ONLY for a non-deployment diagnostic.")
     ent, m04_fold_pure = _load_m04_entities(data_dir, folds, m04_dir)
     fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
                                  pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()}
@@ -308,10 +327,26 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
             m4_conf = 0.0
         else:
             m4_conf = conf_map[_tier]
-        pre_max_raw = entity_pre_m8_max(r.quality_weight, m4_conf, m)   # codex r1#4: store the RAW formula
-        # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
-        # gets a meaningful stress test; the RAW value is persisted unchanged.
-        sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
+        # AUDIT 2026-07-10 fail-closed guards BEFORE the survival stress:
+        # P1#7: a KILL / non-canonical M4 tier (m4_conf == 0) must produce a KILL survival tier, not just a
+        #       zeroed size. Previously m4_conf=0 only zeroed pre_max_raw, which got bumped to min_slice and the
+        #       stress could still emit uncertain/full_weight (0.25/1.0 multiplier). Force kill here.
+        # P1#6: a non-finite quality_weight (NaN) would make pre_max_raw NaN -> NaN stress equity -> `final<=0`
+        #       is False for NaN -> the row could "survive" with a nonsensical slice. Fail closed to kill.
+        qw = r.quality_weight
+        qw_ok = isinstance(qw, (int, float, np.integer, np.floating)) and not isinstance(qw, bool) \
+            and np.isfinite(qw) and qw > 0
+        if m4_conf <= 0.0 or not qw_ok:
+            reason = "m4_kill_or_noncanonical" if m4_conf <= 0.0 else "nonfinite_quality_weight"
+            sv = {"tier": "kill", "survival_outcome": f"fail_closed_{reason}",
+                  "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+                  "indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+            pre_max_raw = 0.0
+        else:
+            pre_max_raw = entity_pre_m8_max(qw, m4_conf, m)   # codex r1#4: store the RAW formula
+            # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
+            # gets a meaningful stress test; the RAW value is persisted unchanged.
+            sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
         sc = inferential_scorers(int(r.entity_id), fid)
         final_tier = _worst_tier(sv["tier"], sc)
         mult = {"kill": m.mult_kill, "suspicious": m.mult_suspicious,
@@ -360,7 +395,9 @@ def main():
     ap.add_argument("--slip-calib", default=str(DATA_DIR / "slippage_calib_v11.json"))
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--m04-dir", default=None,
-                    help="directory with fold-pure m04_entities_f{fold_id}.parquet")
+                    help="directory with fold-pure m04_entities_f{fold_id}.parquet (REQUIRED for a trusted run)")
+    ap.add_argument("--allow-global-m04", action="store_true",
+                    help="opt into the look-ahead global m04_entities.parquet — DIAGNOSTIC ONLY, never for deployment")
     ap.add_argument("--nominal-capital", type=float, default=10_000.0,
                     help="bankroll scale for absolute survival stress slices (default: 10000.0)")
     ap.add_argument(
@@ -375,7 +412,8 @@ def main():
         fixed_target_exposure=args.fixed_target_exposure,
     )
     run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
-            limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None)
+            limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None,
+            allow_global_m04=args.allow_global_m04)
 
 
 if __name__ == "__main__":

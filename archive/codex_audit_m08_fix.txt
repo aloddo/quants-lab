@@ -1,0 +1,1821 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4bcd-2401-7ce1-bed0-757989068254
+--------
+user
+# Verify m08 clear-cut fixes (5 of the audited findings)
+
+You audited v15_m08_survival (4 P0 + 4 P1). I applied the 5 fixes that do NOT need a design decision (the P0#1
+staleness rule is design-gated on Alberto). Read research/v15/v15_m08_survival.py + tests/v15/test_m08_golden.py.
+
+## Fixes applied
+- P0#2 + P0#4 (empty/filtered stream OR NaN sizing -> 0 fills -> "survived"): survival_tier now, right after the
+  big-slice stress, returns tier="kill"/survival_outcome="no_fills_data_gap" if big["n_fills"]==0. No replayable
+  survival evidence => fail closed.
+- P1#7 (KILL/non-canonical M4 tier m4_conf==0 was only zeroing size, still emitted uncertain/full_weight): the
+  run loop now, when m4_conf<=0, sets sv=kill and SKIPS the stress. (also P1#6 below shares this block)
+- P1#6 (non-finite quality_weight -> NaN equity -> row "survives"): same block requires finite qw>0, else kill.
+- P0#3 (default global m04_entities.parquet is look-ahead: future entity->wallet map): run_m08 now RAISES if
+  m04_dir is None unless allow_global_m04=True (a --allow-global-m04 diagnostic-only flag). Fold-pure per-fold M4
+  with strict as_of_ms==test_start provenance is required for a trusted run.
+- (already committed) P1#5 investable bool-dtype; P1#8 unknown-fold raise.
+Golden test tests/v15/test_m08_golden.py: n_fills==0 -> kill; nonzero -> survived; run_m08 w/o m04-dir raises
+"look-ahead". 15 m08 tests + full v15 suite pass. Engine untouched.
+
+## Questions
+- Are the 5 fixes correct + complete for their findings? Any path where a stale-evidence / NaN / KILL-tier /
+  global-M4 wallet still comes out survived with a nonzero multiplier?
+- The m4_conf<=0 block sets pre_max_raw=0 and sv=kill; is bypassing survival_tier entirely correct (vs running
+  it), and does the downstream `_worst_tier(sv["tier"], sc)` + row assembly still work with sv lacking the
+  stress_* fields (I set them to None)?
+- REMAINING (not in this commit): P0#1 = m08 has NO staleness/persistence rule (inactive-180d wallet survives) —
+  design-gated on Alberto's cutoff. Confirm that is the only material trust hole left after these 5.
+
+## Output
+Verdict per fix (correct?/gap?). End OVERALL: with these 5 landed, what remains before m08 is trustworthy
+(expected: only the staleness rule).
+codex
+I’ll re-review this as a verification pass, not implement changes unless the code shows a clear breakage. I’ll read the target module and golden tests first, then trace the specific branches you called out.
+exec
+/bin/zsh -lc "sed -n '260,620p' research/v15/v15_m08_survival.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '1,260p' tests/v15/test_m08_golden.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '1,260p' research/v15/v15_m08_survival.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M8 -- Survival / Danger Tiering (post-engine). M8-v1 = the COUNTERFACTUAL-SURVIVAL primitive
+(the design centerpiece) + tier mapping + the M4/M8 tier-contribution attribution Alberto requested
+(decisions/2026-06-01-m9-m10-manifest-freeze). The INFERENTIAL scorers (off-platform-hedge smell,
+on-chain funder provenance, carry-timing, behavioral linkage) are PHASE-2 here -- they have open
+data-availability questions (design modules/m08 Q3/Q4) and are emitted as deterministic no_flag stubs
+with the contract in place, so the tier is currently survival-driven (mechanical, provable).
+
+Design: brain projects/quant/v15/modules/m08 (codex DESIGN-SHIP r2, Alberto greenlit 2026-06-01).
+ROLE: "is this entity DANGEROUS to copy?" -> coarse pessimistic CONFIDENCE TIER
+{kill 0 / suspicious <=0.10 / uncertain <=0.25 / full_weight 1.0} = the SURVIVAL multiplier in the
+sizing chain (M9 composes). Runs on the M6b INVESTABLE POOL only (small set -> M7 stress sims cheap).
+
+Run:
+  python research/v15/v15_m08_survival.py --m07-dir app/data/v15/m07_pretest --out app/data/v15
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from dataclasses import dataclass, asdict, replace
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger("m08")
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import v15_m07_engine as E  # noqa: E402
+
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15"
+
+
+@dataclass(frozen=True)
+class M8Manifest:
+    manifest_version: str = "m08-v1"
+    # tier survival multipliers (frozen; decisions/2026-06-01-m9-m10-manifest-freeze)
+    mult_kill: float = 0.0
+    mult_suspicious: float = 0.10
+    mult_uncertain: float = 0.25
+    mult_full_weight: float = 1.0
+    suspicious_cohort_cap: float = 0.10        # <=10% of portfolio (enforced in M9)
+    # stress run params (design §3)
+    stress_slippage_band: str = "high"
+    stress_adl: bool = True
+    # entity_pre_m8_max = M6b_quality x M4_confidence x 1.0(survival placeholder) x M9_static_cap.
+    m9_static_per_entity_cap: float = 0.10     # the pre-M9 static cap (NOT the suspicious-cohort cap)
+    # Survival/ruin verdicts are bankroll-scale-dependent; production should pass the real bankroll.
+    nominal_capital: float = 10_000.0          # reference bankroll for the absolute stress slice
+    # multi-slice survival probe (design §3): test at the pre-M8 max, a smaller slice, and the min size
+    smaller_slice_frac: float = 0.25           # "survives at a smaller slice" probe
+    min_slice_capital: float = 50.0            # ~ min deployable subaccount (HL min-notional regime)
+    inferential_layer_active: bool = False
+    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
+    fixed_target_exposure: float = 0.10
+    # outcome -> tier
+    indeterminate_heavy_frac: float = 0.25     # >this share of indeterminate minutes -> cap at UNCERTAIN
+
+
+TIER_ORDER = {"kill": 0, "suspicious": 1, "uncertain": 2, "full_weight": 3}
+TIER_MULT = None  # set per-manifest
+
+
+def _run_stress(actions: pd.DataFrame, md: E.MarketData, start_equity: float, t0: int, t1: int,
+                m: M8Manifest) -> dict:
+    """One counterfactual-survival run: M7 at the STRESS slice (high slippage + adl, causal carry-in,
+    NO source top-ups -- the replica lives on its slice + PnL). Returns the typed outcome."""
+    params = E.EngineParams(
+        slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
+        start_policy="causal_carry_in", sizing_mode=m.sizing_mode,
+        fixed_target_exposure=m.fixed_target_exposure,
+    )
+    res = E.step_subaccount(actions, md, start_equity, params, end_ts_ms=t1, start_ts_ms=t0)
+    s = res["summary"]
+    window_min = max((t1 - t0) / 60_000.0, 1.0)
+    wiped = bool(s["ruin"]) or s["n_backstop_transfer"] > 0 or s["final_equity"] <= 0
+    return {
+        "wiped": wiped, "ruin": bool(s["ruin"]), "backstop": s["n_backstop_transfer"] > 0,
+        "account_ruin": "account_ruin" in s["outcome_states"], "final_equity": s["final_equity"],
+        "roe": s["roe_engine"], "max_dd": s["max_dd"], "time_to_ruin_ms": s["time_to_ruin_ms"],
+        "n_fills": s["n_fills"],
+        # codex r1#3: indeterminate MINUTES / simulated window MINUTES (not / action count).
+        "indeterminate_frac": (s.get("n_indeterminate_minutes", 0) / window_min),
+    }
+
+
+def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dict:
+    """Counterfactual-survival -> mechanical tier + sizing signals (design §1/§3; codex r1#1,#2).
+    - survives at pre_m8_max -> full_weight (UNCERTAIN only if indeterminate-heavy).
+    - wiped at pre_m8_max BUT survives at the MINIMUM tradable size -> copyability_fail_at_stress: a
+      SIZING signal (M9 clamps the max slice); the tier stays SURVIVAL-OK = full_weight (the wallet
+      isn't dangerous, our chosen slice was too big -- NOT downgraded). max_survivable_slice refined by
+      the smaller-slice probe.
+    - wiped even at the MINIMUM size (no positive slice survives) -> KILL (mechanical).
+    Inferential SUSPICIOUS/UNCERTAIN downgrades are applied SEPARATELY (§4 scorers via _worst_tier)."""
+    big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
+    base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
+            "stress_max_dd": big["max_dd"]}
+    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
+    # happens when the action stream is empty / fully filtered, OR when every action has NaN/invalid sizing so
+    # M7 skips it. Such a wallet must NOT come out "survived / full_weight" on unchanged start equity. Fail
+    # closed to KILL (data-gap) so it is excluded from the live cohort.
+    if int(big.get("n_fills", 0)) == 0:
+        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
+                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+    heavy = big["indeterminate_frac"] > m.indeterminate_heavy_frac
+    if not big["wiped"]:
+        return {"tier": "uncertain" if heavy else "full_weight", "survival_outcome": "survived",
+                "copyability_fail_at_stress": False, "max_survivable_slice": pre_m8_max_capital, **base}
+    # wiped at pre_m8_max -> the MIN-size probe decides KILL vs copyability (codex r1#2: KILL only when
+    # even the smallest positive slice fails -- min is the smallest, so min-wipe == no slice survives).
+    mn = _run_stress(actions, md, m.min_slice_capital, t0, t1, m)
+    if mn["wiped"]:
+        return {"tier": "kill", "survival_outcome": "ruin_at_min_size",
+                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+    # survives at min -> copyability SIZING signal, tier stays survival-OK (codex r1#1: NOT downgraded).
+    # refine max_survivable with a smaller-slice probe ONLY if it sits ABOVE min (codex r2#1: never
+    # probe below the min slice -- min already survived, so the floor is min_slice_capital).
+    smaller = pre_m8_max_capital * m.smaller_slice_frac
+    surv_slice = m.min_slice_capital
+    if smaller > m.min_slice_capital:
+        small = _run_stress(actions, md, smaller, t0, t1, m)
+        if not small["wiped"]:
+            surv_slice = smaller
+    return {"tier": "uncertain" if heavy else "full_weight",
+            "survival_outcome": "copyability_fail_at_stress",
+            "copyability_fail_at_stress": True, "max_survivable_slice": surv_slice, **base}
+
+
+# --------------------------------------------------------------------------- #
+# INFERENTIAL SCORERS -- PHASE 2 (deterministic contract; open data questions Q3/Q4). Stubbed no_flag.
+# --------------------------------------------------------------------------- #
+def inferential_scorers(entity_id, fold_id) -> dict:
+    """Each scorer returns one of {no_flag, uncertain, suspicious} + reason + source_module=M8_new.
+    PHASE 2: off-platform-hedge-smell, funder-provenance, carry-timing, behavioral-linkage. Stubbed to
+    no_flag (the inferential layer is NOT yet active -> tier is survival-driven only). The WORST tier
+    any scorer assigns wins; never auto-KILL (inferential -> at most SUSPICIOUS)."""
+    return {"hedge_smell": "no_flag", "funder_provenance": "no_flag",
+            "carry_timing": "no_flag", "behavioral_linkage": "no_flag",
+            "funder_provenance_unavailable": True, "scorers_phase": "phase2_stub"}
+
+
+def _worst_tier(survival_tier_name: str, scorer_out: dict) -> str:
+    """WORST (lowest) tier wins. Inferential suspicious/uncertain can only DOWNGRADE, never KILL."""
+    tier = survival_tier_name
+    # phase2_stub means the inferential layer is inactive: a stubbed no_flag is only "not scored",
+    # not verified clean. Cap its contribution at UNCERTAIN instead of silently granting full weight.
+    no_flag_tier = "uncertain" if scorer_out.get("scorers_phase") == "phase2_stub" else "full_weight"
+    sev = {"no_flag": no_flag_tier, "uncertain": "uncertain", "suspicious": "suspicious"}
+    for k in ("hedge_smell", "funder_provenance", "carry_timing", "behavioral_linkage"):
+        cand = sev.get(scorer_out.get(k, "no_flag"), "full_weight")
+        if TIER_ORDER[cand] < TIER_ORDER[tier]:
+            tier = cand
+    return tier
+
+
+# --------------------------------------------------------------------------- #
+# TIER-CONTRIBUTION ATTRIBUTION (Alberto #4): ROE + key metrics by M4 tier AND M8 tier.
+# --------------------------------------------------------------------------- #
+def tier_attribution(tiers: pd.DataFrame, m07_summary: pd.DataFrame) -> pd.DataFrame:
+    """Per (tier_axis, tier_value): n_entities, mean/median ROE, win-rate, ruin-rate, PnL share.
+    Lets us SEE whether down-weighted/killed cohorts actually underperformed (label right) or were
+    good (over-penalizing -> discarding alpha)."""
+    # Degenerate-pool guard (2026-06-04): an empty tier set (e.g. zero pooled seats in a smoke or a
+    # fold with no eligible entities) is an empty DataFrame with NO columns, so the merge-key lookup
+    # raises KeyError. Return empty attribution instead of crashing the chain.
+    if tiers.empty or not {"entity_id", "fold_id"}.issubset(tiers.columns):
+        return pd.DataFrame()
+    df = tiers.merge(m07_summary[["entity_id", "fold_id", "roe_engine", "ruin"]],
+                     on=["entity_id", "fold_id"], how="left")
+    # codex r1#5: a tiered entity with NO M7 row is a DATA GAP -> do NOT silently treat as roe=0; flag,
+    # exclude from the metrics, and surface n_missing per group (a metric over phantom 0s hides
+    # discarded alpha / missing runner coverage).
+    df["_missing_m07"] = df["roe_engine"].isna()
+    n_missing_total = int(df["_missing_m07"].sum())
+    if n_missing_total:
+        logger.warning("M8 attribution: %d tiered (entity,fold) rows have NO M07 summary -> excluded "
+                       "from metrics + flagged (data gap, not roe=0)", n_missing_total)
+    rows = []
+    present = df[~df["_missing_m07"]]
+    total_pnl = present["roe_engine"].clip(lower=-1.0).sum()
+    for axis, col in (("m4_tier", "m4_tier"), ("m8_tier", "tier")):
+        if col not in df.columns:
+            continue
+        for val, g in df.groupby(col):
+            gp = g[~g["_missing_m07"]]
+            rows.append({
+                "tier_axis": axis, "tier": val, "n_entities": len(g),
+                "n_missing_m07": int(g["_missing_m07"].sum()),
+                "mean_roe": round(float(gp["roe_engine"].mean()), 4) if len(gp) else None,
+                "median_roe": round(float(gp["roe_engine"].median()), 4) if len(gp) else None,
+                "win_rate": round(float((gp["roe_engine"] > 0).mean()), 4) if len(gp) else None,
+                "ruin_rate": round(float(gp["ruin"].fillna(False).mean()), 4) if len(gp) else None,
+                "pnl_share": round(float(gp["roe_engine"].sum() / total_pnl), 4) if (len(gp) and total_pnl) else 0.0,
+            })
+    return pd.DataFrame(rows)
+
+
+def entity_pre_m8_max(quality_weight, m4_confidence, m: M8Manifest) -> float:
+    """The largest slice the system could deploy BEFORE M8 down-weights (design §3; EXCLUDES the
+    M8 survival multiplier, the suspicious cohort cap, and anti-corr). = M6b quality x M4 confidence x
+    1.0 (survival placeholder) x M9 static per-entity cap, as an absolute capital on nominal_capital."""
+    return float(quality_weight) * float(m4_confidence) * 1.0 * m.m9_static_per_entity_cap * m.nominal_capital
+
+
+def _load_m04_entities(data_dir: Path, folds: pd.DataFrame, m04_dir: Optional[Path]) -> tuple[pd.DataFrame, bool]:
+    """Load M4 entity tiers. Fold-pure mode requires exact as_of_ms == fold test_start."""
+    cols = ["entity_id", "primary_wallet", "entity_tier"]
+    if m04_dir is None:
+        logger.warning("LOUD WARNING: using single global m04_entities.parquet for all M8 folds; "
+                       "M8 M4 confidence is NOT fold-pure. Pass --m04-dir to load m04_entities_f{fold}.parquet.")
+        return pd.read_parquet(data_dir / "m04_entities.parquet")[cols], False
+
+    fold_test_start_ms = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000
+                          for r in folds.itertuples()}
+    parts = []
+    for fid in sorted(fold_test_start_ms):
+        p = Path(m04_dir) / f"m04_entities_f{fid}.parquet"
+        if not p.exists():
+            raise FileNotFoundError(f"missing fold-pure M4 entities for fold {fid}: {p}")
+        df = pd.read_parquet(p).copy()
+        missing = [c for c in (*cols, "as_of_ms") if c not in df.columns]
+        if missing:
+            raise ValueError(f"M8 PROVENANCE FAIL-CLOSED: {p} missing columns {missing}")
+        n_null = int(df["as_of_ms"].isna().sum())
+        if n_null:
+            raise ValueError(f"M8 PROVENANCE FAIL-CLOSED: {p} has {n_null} null as_of_ms rows")
+        expected = float(fold_test_start_ms[fid])
+        bad = df["as_of_ms"].astype("float64") != expected
+        if bad.any():
+            raise ValueError(f"M8 PROVENANCE FAIL-CLOSED: {p} has {int(bad.sum())} rows "
+                             f"with as_of_ms != fold {fid} test_start ({int(expected)})")
+        df["fold_id"] = int(fid)
+        parts.append(df[[*cols, "as_of_ms", "fold_id"]])
+    return (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=[*cols, "as_of_ms", "fold_id"])), True
+
+
+def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optional[str] = None,
+            limit: Optional[int] = None, pool_path: Optional[Path] = None,
+            m04_dir: Optional[Path] = None, allow_global_m04: bool = False) -> dict:
+    """Tier the M6b INVESTABLE POOL: per pooled (entity, fold) run the counterfactual-survival
+    primitive (M7 stress) + inferential scorers (phase-2 stub) -> tier; emit m08_tiers + attribution."""
+    import pyarrow.dataset as ds
+    pp = Path(pool_path) if pool_path else (data_dir / "m06b_pool.parquet")
+    pool = pd.read_parquet(pp)
+    pool = pool[pool["in_pool"]].copy()
+    # AUDIT 2026-07-10 (codex P1#5): require a real BOOLEAN dtype. `fillna(False).all()` treated truthy strings
+    # (e.g. the literal "False") as True, so a corrupted/provisional pool could be tiered for deployment.
+    if "investable" not in pool.columns or not pd.api.types.is_bool_dtype(pool["investable"]) \
+            or not bool(pool["investable"].all()):
+        raise ValueError(
+            "M8 requires an investable M6b pool with a boolean `investable` column all True; "
+            "provisional/uncalibrated ranking (or a non-bool column) cannot be tiered for deployment"
+        )
+    folds = pd.read_parquet(data_dir / "m03_folds.parquet")
+    # AUDIT 2026-07-10 (codex P0#3): the global m04_entities.parquet maps entity->primary_wallet using
+    # FULL-history (post-decision) knowledge = look-ahead. A deployable M8 must use fold-pure per-fold M4
+
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m08_survival trust-audit fixes (2026-07-10).
+
+Locks the fail-closed behaviours so a stale / evidence-less / look-ahead-sourced wallet cannot come out
+"survived" and slip into the live cohort:
+- P0#2/#4: a stress run with ZERO fills (empty/filtered stream or NaN sizing skipped by M7) -> KILL data-gap,
+- P0#3: run_m08 without fold-pure --m04-dir (the global M4 map is look-ahead) fails closed unless explicitly
+  opted into the diagnostic path.
+(The run-loop guards m4_conf==0 -> kill and non-finite quality_weight -> kill are additionally codex-reviewed.)
+"""
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m08_survival as M8
+
+M = M8.M8Manifest()
+T0 = 1_700_000_000_000
+DAY = 86_400_000
+
+
+def _stub(monkeypatch, outcomes):
+    seq = iter(outcomes)
+
+    def fake(actions, md, cap, t0, t1, m):
+        wiped, n_fills = next(seq)
+        return {"wiped": wiped, "ruin": wiped, "backstop": False, "account_ruin": False,
+                "final_equity": (0.0 if wiped else cap), "roe": 0.0, "max_dd": 0.0,
+                "time_to_ruin_ms": None, "n_fills": n_fills, "indeterminate_frac": 0.0}
+    monkeypatch.setattr(M8, "_run_stress", fake)
+
+
+def test_p0_zero_fills_fail_closed_to_kill(monkeypatch):
+    # first (big-slice) run has n_fills=0 -> no replayable survival evidence -> KILL, not "survived".
+    _stub(monkeypatch, [(False, 0)])
+    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+    assert out["tier"] == "kill"
+    assert out["survival_outcome"] == "no_fills_data_gap"
+    assert out["max_survivable_slice"] == 0.0
+
+
+def test_nonzero_fills_still_survives(monkeypatch):
+    # sanity: with real fills and not wiped, the module still returns survived (fix is narrow).
+    _stub(monkeypatch, [(False, 12)])
+    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+    assert out["tier"] in ("full_weight", "uncertain") and out["survival_outcome"] == "survived"
+
+
+def test_p0_3_global_m04_lookahead_fails_closed(tmp_path):
+    # run_m08 must refuse the look-ahead global M4 path unless allow_global_m04=True. It reaches the guard
+    # after loading the pool + folds, so provide minimal parquets; the guard should raise before M4 load.
+    d = tmp_path
+    pool = pd.DataFrame({"entity_id": [1], "fold_id": [1], "in_pool": [True], "investable": [True]})
+    pool.to_parquet(d / "m06b_pool.parquet")
+    folds = pd.DataFrame({"fold_id": [1], "train_start": [pd.Timestamp("2026-01-01")],
+                          "test_start": [pd.Timestamp("2026-02-12")]})
+    folds.to_parquet(d / "m03_folds.parquet")
+    with pytest.raises(ValueError, match="look-ahead"):
+        M8.run_m08(d, d, M, m04_dir=None, allow_global_m04=False)
+
+ succeeded in 0ms:
+    # FULL-history (post-decision) knowledge = look-ahead. A deployable M8 must use fold-pure per-fold M4
+    # (--m04-dir, provenance-checked below). Fail closed unless the caller EXPLICITLY opts into the global
+    # diagnostic path (allow_global_m04=True), which must never feed a live cohort.
+    if m04_dir is None and not allow_global_m04:
+        raise ValueError(
+            "M8 look-ahead guard: --m04-dir (fold-pure M4) is REQUIRED for a deployable/trusted run. The global "
+            "m04_entities.parquet uses future entity->wallet knowledge. Pass fold-pure per-fold M4, or set "
+            "allow_global_m04=True ONLY for a non-deployment diagnostic.")
+    ent, m04_fold_pure = _load_m04_entities(data_dir, folds, m04_dir)
+    fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
+                                 pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()}
+    conf_map = {"CLEAN": 1.0, "UNCERTAIN": 0.25, "SUSPICIOUS": 0.10, "KILL": 0.0}
+    pool = pool.merge(ent, on=["entity_id", "fold_id"] if m04_fold_pure else ["entity_id"], how="left")
+    if m04_fold_pure:
+        # FAIL-CLOSED provenance (codex M8 re-review): in fold-pure mode every pooled (entity_id, fold_id)
+        # MUST have a matching fold-pure M4 entity row. A left-merge miss would silently become str(NaN)->
+        # default 0.25 confidence (m4_tier="nan"). Refuse to proceed instead of fabricating confidence.
+        _missing = pool[pool["entity_tier"].isna()]
+        if len(_missing):
+            _ex = _missing[["entity_id", "fold_id"]].head(3).to_dict("records")
+            raise ValueError(
+                f"M8 fold-pure M4 provenance: {len(_missing)} pooled (entity_id,fold_id) rows lack a "
+                f"fold-pure M4 entity row (e.g. {_ex}). Rebuild per-fold M4 via build_m4_perfold.sh so "
+                f"every pooled entity-fold is covered. Fail-closed (no fabricated confidence).")
+    if not m.inferential_layer_active:
+        logger.warning("LOUD WARNING: M8 inferential layer is inactive (phase2_stub); stubbed no_flag "
+                       "is capped at uncertain and must not be read as verified-safe.")
+
+    md = E.MarketData(allow_mongo=True)
+    if slip_calib_path:
+        cal = json.loads(Path(slip_calib_path).read_text())
+        per_fold = {int(k): v for k, v in cal.get("per_fold_asof", {}).items()}
+    else:
+        per_fold = {}
+    acts_ds = ds.dataset(str(data_dir / "m02_actions.parquet"))
+
+    rows = []
+    seats = pool.itertuples()
+    if limit:
+        seats = list(seats)[:limit]
+    for r in seats:
+        fid = int(r.fold_id)
+        if fid not in fold_win:
+            # AUDIT 2026-07-10 (codex P1#8): a pooled seat whose fold is absent from m03_folds is a provenance
+            # mismatch (stale/wrong artifact) — do NOT silently drop the seat (it would vanish from m08 output
+            # with no verdict). Fail closed.
+            raise ValueError(f"M8 provenance: pooled (entity {int(r.entity_id)}, fold {fid}) has no matching "
+                             f"m03_folds row (folds present: {sorted(fold_win)}). Rebuild m03/m06b consistently.")
+        t0, t1 = fold_win[fid]
+        md.set_slip_calib(per_fold.get(fid), cal.get("version") if slip_calib_path else None)
+        filt = ((ds.field("wallet") == r.primary_wallet)
+                & (ds.field("stream_replay_valid") == True)  # noqa: E712
+                & (ds.field("lifecycle_valid") == True))  # noqa: E712
+        wdf = acts_ds.to_table(filter=filt).to_pandas()
+        adf = wdf[(wdf.ts >= t0) & (wdf.ts < t1)]
+        # TIER-DOMAIN FAIL-CLOSED (codex M8 confirm): a non-canonical entity_tier (e.g. a literal "nan"
+        # string or unknown label from corrupted/nonstandard M4 input) must NOT silently get the 0.25
+        # default. Canonical M4 writes only CLEAN/UNCERTAIN/SUSPICIOUS/KILL; anything else -> 0.0 (KILL-
+        # equivalent, fail-closed conservative) + loud warning, so a bad tier excludes the entity rather
+        # than fabricating mid confidence.
+        _tier = str(r.entity_tier)
+        if _tier not in conf_map:
+            logger.warning(f"M8: non-canonical entity_tier {_tier!r} for entity {int(r.entity_id)} fold "
+                           f"{fid} -> fail-closed to 0.0 confidence (expected one of {sorted(conf_map)})")
+            m4_conf = 0.0
+        else:
+            m4_conf = conf_map[_tier]
+        # AUDIT 2026-07-10 fail-closed guards BEFORE the survival stress:
+        # P1#7: a KILL / non-canonical M4 tier (m4_conf == 0) must produce a KILL survival tier, not just a
+        #       zeroed size. Previously m4_conf=0 only zeroed pre_max_raw, which got bumped to min_slice and the
+        #       stress could still emit uncertain/full_weight (0.25/1.0 multiplier). Force kill here.
+        # P1#6: a non-finite quality_weight (NaN) would make pre_max_raw NaN -> NaN stress equity -> `final<=0`
+        #       is False for NaN -> the row could "survive" with a nonsensical slice. Fail closed to kill.
+        qw = r.quality_weight
+        qw_ok = isinstance(qw, (int, float, np.integer, np.floating)) and not isinstance(qw, bool) \
+            and np.isfinite(qw) and qw > 0
+        if m4_conf <= 0.0 or not qw_ok:
+            reason = "m4_kill_or_noncanonical" if m4_conf <= 0.0 else "nonfinite_quality_weight"
+            sv = {"tier": "kill", "survival_outcome": f"fail_closed_{reason}",
+                  "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+                  "indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+            pre_max_raw = 0.0
+        else:
+            pre_max_raw = entity_pre_m8_max(qw, m4_conf, m)   # codex r1#4: store the RAW formula
+            # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
+            # gets a meaningful stress test; the RAW value is persisted unchanged.
+            sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
+        sc = inferential_scorers(int(r.entity_id), fid)
+        final_tier = _worst_tier(sv["tier"], sc)
+        mult = {"kill": m.mult_kill, "suspicious": m.mult_suspicious,
+                "uncertain": m.mult_uncertain, "full_weight": m.mult_full_weight}[final_tier]
+        rows.append({
+            "entity_id": int(r.entity_id), "fold_id": fid, "m4_tier": str(r.entity_tier),
+            "tier": final_tier, "survival_multiplier": mult, "lp_label":
+            ("NO_OBSERVED_DANGER" if final_tier == "full_weight" else final_tier),
+            "survival_outcome": sv["survival_outcome"],
+            "copyability_fail_at_stress": sv["copyability_fail_at_stress"],
+            "max_survivable_slice": sv["max_survivable_slice"], "entity_pre_m8_max": pre_max_raw,
+            "stress_roe": sv["stress_roe"], "stress_max_dd": sv["stress_max_dd"],
+            "hidden_hedge_not_observable": (final_tier != "kill"),
+            "funder_provenance_unavailable": sc["funder_provenance_unavailable"],
+            "inferential_layer_active": m.inferential_layer_active,
+            "scorers_phase": sc["scorers_phase"],
+            **{f"scorer_{k}": sc[k] for k in ("hedge_smell", "funder_provenance", "carry_timing", "behavioral_linkage")},
+        })
+    tiers = pd.DataFrame(rows)
+    summ = _read_m07_summary(m07_dir)
+    att = tier_attribution(tiers, summ)
+    out_dir = data_dir
+    tiers.to_parquet(out_dir / "m08_tiers.parquet", index=False)
+    att.to_parquet(out_dir / "m08_tier_attribution.parquet", index=False)
+    man = asdict(m)
+    man["m04_fold_pure"] = bool(m04_fold_pure)
+    Path(out_dir / "m08_manifest.json").write_text(json.dumps(man, indent=2, default=str))
+    logger.info("M8 done: %d tiered | tier dist %s", len(tiers),
+                tiers["tier"].value_counts().to_dict() if len(tiers) else {})
+    return {"n_tiered": len(tiers), "tier_dist": tiers["tier"].value_counts().to_dict() if len(tiers) else {}}
+
+
+def _read_m07_summary(m07_dir: Path) -> pd.DataFrame:
+    p = m07_dir / "m07_summary.parquet"
+    parts = m07_dir / "m07_summary.parquet.parts"
+    if p.exists():
+        return pd.read_parquet(p)
+    return pd.concat((pd.read_parquet(s) for s in sorted(parts.glob("*.parquet"))), ignore_index=True)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--m07-dir", default=str(DATA_DIR / "m07_pretest_final"))
+    ap.add_argument("--out", default=str(DATA_DIR))
+    ap.add_argument("--slip-calib", default=str(DATA_DIR / "slippage_calib_v11.json"))
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--m04-dir", default=None,
+                    help="directory with fold-pure m04_entities_f{fold_id}.parquet (REQUIRED for a trusted run)")
+    ap.add_argument("--allow-global-m04", action="store_true",
+                    help="opt into the look-ahead global m04_entities.parquet — DIAGNOSTIC ONLY, never for deployment")
+    ap.add_argument("--nominal-capital", type=float, default=10_000.0,
+                    help="bankroll scale for absolute survival stress slices (default: 10000.0)")
+    ap.add_argument(
+        "--sizing-mode", choices=("leader_equity", "fixed_position"),
+        default="leader_equity",
+    )
+    ap.add_argument("--fixed-target-exposure", type=float, default=0.10)
+    args = ap.parse_args()
+    man = replace(
+        M8Manifest(), nominal_capital=args.nominal_capital,
+        sizing_mode=args.sizing_mode,
+        fixed_target_exposure=args.fixed_target_exposure,
+    )
+    run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
+            limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None,
+            allow_global_m04=args.allow_global_m04)
+
+
+if __name__ == "__main__":
+    main()
+
+exec
+/bin/zsh -lc "rg -n \"m08|survival_tier|allow_global_m04|no_fills_data_gap|m4_conf|quality_weight|stale|as_of_ms|m04_dir\" tests research/v15 -g '*.py'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/_streaming_io.py:53:        # codex perf-r1 #1: WIPE any stale parts from a prior aborted/failed run so close() can never
+research/v15/_streaming_io.py:55:        stale = list(self.parts_dir.glob("part_*.parquet"))
+research/v15/_streaming_io.py:56:        for p in stale:
+research/v15/_streaming_io.py:58:        if stale:
+research/v15/_streaming_io.py:59:            logger.warning(f"ShardedParquetWriter: removed {len(stale)} stale part(s) in {self.parts_dir}")
+research/v15/v15_m08_survival.py:5:data-availability questions (design modules/m08 Q3/Q4) and are emitted as deterministic no_flag stubs
+research/v15/v15_m08_survival.py:8:Design: brain projects/quant/v15/modules/m08 (codex DESIGN-SHIP r2, Alberto greenlit 2026-06-01).
+research/v15/v15_m08_survival.py:14:  python research/v15/v15_m08_survival.py --m07-dir app/data/v15/m07_pretest --out app/data/v15
+research/v15/v15_m08_survival.py:28:logger = logging.getLogger("m08")
+research/v15/v15_m08_survival.py:39:    manifest_version: str = "m08-v1"
+research/v15/v15_m08_survival.py:90:def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dict:
+research/v15/v15_m08_survival.py:107:        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
+research/v15/v15_m08_survival.py:146:def _worst_tier(survival_tier_name: str, scorer_out: dict) -> str:
+research/v15/v15_m08_survival.py:148:    tier = survival_tier_name
+research/v15/v15_m08_survival.py:202:def entity_pre_m8_max(quality_weight, m4_confidence, m: M8Manifest) -> float:
+research/v15/v15_m08_survival.py:206:    return float(quality_weight) * float(m4_confidence) * 1.0 * m.m9_static_per_entity_cap * m.nominal_capital
+research/v15/v15_m08_survival.py:209:def _load_m04_entities(data_dir: Path, folds: pd.DataFrame, m04_dir: Optional[Path]) -> tuple[pd.DataFrame, bool]:
+research/v15/v15_m08_survival.py:210:    """Load M4 entity tiers. Fold-pure mode requires exact as_of_ms == fold test_start."""
+research/v15/v15_m08_survival.py:212:    if m04_dir is None:
+research/v15/v15_m08_survival.py:221:        p = Path(m04_dir) / f"m04_entities_f{fid}.parquet"
+research/v15/v15_m08_survival.py:225:        missing = [c for c in (*cols, "as_of_ms") if c not in df.columns]
+research/v15/v15_m08_survival.py:228:        n_null = int(df["as_of_ms"].isna().sum())
+research/v15/v15_m08_survival.py:230:            raise ValueError(f"M8 PROVENANCE FAIL-CLOSED: {p} has {n_null} null as_of_ms rows")
+research/v15/v15_m08_survival.py:232:        bad = df["as_of_ms"].astype("float64") != expected
+research/v15/v15_m08_survival.py:235:                             f"with as_of_ms != fold {fid} test_start ({int(expected)})")
+research/v15/v15_m08_survival.py:237:        parts.append(df[[*cols, "as_of_ms", "fold_id"]])
+research/v15/v15_m08_survival.py:238:    return (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=[*cols, "as_of_ms", "fold_id"])), True
+research/v15/v15_m08_survival.py:241:def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optional[str] = None,
+research/v15/v15_m08_survival.py:243:            m04_dir: Optional[Path] = None, allow_global_m04: bool = False) -> dict:
+research/v15/v15_m08_survival.py:245:    primitive (M7 stress) + inferential scorers (phase-2 stub) -> tier; emit m08_tiers + attribution."""
+research/v15/v15_m08_survival.py:262:    # diagnostic path (allow_global_m04=True), which must never feed a live cohort.
+research/v15/v15_m08_survival.py:263:    if m04_dir is None and not allow_global_m04:
+research/v15/v15_m08_survival.py:267:            "allow_global_m04=True ONLY for a non-deployment diagnostic.")
+research/v15/v15_m08_survival.py:268:    ent, m04_fold_pure = _load_m04_entities(data_dir, folds, m04_dir)
+research/v15/v15_m08_survival.py:304:            # mismatch (stale/wrong artifact) — do NOT silently drop the seat (it would vanish from m08 output
+research/v15/v15_m08_survival.py:324:            m4_conf = 0.0
+research/v15/v15_m08_survival.py:326:            m4_conf = conf_map[_tier]
+research/v15/v15_m08_survival.py:328:        # P1#7: a KILL / non-canonical M4 tier (m4_conf == 0) must produce a KILL survival tier, not just a
+research/v15/v15_m08_survival.py:329:        #       zeroed size. Previously m4_conf=0 only zeroed pre_max_raw, which got bumped to min_slice and the
+research/v15/v15_m08_survival.py:331:        # P1#6: a non-finite quality_weight (NaN) would make pre_max_raw NaN -> NaN stress equity -> `final<=0`
+research/v15/v15_m08_survival.py:333:        qw = r.quality_weight
+research/v15/v15_m08_survival.py:336:        if m4_conf <= 0.0 or not qw_ok:
+research/v15/v15_m08_survival.py:337:            reason = "m4_kill_or_noncanonical" if m4_conf <= 0.0 else "nonfinite_quality_weight"
+research/v15/v15_m08_survival.py:343:            pre_max_raw = entity_pre_m8_max(qw, m4_conf, m)   # codex r1#4: store the RAW formula
+research/v15/v15_m08_survival.py:346:            sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
+research/v15/v15_m08_survival.py:369:    tiers.to_parquet(out_dir / "m08_tiers.parquet", index=False)
+research/v15/v15_m08_survival.py:370:    att.to_parquet(out_dir / "m08_tier_attribution.parquet", index=False)
+research/v15/v15_m08_survival.py:373:    Path(out_dir / "m08_manifest.json").write_text(json.dumps(man, indent=2, default=str))
+research/v15/v15_m08_survival.py:411:    run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
+research/v15/v15_m08_survival.py:412:            limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None,
+research/v15/v15_m08_survival.py:413:            allow_global_m04=args.allow_global_m04)
+tests/v15/test_m06b.py:75:        "as_of_ms": ts_asof,
+tests/v15/test_m06b.py:79:        "eligible": eligible_all, "as_of_ms": ts_asof,
+tests/v15/test_m06b.py:169:def test_quality_weight_normalized_and_ceiling():
+tests/v15/test_m06b.py:175:        assert abs(pooled["quality_weight"].sum() - 1.0) < 1e-6
+tests/v15/test_m06b.py:176:        assert pooled["quality_weight"].max() <= m.per_entity_quality_ceiling + 1e-9
+tests/v15/test_m06b.py:186:        w_by_bucket = pooled.groupby("bucket")["quality_weight"].mean()
+tests/v15/test_m06b.py:219:    inp["m06a"]["as_of_ms"] = bad_asof
+tests/v15/test_m06b.py:426:    # codex r1 #7: NaN/missing as_of_ms is not provenance-OK.
+tests/v15/test_m06b.py:429:    inp["m05"].loc[0, "as_of_ms"] = np.nan
+tests/v15/test_m06b.py:433:    inp2["m06a"] = inp2["m06a"].drop(columns=["as_of_ms"])
+tests/v15/test_m06b.py:445:        assert abs(pooled["quality_weight"].sum() - 1.0) < 1e-6
+tests/v15/test_m06b.py:562:    assert e0["quality_weight"] == 0.0
+research/v15/v15_m09_sim.py:53:def sizing_chain_weight(quality_weight: float, m4_confidence: float, survival_mult: float) -> float:
+research/v15/v15_m09_sim.py:55:    return float(quality_weight) * float(m4_confidence) * float(survival_mult)
+research/v15/v15_m09_sim.py:318:def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entities: pd.DataFrame,
+research/v15/v15_m09_sim.py:367:    tiers = m08_tiers.set_index(["entity_id", "fold_id"]).to_dict("index")
+research/v15/v15_m09_sim.py:434:            w = sizing_chain_weight(r.quality_weight, conf, surv)
+research/v15/v15_m09_sim.py:439:                prio_rows.append({"entity_id": eid, "select_priority": float(r.quality_weight) * surv})
+research/v15/v15_m06a_shortlist.py:153:def _load_entities_by_fold(m04_dir: Path, folds: pd.DataFrame) -> dict[int, pd.DataFrame]:
+research/v15/v15_m06a_shortlist.py:156:        p = m04_dir / f"m04_entities_f{fid}.parquet"
+research/v15/v15_m06a_shortlist.py:189:                         "(disabling the stale-drop is a non-production diagnostic, not clean OOS).")
+research/v15/v15_m06a_shortlist.py:339:                "as_of_ms": test_start_ms,
+research/v15/v15_m06a_shortlist.py:373:        n_stale = int(((sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:374:        wf = {"n_eligible": n_eligible, "n_rankable": n_rankable, "n_stale_dropped": n_stale}
+research/v15/v15_m06a_shortlist.py:384:            stale_idx = sl[(sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)].index  # noqa: E712
+research/v15/v15_m06a_shortlist.py:385:            sl.loc[stale_idx, "in_shortlist"] = False
+research/v15/v15_m06a_shortlist.py:386:            sl.loc[stale_idx, "shortlist_reason"] = "dropped_stale"
+research/v15/v15_m06a_shortlist.py:449:    if args.m04_dir:
+research/v15/v15_m06a_shortlist.py:450:        entities_by_fold = _load_entities_by_fold(Path(args.m04_dir), folds)
+tests/v15/test_m09.py:294:        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:295:        {"entity_id": 2, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:297:    m08 = pd.DataFrame([
+tests/v15/test_m09.py:306:    return m06b, m08, m04, folds
+tests/v15/test_m09.py:321:    m06b, m08, m04, folds = _chained_inputs()
+tests/v15/test_m09.py:324:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(8.0),
+tests/v15/test_m09.py:334:    m06b, m08, m04, folds = _chained_inputs()
+tests/v15/test_m09.py:335:    m06b.loc[m06b.entity_id == 1, "quality_weight"] = 0.8   # higher priority -> kept
+tests/v15/test_m09.py:336:    m06b.loc[m06b.entity_id == 2, "quality_weight"] = 0.2   # pruned
+tests/v15/test_m09.py:338:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:346:    m06b, m08, m04, folds = _chained_inputs(extra_wallet=None)
+tests/v15/test_m09.py:349:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:371:    m06b, m08, m04, folds = _chained_inputs()
+tests/v15/test_m09.py:374:    m08 = m08[m08.entity_id == 1].copy()
+tests/v15/test_m09.py:387:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=loader,
+tests/v15/test_m09.py:408:        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:409:        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:410:        {"entity_id": 2, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:412:    m08 = pd.DataFrame([
+tests/v15/test_m09.py:422:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:437:        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0},
+tests/v15/test_m09.py:438:        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 1.0},
+tests/v15/test_m09.py:440:    m08 = pd.DataFrame([
+tests/v15/test_m09.py:457:        m06b, m08, m04, folds, _FakeEng(), md=None, acts_loader=loader,
+tests/v15/test_m09.py:502:        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 1.0},
+tests/v15/test_m09.py:504:    m08 = pd.DataFrame([
+tests/v15/test_m09.py:512:        m06b, m08, m04, folds, ExitCostEngine(), md=None,
+tests/v15/test_m09.py:529:        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:530:        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:532:    m08 = pd.DataFrame([
+tests/v15/test_m09.py:539:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:557:        {"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:558:        {"entity_id": 1, "fold_id": 1, "in_pool": True, "quality_weight": 0.5},
+tests/v15/test_m09.py:560:    m08 = pd.DataFrame([
+tests/v15/test_m09.py:585:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m09.py:606:    m06b = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "in_pool": True, "quality_weight": 0.5}])
+tests/v15/test_m09.py:607:    m08 = pd.DataFrame([{"entity_id": 1, "fold_id": 0, "survival_multiplier": 1.0, "tier": "ok",
+tests/v15/test_m09.py:628:    out = M9.run_m09_chained(m06b, m08, m04, folds, eng, md=None, acts_loader=_acts(1.0),
+tests/v15/test_m08.py:3:Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py -q
+tests/v15/test_m08.py:14:import v15_m08_survival as M8  # noqa: E402
+tests/v15/test_m08.py:43:    out = M8.survival_tier(acts, md, T0, T0 + 20 * DAY, 1000.0, M)
+tests/v15/test_m08.py:54:    out = M8.survival_tier(acts, md, T0, T0 + 30 * DAY, 5000.0, M)
+tests/v15/test_m08.py:75:    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+tests/v15/test_m08.py:86:    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 100.0, M)  # 100*0.25=25 < min 50
+tests/v15/test_m08.py:95:    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+tests/v15/test_m08.py:102:    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+tests/v15/test_m08_golden.py:1:"""GOLDEN regression test for v15_m08_survival trust-audit fixes (2026-07-10).
+tests/v15/test_m08_golden.py:3:Locks the fail-closed behaviours so a stale / evidence-less / look-ahead-sourced wallet cannot come out
+tests/v15/test_m08_golden.py:6:- P0#3: run_m08 without fold-pure --m04-dir (the global M4 map is look-ahead) fails closed unless explicitly
+tests/v15/test_m08_golden.py:8:(The run-loop guards m4_conf==0 -> kill and non-finite quality_weight -> kill are additionally codex-reviewed.)
+tests/v15/test_m08_golden.py:17:import v15_m08_survival as M8
+tests/v15/test_m08_golden.py:38:    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+tests/v15/test_m08_golden.py:40:    assert out["survival_outcome"] == "no_fills_data_gap"
+tests/v15/test_m08_golden.py:47:    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+tests/v15/test_m08_golden.py:52:    # run_m08 must refuse the look-ahead global M4 path unless allow_global_m04=True. It reaches the guard
+tests/v15/test_m08_golden.py:61:        M8.run_m08(d, d, M, m04_dir=None, allow_global_m04=False)
+tests/v15/test_m07.py:135:def test_m7_rejects_stale_m2_schema_without_stream_validity(tmp_path):
+tests/v15/test_m07.py:213:def test_market_data_mark_rejects_stale_asof_bar():
+tests/v15/test_m07.py:840:def test_ruin_final_equity_and_roe_not_stale():
+tests/v15/test_m07.py:856:    assert s["final_equity"] < 1e-6, "ruined subaccount must report ~0 final_equity, not a stale positive"
+tests/v15/test_m07.py:857:    assert abs(s["roe_engine"] - (-1.0)) < 1e-9, "ruined subaccount ROE must be -100%, not stale"
+research/v15/v15_forward_select.py:102:                              "quality_weight": w, "entity_alloc_weight": 1.0})
+research/v15/v15_forward_select.py:107:    pool["quality_weight"] = pool.groupby("fold_id")["quality_weight"].transform(lambda x: x / x.sum())
+tests/v15/test_m06a.py:45:def test_persistence_partial_and_stale():
+tests/v15/test_m06a.py:51:    assert pr.recent_block_active is False     # no action in block 0 -> stale
+tests/v15/test_m06a.py:182:# ---------------------------------------------------------------- recency gate drops stale
+tests/v15/test_m06a.py:183:def test_recency_gate_drops_stale_holder():
+tests/v15/test_m06a.py:188:        {"wallet": "0xw2", "ts": ms("2025-12-05")},                 # only old -> stale
+tests/v15/test_m06a.py:194:    assert f1.loc[f1.entity_id == 2, "shortlist_reason"].iloc[0] == "dropped_stale"
+research/v15/v15_m10_gates.py:96:    G1/G3/G6 on the ablation metrics here (not a stale caller boolean). `ablation` keys: chained_roe,
+research/v15/v15_m03_fold_geometry.py:404:    # stale pre-validity M2 artifacts fail loudly instead of contaminating M3.
+research/v15/candle_marks.py:7:candle_mark_at(coin, ts_ms): last 1m candle CLOSE at/before ts_ms (asof-backward), None past a staleness cap.
+research/v15/v15_m04_authenticity.py:117:def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float = 12.0):
+research/v15/v15_m04_authenticity.py:121:    log.info(f"STAGE A: {len(wallets)} wallets (as-of {as_of_ms}), procs={procs}")
+research/v15/v15_m04_authenticity.py:276:            "as_of_ms": as_of_ms,
+research/v15/v15_m04_authenticity.py:296:            "as_of_ms": as_of_ms,  # fold-pure provenance (M6b --m04-dir requires it; codex M4 re-review)
+research/v15/v15_m04_authenticity.py:325:    as_of_ms = int(pd.Timestamp(args.as_of, tz="UTC").timestamp() * 1000)
+research/v15/v15_m04_authenticity.py:326:    hi_ms = as_of_ms - 1  # strict: ts < as_of (inclusive m01 loaders)
+research/v15/v15_m04_authenticity.py:328:    lo_ms = as_of_ms - args.lookback_days * 86_400_000
+research/v15/v15_m04_authenticity.py:333:    df, edf = run(wallets, lo_ms, hi_ms, as_of_ms, procs=budget.procs,
+research/v15/v15_m02_journey_trace.py:79:# fraction of equity (material unmarkable exposure) OR is staler than STALE_CAP.
+research/v15/v15_m02_journey_trace.py:159:    # ANCHOR_FALLBACK: base anchor too stale AND material unmarkable exposure, OR
+research/v15/v15_m02_journey_trace.py:160:    # the frozen component is itself stale/material. Hold last PAST anchor flat.
+research/v15/v15_m02_journey_trace.py:161:    stale_anchor = age > STALE_CAP_MS
+research/v15/v15_m02_journey_trace.py:163:    stale_frozen = frozen_age_ms > STALE_CAP_MS
+research/v15/v15_m02_journey_trace.py:164:    if (stale_anchor and ee.n_unmarkable > 0) or material_frozen or stale_frozen:
+research/v15/v15_m02_journey_trace.py:747:            # force a full refresh when explicitly requested OR when stale due to NEW candles /
+research/v15/v15_m02_journey_trace.py:748:            # changed coin-set (else force=False would skip the already-present-but-stale coins).
+research/v15/v15_m05_eligibility.py:73:def _load_m04_by_fold(m04_dir: Path, folds: pd.DataFrame) -> dict[int, pd.DataFrame]:
+research/v15/v15_m05_eligibility.py:76:        p = m04_dir / f"m04_authenticity_f{fid}.parquet"
+research/v15/v15_m05_eligibility.py:359:                "accessible_set_as_of_ms": acc_as_of,
+research/v15/v15_m05_eligibility.py:361:                "as_of_ms": hi_ms,
+research/v15/v15_m05_eligibility.py:439:    if args.m04_dir:
+research/v15/v15_m05_eligibility.py:440:        m04_by_fold = _load_m04_by_fold(Path(args.m04_dir), folds)
+research/v15/v15_m06b_ranking.py:10:  final_slice = quality_weight(M6b) x confidence(M4 alloc) x survival(M8 tier) x caps/anti-corr(M9)
+research/v15/v15_m06b_ranking.py:11:M6b owns ONLY quality_weight (does NOT multiply M4/M8 -- no double-count).
+research/v15/v15_m06b_ranking.py:43:# is undefined/meaningless. Require >= this many closed round-trips to enter in_pool/quality_weight.
+research/v15/v15_m06b_ranking.py:113:def _load_m04_by_fold(m04_dir: Path, folds: pd.DataFrame, stem: str) -> pd.DataFrame:
+research/v15/v15_m06b_ranking.py:116:        p = m04_dir / f"{stem}_f{fid}.parquet"
+research/v15/v15_m06b_ranking.py:125:def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None) -> dict:
+research/v15/v15_m06b_ranking.py:139:    if m04_dir is None:
+research/v15/v15_m06b_ranking.py:147:        m04_entities = _load_m04_by_fold(m04_dir, folds, "m04_entities")
+research/v15/v15_m06b_ranking.py:148:        m04_auth = _load_m04_by_fold(m04_dir, folds, "m04_authenticity")
+research/v15/v15_m06b_ranking.py:401:    # --- provenance: per-fold pretest-pure. M6a/M5 carry as_of_ms; refuse any input stamped AFTER
+research/v15/v15_m06b_ranking.py:410:        if "as_of_ms" not in df.columns:
+research/v15/v15_m06b_ranking.py:411:            provenance_fail.append(f"{nm}:no_as_of_ms_column")
+research/v15/v15_m06b_ranking.py:416:        # require PRESENT + non-null as_of_ms for every row (missing provenance is not provenance-OK)
+research/v15/v15_m06b_ranking.py:417:        n_null = int(df["as_of_ms"].isna().sum())
+research/v15/v15_m06b_ranking.py:419:            provenance_fail.append(f"{nm}:{n_null}_rows_null_as_of_ms")
+research/v15/v15_m06b_ranking.py:424:            bad = (df["as_of_ms"].astype("float64") != ts_start.astype("float64")).fillna(False)
+research/v15/v15_m06b_ranking.py:428:            bad = (df["as_of_ms"].astype("float64") > ts_start.astype("float64")).fillna(False)
+research/v15/v15_m06b_ranking.py:630:        g["quality_weight"] = 0.0
+research/v15/v15_m06b_ranking.py:667:            pooled["quality_weight"] = pooled["raw_w"] / tot if tot > 0 else 0.0
+research/v15/v15_m06b_ranking.py:674:            qw = np.array(pooled["quality_weight"].to_numpy(dtype=float), copy=True)
+research/v15/v15_m06b_ranking.py:685:            pooled["quality_weight"] = qw
+research/v15/v15_m06b_ranking.py:687:            assert abs(qw.sum() - 1.0) < 1e-6, f"fold {fid}: quality_weight sum {qw.sum()} != 1"
+research/v15/v15_m06b_ranking.py:691:        keep = ["entity_id", "fold_id", "rank_in_fold", "in_pool", "bucket", "quality_weight"]
+research/v15/v15_m06b_ranking.py:692:        g = g.drop(columns=["rank_in_fold", "in_pool", "bucket", "quality_weight"]).merge(
+research/v15/v15_m06b_ranking.py:695:        g["quality_weight"] = g["quality_weight"].fillna(0.0)
+research/v15/v15_m06b_ranking.py:779:    "quality_weight", "excluded_reason", "slippage_uncalibrated", "investable",
+research/v15/v15_m06b_ranking.py:815:        m04_dir=Path(args.m04_dir) if args.m04_dir else None,
+research/v15/revalidate_api_execmodel.py:89:    # coverage. This is the exact silent-stale trap that gave testN=0 this morning (marks ended Jun1 while
+research/v15/s3_taker_verify.py:80:    (P1) coin-specific fee; (P1) any_fill keyed on RAW fills so stale-marks wallets stay visible (n=0)."""
+research/v15/v15_m025_authenticity_gate.py:670:            hard_codes.append("stale")
+research/v15/v15_m025_authenticity_gate.py:742:            "wash", "unexecutable_dex", "stale", "funding_farm"}
+research/v15/v15_m01_equity_reconstruct.py:215:    for prefixed coins, with a candle fallback when oracle is absent/stale. Main-dex
+research/v15/v15_m01_equity_reconstruct.py:246:    # bound, so a candle from hours ago was returned as if current -> silently-stale MTM that callers
+research/v15/v15_m01_equity_reconstruct.py:249:    # marking on a stale price. With dense all-market candles this rarely triggers; it only catches the
+research/v15/v15_m01_equity_reconstruct.py:257:# Candle-fallback staleness cap (codex marks-gate 2026-06-24). The 1m candle close is an at-or-before
+research/v15/v15_m01_equity_reconstruct.py:258:# lookup; without a bound a stale bar (delisted/dormant coin, or a data gap) is returned as a live mark.
+research/v15/v15_m01_equity_reconstruct.py:260:# reconstruction; 60min still allows materially-stale MTM on a fast-moving thin coin). With dense
+research/v15/v15_m01_equity_reconstruct.py:262:# -> caller flags degraded/NO_ANCHOR. The pre/post-05-24 coverage+staleness AUDIT validates the cap does
+research/v15/v15_m01_equity_reconstruct.py:315:    if ts_ms - int(ts_arr[i]) > max_age_ms:  # too stale -> let caller fall back to candle
+research/v15/v15_m01_equity_reconstruct.py:367:# scripts/extract_asset_ctx_marks.py. 1-min granularity -> tight staleness cap. Mirrors _coin_series.
+research/v15/v15_m01_equity_reconstruct.py:1883:        the parquet snapshot and now, so it is time-stale but dex-complete.
+research/v15/v15_m01_equity_reconstruct.py:1887:    introduces a mark-staleness term equal to position drift over (markEnd ->
+research/v15/v15_m01_equity_reconstruct.py:1908:    # Live clearinghouse sum over ALL perp dexes (informational; time-stale by
+research/v15/v15_m01_equity_reconstruct.py:2107:    frozen_component_age_ms: int    # staleness of the frozen value at ts
+research/v15/v15_m01_equity_reconstruct.py:2411:        "today% = recon@fetch vs LIVE clearinghouse (time-stale, informational)."
+research/v15/v15_m07_engine.py:75:MARK_MAX_AGE_MS = 15 * MS_MIN               # reject stale/delisted 1m execution marks
+research/v15/v15_m07_engine.py:348:        # executable price. Fail closed when the last available bar is stale.
+research/v15/v15_m07_engine.py:635:    # must start from the REAL marked equity at fold start, not the caller's (possibly stale) start_equity
+research/v15/v15_m07_engine.py:1650:    # memory-bounded (no per-wallet writer held open buffering rows), FRESH dir each run (no stale
+
+codex
+I have the main control flow now. I’m going to check the existing M8 unit tests and line numbers around the changed branches so the verdict can be tied to exact code paths, then I’ll run the focused tests if the environment has the dependencies.
+exec
+/bin/zsh -lc "sed -n '1,180p' tests/v15/test_m08.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M8 survival-tiering tests. Empirical: stress survival on synthetic sources + tier logic.
+
+Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py -q
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # reuse test_m07 fakes
+import v15_m08_survival as M8  # noqa: E402
+import v15_m07_engine as E  # noqa: E402
+import test_m07 as T7  # noqa: E402
+
+DAY = 86_400_000
+T0 = T7.T0
+
+
+def _ohlc_flat(coin, px=100.0, n=None):
+    n = n or 31 * 1440
+    return T7._flat_ohlc(coin, T0, n, px)
+
+
+def _ohlc_crash(coin, px=100.0, crash_min=1500, crash_px=1.0, n=None):
+    n = n or 31 * 1440
+    o = T7._flat_ohlc(coin, T0, n, px)
+    mins, op, hi, lo, cl = o[coin]
+    for arr in (op, hi, lo, cl):
+        arr[crash_min:] = crash_px
+    return {coin: (mins, op, hi, lo, cl)}
+
+
+M = M8.M8Manifest()
+
+
+def test_survival_full_weight_on_benign_source():
+    # low-leverage source on flat price -> survives the stress slice comfortably -> full_weight.
+    md = T7.FakeMarketData(ohlc=_ohlc_flat("BTC"))
+    acts = pd.DataFrame([T7._action("BTC", T0 + 10 * E.MS_MIN, 0.3)])
+    out = M8.survival_tier(acts, md, T0, T0 + 20 * DAY, 1000.0, M)
+    assert out["tier"] == "full_weight"
+    assert out["survival_outcome"] == "survived"
+    assert out["copyability_fail_at_stress"] is False
+
+
+def test_survival_kill_when_ruins_at_min_size():
+    # very high leverage + a deep crash -> wiped even at the minimum slice -> KILL (mechanical).
+    md = T7.FakeMarketData(ohlc=_ohlc_crash("BTC", crash_min=1500, crash_px=1.0), maxlev=10.0)
+    acts = pd.DataFrame([T7._action("BTC", T0 + 10 * E.MS_MIN, 8.0),     # 8x
+                         T7._action("BTC", T0 + 25 * DAY, 8.0)])
+    out = M8.survival_tier(acts, md, T0, T0 + 30 * DAY, 5000.0, M)
+    assert out["tier"] == "kill"
+    assert out["survival_outcome"] == "ruin_at_min_size"
+    assert out["max_survivable_slice"] == 0.0
+
+
+def _stub_runs(monkeypatch, outcomes):
+    """Patch _run_stress to return queued outcomes (by call order): big, [min], [small]."""
+    calls = {"i": 0}
+    def fake(actions, md, eq, t0, t1, m):
+        o = outcomes[min(calls["i"], len(outcomes) - 1)]; calls["i"] += 1
+        return {"wiped": o[0], "ruin": o[0], "backstop": False, "account_ruin": o[0],
+                "final_equity": 0.0 if o[0] else 1.0, "roe": 0.0, "max_dd": 0.5,
+                "time_to_ruin_ms": None, "n_fills": 10, "indeterminate_frac": o[1]}
+    monkeypatch.setattr(M8, "_run_stress", fake)
+
+
+def test_copyability_survives_smaller_stays_full_weight(monkeypatch):
+    # codex r1#1+#2: wiped at big, SURVIVES at min -> copyability sizing signal, tier = full_weight
+    # (NOT uncertain/downgraded). big wiped, min survives, small survives.
+    _stub_runs(monkeypatch, [(True, 0.0), (False, 0.0), (False, 0.0)])
+    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+    assert out["tier"] == "full_weight"
+    assert out["survival_outcome"] == "copyability_fail_at_stress"
+    assert out["copyability_fail_at_stress"] is True
+    assert out["max_survivable_slice"] > 0
+
+
+def test_smaller_probe_never_below_min(monkeypatch):
+    # codex r2#1: big=100, frac 0.25 -> smaller probe=25 < min 50 -> SKIP the probe; min already
+    # survived so max_survivable_slice = min_slice_capital (>= min), never the sub-min 25.
+    _stub_runs(monkeypatch, [(True, 0.0), (False, 0.0)])   # big wiped, min survives (only 2 calls)
+    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 100.0, M)  # 100*0.25=25 < min 50
+    assert out["tier"] == "full_weight"
+    assert out["copyability_fail_at_stress"] is True
+    assert out["max_survivable_slice"] >= M.min_slice_capital
+
+
+def test_kill_only_when_min_also_wipes(monkeypatch):
+    # codex r1#2: KILL only when the MIN slice also wipes.
+    _stub_runs(monkeypatch, [(True, 0.0), (True, 0.0)])   # big wiped, min wiped
+    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+    assert out["tier"] == "kill" and out["max_survivable_slice"] == 0.0
+
+
+def test_indeterminate_heavy_caps_uncertain(monkeypatch):
+    # survives at big but indeterminate-heavy -> UNCERTAIN.
+    _stub_runs(monkeypatch, [(False, 0.9)])   # not wiped, 90% indeterminate
+    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+    assert out["tier"] == "uncertain" and out["survival_outcome"] == "survived"
+
+
+def test_entity_pre_m8_max_is_raw_formula():
+    m = M8.M8Manifest()
+    v = M8.entity_pre_m8_max(0.02, 1.0, m)
+    assert v == pytest.approx(0.02 * 1.0 * 1.0 * m.m9_static_per_entity_cap * m.nominal_capital)
+
+
+def test_entity_pre_m8_max_uses_configured_nominal_capital():
+    m = M8.M8Manifest(nominal_capital=518.0)
+    v = M8.entity_pre_m8_max(0.02, 1.0, m)
+    assert v == pytest.approx(0.02 * 1.0 * 1.0 * m.m9_static_per_entity_cap * 518.0)
+
+
+def test_attribution_flags_missing_m07_rows():
+    # codex r1#5: a tiered entity with no M7 row is flagged, excluded from metrics (not roe=0).
+    tiers = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 1, "m4_tier": "CLEAN", "tier": "full_weight"},
+        {"entity_id": 2, "fold_id": 1, "m4_tier": "CLEAN", "tier": "full_weight"},
+    ])
+    summ = pd.DataFrame([{"entity_id": 1, "fold_id": 1, "roe_engine": 0.4, "ruin": False}])  # entity 2 missing
+    att = M8.tier_attribution(tiers, summ)
+    fw = att[(att.tier_axis == "m8_tier") & (att.tier == "full_weight")].iloc[0]
+    assert fw["n_entities"] == 2 and fw["n_missing_m07"] == 1
+    assert fw["mean_roe"] == pytest.approx(0.4)   # only the present entity, NOT (0.4+0)/2
+
+
+def test_worst_tier_inferential_downgrades_never_kills():
+    # survival says full_weight; a suspicious inferential scorer downgrades to suspicious, NOT kill.
+    M8.TIER_ORDER  # exists
+    t = M8._worst_tier("full_weight", {"hedge_smell": "suspicious", "funder_provenance": "no_flag",
+                                       "carry_timing": "no_flag", "behavioral_linkage": "no_flag"})
+    assert t == "suspicious"
+    # inferential can never produce kill even if survival is full_weight
+    t2 = M8._worst_tier("full_weight", {"hedge_smell": "suspicious", "funder_provenance": "uncertain",
+                                        "carry_timing": "no_flag", "behavioral_linkage": "no_flag"})
+    assert t2 == "suspicious"
+    # a KILL survival tier is preserved (worst wins)
+    assert M8._worst_tier("kill", {"hedge_smell": "no_flag", "funder_provenance": "no_flag",
+                                   "carry_timing": "no_flag", "behavioral_linkage": "no_flag"}) == "kill"
+
+
+def test_inferential_scorers_phase2_stub():
+    out = M8.inferential_scorers(1, 1)
+    assert all(out[k] == "no_flag" for k in ["hedge_smell", "funder_provenance", "carry_timing", "behavioral_linkage"])
+    assert out["scorers_phase"] == "phase2_stub"
+    assert M8._worst_tier("full_weight", out) == "uncertain"
+
+
+def test_tier_attribution_by_m4_and_m8():
+    tiers = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 1, "m4_tier": "CLEAN", "tier": "full_weight"},
+        {"entity_id": 2, "fold_id": 1, "m4_tier": "CLEAN", "tier": "uncertain"},
+        {"entity_id": 3, "fold_id": 1, "m4_tier": "UNCERTAIN", "tier": "suspicious"},
+    ])
+    summ = pd.DataFrame([
+        {"entity_id": 1, "fold_id": 1, "roe_engine": 0.5, "ruin": False},
+        {"entity_id": 2, "fold_id": 1, "roe_engine": -0.2, "ruin": False},
+        {"entity_id": 3, "fold_id": 1, "roe_engine": -0.9, "ruin": True},
+    ])
+    att = M8.tier_attribution(tiers, summ)
+    assert set(att["tier_axis"]) == {"m4_tier", "m8_tier"}
+    fw = att[(att.tier_axis == "m8_tier") & (att.tier == "full_weight")].iloc[0]
+    assert fw["n_entities"] == 1 and fw["mean_roe"] == pytest.approx(0.5)
+    susp = att[(att.tier_axis == "m8_tier") & (att.tier == "suspicious")].iloc[0]
+    assert susp["ruin_rate"] == 1.0     # the suspicious cohort here did ruin -> label justified
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m08_survival.py | sed -n '90,380p'" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "nl -ba tests/v15/test_m08_golden.py | sed -n '1,120p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	"""GOLDEN regression test for v15_m08_survival trust-audit fixes (2026-07-10).
+     2	
+     3	Locks the fail-closed behaviours so a stale / evidence-less / look-ahead-sourced wallet cannot come out
+     4	"survived" and slip into the live cohort:
+     5	- P0#2/#4: a stress run with ZERO fills (empty/filtered stream or NaN sizing skipped by M7) -> KILL data-gap,
+     6	- P0#3: run_m08 without fold-pure --m04-dir (the global M4 map is look-ahead) fails closed unless explicitly
+     7	  opted into the diagnostic path.
+     8	(The run-loop guards m4_conf==0 -> kill and non-finite quality_weight -> kill are additionally codex-reviewed.)
+     9	"""
+    10	import sys
+    11	from pathlib import Path
+    12	
+    13	import pandas as pd
+    14	import pytest
+    15	
+    16	sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+    17	import v15_m08_survival as M8
+    18	
+    19	M = M8.M8Manifest()
+    20	T0 = 1_700_000_000_000
+    21	DAY = 86_400_000
+    22	
+    23	
+    24	def _stub(monkeypatch, outcomes):
+    25	    seq = iter(outcomes)
+    26	
+    27	    def fake(actions, md, cap, t0, t1, m):
+    28	        wiped, n_fills = next(seq)
+    29	        return {"wiped": wiped, "ruin": wiped, "backstop": False, "account_ruin": False,
+    30	                "final_equity": (0.0 if wiped else cap), "roe": 0.0, "max_dd": 0.0,
+    31	                "time_to_ruin_ms": None, "n_fills": n_fills, "indeterminate_frac": 0.0}
+    32	    monkeypatch.setattr(M8, "_run_stress", fake)
+    33	
+    34	
+    35	def test_p0_zero_fills_fail_closed_to_kill(monkeypatch):
+    36	    # first (big-slice) run has n_fills=0 -> no replayable survival evidence -> KILL, not "survived".
+    37	    _stub(monkeypatch, [(False, 0)])
+    38	    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+    39	    assert out["tier"] == "kill"
+    40	    assert out["survival_outcome"] == "no_fills_data_gap"
+    41	    assert out["max_survivable_slice"] == 0.0
+    42	
+    43	
+    44	def test_nonzero_fills_still_survives(monkeypatch):
+    45	    # sanity: with real fills and not wiped, the module still returns survived (fix is narrow).
+    46	    _stub(monkeypatch, [(False, 12)])
+    47	    out = M8.survival_tier(pd.DataFrame(), None, T0, T0 + 20 * DAY, 1000.0, M)
+    48	    assert out["tier"] in ("full_weight", "uncertain") and out["survival_outcome"] == "survived"
+    49	
+    50	
+    51	def test_p0_3_global_m04_lookahead_fails_closed(tmp_path):
+    52	    # run_m08 must refuse the look-ahead global M4 path unless allow_global_m04=True. It reaches the guard
+    53	    # after loading the pool + folds, so provide minimal parquets; the guard should raise before M4 load.
+    54	    d = tmp_path
+    55	    pool = pd.DataFrame({"entity_id": [1], "fold_id": [1], "in_pool": [True], "investable": [True]})
+    56	    pool.to_parquet(d / "m06b_pool.parquet")
+    57	    folds = pd.DataFrame({"fold_id": [1], "train_start": [pd.Timestamp("2026-01-01")],
+    58	                          "test_start": [pd.Timestamp("2026-02-12")]})
+    59	    folds.to_parquet(d / "m03_folds.parquet")
+    60	    with pytest.raises(ValueError, match="look-ahead"):
+    61	        M8.run_m08(d, d, M, m04_dir=None, allow_global_m04=False)
+
+ succeeded in 0ms:
+    90	def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dict:
+    91	    """Counterfactual-survival -> mechanical tier + sizing signals (design §1/§3; codex r1#1,#2).
+    92	    - survives at pre_m8_max -> full_weight (UNCERTAIN only if indeterminate-heavy).
+    93	    - wiped at pre_m8_max BUT survives at the MINIMUM tradable size -> copyability_fail_at_stress: a
+    94	      SIZING signal (M9 clamps the max slice); the tier stays SURVIVAL-OK = full_weight (the wallet
+    95	      isn't dangerous, our chosen slice was too big -- NOT downgraded). max_survivable_slice refined by
+    96	      the smaller-slice probe.
+    97	    - wiped even at the MINIMUM size (no positive slice survives) -> KILL (mechanical).
+    98	    Inferential SUSPICIOUS/UNCERTAIN downgrades are applied SEPARATELY (§4 scorers via _worst_tier)."""
+    99	    big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
+   100	    base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
+   101	            "stress_max_dd": big["max_dd"]}
+   102	    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
+   103	    # happens when the action stream is empty / fully filtered, OR when every action has NaN/invalid sizing so
+   104	    # M7 skips it. Such a wallet must NOT come out "survived / full_weight" on unchanged start equity. Fail
+   105	    # closed to KILL (data-gap) so it is excluded from the live cohort.
+   106	    if int(big.get("n_fills", 0)) == 0:
+   107	        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
+   108	                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+   109	    heavy = big["indeterminate_frac"] > m.indeterminate_heavy_frac
+   110	    if not big["wiped"]:
+   111	        return {"tier": "uncertain" if heavy else "full_weight", "survival_outcome": "survived",
+   112	                "copyability_fail_at_stress": False, "max_survivable_slice": pre_m8_max_capital, **base}
+   113	    # wiped at pre_m8_max -> the MIN-size probe decides KILL vs copyability (codex r1#2: KILL only when
+   114	    # even the smallest positive slice fails -- min is the smallest, so min-wipe == no slice survives).
+   115	    mn = _run_stress(actions, md, m.min_slice_capital, t0, t1, m)
+   116	    if mn["wiped"]:
+   117	        return {"tier": "kill", "survival_outcome": "ruin_at_min_size",
+   118	                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+   119	    # survives at min -> copyability SIZING signal, tier stays survival-OK (codex r1#1: NOT downgraded).
+   120	    # refine max_survivable with a smaller-slice probe ONLY if it sits ABOVE min (codex r2#1: never
+   121	    # probe below the min slice -- min already survived, so the floor is min_slice_capital).
+   122	    smaller = pre_m8_max_capital * m.smaller_slice_frac
+   123	    surv_slice = m.min_slice_capital
+   124	    if smaller > m.min_slice_capital:
+   125	        small = _run_stress(actions, md, smaller, t0, t1, m)
+   126	        if not small["wiped"]:
+   127	            surv_slice = smaller
+   128	    return {"tier": "uncertain" if heavy else "full_weight",
+   129	            "survival_outcome": "copyability_fail_at_stress",
+   130	            "copyability_fail_at_stress": True, "max_survivable_slice": surv_slice, **base}
+   131	
+   132	
+   133	# --------------------------------------------------------------------------- #
+   134	# INFERENTIAL SCORERS -- PHASE 2 (deterministic contract; open data questions Q3/Q4). Stubbed no_flag.
+   135	# --------------------------------------------------------------------------- #
+   136	def inferential_scorers(entity_id, fold_id) -> dict:
+   137	    """Each scorer returns one of {no_flag, uncertain, suspicious} + reason + source_module=M8_new.
+   138	    PHASE 2: off-platform-hedge-smell, funder-provenance, carry-timing, behavioral-linkage. Stubbed to
+   139	    no_flag (the inferential layer is NOT yet active -> tier is survival-driven only). The WORST tier
+   140	    any scorer assigns wins; never auto-KILL (inferential -> at most SUSPICIOUS)."""
+   141	    return {"hedge_smell": "no_flag", "funder_provenance": "no_flag",
+   142	            "carry_timing": "no_flag", "behavioral_linkage": "no_flag",
+   143	            "funder_provenance_unavailable": True, "scorers_phase": "phase2_stub"}
+   144	
+   145	
+   146	def _worst_tier(survival_tier_name: str, scorer_out: dict) -> str:
+   147	    """WORST (lowest) tier wins. Inferential suspicious/uncertain can only DOWNGRADE, never KILL."""
+   148	    tier = survival_tier_name
+   149	    # phase2_stub means the inferential layer is inactive: a stubbed no_flag is only "not scored",
+   150	    # not verified clean. Cap its contribution at UNCERTAIN instead of silently granting full weight.
+   151	    no_flag_tier = "uncertain" if scorer_out.get("scorers_phase") == "phase2_stub" else "full_weight"
+   152	    sev = {"no_flag": no_flag_tier, "uncertain": "uncertain", "suspicious": "suspicious"}
+   153	    for k in ("hedge_smell", "funder_provenance", "carry_timing", "behavioral_linkage"):
+   154	        cand = sev.get(scorer_out.get(k, "no_flag"), "full_weight")
+   155	        if TIER_ORDER[cand] < TIER_ORDER[tier]:
+   156	            tier = cand
+   157	    return tier
+   158	
+   159	
+   160	# --------------------------------------------------------------------------- #
+   161	# TIER-CONTRIBUTION ATTRIBUTION (Alberto #4): ROE + key metrics by M4 tier AND M8 tier.
+   162	# --------------------------------------------------------------------------- #
+   163	def tier_attribution(tiers: pd.DataFrame, m07_summary: pd.DataFrame) -> pd.DataFrame:
+   164	    """Per (tier_axis, tier_value): n_entities, mean/median ROE, win-rate, ruin-rate, PnL share.
+   165	    Lets us SEE whether down-weighted/killed cohorts actually underperformed (label right) or were
+   166	    good (over-penalizing -> discarding alpha)."""
+   167	    # Degenerate-pool guard (2026-06-04): an empty tier set (e.g. zero pooled seats in a smoke or a
+   168	    # fold with no eligible entities) is an empty DataFrame with NO columns, so the merge-key lookup
+   169	    # raises KeyError. Return empty attribution instead of crashing the chain.
+   170	    if tiers.empty or not {"entity_id", "fold_id"}.issubset(tiers.columns):
+   171	        return pd.DataFrame()
+   172	    df = tiers.merge(m07_summary[["entity_id", "fold_id", "roe_engine", "ruin"]],
+   173	                     on=["entity_id", "fold_id"], how="left")
+   174	    # codex r1#5: a tiered entity with NO M7 row is a DATA GAP -> do NOT silently treat as roe=0; flag,
+   175	    # exclude from the metrics, and surface n_missing per group (a metric over phantom 0s hides
+   176	    # discarded alpha / missing runner coverage).
+   177	    df["_missing_m07"] = df["roe_engine"].isna()
+   178	    n_missing_total = int(df["_missing_m07"].sum())
+   179	    if n_missing_total:
+   180	        logger.warning("M8 attribution: %d tiered (entity,fold) rows have NO M07 summary -> excluded "
+   181	                       "from metrics + flagged (data gap, not roe=0)", n_missing_total)
+   182	    rows = []
+   183	    present = df[~df["_missing_m07"]]
+   184	    total_pnl = present["roe_engine"].clip(lower=-1.0).sum()
+   185	    for axis, col in (("m4_tier", "m4_tier"), ("m8_tier", "tier")):
+   186	        if col not in df.columns:
+   187	            continue
+   188	        for val, g in df.groupby(col):
+   189	            gp = g[~g["_missing_m07"]]
+   190	            rows.append({
+   191	                "tier_axis": axis, "tier": val, "n_entities": len(g),
+   192	                "n_missing_m07": int(g["_missing_m07"].sum()),
+   193	                "mean_roe": round(float(gp["roe_engine"].mean()), 4) if len(gp) else None,
+   194	                "median_roe": round(float(gp["roe_engine"].median()), 4) if len(gp) else None,
+   195	                "win_rate": round(float((gp["roe_engine"] > 0).mean()), 4) if len(gp) else None,
+   196	                "ruin_rate": round(float(gp["ruin"].fillna(False).mean()), 4) if len(gp) else None,
+   197	                "pnl_share": round(float(gp["roe_engine"].sum() / total_pnl), 4) if (len(gp) and total_pnl) else 0.0,
+   198	            })
+   199	    return pd.DataFrame(rows)
+   200	
+   201	
+   202	def entity_pre_m8_max(quality_weight, m4_confidence, m: M8Manifest) -> float:
+   203	    """The largest slice the system could deploy BEFORE M8 down-weights (design §3; EXCLUDES the
+   204	    M8 survival multiplier, the suspicious cohort cap, and anti-corr). = M6b quality x M4 confidence x
+   205	    1.0 (survival placeholder) x M9 static per-entity cap, as an absolute capital on nominal_capital."""
+   206	    return float(quality_weight) * float(m4_confidence) * 1.0 * m.m9_static_per_entity_cap * m.nominal_capital
+   207	
+   208	
+   209	def _load_m04_entities(data_dir: Path, folds: pd.DataFrame, m04_dir: Optional[Path]) -> tuple[pd.DataFrame, bool]:
+   210	    """Load M4 entity tiers. Fold-pure mode requires exact as_of_ms == fold test_start."""
+   211	    cols = ["entity_id", "primary_wallet", "entity_tier"]
+   212	    if m04_dir is None:
+   213	        logger.warning("LOUD WARNING: using single global m04_entities.parquet for all M8 folds; "
+   214	                       "M8 M4 confidence is NOT fold-pure. Pass --m04-dir to load m04_entities_f{fold}.parquet.")
+   215	        return pd.read_parquet(data_dir / "m04_entities.parquet")[cols], False
+   216	
+   217	    fold_test_start_ms = {int(r.fold_id): pd.Timestamp(r.test_start).value // 1_000_000
+   218	                          for r in folds.itertuples()}
+   219	    parts = []
+   220	    for fid in sorted(fold_test_start_ms):
+   221	        p = Path(m04_dir) / f"m04_entities_f{fid}.parquet"
+   222	        if not p.exists():
+   223	            raise FileNotFoundError(f"missing fold-pure M4 entities for fold {fid}: {p}")
+   224	        df = pd.read_parquet(p).copy()
+   225	        missing = [c for c in (*cols, "as_of_ms") if c not in df.columns]
+   226	        if missing:
+   227	            raise ValueError(f"M8 PROVENANCE FAIL-CLOSED: {p} missing columns {missing}")
+   228	        n_null = int(df["as_of_ms"].isna().sum())
+   229	        if n_null:
+   230	            raise ValueError(f"M8 PROVENANCE FAIL-CLOSED: {p} has {n_null} null as_of_ms rows")
+   231	        expected = float(fold_test_start_ms[fid])
+   232	        bad = df["as_of_ms"].astype("float64") != expected
+   233	        if bad.any():
+   234	            raise ValueError(f"M8 PROVENANCE FAIL-CLOSED: {p} has {int(bad.sum())} rows "
+   235	                             f"with as_of_ms != fold {fid} test_start ({int(expected)})")
+   236	        df["fold_id"] = int(fid)
+   237	        parts.append(df[[*cols, "as_of_ms", "fold_id"]])
+   238	    return (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=[*cols, "as_of_ms", "fold_id"])), True
+   239	
+   240	
+   241	def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optional[str] = None,
+   242	            limit: Optional[int] = None, pool_path: Optional[Path] = None,
+   243	            m04_dir: Optional[Path] = None, allow_global_m04: bool = False) -> dict:
+   244	    """Tier the M6b INVESTABLE POOL: per pooled (entity, fold) run the counterfactual-survival
+   245	    primitive (M7 stress) + inferential scorers (phase-2 stub) -> tier; emit m08_tiers + attribution."""
+   246	    import pyarrow.dataset as ds
+   247	    pp = Path(pool_path) if pool_path else (data_dir / "m06b_pool.parquet")
+   248	    pool = pd.read_parquet(pp)
+   249	    pool = pool[pool["in_pool"]].copy()
+   250	    # AUDIT 2026-07-10 (codex P1#5): require a real BOOLEAN dtype. `fillna(False).all()` treated truthy strings
+   251	    # (e.g. the literal "False") as True, so a corrupted/provisional pool could be tiered for deployment.
+   252	    if "investable" not in pool.columns or not pd.api.types.is_bool_dtype(pool["investable"]) \
+   253	            or not bool(pool["investable"].all()):
+   254	        raise ValueError(
+   255	            "M8 requires an investable M6b pool with a boolean `investable` column all True; "
+   256	            "provisional/uncalibrated ranking (or a non-bool column) cannot be tiered for deployment"
+   257	        )
+   258	    folds = pd.read_parquet(data_dir / "m03_folds.parquet")
+   259	    # AUDIT 2026-07-10 (codex P0#3): the global m04_entities.parquet maps entity->primary_wallet using
+   260	    # FULL-history (post-decision) knowledge = look-ahead. A deployable M8 must use fold-pure per-fold M4
+   261	    # (--m04-dir, provenance-checked below). Fail closed unless the caller EXPLICITLY opts into the global
+   262	    # diagnostic path (allow_global_m04=True), which must never feed a live cohort.
+   263	    if m04_dir is None and not allow_global_m04:
+   264	        raise ValueError(
+   265	            "M8 look-ahead guard: --m04-dir (fold-pure M4) is REQUIRED for a deployable/trusted run. The global "
+   266	            "m04_entities.parquet uses future entity->wallet knowledge. Pass fold-pure per-fold M4, or set "
+   267	            "allow_global_m04=True ONLY for a non-deployment diagnostic.")
+   268	    ent, m04_fold_pure = _load_m04_entities(data_dir, folds, m04_dir)
+   269	    fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
+   270	                                 pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()}
+   271	    conf_map = {"CLEAN": 1.0, "UNCERTAIN": 0.25, "SUSPICIOUS": 0.10, "KILL": 0.0}
+   272	    pool = pool.merge(ent, on=["entity_id", "fold_id"] if m04_fold_pure else ["entity_id"], how="left")
+   273	    if m04_fold_pure:
+   274	        # FAIL-CLOSED provenance (codex M8 re-review): in fold-pure mode every pooled (entity_id, fold_id)
+   275	        # MUST have a matching fold-pure M4 entity row. A left-merge miss would silently become str(NaN)->
+   276	        # default 0.25 confidence (m4_tier="nan"). Refuse to proceed instead of fabricating confidence.
+   277	        _missing = pool[pool["entity_tier"].isna()]
+   278	        if len(_missing):
+   279	            _ex = _missing[["entity_id", "fold_id"]].head(3).to_dict("records")
+   280	            raise ValueError(
+   281	                f"M8 fold-pure M4 provenance: {len(_missing)} pooled (entity_id,fold_id) rows lack a "
+   282	                f"fold-pure M4 entity row (e.g. {_ex}). Rebuild per-fold M4 via build_m4_perfold.sh so "
+   283	                f"every pooled entity-fold is covered. Fail-closed (no fabricated confidence).")
+   284	    if not m.inferential_layer_active:
+   285	        logger.warning("LOUD WARNING: M8 inferential layer is inactive (phase2_stub); stubbed no_flag "
+   286	                       "is capped at uncertain and must not be read as verified-safe.")
+   287	
+   288	    md = E.MarketData(allow_mongo=True)
+   289	    if slip_calib_path:
+   290	        cal = json.loads(Path(slip_calib_path).read_text())
+   291	        per_fold = {int(k): v for k, v in cal.get("per_fold_asof", {}).items()}
+   292	    else:
+   293	        per_fold = {}
+   294	    acts_ds = ds.dataset(str(data_dir / "m02_actions.parquet"))
+   295	
+   296	    rows = []
+   297	    seats = pool.itertuples()
+   298	    if limit:
+   299	        seats = list(seats)[:limit]
+   300	    for r in seats:
+   301	        fid = int(r.fold_id)
+   302	        if fid not in fold_win:
+   303	            # AUDIT 2026-07-10 (codex P1#8): a pooled seat whose fold is absent from m03_folds is a provenance
+   304	            # mismatch (stale/wrong artifact) — do NOT silently drop the seat (it would vanish from m08 output
+   305	            # with no verdict). Fail closed.
+   306	            raise ValueError(f"M8 provenance: pooled (entity {int(r.entity_id)}, fold {fid}) has no matching "
+   307	                             f"m03_folds row (folds present: {sorted(fold_win)}). Rebuild m03/m06b consistently.")
+   308	        t0, t1 = fold_win[fid]
+   309	        md.set_slip_calib(per_fold.get(fid), cal.get("version") if slip_calib_path else None)
+   310	        filt = ((ds.field("wallet") == r.primary_wallet)
+   311	                & (ds.field("stream_replay_valid") == True)  # noqa: E712
+   312	                & (ds.field("lifecycle_valid") == True))  # noqa: E712
+   313	        wdf = acts_ds.to_table(filter=filt).to_pandas()
+   314	        adf = wdf[(wdf.ts >= t0) & (wdf.ts < t1)]
+   315	        # TIER-DOMAIN FAIL-CLOSED (codex M8 confirm): a non-canonical entity_tier (e.g. a literal "nan"
+   316	        # string or unknown label from corrupted/nonstandard M4 input) must NOT silently get the 0.25
+   317	        # default. Canonical M4 writes only CLEAN/UNCERTAIN/SUSPICIOUS/KILL; anything else -> 0.0 (KILL-
+   318	        # equivalent, fail-closed conservative) + loud warning, so a bad tier excludes the entity rather
+   319	        # than fabricating mid confidence.
+   320	        _tier = str(r.entity_tier)
+   321	        if _tier not in conf_map:
+   322	            logger.warning(f"M8: non-canonical entity_tier {_tier!r} for entity {int(r.entity_id)} fold "
+   323	                           f"{fid} -> fail-closed to 0.0 confidence (expected one of {sorted(conf_map)})")
+   324	            m4_conf = 0.0
+   325	        else:
+   326	            m4_conf = conf_map[_tier]
+   327	        # AUDIT 2026-07-10 fail-closed guards BEFORE the survival stress:
+   328	        # P1#7: a KILL / non-canonical M4 tier (m4_conf == 0) must produce a KILL survival tier, not just a
+   329	        #       zeroed size. Previously m4_conf=0 only zeroed pre_max_raw, which got bumped to min_slice and the
+   330	        #       stress could still emit uncertain/full_weight (0.25/1.0 multiplier). Force kill here.
+   331	        # P1#6: a non-finite quality_weight (NaN) would make pre_max_raw NaN -> NaN stress equity -> `final<=0`
+   332	        #       is False for NaN -> the row could "survive" with a nonsensical slice. Fail closed to kill.
+   333	        qw = r.quality_weight
+   334	        qw_ok = isinstance(qw, (int, float, np.integer, np.floating)) and not isinstance(qw, bool) \
+   335	            and np.isfinite(qw) and qw > 0
+   336	        if m4_conf <= 0.0 or not qw_ok:
+   337	            reason = "m4_kill_or_noncanonical" if m4_conf <= 0.0 else "nonfinite_quality_weight"
+   338	            sv = {"tier": "kill", "survival_outcome": f"fail_closed_{reason}",
+   339	                  "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
+   340	                  "indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
+   341	            pre_max_raw = 0.0
+   342	        else:
+   343	            pre_max_raw = entity_pre_m8_max(qw, m4_conf, m)   # codex r1#4: store the RAW formula
+   344	            # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
+   345	            # gets a meaningful stress test; the RAW value is persisted unchanged.
+   346	            sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
+   347	        sc = inferential_scorers(int(r.entity_id), fid)
+   348	        final_tier = _worst_tier(sv["tier"], sc)
+   349	        mult = {"kill": m.mult_kill, "suspicious": m.mult_suspicious,
+   350	                "uncertain": m.mult_uncertain, "full_weight": m.mult_full_weight}[final_tier]
+   351	        rows.append({
+   352	            "entity_id": int(r.entity_id), "fold_id": fid, "m4_tier": str(r.entity_tier),
+   353	            "tier": final_tier, "survival_multiplier": mult, "lp_label":
+   354	            ("NO_OBSERVED_DANGER" if final_tier == "full_weight" else final_tier),
+   355	            "survival_outcome": sv["survival_outcome"],
+   356	            "copyability_fail_at_stress": sv["copyability_fail_at_stress"],
+   357	            "max_survivable_slice": sv["max_survivable_slice"], "entity_pre_m8_max": pre_max_raw,
+   358	            "stress_roe": sv["stress_roe"], "stress_max_dd": sv["stress_max_dd"],
+   359	            "hidden_hedge_not_observable": (final_tier != "kill"),
+   360	            "funder_provenance_unavailable": sc["funder_provenance_unavailable"],
+   361	            "inferential_layer_active": m.inferential_layer_active,
+   362	            "scorers_phase": sc["scorers_phase"],
+   363	            **{f"scorer_{k}": sc[k] for k in ("hedge_smell", "funder_provenance", "carry_timing", "behavioral_linkage")},
+   364	        })
+   365	    tiers = pd.DataFrame(rows)
+   366	    summ = _read_m07_summary(m07_dir)
+   367	    att = tier_attribution(tiers, summ)
+   368	    out_dir = data_dir
+   369	    tiers.to_parquet(out_dir / "m08_tiers.parquet", index=False)
+   370	    att.to_parquet(out_dir / "m08_tier_attribution.parquet", index=False)
+   371	    man = asdict(m)
+   372	    man["m04_fold_pure"] = bool(m04_fold_pure)
+   373	    Path(out_dir / "m08_manifest.json").write_text(json.dumps(man, indent=2, default=str))
+   374	    logger.info("M8 done: %d tiered | tier dist %s", len(tiers),
+   375	                tiers["tier"].value_counts().to_dict() if len(tiers) else {})
+   376	    return {"n_tiered": len(tiers), "tier_dist": tiers["tier"].value_counts().to_dict() if len(tiers) else {}}
+   377	
+   378	
+   379	def _read_m07_summary(m07_dir: Path) -> pd.DataFrame:
+   380	    p = m07_dir / "m07_summary.parquet"
+
+exec
+/bin/zsh -lc 'git diff -- research/v15/v15_m08_survival.py tests/v15/test_m08_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+diff --git a/research/v15/v15_m08_survival.py b/research/v15/v15_m08_survival.py
+index fb463a0..aae0206 100644
+--- a/research/v15/v15_m08_survival.py
++++ b/research/v15/v15_m08_survival.py
+@@ -99,6 +99,13 @@ def survival_tier(actions, md, t0, t1, pre_m8_max_capital, m: M8Manifest) -> dic
+     big = _run_stress(actions, md, pre_m8_max_capital, t0, t1, m)
+     base = {"indeterminate_frac": big["indeterminate_frac"], "stress_roe": big["roe"],
+             "stress_max_dd": big["max_dd"]}
++    # AUDIT 2026-07-10 (codex P0#2 + P0#4): a run with ZERO fills has NO replayable survival evidence. This
++    # happens when the action stream is empty / fully filtered, OR when every action has NaN/invalid sizing so
++    # M7 skips it. Such a wallet must NOT come out "survived / full_weight" on unchanged start equity. Fail
++    # closed to KILL (data-gap) so it is excluded from the live cohort.
++    if int(big.get("n_fills", 0)) == 0:
++        return {"tier": "kill", "survival_outcome": "no_fills_data_gap",
++                "copyability_fail_at_stress": True, "max_survivable_slice": 0.0, **base}
+     heavy = big["indeterminate_frac"] > m.indeterminate_heavy_frac
+     if not big["wiped"]:
+         return {"tier": "uncertain" if heavy else "full_weight", "survival_outcome": "survived",
+@@ -233,7 +240,7 @@ def _load_m04_entities(data_dir: Path, folds: pd.DataFrame, m04_dir: Optional[Pa
+ 
+ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optional[str] = None,
+             limit: Optional[int] = None, pool_path: Optional[Path] = None,
+-            m04_dir: Optional[Path] = None) -> dict:
++            m04_dir: Optional[Path] = None, allow_global_m04: bool = False) -> dict:
+     """Tier the M6b INVESTABLE POOL: per pooled (entity, fold) run the counterfactual-survival
+     primitive (M7 stress) + inferential scorers (phase-2 stub) -> tier; emit m08_tiers + attribution."""
+     import pyarrow.dataset as ds
+@@ -249,6 +256,15 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
+             "provisional/uncalibrated ranking (or a non-bool column) cannot be tiered for deployment"
+         )
+     folds = pd.read_parquet(data_dir / "m03_folds.parquet")
++    # AUDIT 2026-07-10 (codex P0#3): the global m04_entities.parquet maps entity->primary_wallet using
++    # FULL-history (post-decision) knowledge = look-ahead. A deployable M8 must use fold-pure per-fold M4
++    # (--m04-dir, provenance-checked below). Fail closed unless the caller EXPLICITLY opts into the global
++    # diagnostic path (allow_global_m04=True), which must never feed a live cohort.
++    if m04_dir is None and not allow_global_m04:
++        raise ValueError(
++            "M8 look-ahead guard: --m04-dir (fold-pure M4) is REQUIRED for a deployable/trusted run. The global "
++            "m04_entities.parquet uses future entity->wallet knowledge. Pass fold-pure per-fold M4, or set "
++            "allow_global_m04=True ONLY for a non-deployment diagnostic.")
+     ent, m04_fold_pure = _load_m04_entities(data_dir, folds, m04_dir)
+     fold_win = {int(r.fold_id): (pd.Timestamp(r.train_start).value // 1_000_000,
+                                  pd.Timestamp(r.test_start).value // 1_000_000) for r in folds.itertuples()}
+@@ -308,10 +324,26 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
+             m4_conf = 0.0
+         else:
+             m4_conf = conf_map[_tier]
+-        pre_max_raw = entity_pre_m8_max(r.quality_weight, m4_conf, m)   # codex r1#4: store the RAW formula
+-        # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
+-        # gets a meaningful stress test; the RAW value is persisted unchanged.
+-        sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
++        # AUDIT 2026-07-10 fail-closed guards BEFORE the survival stress:
++        # P1#7: a KILL / non-canonical M4 tier (m4_conf == 0) must produce a KILL survival tier, not just a
++        #       zeroed size. Previously m4_conf=0 only zeroed pre_max_raw, which got bumped to min_slice and the
++        #       stress could still emit uncertain/full_weight (0.25/1.0 multiplier). Force kill here.
++        # P1#6: a non-finite quality_weight (NaN) would make pre_max_raw NaN -> NaN stress equity -> `final<=0`
++        #       is False for NaN -> the row could "survive" with a nonsensical slice. Fail closed to kill.
++        qw = r.quality_weight
++        qw_ok = isinstance(qw, (int, float, np.integer, np.floating)) and not isinstance(qw, bool) \
++            and np.isfinite(qw) and qw > 0
++        if m4_conf <= 0.0 or not qw_ok:
++            reason = "m4_kill_or_noncanonical" if m4_conf <= 0.0 else "nonfinite_quality_weight"
++            sv = {"tier": "kill", "survival_outcome": f"fail_closed_{reason}",
++                  "copyability_fail_at_stress": True, "max_survivable_slice": 0.0,
++                  "indeterminate_frac": None, "stress_roe": None, "stress_max_dd": None}
++            pre_max_raw = 0.0
++        else:
++            pre_max_raw = entity_pre_m8_max(qw, m4_conf, m)   # codex r1#4: store the RAW formula
++            # the big-slice probe runs at the deployable slice = max(raw, min) so a tiny-quality row still
++            # gets a meaningful stress test; the RAW value is persisted unchanged.
++            sv = survival_tier(adf, md, t0, t1, max(pre_max_raw, m.min_slice_capital), m)
+         sc = inferential_scorers(int(r.entity_id), fid)
+         final_tier = _worst_tier(sv["tier"], sc)
+         mult = {"kill": m.mult_kill, "suspicious": m.mult_suspicious,
+@@ -360,7 +392,9 @@ def main():
+     ap.add_argument("--slip-calib", default=str(DATA_DIR / "slippage_calib_v11.json"))
+     ap.add_argument("--limit", type=int, default=None)
+     ap.add_argument("--m04-dir", default=None,
+-                    help="directory with fold-pure m04_entities_f{fold_id}.parquet")
++                    help="directory with fold-pure m04_entities_f{fold_id}.parquet (REQUIRED for a trusted run)")
++    ap.add_argument("--allow-global-m04", action="store_true",
++                    help="opt into the look-ahead global m04_entities.parquet — DIAGNOSTIC ONLY, never for deployment")
+     ap.add_argument("--nominal-capital", type=float, default=10_000.0,
+                     help="bankroll scale for absolute survival stress slices (default: 10000.0)")
+     ap.add_argument(
+@@ -375,7 +409,8 @@ def main():
+         fixed_target_exposure=args.fixed_target_exposure,
+     )
+     run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
+-            limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None)
++            limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None,
++            allow_global_m04=args.allow_global_m04)
+ 
+ 
+ if __name__ == "__main__":
+
+codex
+One subtle branch worth checking is the min-size replay after a big-slice wipe. The new zero-fill guard is on the big probe; I’m checking whether M7 can produce fills at the big slice and zero fills at the min slice, because that would matter for the “survives at min” inference.
+exec
+/bin/zsh -lc 'rg -n "n_fills|skip|notional|minimum|min_notional|fill" research/v15/v15_m07_engine.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+13:  replica's fills, typed state-transition events, a bounded-cadence equity path, the full ending
+19:  limit, recorded as unfilled tracking error), which is a fill constraint, not an allocation choice.
+79:# to a late taker (a BUY in an up-bar / a SELL in a down-bar fills worse). 1m-RESOLUTION APPROXIMATION
+161:    the initial margin at the tier's max leverage; the tier is the largest lowerBound <= notional
+196:    def tier_maxlev(self, coin: str, notional: float) -> float:
+202:            if notional >= lb:
+208:    def maint_rate(self, coin: str, notional: float) -> float:
+209:        return 1.0 / (2.0 * self.tier_maxlev(coin, abs(notional)))
+211:    def init_margin_rate(self, coin: str, notional: float) -> float:
+212:        return 1.0 / self.tier_maxlev(coin, abs(notional))
+393:        # fills only calibrate the spread INTERCEPT, not ADV/the impact slope -> those stay prior).
+490:    # every action boundary + fold-end using REAL engine equity (fills/fees/funding/liq priced in).
+517:    Returns fills/events/equity/ending_account_state/summary."""
+521:        actions = actions[actions["stream_replay_valid"].fillna(False).astype(bool)].copy()
+523:        actions = actions[actions["lifecycle_valid"].fillna(False).astype(bool)].copy()
+529:    fills: list[dict] = []
+533:    summary["_fills_ref"] = fills    # internal: lets the liquidation path append market_liq_order fills
+541:        full at ts via force_close (no min-notional / capacity skip). Pricing falls back causal mark ->
+556:                         params, band, fills, events, summary, force_close=True)
+594:    # fills/events/summary/state) -> existing outputs byte-identical. Equity at b uses mark(b).
+694:        target_notional = tgt_pct * cur_eq
+695:        target_szi = target_notional / mark
+702:        _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary)
+710:        # fill's fee/slippage/marking can itself breach the trail -> check again immediately so we never
+785:    return _finalize(st, fills, events, equity_samples, summary, md, start_equity)
+791:        "n_actions": int(n_actions), "n_fills": 0, "n_rejected": 0, "n_capacity_capped": 0,
+793:        "total_fees": 0.0, "total_funding": 0.0, "slip_bps_notional_sum": 0.0, "notional_traded": 0.0,
+814:        # _finalize. Latency cost is ALREADY priced into each fill_px (CHANGE B), so the accumulated
+828:    BEFORE our fill timestamp. Using the CONTAINING bar's (close-open) was non-causal (within-minute
+832:    within-minute drift our late fill eats, pending real sub-minute (HL trades / L2) data. Always >= 0
+879:    window. We back-fill the position to (position_after - signed_size) at the first action, sized to
+922:def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary,
+924:    """Order lifecycle (design §4.4): lot round -> min-notional skip -> leverage/IM check -> capacity
+925:    cap (execution depth, recorded) -> fill at slippage price -> versioned fee -> position+bucket
+929:    the full position. It still pays realistic fee + slippage, but is NOT blocked by the min-notional
+930:    skip and is NOT downsized by the participation/capacity cap. Exit impact is charged on the FULL
+939:    delta_notional = abs(delta_szi) * mark
+940:    if delta_notional < MIN_ORDER_NOTIONAL and not force_close:
+956:        max_notional = CAPACITY_PARTICIPATION_CAP * adv
+957:        if delta_notional > max_notional:
+958:            delta_szi *= max_notional / delta_notional
+960:            delta_notional = abs(delta_szi) * mark
+963:            if delta_notional < MIN_ORDER_NOTIONAL:
+968:    participation = (delta_notional / adv) if adv > 0 else (1.0 if force_close else CAPACITY_PARTICIPATION_CAP)
+975:    fill_px = mark * (1 + side * slip_bps / 1e4)
+980:    # |causal vol proxy|, applied ALWAYS-adverse to a late taker: a BUY fills higher, a SELL fills lower.
+992:        # our trade. Large exactly on fast directional bars; charged on every copied fill so the latency
+996:        fill_px *= (1 + side * latency_drift)
+999:    fee = abs(delta_szi) * fill_px * fee_rate
+1009:        # use the SLIPPAGE-ADJUSTED fill_px (codex code-r4 #2) so the gate matches what _book_fill
+1011:        new_notional = abs(new_szi) * fill_px
+1012:        new_im = new_notional * md.meta.init_margin_rate(coin, new_notional)   # TOTAL IM (tier-correct; codex code-r3)
+1013:        slip_cost = abs(delta_szi) * abs(fill_px - mark)
+1020:            # TOTAL cross IM of the scope AFTER the fill (existing positions re-rated at their tier)
+1039:    _book_fill(st, md, coin, delta_szi, fill_px, mode, fee, summary)
+1041:    summary["n_fills"] += 1
+1043:    summary["notional_traded"] += delta_notional
+1044:    # FIX (codex finding #4): include the latency-drift bps in the notional-weighted slip diagnostic so
+1045:    # the reported execution haircut isn't understated (the drift is a real per-fill execution cost
+1046:    # already priced into fill_px above; it must show up in slip_bps_notional_weighted too).
+1047:    summary["slip_bps_notional_sum"] += (slip_bps + latency_drift_bps) * delta_notional
+1048:    fills.append({
+1051:        "our_fill_size": float(delta_szi), "our_fill_px": float(fill_px), "ref_mark": float(mark),
+1053:        "fill_type": "normal", "capacity_capped": bool(capacity_capped), "margin_mode": mode,
+1106:def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fill_px: float,
+1115:        new = Position(coin, delta_szi, fill_px, mode, md.meta.max_leverage(coin))
+1117:            im = abs(delta_szi) * fill_px * md.meta.init_margin_rate(coin, abs(delta_szi) * fill_px)
+1130:        realized = reduce * (fill_px - p.entry_px) * (1 if p.szi > 0 else -1)
+1145:        p.entry_px = (p.entry_px * abs(p.szi) + fill_px * abs(delta_szi)) / abs(new_szi)
+1147:            # post the TIER-CORRECT total IM for the resulting notional; draw the delta (incl any
+1149:            new_notional = abs(new_szi) * fill_px
+1150:            target_im = new_notional * md.meta.init_margin_rate(coin, new_notional)
+1157:        p.entry_px = fill_px      # flipped through zero
+1164:        # FIX (codex finding #2): SPLIT the single flip-order fee by closing vs opening notional so each
+1213:    position; it appends to a NEW equity-samples list ONLY (never touches fills/events/summary/state)
+1377:    with _scan_breach), so a detected breach actually fires, and the forced fill is conservatively
+1444:    most-marginal position by 20% if its notional > 100k and not in cooldown (then sets the 30s
+1487:    close_notional = abs(close_szi) * mark
+1490:    participation = close_notional / adv if adv > 0 else 1.0
+1496:    fill_px = mark * (1 + side * forced_slip_bps / 1e4)
+1498:    realized = min(abs(close_szi), abs(p.szi)) * (fill_px - p.entry_px) * (1 if p.szi > 0 else -1)
+1506:    fl = summary.get("_fills_ref")
+1510:                   "our_fill_size": float(close_szi), "our_fill_px": float(fill_px), "ref_mark": float(mark),
+1513:                   "fill_type": "market_liq_order", "capacity_capped": False, "margin_mode": p.mode})
+1559:def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
+1560:    summary.pop("_fills_ref", None)     # internal handle; never written to the summary parquet
+1572:    summary["slip_bps_notional_weighted"] = (
+1573:        summary["slip_bps_notional_sum"] / summary["notional_traded"] if summary["notional_traded"] > 0 else 0.0)
+1580:    # CHANGE B: declare the latency-cost model used to price every fill (see _apply_order).
+1588:    return {"fills": fills, "events": events, "equity": equity_samples,
+1689:    fw = ShardedParquetWriter(out_dir / "m07_fills.parquet", flush_rows=flush_rows)
+1712:            fw.add_many(res["fills"]); ew.add_many(res["events"]); qw.add_many(res["equity"])
+1716:    logger.info("M7 runner done: %d fills, %d events, %d summaries, %d equity", nf, ne, ns, nq)
+1717:    return {"fills": nf, "events": ne, "summaries": ns, "equity": nq}
+
+exec
+/bin/zsh -lc 'pytest tests/v15/test_m08.py tests/v15/test_m08_golden.py -q' in /Users/hermes/quants-lab
+ exited 1 in 1520ms:
+..............F                                                          [100%]
+=================================== FAILURES ===================================
+_________________ test_p0_3_global_m04_lookahead_fails_closed __________________
+
+tmp_path = PosixPath('/private/var/folders/b3/f0nqzyqs4h3cs71g_xn2rs0c0000gp/T/pytest-of-hermes/pytest-300/test_p0_3_global_m04_lookahead0')
+
+    def test_p0_3_global_m04_lookahead_fails_closed(tmp_path):
+        # run_m08 must refuse the look-ahead global M4 path unless allow_global_m04=True. It reaches the guard
+        # after loading the pool + folds, so provide minimal parquets; the guard should raise before M4 load.
+        d = tmp_path
+        pool = pd.DataFrame({"entity_id": [1], "fold_id": [1], "in_pool": [True], "investable": [True]})
+>       pool.to_parquet(d / "m06b_pool.parquet")
+
+tests/v15/test_m08_golden.py:56: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../Library/Python/3.11/lib/python/site-packages/pandas/util/_decorators.py:333: in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+../Library/Python/3.11/lib/python/site-packages/pandas/core/frame.py:3113: in to_parquet
+    return to_parquet(
+../Library/Python/3.11/lib/python/site-packages/pandas/io/parquet.py:476: in to_parquet
+    impl = get_engine(engine)
+           ^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+engine = 'auto'
+
+    def get_engine(engine: str) -> BaseImpl:
+        """return our implementation"""
+        if engine == "auto":
+            engine = get_option("io.parquet.engine")
+    
+        if engine == "auto":
+            # try engines in this order
+            engine_classes = [PyArrowImpl, FastParquetImpl]
+    
+            error_msgs = ""
+            for engine_class in engine_classes:
+                try:
+                    return engine_class()
+                except ImportError as err:
+                    error_msgs += "\n - " + str(err)
+    
+>           raise ImportError(
+                "Unable to find a usable engine; "
+                "tried using: 'pyarrow', 'fastparquet'.\n"
+                "A suitable version of "
+                "pyarrow or fastparquet is required for parquet "
+                "support.\n"
+                "Trying to import the above resulted in these errors:"
+                f"{error_msgs}"
+            )
+E           ImportError: Unable to find a usable engine; tried using: 'pyarrow', 'fastparquet'.
+E           A suitable version of pyarrow or fastparquet is required for parquet support.
+E           Trying to import the above resulted in these errors:
+E            - Missing optional dependency 'pyarrow'. pyarrow is required for parquet support. Use pip or conda to install pyarrow.
+E            - Missing optional dependency 'fastparquet'. fastparquet is required for parquet support. Use pip or conda to install fastparquet.
+
+../Library/Python/3.11/lib/python/site-packages/pandas/io/parquet.py:67: ImportError
+=============================== warnings summary ===============================
+tests/v15/test_m08.py::test_attribution_flags_missing_m07_rows
+tests/v15/test_m08.py::test_attribution_flags_missing_m07_rows
+  /Users/hermes/quants-lab/research/v15/v15_m08_survival.py:196: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+    "ruin_rate": round(float(gp["ruin"].fillna(False).mean()), 4) if len(gp) else None,
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v15/test_m08_golden.py::test_p0_3_global_m04_lookahead_fails_closed
+1 failed, 14 passed, 2 warnings in 1.03s
+
+codex
+Focused tests hit a local environment issue: this Python lacks `pyarrow`/`fastparquet`, so the parquet-writing golden test can’t run here. The pure logic tests pass up to that point; I’ll still finish the static control-flow review.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '680,710p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   680	            summary["_core_final_eq"] = cur_eq
+   681	            prev_ts = our_ts
+   682	            continue
+   683	
+   684	        mark = marks.get(coin)
+   685	        if mark is None or mark != mark or mark <= 0:
+   686	            summary["metadata_uncertain"] = True
+   687	            prev_ts = our_ts
+   688	            continue
+   689	
+   690	        tgt_pct = _action_target_pct(a, params)
+   691	        if tgt_pct != tgt_pct:
+   692	            prev_ts = our_ts
+   693	            continue
+   694	        target_notional = tgt_pct * cur_eq
+   695	        target_szi = target_notional / mark
+   696	        cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
+   697	        exit_cond = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
+   698	        if exit_cond:
+   699	            target_szi = 0.0
+   700	        delta_szi = target_szi - cur_szi
+   701	
+   702	        _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary)
+   703	
+   704	        marks = _marks(st, md, our_ts, extra=coin)
+   705	        eq = st.equity(marks)
+   706	        peak_equity = max(peak_equity, eq)
+   707	        if peak_equity > 0:
+   708	            summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
+   709	        # FOLLOWER trailing exit POST-FILL (codex review bug #3): this action just changed exposure; the
+   710	        # fill's fee/slippage/marking can itself breach the trail -> check again immediately so we never
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '922,972p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   922	def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary,
+   923	                 force_close=False):
+   924	    """Order lifecycle (design §4.4): lot round -> min-notional skip -> leverage/IM check -> capacity
+   925	    cap (execution depth, recorded) -> fill at slippage price -> versioned fee -> position+bucket
+   926	    update.
+   927	
+   928	    force_close (codex follower-trail review bug #5): a RISK exit (breaker flatten) must reliably close
+   929	    the full position. It still pays realistic fee + slippage, but is NOT blocked by the min-notional
+   930	    skip and is NOT downsized by the participation/capacity cap. Exit impact is charged on the FULL
+   931	    order/ADV ratio; capping impact at the entry participation limit would make emergency exits
+   932	    optimistically cheap exactly when capacity is breached."""
+   933	    if abs(delta_szi) < 1e-15:
+   934	        return
+   935	    szdec = md.meta.szdec(coin)
+   936	    delta_szi = round(delta_szi, szdec)
+   937	    if abs(delta_szi) < 10 ** (-szdec):
+   938	        return
+   939	    delta_notional = abs(delta_szi) * mark
+   940	    if delta_notional < MIN_ORDER_NOTIONAL and not force_close:
+   941	        return
+   942	
+   943	    mode = default_margin_mode(coin)
+   944	    liq = md.liquidity(coin, our_ts)
+   945	    if liq.get("adv_unavailable") and not force_close:
+   946	        summary["adv_unavailable"] = True
+   947	        summary["n_rejected"] += 1
+   948	        return
+   949	    if liq.get("uncalibrated"):
+   950	        summary["slippage_uncalibrated"] = True
+   951	    elif getattr(md, "slip_calib_version", None) is not None:
+   952	        summary["slippage_calibration_version"] = md.slip_calib_version
+   953	    adv = liq.get("adv", 0.0)
+   954	    capacity_capped = False
+   955	    if adv > 0 and not force_close:
+   956	        max_notional = CAPACITY_PARTICIPATION_CAP * adv
+   957	        if delta_notional > max_notional:
+   958	            delta_szi *= max_notional / delta_notional
+   959	            delta_szi = round(delta_szi, szdec)
+   960	            delta_notional = abs(delta_szi) * mark
+   961	            capacity_capped = True
+   962	            summary["n_capacity_capped"] += 1
+   963	            if delta_notional < MIN_ORDER_NOTIONAL:
+   964	                return
+   965	
+   966	    # If ADV is unavailable on a forced close, use a full-ADV conservative
+   967	    # fallback. New exposure already fails closed above.
+   968	    participation = (delta_notional / adv) if adv > 0 else (1.0 if force_close else CAPACITY_PARTICIPATION_CAP)
+   969	    impact_k = liq.get("impact_k_bps", DEFAULT_IMPACT_K_BPS)        # D1: calibrated-or-prior slope
+   970	    impact_alpha = liq.get("impact_alpha", DEFAULT_IMPACT_ALPHA)
+   971	    impact_bps = impact_k * (participation ** impact_alpha) * band
+   972	    half_spread_bps = liq.get("half_spread_bps", DEFAULT_HALF_SPREAD_BPS) * band
+
+exec
+/bin/zsh -lc 'rg -n "MIN_ORDER_NOTIONAL|fixed_position|leader_equity|target_pct|sizing_mode" research/v15/v15_m07_engine.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+65:MIN_ORDER_NOTIONAL = 10.0                   # HL ~$10 min order
+486:    sizing_mode: str = "leader_equity"         # leader_equity | fixed_position
+493:def _action_target_pct(action: dict, params: EngineParams) -> float:
+495:    if params.sizing_mode == "leader_equity":
+497:    if params.sizing_mode == "fixed_position":
+504:    raise ValueError(f"unknown sizing_mode {params.sizing_mode!r}")
+690:        tgt_pct = _action_target_pct(a, params)
+775:            tp = _action_target_pct(a, params)
+796:        "sizing_mode": params.sizing_mode,
+798:            float(params.fixed_target_exposure) if params.sizing_mode == "fixed_position" else None
+859:    our_pct_c = signed szi_c * mark_c / equity; target_pct_c = the source's signed target exposure.
+860:    L1 = sum_c |our_pct_c - target_pct_c| (long-vs-short mismatch ADDITIVE, no cancel). active iff
+892:    post_pct = _action_target_pct(first_row, params)       # SIGNED exposure% AFTER the first action
+898:        if params.sizing_mode == "fixed_position":
+940:    if delta_notional < MIN_ORDER_NOTIONAL and not force_close:
+963:            if delta_notional < MIN_ORDER_NOTIONAL:
+1614:                  copy_latency_ms: int = 2_000, sizing_mode: str = "leader_equity",
+1695:        copy_latency_ms=copy_latency_ms, sizing_mode=sizing_mode,
+1738:        "--sizing-mode", choices=("leader_equity", "fixed_position"),
+1739:        default="leader_equity",
+1743:        help="Absolute follower exposure per open leader position in fixed_position mode.",
+1750:                  sizing_mode=args.sizing_mode,
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '486,506p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   486	    sizing_mode: str = "leader_equity"         # leader_equity | fixed_position
+   487	    fixed_target_exposure: float = 0.10         # signed direction gets this absolute follower exposure
+   488	    # equity draws down >= follower_trail from its running peak, FLATTEN all positions and sit out the rest
+   489	    # of the fold (independent of source). None = disabled (copy source exposure verbatim). Checked at
+   490	    # every action boundary + fold-end using REAL engine equity (fills/fees/funding/liq priced in).
+   491	
+   492	
+   493	def _action_target_pct(action: dict, params: EngineParams) -> float:
+   494	    """Return the declared source target under the selected sizing policy."""
+   495	    if params.sizing_mode == "leader_equity":
+   496	        return _f(action.get("target_exposure_pct"))
+   497	    if params.sizing_mode == "fixed_position":
+   498	        pa = _f(action.get("position_after"))
+   499	        if pa != pa:
+   500	            return float("nan")
+   501	        if abs(pa) <= 1e-12:
+   502	            return 0.0
+   503	        return float(np.sign(pa) * abs(params.fixed_target_exposure))
+   504	    raise ValueError(f"unknown sizing_mode {params.sizing_mode!r}")
+   505	
+   506	
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '760,782p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   760	    else:
+   761	        # D3: flush the pre-ruin interval to the ruin instant (our tracked exposure), then the SOURCE
+   762	        # keeps trading while our exposure is forced 0 -> full penalty = sum|source target| accrued
+   763	        # time-weighted to fold_end, advancing the source target vector read-only over later actions.
+   764	        rt = int(summary.get("time_to_ruin_ms") or end_ts_ms)
+   765	        _te_accrue(rt)
+   766	        cur = rt
+   767	        for a in rows:
+   768	            ats = int(a["ts"]) + params.copy_latency_ms
+   769	            if ats <= rt or coin_is_spot(a["coin"]):
+   770	                continue
+   771	            pen = sum(abs(v) for v in src_target.values() if v == v)
+   772	            if ats > cur and pen > 0:
+   773	                summary["_te_weighted_sum"] += (ats - cur) * pen
+   774	                summary["tracking_error_active_ms"] += (ats - cur)
+   775	            tp = _action_target_pct(a, params)
+   776	            if tp == tp:
+   777	                ex = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
+   778	                src_target[a["coin"]] = (0.0 if ex else tp)
+   779	            cur = ats
+   780	        pen = sum(abs(v) for v in src_target.values() if v == v)
+   781	        if end_ts_ms > cur and pen > 0:
+   782	            summary["_te_weighted_sum"] += (end_ts_ms - cur) * pen
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m07_engine.py | sed -n '884,904p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   884	        return
+   885	    coin = first_row["coin"]
+   886	    if coin_is_spot(coin):
+   887	        return
+   888	    our_ts = int(first_row["ts"]) + params.copy_latency_ms
+   889	    mark = md.mark(coin, our_ts)
+   890	    if mark is None or mark != mark or mark <= 0:
+   891	        return
+   892	    post_pct = _action_target_pct(first_row, params)       # SIGNED exposure% AFTER the first action
+   893	    pa = _f(first_row.get("position_after"))               # source signed size after the first action
+   894	    ss = _f(first_row.get("signed_size"))                  # the first action's own signed delta
+   895	    if post_pct == post_pct and pa == pa and ss == ss and pa != 0 and pa != ss:  # had a prior position
+   896	        eq = sum(st.cross_collateral.values())
+   897	        pre_pos = pa - ss
+   898	        if params.sizing_mode == "fixed_position":
+   899	            pre_pct = float(np.sign(pre_pos) * abs(params.fixed_target_exposure))
+   900	        else:
+   901	            # source exposure% BEFORE the first observed action = post% scaled by the pre/post size ratio.
+   902	            # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
+   903	            # shorts -- codex code-r4 #3). The main loop's first order then trades to the post target.
+   904	            pre_pct = post_pct * pre_pos / pa
+
+codex
+The review is converging. I found one edge case in the survival helper itself: only the big-slice stress is guarded for `n_fills == 0`; the min/smaller probes are still treated as valid survival evidence without checking fill count. I’m checking the project Python now so I can separate that code finding from the local dependency problem.
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import pyarrow, pandas
+print('pyarrow', pyarrow.__version__)
+print('pandas', pandas.__version__)
+PY" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py tests/v15/test_m08_golden.py -q' in /Users/hermes/quants-lab
+ succeeded in 524ms:
+pyarrow 23.0.1
+pandas 3.0.1
+
+ succeeded in 874ms:
+...............                                                          [100%]
+15 passed in 0.44s
+
+codex
+Verdict: the fixes mostly close the audited paths, but I would not call this fully complete yet.
+
+- P0#2 + P0#4, big stress `n_fills == 0`: correct for empty/fully filtered/NaN-sized streams. The big probe now fails closed to `kill` with multiplier `0.0` through `_worst_tier`. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:99).
+- Gap: the min/smaller probes are not guarded for zero fills. Path: big probe has fills and wipes, min probe returns `wiped=False, n_fills=0`, then M8 emits `copyability_fail_at_stress` with survival tier `full_weight`/`uncertain`, downstream capped to `uncertain` by phase2 stub, multiplier `0.25`. That is still evidence-less survival at the min probe. I’d add `n_fills > 0` checks for `mn` before accepting min survival, and for `small` before raising `max_survivable_slice`.
+
+- P1#7, M4 `KILL` / non-canonical tier: correct. `m4_conf <= 0.0` bypasses stress and emits `sv["tier"] = "kill"`; `_worst_tier("kill", sc)` preserves kill, so multiplier is `0.0`. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:320).
+
+- P1#6, non-finite/non-positive `quality_weight`: correct. `NaN`, `inf`, `pd.NA`-like non-numeric values, zero, negative, and bools fail closed before `entity_pre_m8_max`, so no NaN equity can survive. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:333).
+
+- P0#3, default global M4 look-ahead: correct for trusted/default runs. `run_m08(..., m04_dir=None, allow_global_m04=False)` raises before global M4 load. Fold-pure mode also checks exact `as_of_ms == test_start` and fails missing entity-fold joins. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:263).
+- Caveat: `allow_global_m04=True` can still write nonzero M8 tiers using global M4. That is acceptable only if downstream/live scripts also treat `m04_fold_pure=False` as non-deployable, not just advisory.
+
+- Bypassing `survival_tier` for `m4_conf <= 0` / bad `quality_weight`: correct. The row assembly works because the synthetic `sv` includes every accessed key: `tier`, `survival_outcome`, `copyability_fail_at_stress`, `max_survivable_slice`, `stress_roe`, `stress_max_dd`. `_worst_tier` preserves kill.
+
+Verification: `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py tests/v15/test_m08_golden.py -q` passes: `15 passed`.
+
+OVERALL: after these five, P0#1 staleness/persistence remains the main design-gated trust hole, but there is also one small completion gap in this commit: zero-fill evidence should be checked on the min/smaller survival probes, not only the big probe.
+tokens used
+46.578
+Verdict: the fixes mostly close the audited paths, but I would not call this fully complete yet.
+
+- P0#2 + P0#4, big stress `n_fills == 0`: correct for empty/fully filtered/NaN-sized streams. The big probe now fails closed to `kill` with multiplier `0.0` through `_worst_tier`. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:99).
+- Gap: the min/smaller probes are not guarded for zero fills. Path: big probe has fills and wipes, min probe returns `wiped=False, n_fills=0`, then M8 emits `copyability_fail_at_stress` with survival tier `full_weight`/`uncertain`, downstream capped to `uncertain` by phase2 stub, multiplier `0.25`. That is still evidence-less survival at the min probe. I’d add `n_fills > 0` checks for `mn` before accepting min survival, and for `small` before raising `max_survivable_slice`.
+
+- P1#7, M4 `KILL` / non-canonical tier: correct. `m4_conf <= 0.0` bypasses stress and emits `sv["tier"] = "kill"`; `_worst_tier("kill", sc)` preserves kill, so multiplier is `0.0`. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:320).
+
+- P1#6, non-finite/non-positive `quality_weight`: correct. `NaN`, `inf`, `pd.NA`-like non-numeric values, zero, negative, and bools fail closed before `entity_pre_m8_max`, so no NaN equity can survive. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:333).
+
+- P0#3, default global M4 look-ahead: correct for trusted/default runs. `run_m08(..., m04_dir=None, allow_global_m04=False)` raises before global M4 load. Fold-pure mode also checks exact `as_of_ms == test_start` and fails missing entity-fold joins. See [v15_m08_survival.py](/Users/hermes/quants-lab/research/v15/v15_m08_survival.py:263).
+- Caveat: `allow_global_m04=True` can still write nonzero M8 tiers using global M4. That is acceptable only if downstream/live scripts also treat `m04_fold_pure=False` as non-deployable, not just advisory.
+
+- Bypassing `survival_tier` for `m4_conf <= 0` / bad `quality_weight`: correct. The row assembly works because the synthetic `sv` includes every accessed key: `tier`, `survival_outcome`, `copyability_fail_at_stress`, `max_survivable_slice`, `stress_roe`, `stress_max_dd`. `_worst_tier` preserves kill.
+
+Verification: `/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py tests/v15/test_m08_golden.py -q` passes: `15 passed`.
+
+OVERALL: after these five, P0#1 staleness/persistence remains the main design-gated trust hole, but there is also one small completion gap in this commit: zero-fill evidence should be checked on the min/smaller survival probes, not only the big probe.
