@@ -62,6 +62,10 @@ BLOCK_DAYS = 14
 HORIZON_DAYS = 168            # ~6mo intended persistence lookback (archive is 174d -> natural cap)
 PERS_SAT_BLOCKS = 6           # codex#7 "6-block saturation": min(6, possible_blocks) denominator
 DD_LO = 0.20                  # clamp floor; aligns with M5 max_dd<=0.80 (no-op rail)
+# M5 upstream-contract rails asserted for eligible rows (codex m06a P2). Mirror m05 MIN_JOURNEYS_PRETEST /
+# MAXDD_CAP; these are non-perf blocking gates M5 enforces in BOTH strict and COPYABILITY_ONLY mode.
+MIN_JOURNEYS_M5 = 3
+MAXDD_M5 = 0.80
 MS_DAY = 86_400_000
 BLOCK_MS = BLOCK_DAYS * MS_DAY
 HORIZON_MS = HORIZON_DAYS * MS_DAY
@@ -195,6 +199,17 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
             raise ValueError(f"shortlist_n_per_fold must be a positive int, got {Nraw!r}")
         N = int(Nraw)
 
+    # AUDIT 2026-07-10 (codex m06a P1): `eligible` MUST be a strict bool. A NaN/non-bool slips PAST the I9
+    # precheck (`== True` is False for NaN) yet `bool(np.nan)` is True in the scoring loop -> the row can become
+    # rankable + shortlisted with NO copyability check. Fail CLOSED here (validate the column once, up front).
+    if "eligible" not in elig.columns:
+        raise AssertionError("M5 eligibility frame lacks the 'eligible' column")
+    _bad_elig = elig["eligible"].isna() | ~elig["eligible"].isin([True, False])
+    if bool(_bad_elig.any()):
+        raise AssertionError(
+            f"M5 eligibility has {int(_bad_elig.sum())} missing/non-bool 'eligible' values "
+            f"(e.g. entity_ids {elig.loc[_bad_elig, 'entity_id'].head(5).tolist()}); fail closed.")
+
     # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
     #     primary_wallet matching m04 (codex code-r1 #5). ---
     if entities_by_fold is None:
@@ -269,7 +284,7 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
         test_start_ms = _ts_ms(fold_test_start[int(fid)])
         for _, r in sub.iterrows():
             eid = int(r["entity_id"])
-            elig_row = bool(r["eligible"])
+            elig_row = (r["eligible"] == True)  # noqa: E712 -- validated strict-bool above; no bool(NaN) trap
             fcop, fprim, falloc = _maps_for_fold(int(fid))
             w = fprim.get(eid)  # canonical primary wallet (validated above for eligible rows)
             ts_arr = act_by.get(w, np.empty(0, "int64"))
@@ -292,9 +307,16 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
             # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
             # the real post-engine ranking. We still require FINITE inputs (NaN would be a true data breach).
             if elig_row:
-                if not (njr_finite and njr_n >= 0):
+                # AUDIT 2026-07-10 (codex m06a P2): finiteness is not enough -- assert the M5 RANGE contract so an
+                # upstream floor breach fails CLOSED instead of being silently clamped. n_journeys>=3 is a non-perf
+                # blocking gate M5 enforces in EVERY lane (strict, COPYABILITY_ONLY, AND the equity-independent
+                # activity_only lane), so it is asserted here for ALL eligible rows. The max_dd<=0.80 rail is
+                # asserted ONLY in the equity_roe branch below: activity_only is the equity-INDEPENDENT lane where
+                # M5 ran equity_required=False, so max_dd_pretest is legitimately NaN/absent and DD is deferred to
+                # M7/M6b (asserting it here would false-positive on that lane by design).
+                if not (njr_finite and njr_n >= MIN_JOURNEYS_M5):
                     raise AssertionError(
-                        f"ELIGIBLE row entity {eid} fold {fid} has invalid n_journeys={njr_n}."
+                        f"ELIGIBLE row entity {eid} fold {fid} has n_journeys={njr_n} (< M5 floor {MIN_JOURNEYS_M5})."
                     )
                 if score_basis == "activity_only":
                     # Equity-independent high-recall bouncer. Performance is
@@ -306,6 +328,12 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
                         raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
                     if not np.isfinite(dd):
                         raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd={dd_n}.")
+                    # DD rail: equity_roe lane only (see the note above the n_journeys assert). A breach here would
+                    # otherwise hide behind the 0.20 dd_term clamp -> fail closed instead.
+                    if dd > MAXDD_M5:
+                        raise AssertionError(
+                            f"ELIGIBLE row entity {eid} fold {fid} has max_dd={dd_n} (> M5 cap {MAXDD_M5}); "
+                            f"upstream floor breach, fail closed (not silently clamped).")
                     if not COPYABILITY_ONLY and roe <= 0:
                         raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
                     # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.

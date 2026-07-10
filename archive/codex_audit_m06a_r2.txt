@@ -1,0 +1,1474 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c85-28c5-7a93-882d-3b635161ac5a
+--------
+user
+# Round-2 m06a — closing the two audit findings
+
+Your audit found 2 fail-open defects in research/v15/v15_m06a_shortlist.py. Both fixed; verify closure. Read
+the file (constants ~L60-72; eligible-column validation ~L200-212; the eligible scoring branch ~L305-330).
+
+## Fixes applied
+1. P1 (missing/non-bool `eligible` -> rankable via bool(np.nan)): run() now validates the `eligible` column ONCE
+   up front -- `elig["eligible"].isna() | ~isin([True,False])` -> AssertionError. And the per-row read is now
+   `elig_row = (r["eligible"] == True)`, never `bool(raw)`.
+2. P2 (eligible row breaching M5 range contract silently clamped): eligible rows now assert the M5 RANGE, not
+   just finiteness -- n_journeys >= MIN_JOURNEYS_M5(3) (shared, both bases), and max_dd <= MAXDD_M5(0.80) in the
+   equity_roe branch -> AssertionError on breach (dd=1.5 no longer hides behind the 0.20 clamp). Constants mirror
+   m05 MIN_JOURNEYS_PRETEST / MAXDD_CAP (verified equal). These are non-perf blocking gates M5 enforces in BOTH
+   strict and COPYABILITY_ONLY, so asserting them unconditionally for eligible rows is correct (only
+   net_pnl/roe/days_green relax under COPYABILITY_ONLY, and roe<=0 stays gated by the existing
+   `not COPYABILITY_ONLY and roe<=0` check).
+Golden: tests/v15/test_m06a_golden.py -- NaN eligible -> fail; nj=1 -> fail; dd=1.5 -> fail; clean row still
+shortlists. 32 m06a + full v15 pass.
+
+## Questions
+- Are BOTH findings fully closed? Any remaining path where a corrupt/missing eligibility or an out-of-contract
+  eligible row reaches rankable/in_shortlist?
+- Is asserting n_journeys>=3 and max_dd<=0.80 unconditionally for eligible rows correct under COPYABILITY_ONLY,
+  or does that mode legitimately relax either (would my assert then false-positive on a valid run)?
+- Any NEW bug or determinism/loose-path regression from these edits.
+
+## Output
+Verdict. End OVERALL: is m06a now look-ahead-safe AND fail-CLOSED and ready to be marked TRUSTED, or list exactly
+what remains.
+codex
+I’ll review the targeted code and tests in a code-review stance, then run the relevant test slice if the environment allows it.
+exec
+/bin/zsh -lc "sed -n '55,80p' research/v15/v15_m06a_shortlist.py && sed -n '190,220p' research/v15/v15_m06a_shortlist.py && sed -n '295,340p' research/v15/v15_m06a_shortlist.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+# (M5 no longer floors performance). M6a then RANKS performance instead of asserting it. Default OFF =
+# strict behavior byte-identical.
+import os as _os
+COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+
+# === Constants (LOCKED by design r6) ===
+BLOCK_DAYS = 14
+HORIZON_DAYS = 168            # ~6mo intended persistence lookback (archive is 174d -> natural cap)
+PERS_SAT_BLOCKS = 6           # codex#7 "6-block saturation": min(6, possible_blocks) denominator
+DD_LO = 0.20                  # clamp floor; aligns with M5 max_dd<=0.80 (no-op rail)
+# M5 upstream-contract rails asserted for eligible rows (codex m06a P2). Mirror m05 MIN_JOURNEYS_PRETEST /
+# MAXDD_CAP; these are non-perf blocking gates M5 enforces in BOTH strict and COPYABILITY_ONLY mode.
+MIN_JOURNEYS_M5 = 3
+MAXDD_M5 = 0.80
+MS_DAY = 86_400_000
+BLOCK_MS = BLOCK_DAYS * MS_DAY
+HORIZON_MS = HORIZON_DAYS * MS_DAY
+HORIZON_BLOCKS = HORIZON_DAYS // BLOCK_DAYS   # 12 (denominator for persistence_coverage)
+
+DEFAULT_MANIFEST = {
+    "manifest_version": "v1",
+    "mode": "shortlist",                 # "shortlist" | "rank_only"
+    "shortlist_n_per_fold": 1000,        # Alberto, pre-registered (engine-budget round number)
+    "recency_gate": True,                # drop entities with no action/open-position in the most recent 14d block
+    "contamination_status": "clean_oos", # clean_oos | exploratory_calibration | alberto_override
+    "persistence_horizon_days": HORIZON_DAYS,
+    # non-clean (explicitly diagnostic) manifest.
+    if not recency_gate and contam == "clean_oos":
+        raise ValueError("recency_gate=False requires contamination_status != 'clean_oos' "
+                         "(disabling the stale-drop is a non-production diagnostic, not clean OOS).")
+    N = None
+    if mode == "shortlist":
+        # codex code-r1 #6: N must be a real positive int (reject bool/float/negative).
+        Nraw = manifest["shortlist_n_per_fold"]
+        if isinstance(Nraw, bool) or not isinstance(Nraw, int) or Nraw <= 0:
+            raise ValueError(f"shortlist_n_per_fold must be a positive int, got {Nraw!r}")
+        N = int(Nraw)
+
+    # AUDIT 2026-07-10 (codex m06a P1): `eligible` MUST be a strict bool. A NaN/non-bool slips PAST the I9
+    # precheck (`== True` is False for NaN) yet `bool(np.nan)` is True in the scoring loop -> the row can become
+    # rankable + shortlisted with NO copyability check. Fail CLOSED here (validate the column once, up front).
+    if "eligible" not in elig.columns:
+        raise AssertionError("M5 eligibility frame lacks the 'eligible' column")
+    _bad_elig = elig["eligible"].isna() | ~elig["eligible"].isin([True, False])
+    if bool(_bad_elig.any()):
+        raise AssertionError(
+            f"M5 eligibility has {int(_bad_elig.sum())} missing/non-bool 'eligible' values "
+            f"(e.g. entity_ids {elig.loc[_bad_elig, 'entity_id'].head(5).tolist()}); fail closed.")
+
+    # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
+    #     primary_wallet matching m04 (codex code-r1 #5). ---
+    if entities_by_fold is None:
+        if entities is None:
+            raise ValueError("run() requires either entities or entities_by_fold")
+        cop, prim, alloc = _entity_maps(entities)
+        maps_by_fold = None
+        logger.warning("LOUD WARNING: using a single M4 entities file for all folds; "
+            roe_n = _num(r["roe_pretest_flow_adj"])
+            roe = float(roe_n) if (pd.notna(roe_n) and np.isfinite(roe_n)) else np.nan
+            njr_n = _num(r["n_journeys_pretest"])
+            njr_finite = bool(pd.notna(njr_n) and np.isfinite(njr_n))
+            njr = int(njr_n) if njr_finite else 0
+            dd_n = _num(r["max_dd_pretest"])
+            dd = float(dd_n) if (pd.notna(dd_n) and np.isfinite(dd_n)) else np.nan
+            dd_term = _clamp(1.0 - dd, DD_LO, 1.0) if np.isfinite(dd) else np.nan
+            # eligible rows MUST have finite, positive required inputs (M5 floors net_pnl>0, roe>0,
+            # n_journeys>=3, max_dd<=0.80). A violation is an upstream contract breach -> hard-fail.
+            # COPYABILITY_ONLY (Alberto 2026-06-09): M5 no longer floors performance, so eligible rows may
+            # have roe<=0. M6a then RANKS performance (it does not require it): the score is monotone in roe,
+            # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
+            # the real post-engine ranking. We still require FINITE inputs (NaN would be a true data breach).
+            if elig_row:
+                # AUDIT 2026-07-10 (codex m06a P2): finiteness is not enough -- assert the M5 RANGE contract so
+                # an upstream floor breach fails CLOSED here instead of being silently clamped (dd=1.5 -> 0.20
+                # dd_term hides the breach). n_journeys>=3 and max_dd<=0.80 are non-perf blocking gates that
+                # M5 enforces in BOTH strict AND COPYABILITY_ONLY mode (only net_pnl/roe/days_green relax).
+                if not (njr_finite and njr_n >= MIN_JOURNEYS_M5):
+                    raise AssertionError(
+                        f"ELIGIBLE row entity {eid} fold {fid} has n_journeys={njr_n} (< M5 floor {MIN_JOURNEYS_M5})."
+                    )
+                if score_basis == "activity_only":
+                    # Equity-independent high-recall bouncer. Performance is
+                    # deliberately deferred to fixed-position M7 and M6b.
+                    dd_term = 1.0
+                    score = pr.persistence_term * math.log1p(njr)
+                else:
+                    if not np.isfinite(roe):
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
+                    if not np.isfinite(dd):
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd={dd_n}.")
+                    if dd > MAXDD_M5:
+                        raise AssertionError(
+                            f"ELIGIBLE row entity {eid} fold {fid} has max_dd={dd_n} (> M5 cap {MAXDD_M5}); "
+                            f"upstream floor breach, fail closed (not silently clamped).")
+                    if not COPYABILITY_ONLY and roe <= 0:
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
+                    # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.
+                    score = roe * pr.persistence_term * math.log1p(njr) * dd_term
+            else:
+                score = float("nan")
+
+            rankable = elig_row and (not recency_gate or pr.recent_block_active) and bool(np.isfinite(score))
+            pinfo = pool_by.get(eid, {})
+
+exec
+/bin/zsh -lc 'git diff -- research/v15/v15_m06a_shortlist.py tests/v15/test_m06a_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+diff --git a/research/v15/v15_m06a_shortlist.py b/research/v15/v15_m06a_shortlist.py
+index 6addfc1..b2b2859 100644
+--- a/research/v15/v15_m06a_shortlist.py
++++ b/research/v15/v15_m06a_shortlist.py
+@@ -62,6 +62,10 @@ BLOCK_DAYS = 14
+ HORIZON_DAYS = 168            # ~6mo intended persistence lookback (archive is 174d -> natural cap)
+ PERS_SAT_BLOCKS = 6           # codex#7 "6-block saturation": min(6, possible_blocks) denominator
+ DD_LO = 0.20                  # clamp floor; aligns with M5 max_dd<=0.80 (no-op rail)
++# M5 upstream-contract rails asserted for eligible rows (codex m06a P2). Mirror m05 MIN_JOURNEYS_PRETEST /
++# MAXDD_CAP; these are non-perf blocking gates M5 enforces in BOTH strict and COPYABILITY_ONLY mode.
++MIN_JOURNEYS_M5 = 3
++MAXDD_M5 = 0.80
+ MS_DAY = 86_400_000
+ BLOCK_MS = BLOCK_DAYS * MS_DAY
+ HORIZON_MS = HORIZON_DAYS * MS_DAY
+@@ -195,6 +199,17 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
+             raise ValueError(f"shortlist_n_per_fold must be a positive int, got {Nraw!r}")
+         N = int(Nraw)
+ 
++    # AUDIT 2026-07-10 (codex m06a P1): `eligible` MUST be a strict bool. A NaN/non-bool slips PAST the I9
++    # precheck (`== True` is False for NaN) yet `bool(np.nan)` is True in the scoring loop -> the row can become
++    # rankable + shortlisted with NO copyability check. Fail CLOSED here (validate the column once, up front).
++    if "eligible" not in elig.columns:
++        raise AssertionError("M5 eligibility frame lacks the 'eligible' column")
++    _bad_elig = elig["eligible"].isna() | ~elig["eligible"].isin([True, False])
++    if bool(_bad_elig.any()):
++        raise AssertionError(
++            f"M5 eligibility has {int(_bad_elig.sum())} missing/non-bool 'eligible' values "
++            f"(e.g. entity_ids {elig.loc[_bad_elig, 'entity_id'].head(5).tolist()}); fail closed.")
++
+     # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
+     #     primary_wallet matching m04 (codex code-r1 #5). ---
+     if entities_by_fold is None:
+@@ -269,7 +284,7 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
+         test_start_ms = _ts_ms(fold_test_start[int(fid)])
+         for _, r in sub.iterrows():
+             eid = int(r["entity_id"])
+-            elig_row = bool(r["eligible"])
++            elig_row = (r["eligible"] == True)  # noqa: E712 -- validated strict-bool above; no bool(NaN) trap
+             fcop, fprim, falloc = _maps_for_fold(int(fid))
+             w = fprim.get(eid)  # canonical primary wallet (validated above for eligible rows)
+             ts_arr = act_by.get(w, np.empty(0, "int64"))
+@@ -292,9 +307,13 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
+             # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
+             # the real post-engine ranking. We still require FINITE inputs (NaN would be a true data breach).
+             if elig_row:
+-                if not (njr_finite and njr_n >= 0):
++                # AUDIT 2026-07-10 (codex m06a P2): finiteness is not enough -- assert the M5 RANGE contract so
++                # an upstream floor breach fails CLOSED here instead of being silently clamped (dd=1.5 -> 0.20
++                # dd_term hides the breach). n_journeys>=3 and max_dd<=0.80 are non-perf blocking gates that
++                # M5 enforces in BOTH strict AND COPYABILITY_ONLY mode (only net_pnl/roe/days_green relax).
++                if not (njr_finite and njr_n >= MIN_JOURNEYS_M5):
+                     raise AssertionError(
+-                        f"ELIGIBLE row entity {eid} fold {fid} has invalid n_journeys={njr_n}."
++                        f"ELIGIBLE row entity {eid} fold {fid} has n_journeys={njr_n} (< M5 floor {MIN_JOURNEYS_M5})."
+                     )
+                 if score_basis == "activity_only":
+                     # Equity-independent high-recall bouncer. Performance is
+@@ -306,6 +325,10 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
+                         raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
+                     if not np.isfinite(dd):
+                         raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd={dd_n}.")
++                    if dd > MAXDD_M5:
++                        raise AssertionError(
++                            f"ELIGIBLE row entity {eid} fold {fid} has max_dd={dd_n} (> M5 cap {MAXDD_M5}); "
++                            f"upstream floor breach, fail closed (not silently clamped).")
+                     if not COPYABILITY_ONLY and roe <= 0:
+                         raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
+                     # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.
+
+exec
+/bin/zsh -lc 'rg -n "MIN_JOURNEYS|MAXDD|COPYABILITY_ONLY|eligible|in_shortlist|rankable|shortlist" research/v15/v15_m06a_shortlist.py research/v15 tests/v15/test_m06a_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/v15_m06a_shortlist.py:7:M6a is the CHEAP, NO-ENGINE candidate generator. It ranks the M5-eligible (entity, fold)
+research/v15/v15_m06a_shortlist.py:10:shortlist via pure per-fold top-N (budget = sum_k min(N, n_rankable_k) <= 8N). It is the bouncer,
+research/v15/v15_m06a_shortlist.py:35:  <outdir>/m06a_shortlist.parquet      per (entity, fold) FULL audit (incl drops)
+research/v15/v15_m06a_shortlist.py:54:# Alberto 2026-06-09: when M5 runs copyability-only (M5_COPYABILITY_ONLY=1), eligible rows may have roe<=0
+research/v15/v15_m06a_shortlist.py:58:COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+research/v15/v15_m06a_shortlist.py:65:# M5 upstream-contract rails asserted for eligible rows (codex m06a P2). Mirror m05 MIN_JOURNEYS_PRETEST /
+research/v15/v15_m06a_shortlist.py:66:# MAXDD_CAP; these are non-perf blocking gates M5 enforces in BOTH strict and COPYABILITY_ONLY mode.
+research/v15/v15_m06a_shortlist.py:67:MIN_JOURNEYS_M5 = 3
+research/v15/v15_m06a_shortlist.py:68:MAXDD_M5 = 0.80
+research/v15/v15_m06a_shortlist.py:76:    "mode": "shortlist",                 # "shortlist" | "rank_only"
+research/v15/v15_m06a_shortlist.py:77:    "shortlist_n_per_fold": 1000,        # Alberto, pre-registered (engine-budget round number)
+research/v15/v15_m06a_shortlist.py:181:    if mode not in ("shortlist", "rank_only"):
+research/v15/v15_m06a_shortlist.py:182:        raise ValueError(f"manifest.mode must be 'shortlist' or 'rank_only', got {mode!r}")
+research/v15/v15_m06a_shortlist.py:195:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:197:        Nraw = manifest["shortlist_n_per_fold"]
+research/v15/v15_m06a_shortlist.py:199:            raise ValueError(f"shortlist_n_per_fold must be a positive int, got {Nraw!r}")
+research/v15/v15_m06a_shortlist.py:202:    # AUDIT 2026-07-10 (codex m06a P1): `eligible` MUST be a strict bool. A NaN/non-bool slips PAST the I9
+research/v15/v15_m06a_shortlist.py:204:    # rankable + shortlisted with NO copyability check. Fail CLOSED here (validate the column once, up front).
+research/v15/v15_m06a_shortlist.py:205:    if "eligible" not in elig.columns:
+research/v15/v15_m06a_shortlist.py:206:        raise AssertionError("M5 eligibility frame lacks the 'eligible' column")
+research/v15/v15_m06a_shortlist.py:207:    _bad_elig = elig["eligible"].isna() | ~elig["eligible"].isin([True, False])
+research/v15/v15_m06a_shortlist.py:210:            f"M5 eligibility has {int(_bad_elig.sum())} missing/non-bool 'eligible' values "
+research/v15/v15_m06a_shortlist.py:213:    # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
+research/v15/v15_m06a_shortlist.py:233:    for _, r in elig[elig["eligible"] == True].iterrows():  # noqa: E712
+research/v15/v15_m06a_shortlist.py:247:            f"RANKABLE CONTRACT VIOLATION (I9): {len(bad_cop)} eligible entity_ids are not copyable "
+research/v15/v15_m06a_shortlist.py:248:            f"primaries (e.g. {bad_cop[:5]}). M5 must only mark copyable primaries eligible.")
+research/v15/v15_m06a_shortlist.py:251:            f"PRIMARY-WALLET MISMATCH (I9): {len(bad_wallet)} eligible rows have a primary_wallet "
+research/v15/v15_m06a_shortlist.py:287:            elig_row = (r["eligible"] == True)  # noqa: E712 -- validated strict-bool above; no bool(NaN) trap
+research/v15/v15_m06a_shortlist.py:289:            w = fprim.get(eid)  # canonical primary wallet (validated above for eligible rows)
+research/v15/v15_m06a_shortlist.py:293:            # codex code-r1 #3/#4: coerce metrics (ineligible/drop rows may be NA) and check
+research/v15/v15_m06a_shortlist.py:303:            # eligible rows MUST have finite, positive required inputs (M5 floors net_pnl>0, roe>0,
+research/v15/v15_m06a_shortlist.py:305:            # COPYABILITY_ONLY (Alberto 2026-06-09): M5 no longer floors performance, so eligible rows may
+research/v15/v15_m06a_shortlist.py:307:            # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
+research/v15/v15_m06a_shortlist.py:313:                # M5 enforces in BOTH strict AND COPYABILITY_ONLY mode (only net_pnl/roe/days_green relax).
+research/v15/v15_m06a_shortlist.py:314:                if not (njr_finite and njr_n >= MIN_JOURNEYS_M5):
+research/v15/v15_m06a_shortlist.py:316:                        f"ELIGIBLE row entity {eid} fold {fid} has n_journeys={njr_n} (< M5 floor {MIN_JOURNEYS_M5})."
+research/v15/v15_m06a_shortlist.py:328:                    if dd > MAXDD_M5:
+research/v15/v15_m06a_shortlist.py:330:                            f"ELIGIBLE row entity {eid} fold {fid} has max_dd={dd_n} (> M5 cap {MAXDD_M5}); "
+research/v15/v15_m06a_shortlist.py:332:                    if not COPYABILITY_ONLY and roe <= 0:
+research/v15/v15_m06a_shortlist.py:339:            rankable = elig_row and (not recency_gate or pr.recent_block_active) and bool(np.isfinite(score))
+research/v15/v15_m06a_shortlist.py:344:                "eligible": elig_row, "copyable": bool(fcop.get(eid, False)),
+research/v15/v15_m06a_shortlist.py:347:                "rankable": rankable,
+research/v15/v15_m06a_shortlist.py:370:    # rank_in_fold is emitted in BOTH modes; selection/budget columns ONLY in shortlist mode
+research/v15/v15_m06a_shortlist.py:371:    # (codex code-r1 #1: rank_only must not carry B_k / in_shortlist / shortlist_reason).
+research/v15/v15_m06a_shortlist.py:373:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:375:        sl["in_shortlist"] = pd.Series([pd.NA] * len(sl), dtype="boolean")
+research/v15/v15_m06a_shortlist.py:376:        sl["shortlist_reason"] = pd.Series([pd.NA] * len(sl), dtype="object")
+research/v15/v15_m06a_shortlist.py:377:        # M5 emits ineligible (entity,fold) rows too; NOT M6a's ranking universe. Label explicitly
+research/v15/v15_m06a_shortlist.py:379:        inelig_mask = sl["eligible"] != True  # noqa: E712
+research/v15/v15_m06a_shortlist.py:380:        sl.loc[inelig_mask, "in_shortlist"] = False
+research/v15/v15_m06a_shortlist.py:381:        sl.loc[inelig_mask, "shortlist_reason"] = "ineligible"
+research/v15/v15_m06a_shortlist.py:386:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:387:        waterfall["shortlist_n_per_fold"] = N
+research/v15/v15_m06a_shortlist.py:390:        m = (sl["fold_id"] == fid) & (sl["rankable"] == True)  # noqa: E712
+research/v15/v15_m06a_shortlist.py:394:        n_rankable = len(idx)
+research/v15/v15_m06a_shortlist.py:395:        n_eligible = int(((sl["fold_id"] == fid) & (sl["eligible"] == True)).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:396:        n_stale = int(((sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:397:        wf = {"n_eligible": n_eligible, "n_rankable": n_rankable, "n_stale_dropped": n_stale}
+research/v15/v15_m06a_shortlist.py:398:        sq = {q: float(np.nanpercentile(sl.loc[idx, "source_score_pretest"], q)) for q in (50, 75, 90, 99)} if n_rankable else {}
+research/v15/v15_m06a_shortlist.py:399:        if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:400:            B_k = min(N, n_rankable)
+research/v15/v15_m06a_shortlist.py:403:            sl.loc[in_sl_idx, "in_shortlist"] = True
+research/v15/v15_m06a_shortlist.py:404:            sl.loc[in_sl_idx, "shortlist_reason"] = "top_n"
+research/v15/v15_m06a_shortlist.py:405:            sl.loc[drop_idx, "in_shortlist"] = False
+research/v15/v15_m06a_shortlist.py:406:            sl.loc[drop_idx, "shortlist_reason"] = "dropped_rank"
+research/v15/v15_m06a_shortlist.py:407:            stale_idx = sl[(sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)].index  # noqa: E712
+research/v15/v15_m06a_shortlist.py:408:            sl.loc[stale_idx, "in_shortlist"] = False
+research/v15/v15_m06a_shortlist.py:409:            sl.loc[stale_idx, "shortlist_reason"] = "dropped_stale"
+research/v15/v15_m06a_shortlist.py:412:            wf.update({"B_k": int(B_k), "n_shortlisted": int(B_k),
+research/v15/v15_m06a_shortlist.py:413:                       "p90_diag": (sq.get(90) if n_rankable else None),
+research/v15/v15_m06a_shortlist.py:419:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:429:        n_elig_folds = int((grp["eligible"] == True).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:430:        if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:431:            n_sl = int((grp["in_shortlist"] == True).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:438:            "n_folds_eligible": n_elig_folds,
+research/v15/v15_m06a_shortlist.py:439:            "n_folds_in_shortlist": n_sl, "ever_in_shortlist": ever,
+research/v15/v15_m06a_shortlist.py:490:    sl.to_parquet(outdir / "m06a_shortlist.parquet", index=False)
+research/v15/v15_m06a_shortlist.py:493:    if manifest["mode"] == "shortlist":
+research/v15/v15_m06a_shortlist.py:494:        logger.info(f"shortlist: {int((sl['in_shortlist']==True).sum()):,} (entity,fold) seats; "  # noqa: E712
+research/v15/v15_m06a_shortlist.py:496:                    f"budget_ok={waterfall['budget_ok']}; distinct entities shortlisted="
+research/v15/v15_m06a_shortlist.py:497:                    f"{pool_df['ever_in_shortlist'].sum() if 'ever_in_shortlist' in pool_df else 'NA'}")
+research/v15/v15_m06a_shortlist.py:499:        logger.info("RANK-ONLY: ranks + N-independent diagnostics emitted (no in_shortlist).")
+tests/v15/test_m06a_golden.py:1:"""GOLDEN regression test for v15_m06a_shortlist trust-audit fixes (2026-07-10).
+tests/v15/test_m06a_golden.py:4:- P1: a missing / non-bool `eligible` value must NOT slip past the I9 precheck (`== True` is False for NaN)
+tests/v15/test_m06a_golden.py:5:  and then become rankable via `bool(np.nan) is True`. It fails closed up front.
+tests/v15/test_m06a_golden.py:6:- P2: an eligible row that breaches the stated M5 range contract (n_journeys < 3, or max_dd > 0.80) must
+tests/v15/test_m06a_golden.py:17:import v15_m06a_shortlist as m6a  # noqa: E402
+tests/v15/test_m06a_golden.py:21:def test_p1_nan_eligible_fails_closed():
+tests/v15/test_m06a_golden.py:23:    row = _elig_row(1, 1, roe=0.5, nj=10, dd=0.2, eligible=True)
+tests/v15/test_m06a_golden.py:24:    row["eligible"] = np.nan   # corrupt: missing eligibility must not slip through
+tests/v15/test_m06a_golden.py:31:def test_p2_eligible_low_journeys_hardfails():
+tests/v15/test_m06a_golden.py:34:    elig = pd.DataFrame([_elig_row(1, 1, roe=0.5, nj=1, dd=0.2, eligible=True)])  # nj=1 < M5 floor 3
+tests/v15/test_m06a_golden.py:39:def test_p2_eligible_excess_dd_hardfails():
+tests/v15/test_m06a_golden.py:42:    elig = pd.DataFrame([_elig_row(1, 1, roe=0.5, nj=10, dd=1.5, eligible=True)])  # dd 1.5 > M5 cap 0.80
+tests/v15/test_m06a_golden.py:47:def test_good_row_still_shortlists():
+tests/v15/test_m06a_golden.py:48:    # a clean eligible row is unaffected by the new fail-closed rails.
+tests/v15/test_m06a_golden.py:51:    elig = pd.DataFrame([_elig_row(1, 1, roe=0.5, nj=10, dd=0.2, eligible=True)])
+tests/v15/test_m06a_golden.py:53:    assert bool((sl["in_shortlist"] == True).any())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:7:M6a is the CHEAP, NO-ENGINE candidate generator. It ranks the M5-eligible (entity, fold)
+research/v15/v15_m06a_shortlist.py:10:shortlist via pure per-fold top-N (budget = sum_k min(N, n_rankable_k) <= 8N). It is the bouncer,
+research/v15/v15_m06a_shortlist.py:35:  <outdir>/m06a_shortlist.parquet      per (entity, fold) FULL audit (incl drops)
+research/v15/v15_m06a_shortlist.py:54:# Alberto 2026-06-09: when M5 runs copyability-only (M5_COPYABILITY_ONLY=1), eligible rows may have roe<=0
+research/v15/v15_m06a_shortlist.py:58:COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+research/v15/v15_m06a_shortlist.py:65:# M5 upstream-contract rails asserted for eligible rows (codex m06a P2). Mirror m05 MIN_JOURNEYS_PRETEST /
+research/v15/v15_m06a_shortlist.py:66:# MAXDD_CAP; these are non-perf blocking gates M5 enforces in BOTH strict and COPYABILITY_ONLY mode.
+research/v15/v15_m06a_shortlist.py:67:MIN_JOURNEYS_M5 = 3
+research/v15/v15_m06a_shortlist.py:68:MAXDD_M5 = 0.80
+research/v15/v15_m06a_shortlist.py:76:    "mode": "shortlist",                 # "shortlist" | "rank_only"
+research/v15/v15_m06a_shortlist.py:77:    "shortlist_n_per_fold": 1000,        # Alberto, pre-registered (engine-budget round number)
+research/v15/v15_m06a_shortlist.py:181:    if mode not in ("shortlist", "rank_only"):
+research/v15/v15_m06a_shortlist.py:182:        raise ValueError(f"manifest.mode must be 'shortlist' or 'rank_only', got {mode!r}")
+research/v15/v15_m06a_shortlist.py:195:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:197:        Nraw = manifest["shortlist_n_per_fold"]
+research/v15/v15_m06a_shortlist.py:199:            raise ValueError(f"shortlist_n_per_fold must be a positive int, got {Nraw!r}")
+research/v15/v15_m06a_shortlist.py:202:    # AUDIT 2026-07-10 (codex m06a P1): `eligible` MUST be a strict bool. A NaN/non-bool slips PAST the I9
+research/v15/v15_m06a_shortlist.py:204:    # rankable + shortlisted with NO copyability check. Fail CLOSED here (validate the column once, up front).
+research/v15/v15_m06a_shortlist.py:205:    if "eligible" not in elig.columns:
+research/v15/v15_m06a_shortlist.py:206:        raise AssertionError("M5 eligibility frame lacks the 'eligible' column")
+research/v15/v15_m06a_shortlist.py:207:    _bad_elig = elig["eligible"].isna() | ~elig["eligible"].isin([True, False])
+research/v15/v15_m06a_shortlist.py:210:            f"M5 eligibility has {int(_bad_elig.sum())} missing/non-bool 'eligible' values "
+research/v15/v15_m06a_shortlist.py:213:    # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
+research/v15/v15_m06a_shortlist.py:233:    for _, r in elig[elig["eligible"] == True].iterrows():  # noqa: E712
+research/v15/v15_m06a_shortlist.py:247:            f"RANKABLE CONTRACT VIOLATION (I9): {len(bad_cop)} eligible entity_ids are not copyable "
+research/v15/v15_m06a_shortlist.py:248:            f"primaries (e.g. {bad_cop[:5]}). M5 must only mark copyable primaries eligible.")
+research/v15/v15_m06a_shortlist.py:251:            f"PRIMARY-WALLET MISMATCH (I9): {len(bad_wallet)} eligible rows have a primary_wallet "
+research/v15/v15_m06a_shortlist.py:287:            elig_row = (r["eligible"] == True)  # noqa: E712 -- validated strict-bool above; no bool(NaN) trap
+research/v15/v15_m06a_shortlist.py:289:            w = fprim.get(eid)  # canonical primary wallet (validated above for eligible rows)
+research/v15/v15_m06a_shortlist.py:293:            # codex code-r1 #3/#4: coerce metrics (ineligible/drop rows may be NA) and check
+research/v15/v15_m06a_shortlist.py:303:            # eligible rows MUST have finite, positive required inputs (M5 floors net_pnl>0, roe>0,
+research/v15/v15_m06a_shortlist.py:305:            # COPYABILITY_ONLY (Alberto 2026-06-09): M5 no longer floors performance, so eligible rows may
+research/v15/v15_m06a_shortlist.py:307:            # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
+research/v15/v15_m06a_shortlist.py:313:                # M5 enforces in BOTH strict AND COPYABILITY_ONLY mode (only net_pnl/roe/days_green relax).
+research/v15/v15_m06a_shortlist.py:314:                if not (njr_finite and njr_n >= MIN_JOURNEYS_M5):
+research/v15/v15_m06a_shortlist.py:316:                        f"ELIGIBLE row entity {eid} fold {fid} has n_journeys={njr_n} (< M5 floor {MIN_JOURNEYS_M5})."
+research/v15/v15_m06a_shortlist.py:328:                    if dd > MAXDD_M5:
+research/v15/v15_m06a_shortlist.py:330:                            f"ELIGIBLE row entity {eid} fold {fid} has max_dd={dd_n} (> M5 cap {MAXDD_M5}); "
+research/v15/v15_m06a_shortlist.py:332:                    if not COPYABILITY_ONLY and roe <= 0:
+research/v15/v15_m06a_shortlist.py:339:            rankable = elig_row and (not recency_gate or pr.recent_block_active) and bool(np.isfinite(score))
+research/v15/v15_m06a_shortlist.py:344:                "eligible": elig_row, "copyable": bool(fcop.get(eid, False)),
+research/v15/v15_m06a_shortlist.py:347:                "rankable": rankable,
+research/v15/v15_m06a_shortlist.py:370:    # rank_in_fold is emitted in BOTH modes; selection/budget columns ONLY in shortlist mode
+research/v15/v15_m06a_shortlist.py:371:    # (codex code-r1 #1: rank_only must not carry B_k / in_shortlist / shortlist_reason).
+research/v15/v15_m06a_shortlist.py:373:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:375:        sl["in_shortlist"] = pd.Series([pd.NA] * len(sl), dtype="boolean")
+research/v15/v15_m06a_shortlist.py:376:        sl["shortlist_reason"] = pd.Series([pd.NA] * len(sl), dtype="object")
+research/v15/v15_m06a_shortlist.py:377:        # M5 emits ineligible (entity,fold) rows too; NOT M6a's ranking universe. Label explicitly
+research/v15/v15_m06a_shortlist.py:379:        inelig_mask = sl["eligible"] != True  # noqa: E712
+research/v15/v15_m06a_shortlist.py:380:        sl.loc[inelig_mask, "in_shortlist"] = False
+research/v15/v15_m06a_shortlist.py:381:        sl.loc[inelig_mask, "shortlist_reason"] = "ineligible"
+research/v15/v15_m06a_shortlist.py:386:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:387:        waterfall["shortlist_n_per_fold"] = N
+research/v15/v15_m06a_shortlist.py:390:        m = (sl["fold_id"] == fid) & (sl["rankable"] == True)  # noqa: E712
+research/v15/v15_m06a_shortlist.py:394:        n_rankable = len(idx)
+research/v15/v15_m06a_shortlist.py:395:        n_eligible = int(((sl["fold_id"] == fid) & (sl["eligible"] == True)).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:396:        n_stale = int(((sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:397:        wf = {"n_eligible": n_eligible, "n_rankable": n_rankable, "n_stale_dropped": n_stale}
+research/v15/v15_m06a_shortlist.py:398:        sq = {q: float(np.nanpercentile(sl.loc[idx, "source_score_pretest"], q)) for q in (50, 75, 90, 99)} if n_rankable else {}
+research/v15/v15_m06a_shortlist.py:399:        if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:400:            B_k = min(N, n_rankable)
+research/v15/v15_m06a_shortlist.py:403:            sl.loc[in_sl_idx, "in_shortlist"] = True
+research/v15/v15_m06a_shortlist.py:404:            sl.loc[in_sl_idx, "shortlist_reason"] = "top_n"
+research/v15/v15_m06a_shortlist.py:405:            sl.loc[drop_idx, "in_shortlist"] = False
+research/v15/v15_m06a_shortlist.py:406:            sl.loc[drop_idx, "shortlist_reason"] = "dropped_rank"
+research/v15/v15_m06a_shortlist.py:407:            stale_idx = sl[(sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)].index  # noqa: E712
+research/v15/v15_m06a_shortlist.py:408:            sl.loc[stale_idx, "in_shortlist"] = False
+research/v15/v15_m06a_shortlist.py:409:            sl.loc[stale_idx, "shortlist_reason"] = "dropped_stale"
+research/v15/v15_m06a_shortlist.py:412:            wf.update({"B_k": int(B_k), "n_shortlisted": int(B_k),
+research/v15/v15_m06a_shortlist.py:413:                       "p90_diag": (sq.get(90) if n_rankable else None),
+research/v15/v15_m06a_shortlist.py:419:    if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:429:        n_elig_folds = int((grp["eligible"] == True).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:430:        if mode == "shortlist":
+research/v15/v15_m06a_shortlist.py:431:            n_sl = int((grp["in_shortlist"] == True).sum())  # noqa: E712
+research/v15/v15_m06a_shortlist.py:438:            "n_folds_eligible": n_elig_folds,
+research/v15/v15_m06a_shortlist.py:439:            "n_folds_in_shortlist": n_sl, "ever_in_shortlist": ever,
+research/v15/v15_m06a_shortlist.py:490:    sl.to_parquet(outdir / "m06a_shortlist.parquet", index=False)
+research/v15/v15_m06a_shortlist.py:493:    if manifest["mode"] == "shortlist":
+research/v15/v15_m06a_shortlist.py:494:        logger.info(f"shortlist: {int((sl['in_shortlist']==True).sum()):,} (entity,fold) seats; "  # noqa: E712
+research/v15/v15_m06a_shortlist.py:496:                    f"budget_ok={waterfall['budget_ok']}; distinct entities shortlisted="
+research/v15/v15_m06a_shortlist.py:497:                    f"{pool_df['ever_in_shortlist'].sum() if 'ever_in_shortlist' in pool_df else 'NA'}")
+research/v15/v15_m06a_shortlist.py:499:        logger.info("RANK-ONLY: ranks + N-independent diagnostics emitted (no in_shortlist).")
+research/v15/v15_m06b_ranking.py:5:M6a high-recall shortlist on M7 AFTER-OUR-COST engine results computed FOLD-PRETEST-PURE on
+research/v15/v15_m06b_ranking.py:39:# Pre-registered min CLOSED round-trips for an entity to be RANKABLE / pool-eligible (codex
+research/v15/v15_m06b_ranking.py:77:    consistency_min_active_subsplits: int = 2  # < this -> consistency = 0, not top-bucket eligible
+research/v15/v15_m06b_ranking.py:137:    m06a = pd.read_parquet(data_dir / "m06a_shortlist.parquet")
+research/v15/v15_m06b_ranking.py:502:    elig = m05[["entity_id", "fold_id", "eligible"]].rename(columns={"eligible": "m5_eligible"})
+research/v15/v15_m06b_ranking.py:507:    m6a_cols = m06a[["entity_id", "fold_id", "copyable", "rankable", "n_journeys_pretest",
+research/v15/v15_m06b_ranking.py:512:    # --- assemble: UNIVERSE = M6a (every shortlist row), LEFT-join M7 engine results. A M6a row with
+research/v15/v15_m06b_ranking.py:567:    # n_round_trips==0), so it must NOT be rankable / enter the pool. Applies whenever the engine
+research/v15/v15_m06b_ranking.py:574:    rankable = (
+research/v15/v15_m06b_ranking.py:575:        df["m5_eligible"].fillna(False)
+research/v15/v15_m06b_ranking.py:584:        # and the pool cut (`& m6b_score.notna()`) would SILENTLY drop a "rankable" row with a blank reason.
+research/v15/v15_m06b_ranking.py:589:    df["m6b_rankable"] = rankable
+research/v15/v15_m06b_ranking.py:592:        if r["m6b_rankable"]:
+research/v15/v15_m06b_ranking.py:596:        if not bool(r["m5_eligible"]):
+research/v15/v15_m06b_ranking.py:597:            reasons.append("m5_ineligible")
+research/v15/v15_m06b_ranking.py:622:        rk = g[g["m6b_rankable"]].copy()
+research/v15/v15_m06b_ranking.py:659:        rk = g[g["m6b_rankable"] & g["m6b_score"].notna()].copy()
+research/v15/v15_m06b_ranking.py:724:        # rank_in_fold for non-pooled rankable: keep from rk
+research/v15/v15_m06b_ranking.py:738:    # provisional rows must still block). FINAL requires EVERY rankable row to carry real M7 sources.
+research/v15/v15_m06b_ranking.py:739:    rk_mask = out["m6b_rankable"].fillna(False)
+research/v15/v15_m06b_ranking.py:741:    # non-rankable rows (no M7 row -> provisional default) and is misleading.
+research/v15/v15_m06b_ranking.py:747:    # v2: FINAL additionally requires the REALIZED round-trip metrics to be present on every rankable
+research/v15/v15_m06b_ranking.py:825:    "m5_eligible", "entity_copyable", "m6b_rankable", "rank_in_fold", "bucket", "in_pool",
+research/v15/v15_m08_survival.py:57:    # activity within the last N days BEFORE the fold decision (test_start) to be eligible to survive; else KILL.
+research/v15/v15_m08_survival.py:193:    # fold with no eligible entities) is an empty DataFrame with NO columns, so the merge-key lookup
+research/v15/leadlag_clean_rank_sim.py:20:A POSITIVE result here is NOT deployable without a point-in-time-eligible universe and conservative
+research/v15/leadlag_clean_rank_sim.py:589:                # ORACLE CEILING (who-vs-how): rank eligible wallets by their FORWARD (t, t+hold]
+research/v15/leadlag_clean_rank_sim.py:639:            # 3) matched null: rank-eligible NON-top wallets, matched on causal trailing-activity bucket
+research/v15/leadlag_clean_rank_sim.py:669:                "decision_ts": t, "n_eligible": len(trailing), "n_top": len(top),
+research/v15/leadlag_clean_rank_sim.py:744:                    help="min trailing lots for a wallet to be rankable under sharpe/consistency.")
+research/v15/v15_forward_select.py:10:- m5_eligible_k / trail_elig : M5 eligibility for fold k + count of prior folds eligible.
+research/v15/v15_forward_select.py:34:    m5 = pd.read_parquet(DATA / "m05_eligibility.parquet")[["entity_id", "fold_id", "eligible"]]
+research/v15/v15_forward_select.py:44:    elig_prior = m5[(m5.fold_id < k) & (m5.eligible)].groupby("entity_id").size().rename("trail_elig").reset_index()
+research/v15/v15_forward_select.py:46:    ek = m5[m5.fold_id == k][["entity_id", "eligible"]].rename(columns={"eligible": "m5_eligible_k"})
+research/v15/v15_forward_select.py:55:                     require_eligible: bool = True, uniform_weight: bool = True) -> dict:
+research/v15/v15_forward_select.py:90:        if require_eligible:
+research/v15/v15_forward_select.py:91:            f = f[f.m5_eligible_k.fillna(False)]
+research/v15/forward_oos_hot.py:185:    # OOM. This script is a survivor-shortlist OOS scorer, not a full-universe gate -> abort LOUD (not silent SIGKILL).
+research/v15/forward_oos_hot.py:187:        raise SystemExit(f"forward_oos_hot: {len(wallets)} wallets exceeds the 2000 survivor-shortlist cap "
+research/v15/v15_m03_fold_geometry.py:17:behavioral/time-based; a fold never "counts" because it was profitable or eligible.
+research/v15/v15_m05_eligibility.py:42:MAXDD_CAP = 0.80
+research/v15/v15_m05_eligibility.py:43:MIN_JOURNEYS_PRETEST = 3
+research/v15/v15_m05_eligibility.py:225:# makes the pool artificially negative-mean OOS. COPYABILITY_ONLY mode (env M5_COPYABILITY_ONLY=1) keeps the
+research/v15/v15_m05_eligibility.py:227:# fail_reasons for audit). This widens the eligible pool ~175 -> ~2,383 entity-folds so M6b can RANK
+research/v15/v15_m05_eligibility.py:230:COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+research/v15/v15_m05_eligibility.py:238:    """Per-fold pretest floors. Returns (eligible, fail_reasons).
+research/v15/v15_m05_eligibility.py:240:    In COPYABILITY_ONLY mode, performance fails (net_pnl/roe/days_green) are recorded in fail_reasons but do
+research/v15/v15_m05_eligibility.py:251:                       # codex r2: n_journeys inf/NaN would skip the `< MIN_JOURNEYS` gate; accessible inf
+research/v15/v15_m05_eligibility.py:288:        if eqm["max_dd"] > MAXDD_CAP:
+research/v15/v15_m05_eligibility.py:289:            f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
+research/v15/v15_m05_eligibility.py:290:    if jm["n_journeys"] < MIN_JOURNEYS_PRETEST:
+research/v15/v15_m05_eligibility.py:291:        f.append(f"n_journeys<{MIN_JOURNEYS_PRETEST} ({jm['n_journeys']})")
+research/v15/v15_m05_eligibility.py:331:    if COPYABILITY_ONLY:
+research/v15/v15_m05_eligibility.py:332:        # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
+research/v15/v15_m05_eligibility.py:425:                "eligible": elig, "fail_reasons": "|".join(fails),
+research/v15/v15_m05_eligibility.py:444:        waterfall["folds"][fid] = {"evaluated": n_eval, "eligible": n_elig}
+research/v15/v15_m05_eligibility.py:445:        logger.info(f"  fold {fid}: {n_eval} evaluated -> {n_elig} eligible")
+research/v15/v15_m05_eligibility.py:449:    # codex code-r1 #6: eligible_folds via one groupby, not a per-entity scan.
+research/v15/v15_m05_eligibility.py:450:    elig_folds_by_eid = (elig_df.groupby("entity_id")["eligible"].sum().astype(int).to_dict()
+research/v15/v15_m05_eligibility.py:467:            "eligible_folds": elig_folds_by_eid.get(eid, 0),
+research/v15/v15_m05_eligibility.py:556:    elig_any = elig_df.groupby("entity_id")["eligible"].any().sum() if len(elig_df) else 0
+research/v15/v15_m05_eligibility.py:557:    logger.info(f"eligible-entity-folds: {int(elig_df['eligible'].sum()) if len(elig_df) else 0}; "
+research/v15/v15_m05_eligibility.py:558:                f"entities eligible in >=1 fold: {int(elig_any)}; "
+research/v15/v15_m07_engine.py:519:    # not pass through run_shortlist's parquet predicate.
+research/v15/v15_m07_engine.py:1537:    # The position simply waits; the next eligible 1m bar (>=60s > 30s cooldown) issues the next order.
+research/v15/v15_m07_engine.py:1696:def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, out_dir: Path,
+research/v15/v15_m07_engine.py:1724:    sl = pd.read_parquet(shortlist_path, columns=["entity_id", "primary_wallet", "fold_id", "in_shortlist"])
+research/v15/v15_m07_engine.py:1725:    sl = sl[sl.in_shortlist].copy()
+research/v15/v15_m07_engine.py:1754:    # PRELOAD market caches for the shortlist coin set so the inner loop never hits Mongo (codex
+research/v15/v15_m07_engine.py:1810:    ap.add_argument("--shortlist", default=str(DATA_DIR / "m06a_shortlist.parquet"))
+research/v15/v15_m07_engine.py:1832:    run_shortlist(Path(args.actions), Path(args.shortlist), Path(args.folds), Path(args.out),
+
+codex
+The first pass shows the exact P1 bool trap is removed: the file now validates the column before any eligible filtering, and the scoring loop no longer calls `bool()` on the raw value. I’m checking M5’s copyability-only semantics now, because that determines whether the new hard assertions are legitimate or over-tight.
+exec
+/bin/zsh -lc "sed -n '230,340p' research/v15/v15_m05_eligibility.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+# performance fails (judged by ranking, not eligibility) vs risk/copyability fails (hard exclusions)
+_PERF_FAIL_PREFIXES = ("net_pnl<=0", "roe<=0", "days_green<")
+
+
+def apply_floors(
+    eqm: dict, jm: dict, *, equity_required: bool = True, strict: bool = False,
+) -> tuple[bool, list[str]]:
+    """Per-fold pretest floors. Returns (eligible, fail_reasons).
+
+    In COPYABILITY_ONLY mode, performance fails (net_pnl/roe/days_green) are recorded in fail_reasons but do
+    NOT block eligibility -- only risk/copyability fails do. structural_ruin STAYS a hard risk gate.
+    """
+    f = []
+    # AUDIT 2026-07-10 (codex m05 fix r2): STRICT = deployable fail-closed. EVERY blocking floor input must be
+    # FINITE (np.isfinite catches NaN AND inf); a non-finite value would make its `<`/`>` comparison silently
+    # not fire. Fail closed here so no gate can be skipped on bad data. (Loose mode is unchanged.)
+    if strict:
+        _fin_checks = [("net_pnl", jm.get("net_pnl")), ("median_hold_s", jm.get("median_hold_s")),
+                       ("share_below_latency", jm.get("share_below_latency")),
+                       ("censored_max_hold_s", jm.get("censored_max_hold_s")),
+                       # codex r2: n_journeys inf/NaN would skip the `< MIN_JOURNEYS` gate; accessible inf
+                       # would pass `< ACCESSIBLE_FRAC_MIN`. Both are blocking inputs -> strict-finite them.
+                       ("n_journeys", jm.get("n_journeys")),
+                       ("accessible_frac_notional", jm.get("accessible_frac_notional"))]
+        if equity_required:
+            _fin_checks += [("roe", eqm.get("roe")), ("median_equity", eqm.get("median_equity")),
+                            ("max_dd", eqm.get("max_dd")), ("median_leverage", eqm.get("median_leverage")),
+                            ("frac_days_green", eqm.get("frac_days_green"))]
+        for _k, _v in _fin_checks:
+            if _v is None:
+                continue   # absent key: gates use .get(default) or KeyError loudly; not a silent fail-open
+            if _k == "accessible_frac_notional" and not (_v == _v):
+                continue   # NaN accessibility is handled by the dedicated accessible_frac_unknown(strict) gate
+            try:
+                _ok = np.isfinite(float(_v))
+            except (TypeError, ValueError):
+                _ok = False
+            if not _ok:
+                f.append(f"nonfinite_{_k}(strict)")   # PRESENT but NaN/inf -> fail closed
+        # codex r2: bounds-check accessibility in strict (a present, finite, but out-of-[0,1] weight is corrupt).
+        _af = jm.get("accessible_frac_notional")
+        try:
+            if _af is not None and _af == _af and np.isfinite(float(_af)) and not (0.0 <= float(_af) <= 1.0):
+                f.append("accessible_frac_out_of_range(strict)")
+        except (TypeError, ValueError):
+            f.append("accessible_frac_out_of_range(strict)")
+    if jm["net_pnl"] <= 0:
+        f.append(f"net_pnl<=0 ({jm['net_pnl']:.1f})")
+    if equity_required:
+        if eqm["structural_ruin"]:
+            f.append("structural_ruin")
+        elif eqm["roe"] <= 0:
+            f.append(f"roe<=0 ({eqm['roe']:.2%})")
+        # absolute pretest equity floor: drop tiny degen accounts that merely survived (fold-pure)
+        me = eqm.get("median_equity", 0.0)
+        if me < MIN_EQUITY_USD:
+            f.append(f"equity_too_small (${me:.0f}<{MIN_EQUITY_USD:.0f})")
+        if eqm["max_dd"] > MAXDD_CAP:
+            f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
+    if jm["n_journeys"] < MIN_JOURNEYS_PRETEST:
+        f.append(f"n_journeys<{MIN_JOURNEYS_PRETEST} ({jm['n_journeys']})")
+    _mh = jm["median_hold_s"]
+    # AUDIT 2026-07-10 (codex P0#5): NaN hold (bad/missing durations) makes `NaN <= floor` False -> the hold
+    # floor silently doesn't fire. In strict mode a non-finite hold FAILS closed (no usable copyability evidence).
+    if (strict and not (_mh == _mh)) or _mh <= HOLD_FLOOR_S:
+        f.append(f"median_hold<={HOLD_FLOOR_S:.0f}s ({_mh:.0f}s)" if _mh == _mh else "median_hold_nonfinite")
+    # upper hold gate: V15 copies fast directional; reject multi-day/week holders
+    if jm["median_hold_s"] > SWING_MAX_HOLD_S:
+        f.append(f"hold_too_long (>{SWING_MAX_HOLD_S:.0f}s, {jm['median_hold_s']:.0f}s)")
+    # boundary-straddling week-holder (codex finding a): a position opened in pretest still OPEN at
+    # test_start whose CENSORED hold already exceeds the swing cap is a week-holder invisible to the
+    # median (the close lands after the boundary). Reject on the censored lower-bound alone.
+    cmh = jm.get("censored_max_hold_s", 0.0)
+    if cmh > SWING_MAX_HOLD_S:
+        f.append(f"hold_too_long_censored (>{SWING_MAX_HOLD_S:.0f}s, open-at-test_start {cmh:.0f}s)")
+    if jm["share_below_latency"] > SHARE_BELOW_LATENCY_CAP:
+        f.append(f"share_below_latency>{SHARE_BELOW_LATENCY_CAP:.0%} ({jm['share_below_latency']:.0%})")
+    # LEVERAGE gate (Alberto spec): copy high but not ultra-high; reject median daily leverage > 10x.
+    mlev = eqm.get("median_leverage", 0.0)
+    if equity_required and mlev > LEVERAGE_CAP:
+        f.append(f"leverage>{LEVERAGE_CAP:.0f}x ({mlev:.1f}x)")
+    # CONSISTENCY gate (Alberto spec): >=80% of active days green, enforced only when enough active days
+    # exist to judge it (short fold windows can't prove consistency; thin history caught by other gates).
+    nad = int(eqm.get("n_active_days", 0))
+    fdg = eqm.get("frac_days_green", 0.0)
+    if equity_required and nad >= MIN_ACTIVE_DAYS_GREEN and fdg < DAYS_GREEN_MIN:
+        f.append(f"days_green<{DAYS_GREEN_MIN:.0%} ({fdg:.0%} over {nad}d)")
+    # accessibility (codex P0#3/#4): loose mode = unknown (NaN) does NOT fire; STRICT mode = unknown/unreliable
+    # accessibility (no --accessible-coins for this fold, or NaN notional weighting) FAILS closed -> a wallet
+    # trading exotic/unavailable coins can't slip through on missing data.
+    af = jm["accessible_frac_notional"]
+    if (strict and not (af == af)) or (af == af and af < ACCESSIBLE_FRAC_MIN):
+        f.append(f"accessible_frac<{ACCESSIBLE_FRAC_MIN:.0%} ({af:.0%})" if af == af
+                 else "accessible_frac_unknown(strict)")
+    if not equity_required:
+        # Fixed-notional/direction-only lane: M1-derived equity, DD, leverage,
+        # and consistency are intentionally absent. Source net PnL is recorded
+        # but final performance judgment belongs to after-cost M7/M6b.
+        blocking = [x for x in f if not x.startswith("net_pnl<=0")]
+        return (len(blocking) == 0, f)
+    if COPYABILITY_ONLY:
+        # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
+        blocking = [x for x in f if not x.startswith(_PERF_FAIL_PREFIXES)]
+        return (len(blocking) == 0, f)
+    return (len(f) == 0, f)
+
+
+def run(folds: pd.DataFrame, journeys: pd.DataFrame, equity: pd.DataFrame, m04: pd.DataFrame | None,
+        accessible_by_fold: dict | None = None,
+        active_test_folds_by_wallet: dict | None = None,
+
+exec
+/bin/zsh -lc "sed -n '1,140p' tests/v15/test_m06a_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m06a_shortlist trust-audit fixes (2026-07-10).
+
+Locks two fail-CLOSED behaviours the codex m06a audit surfaced:
+- P1: a missing / non-bool `eligible` value must NOT slip past the I9 precheck (`== True` is False for NaN)
+  and then become rankable via `bool(np.nan) is True`. It fails closed up front.
+- P2: an eligible row that breaches the stated M5 range contract (n_journeys < 3, or max_dd > 0.80) must
+  hard-fail here instead of being silently clamped (dd=1.5 -> dd_term=0.20 would hide the breach).
+Reuses the fixture helpers from test_m06a.
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m06a_shortlist as m6a  # noqa: E402
+from test_m06a import _folds, _entities, _pool, _elig_row, _actions, _manifest  # noqa: E402
+
+
+def test_p1_nan_eligible_fails_closed():
+    eids = [1]
+    row = _elig_row(1, 1, roe=0.5, nj=10, dd=0.2, eligible=True)
+    row["eligible"] = np.nan   # corrupt: missing eligibility must not slip through
+    import pandas as pd
+    elig = pd.DataFrame([row])
+    with pytest.raises(AssertionError, match="non-bool"):
+        m6a.run(elig, _pool(eids), _folds(), _entities(eids), _actions(eids), _manifest())
+
+
+def test_p2_eligible_low_journeys_hardfails():
+    eids = [1]
+    import pandas as pd
+    elig = pd.DataFrame([_elig_row(1, 1, roe=0.5, nj=1, dd=0.2, eligible=True)])  # nj=1 < M5 floor 3
+    with pytest.raises(AssertionError, match="n_journeys"):
+        m6a.run(elig, _pool(eids), _folds(), _entities(eids), _actions(eids), _manifest())
+
+
+def test_p2_eligible_excess_dd_hardfails():
+    eids = [1]
+    import pandas as pd
+    elig = pd.DataFrame([_elig_row(1, 1, roe=0.5, nj=10, dd=1.5, eligible=True)])  # dd 1.5 > M5 cap 0.80
+    with pytest.raises(AssertionError, match="max_dd"):
+        m6a.run(elig, _pool(eids), _folds(), _entities(eids), _actions(eids), _manifest())
+
+
+def test_good_row_still_shortlists():
+    # a clean eligible row is unaffected by the new fail-closed rails.
+    eids = [1]
+    import pandas as pd
+    elig = pd.DataFrame([_elig_row(1, 1, roe=0.5, nj=10, dd=0.2, eligible=True)])
+    sl, _, _ = m6a.run(elig, _pool(eids), _folds(), _entities(eids), _actions(eids), _manifest())
+    assert bool((sl["in_shortlist"] == True).any())  # noqa: E712
+
+exec
+/bin/zsh -lc "sed -n '220,430p' research/v15/v15_m06a_shortlist.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+        logger.warning("LOUD WARNING: using a single M4 entities file for all folds; "
+                       "M6a M4 copyability/canonical-wallet checks are not fold-pure. Pass --m04-dir.")
+    else:
+        maps_by_fold = {int(fid): _entity_maps(df) for fid, df in entities_by_fold.items()}
+        cop = prim = alloc = None
+        logger.info("fold-pure M4 entities enabled for M6a: folds=%s", sorted(maps_by_fold))
+
+    def _maps_for_fold(fid: int):
+        if maps_by_fold is None:
+            return cop, prim, alloc
+        return maps_by_fold.get(int(fid), ({}, {}, {}))
+
+    bad_cop, bad_wallet = [], []
+    for _, r in elig[elig["eligible"] == True].iterrows():  # noqa: E712
+        eid = int(r["entity_id"])
+        fcop, fprim, _ = _maps_for_fold(int(r["fold_id"]))
+        cv = fcop.get(eid)
+        copyable_true = bool(cv) if pd.notna(cv) else False   # NA-safe (pd.NA copyable -> not copyable)
+        canon = fprim.get(eid)
+        if not copyable_true or _null_wallet(canon):
+            bad_cop.append(eid)
+            continue
+        ew = r.get("primary_wallet")
+        if _null_wallet(ew) or ew != canon:   # short-circuit: != only on two non-null strings
+            bad_wallet.append((eid, ew, canon))
+    if bad_cop:
+        raise AssertionError(
+            f"RANKABLE CONTRACT VIOLATION (I9): {len(bad_cop)} eligible entity_ids are not copyable "
+            f"primaries (e.g. {bad_cop[:5]}). M5 must only mark copyable primaries eligible.")
+    if bad_wallet:
+        raise AssertionError(
+            f"PRIMARY-WALLET MISMATCH (I9): {len(bad_wallet)} eligible rows have a primary_wallet "
+            f"that is null or != m04 canonical (e.g. {bad_wallet[:3]}).")
+
+    # --- archive start (= fold 1 train_start) for the persistence horizon clamp ---
+    start_ms = int(pd.Timestamp(folds["train_start"].min()).tz_localize("UTC").timestamp() * 1000) \
+        if folds["train_start"].min().tzinfo is None \
+        else int(pd.Timestamp(folds["train_start"].min()).timestamp() * 1000)
+
+    # --- per-PRIMARY replayable action ts arrays, once ---
+    if "stream_replay_valid" in actions.columns:
+        actions = actions[actions["stream_replay_valid"].fillna(False).astype(bool)].copy()
+    act = actions[["wallet", "ts"]].sort_values(["wallet", "ts"])
+    act_by: dict[str, np.ndarray] = {w: g["ts"].to_numpy(dtype="int64")
+                                     for w, g in act.groupby("wallet", sort=False)}
+
+    # --- pool-summary reporting fields (carried, never select) ---
+    pool_by = {int(r["entity_id"]): r for _, r in pool.iterrows()} if len(pool) else {}
+
+    fold_test_start = {int(r["fold_id"]): r["test_start"] for _, r in folds.iterrows()}
+    fold_chain = {int(r["fold_id"]): int(r["oos_chain_order"]) for _, r in folds.iterrows()}
+
+    def _ts_ms(t) -> int:
+        ts = pd.Timestamp(t)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return int(ts.timestamp() * 1000)
+
+    def _num(x):
+        return pd.to_numeric(x, errors="coerce")
+
+    rows = []
+    for fid in sorted(elig["fold_id"].unique()):
+        sub = elig[(elig["fold_id"] == fid)].copy()
+        test_start_ms = _ts_ms(fold_test_start[int(fid)])
+        for _, r in sub.iterrows():
+            eid = int(r["entity_id"])
+            elig_row = (r["eligible"] == True)  # noqa: E712 -- validated strict-bool above; no bool(NaN) trap
+            fcop, fprim, falloc = _maps_for_fold(int(fid))
+            w = fprim.get(eid)  # canonical primary wallet (validated above for eligible rows)
+            ts_arr = act_by.get(w, np.empty(0, "int64"))
+            pr = compute_persistence(ts_arr, test_start_ms, start_ms)
+
+            # codex code-r1 #3/#4: coerce metrics (ineligible/drop rows may be NA) and check
+            # FINITENESS before any int()/log (np.inf must not crash before the contract assert).
+            roe_n = _num(r["roe_pretest_flow_adj"])
+            roe = float(roe_n) if (pd.notna(roe_n) and np.isfinite(roe_n)) else np.nan
+            njr_n = _num(r["n_journeys_pretest"])
+            njr_finite = bool(pd.notna(njr_n) and np.isfinite(njr_n))
+            njr = int(njr_n) if njr_finite else 0
+            dd_n = _num(r["max_dd_pretest"])
+            dd = float(dd_n) if (pd.notna(dd_n) and np.isfinite(dd_n)) else np.nan
+            dd_term = _clamp(1.0 - dd, DD_LO, 1.0) if np.isfinite(dd) else np.nan
+            # eligible rows MUST have finite, positive required inputs (M5 floors net_pnl>0, roe>0,
+            # n_journeys>=3, max_dd<=0.80). A violation is an upstream contract breach -> hard-fail.
+            # COPYABILITY_ONLY (Alberto 2026-06-09): M5 no longer floors performance, so eligible rows may
+            # have roe<=0. M6a then RANKS performance (it does not require it): the score is monotone in roe,
+            # so losers rank below winners; all <=1000/fold are shortlisted and the engine sims them; M6b does
+            # the real post-engine ranking. We still require FINITE inputs (NaN would be a true data breach).
+            if elig_row:
+                # AUDIT 2026-07-10 (codex m06a P2): finiteness is not enough -- assert the M5 RANGE contract so
+                # an upstream floor breach fails CLOSED here instead of being silently clamped (dd=1.5 -> 0.20
+                # dd_term hides the breach). n_journeys>=3 and max_dd<=0.80 are non-perf blocking gates that
+                # M5 enforces in BOTH strict AND COPYABILITY_ONLY mode (only net_pnl/roe/days_green relax).
+                if not (njr_finite and njr_n >= MIN_JOURNEYS_M5):
+                    raise AssertionError(
+                        f"ELIGIBLE row entity {eid} fold {fid} has n_journeys={njr_n} (< M5 floor {MIN_JOURNEYS_M5})."
+                    )
+                if score_basis == "activity_only":
+                    # Equity-independent high-recall bouncer. Performance is
+                    # deliberately deferred to fixed-position M7 and M6b.
+                    dd_term = 1.0
+                    score = pr.persistence_term * math.log1p(njr)
+                else:
+                    if not np.isfinite(roe):
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
+                    if not np.isfinite(dd):
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd={dd_n}.")
+                    if dd > MAXDD_M5:
+                        raise AssertionError(
+                            f"ELIGIBLE row entity {eid} fold {fid} has max_dd={dd_n} (> M5 cap {MAXDD_M5}); "
+                            f"upstream floor breach, fail closed (not silently clamped).")
+                    if not COPYABILITY_ONLY and roe <= 0:
+                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
+                    # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.
+                    score = roe * pr.persistence_term * math.log1p(njr) * dd_term
+            else:
+                score = float("nan")
+
+            rankable = elig_row and (not recency_gate or pr.recent_block_active) and bool(np.isfinite(score))
+            pinfo = pool_by.get(eid, {})
+            rows.append({
+                "entity_id": eid, "primary_wallet": w, "fold_id": int(fid),
+                "oos_chain_order": fold_chain[int(fid)],
+                "eligible": elig_row, "copyable": bool(fcop.get(eid, False)),
+                "has_primary": (w is not None) and not (isinstance(w, float) and pd.isna(w)) and w != "",
+                "recent_block_active": pr.recent_block_active,
+                "rankable": rankable,
+                "source_score_pretest": score,
+                "roe_pretest_flow_adj": roe,
+                "persistence_term": pr.persistence_term,
+                "active_blocks": pr.active_blocks, "possible_blocks": pr.possible_blocks,
+                "persistence_lookback_days": pr.lookback_days,
+                "left_censored_persistence": pr.left_censored,
+                "persistence_coverage": pr.persistence_coverage,
+                "n_journeys_pretest": njr, "max_dd_pretest": dd, "dd_clamp_term": dd_term,
+                "m4_tier": r.get("m4_tier"),
+                "entity_alloc_weight": float(falloc.get(eid, np.nan)),
+                # reporting-only (carried; never selects):
+                "source_6m_roe_full": float(pinfo.get("source_6m_roe_full", np.nan)) if len(pinfo) else np.nan,
+                "active_test_folds": pinfo.get("active_test_folds", np.nan) if len(pinfo) else np.nan,
+                "g5_pool_candidate_pass": bool(pinfo.get("g5_pool_candidate_pass", False)) if len(pinfo) else False,
+                "as_of_ms": test_start_ms,
+                "run_mode": mode, "manifest_version": mver,
+                "score_basis": score_basis,
+            })
+
+    sl = pd.DataFrame(rows)
+
+    # --- the CUT (deterministic, per fold) ---
+    # rank_in_fold is emitted in BOTH modes; selection/budget columns ONLY in shortlist mode
+    # (codex code-r1 #1: rank_only must not carry B_k / in_shortlist / shortlist_reason).
+    sl["rank_in_fold"] = pd.Series([pd.NA] * len(sl), dtype="Int64")
+    if mode == "shortlist":
+        sl["B_k"] = pd.Series([pd.NA] * len(sl), dtype="Int64")
+        sl["in_shortlist"] = pd.Series([pd.NA] * len(sl), dtype="boolean")
+        sl["shortlist_reason"] = pd.Series([pd.NA] * len(sl), dtype="object")
+        # M5 emits ineligible (entity,fold) rows too; NOT M6a's ranking universe. Label explicitly
+        # (not a silent drop), exclude from rankability/budget/conservation.
+        inelig_mask = sl["eligible"] != True  # noqa: E712
+        sl.loc[inelig_mask, "in_shortlist"] = False
+        sl.loc[inelig_mask, "shortlist_reason"] = "ineligible"
+
+    waterfall = {"run_mode": mode, "manifest_version": mver,
+                 "score_basis": score_basis,
+                 "recency_gate": recency_gate, "folds": {}}
+    if mode == "shortlist":
+        waterfall["shortlist_n_per_fold"] = N
+    total_sims = 0
+    for fid in sorted(sl["fold_id"].unique()):
+        m = (sl["fold_id"] == fid) & (sl["rankable"] == True)  # noqa: E712
+        idx = sl[m].sort_values(["source_score_pretest", "entity_id"],
+                                ascending=[False, True]).index
+        sl.loc[idx, "rank_in_fold"] = np.arange(1, len(idx) + 1)
+        n_rankable = len(idx)
+        n_eligible = int(((sl["fold_id"] == fid) & (sl["eligible"] == True)).sum())  # noqa: E712
+        n_stale = int(((sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)).sum())  # noqa: E712
+        wf = {"n_eligible": n_eligible, "n_rankable": n_rankable, "n_stale_dropped": n_stale}
+        sq = {q: float(np.nanpercentile(sl.loc[idx, "source_score_pretest"], q)) for q in (50, 75, 90, 99)} if n_rankable else {}
+        if mode == "shortlist":
+            B_k = min(N, n_rankable)
+            sl.loc[idx, "B_k"] = B_k
+            in_sl_idx, drop_idx = idx[:B_k], idx[B_k:]
+            sl.loc[in_sl_idx, "in_shortlist"] = True
+            sl.loc[in_sl_idx, "shortlist_reason"] = "top_n"
+            sl.loc[drop_idx, "in_shortlist"] = False
+            sl.loc[drop_idx, "shortlist_reason"] = "dropped_rank"
+            stale_idx = sl[(sl["fold_id"] == fid) & (sl["eligible"] == True) & (sl["rankable"] == False)].index  # noqa: E712
+            sl.loc[stale_idx, "in_shortlist"] = False
+            sl.loc[stale_idx, "shortlist_reason"] = "dropped_stale"
+            total_sims += B_k
+            band = sl.loc[idx[B_k:B_k + 200], ["entity_id", "source_score_pretest", "rank_in_fold"]]
+            wf.update({"B_k": int(B_k), "n_shortlisted": int(B_k),
+                       "p90_diag": (sq.get(90) if n_rankable else None),
+                       "marginal_band": band.to_dict("records"), "score_quantiles": sq})
+        else:
+            wf["score_quantiles"] = sq
+        waterfall["folds"][int(fid)] = wf
+
+    if mode == "shortlist":
+        waterfall["total_engine_sims"] = int(total_sims)
+        waterfall["engine_budget"] = 8 * N
+        waterfall["budget_ok"] = bool(total_sims <= 8 * N)
+        assert total_sims <= 8 * N, f"BUDGET BREACH: {total_sims} > {8*N}"
+
+    # --- pool summary ---
+    g = sl.groupby("entity_id")
+    pool_rows = []
+    for eid, grp in g:
+        n_elig_folds = int((grp["eligible"] == True).sum())  # noqa: E712
+        if mode == "shortlist":
+
+codex
+One important nuance has emerged: `n_journeys` is asserted before both scoring bases, but `max_dd` is only asserted in the `equity_roe` branch. I’m checking whether `activity_only` is a production-supported basis or only diagnostic, because that decides whether this is still an open fail-open path.
+exec
+/bin/zsh -lc "sed -n '1,220p' research/v15/v15_m06a_shortlist.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""V15 M6a — Cheap Broad Source-Score Shortlist.
+
+DESIGN: brain projects/quant/v15/modules/m06a (r6, codex DESIGN-SHIP r5 + persistence
+Option-B coverage-adjusted per Alberto + codex consult /tmp/codex_m6a_persist_out.txt).
+
+M6a is the CHEAP, NO-ENGINE candidate generator. It ranks the M5-eligible (entity, fold)
+survivors by the codex#7 source_score, FOLD-PRETEST-PURE on [train_start_k, test_start_k) for the
+RETURN terms, with a COVERAGE-ADJUSTED causal-activity persistence term, and emits a high-recall
+shortlist via pure per-fold top-N (budget = sum_k min(N, n_rankable_k) <= 8N). It is the bouncer,
+not the judge: M6b (post-M7-engine) is the real, copyability-adjusted ranking. Raw source ROE never
+locks the pool (strategy thesis 4b).
+
+source_score_pretest_k = roe_pretest_flow_adj
+                       * persistence_term_k            # = min(1, active_blocks / min(6, possible_blocks))
+                       * log1p(n_journeys_pretest)
+                       * clamp(1 - max_dd_pretest, 0.20, 1.0)
+
+KEY DISCIPLINE:
+- RETURN terms (ROE, DD, journeys) are M5 pretest-only (no look-ahead; W1/W2).
+- persistence is ACTIVITY/EXISTENCE only and may look back over the whole causal history
+  [max(START, test_start_k - 168d), test_start_k) (W1/W2 carve-out C3, Alberto-approved). No future
+  leak: every block ends before test_start_k.
+- N is PRE-REGISTERED in a run manifest BEFORE any rank/score is inspected (multiple-testing
+  discipline). N=1000 was chosen by Alberto as an engine-budget round number, not from scores.
+
+PERSISTENCE = ACTION-BASED (codex-SHIPped r6 design). A block is ACTIVE iff it contains >=1 causal
+m02_actions ts. This deliberately REWARDS active, turn-it-over traders and down-ranks one-burst
+wallets AND multi-week sitters (Alberto 2026-05-31: "I want to realize returns fast, not be stressed
+about volatility" — we do NOT reward holding a position open for weeks). The recency gate (active in
+the most recent 14d block) likewise drops long-sitters, which is the intent. (An earlier
+"holder-aware" variant that counted open-position-spanning blocks was REVERTED per that correction.)
+
+Output:
+  <outdir>/m06a_shortlist.parquet      per (entity, fold) FULL audit (incl drops)
+  <outdir>/m06a_pool_summary.parquet   per entity
+  <outdir>/m06a_waterfall.json         per-fold counts + budget + diagnostic marginal band
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [v15_m06a] %(message)s")
+logger = logging.getLogger("v15_m06a")
+
+# Alberto 2026-06-09: when M5 runs copyability-only (M5_COPYABILITY_ONLY=1), eligible rows may have roe<=0
+# (M5 no longer floors performance). M6a then RANKS performance instead of asserting it. Default OFF =
+# strict behavior byte-identical.
+import os as _os
+COPYABILITY_ONLY = _os.environ.get("M5_COPYABILITY_ONLY", "0") == "1"
+
+# === Constants (LOCKED by design r6) ===
+BLOCK_DAYS = 14
+HORIZON_DAYS = 168            # ~6mo intended persistence lookback (archive is 174d -> natural cap)
+PERS_SAT_BLOCKS = 6           # codex#7 "6-block saturation": min(6, possible_blocks) denominator
+DD_LO = 0.20                  # clamp floor; aligns with M5 max_dd<=0.80 (no-op rail)
+# M5 upstream-contract rails asserted for eligible rows (codex m06a P2). Mirror m05 MIN_JOURNEYS_PRETEST /
+# MAXDD_CAP; these are non-perf blocking gates M5 enforces in BOTH strict and COPYABILITY_ONLY mode.
+MIN_JOURNEYS_M5 = 3
+MAXDD_M5 = 0.80
+MS_DAY = 86_400_000
+BLOCK_MS = BLOCK_DAYS * MS_DAY
+HORIZON_MS = HORIZON_DAYS * MS_DAY
+HORIZON_BLOCKS = HORIZON_DAYS // BLOCK_DAYS   # 12 (denominator for persistence_coverage)
+
+DEFAULT_MANIFEST = {
+    "manifest_version": "v1",
+    "mode": "shortlist",                 # "shortlist" | "rank_only"
+    "shortlist_n_per_fold": 1000,        # Alberto, pre-registered (engine-budget round number)
+    "recency_gate": True,                # drop entities with no action/open-position in the most recent 14d block
+    "contamination_status": "clean_oos", # clean_oos | exploratory_calibration | alberto_override
+    "persistence_horizon_days": HORIZON_DAYS,
+    "score_basis": "equity_roe",          # equity_roe | activity_only
+}
+
+
+# ---------------------------------------------------------------------------
+# Persistence: coverage-adjusted causal activity over fold-anchored 14d blocks
+# ---------------------------------------------------------------------------
+@dataclass
+class PersistenceResult:
+    persistence_term: float          # min(1, active_blocks / min(6, possible_blocks))
+    active_blocks: int
+    possible_blocks: int
+    recent_block_active: bool         # block 0 = [test_start-14d, test_start) had action OR open position
+    lookback_days: float
+    persistence_coverage: float       # possible_blocks / HORIZON_BLOCKS (degree of left-censoring)
+    left_censored: bool               # lookback_days < HORIZON_DAYS
+
+
+def _block_index(ts_ms: int, test_start_ms: int) -> int:
+    """Fold-anchored block index walking back from test_start_k.
+    block b = [test_start - 14d*(b+1), test_start - 14d*b). A ts strictly < test_start lands in
+    b = floor((test_start - 1 - ts) / BLOCK_MS) so the instant test_start-1 is b=0 and test_start
+    itself (== a boundary) is excluded (half-open)."""
+    return (test_start_ms - 1 - ts_ms) // BLOCK_MS
+
+
+def compute_persistence(ts_ms: np.ndarray, test_start_ms: int, start_ms: int) -> PersistenceResult:
+    """ts_ms: the PRIMARY wallet's m02_actions timestamps (ms). Counts distinct 14d blocks in
+    [max(START, test_start-168d), test_start) that contain >=1 ACTION (action-based; Alberto:
+    reward active turn-it-over traders, not multi-week sitters). Fully causal: every block ends
+    <= test_start (no future data)."""
+    horizon_start = max(start_ms, test_start_ms - HORIZON_MS)
+    if test_start_ms <= horizon_start:
+        return PersistenceResult(0.0, 0, 0, False, 0.0, 0.0, True)
+    # codex code-r1 #2: count fold-anchored blocks INTERSECTING [horizon_start, test_start), incl a
+    # partial oldest block. possible = block index of horizon_start + 1 (NOT floor(span/14d), which
+    # drops the partial oldest block and can zero out short histories).
+    possible = _block_index(horizon_start, test_start_ms) + 1
+    if possible <= 0:
+        return PersistenceResult(0.0, 0, 0, False, 0.0, 0.0, True)
+
+    active: set[int] = set()
+    for i in range(len(ts_ms)):
+        ts = int(ts_ms[i])
+        if horizon_start <= ts < test_start_ms:
+            b = _block_index(ts, test_start_ms)
+            if 0 <= b < possible:
+                active.add(b)
+
+    n_active = len(active)
+    denom = min(PERS_SAT_BLOCKS, possible)
+    term = min(1.0, n_active / denom) if denom > 0 else 0.0
+    return PersistenceResult(
+        persistence_term=term,
+        active_blocks=n_active,
+        possible_blocks=possible,
+        recent_block_active=(0 in active),
+        lookback_days=(test_start_ms - horizon_start) / MS_DAY,
+        persistence_coverage=possible / HORIZON_BLOCKS,
+        left_censored=(test_start_ms - horizon_start) < HORIZON_MS,
+    )
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _null_wallet(v) -> bool:
+    """NA-safe null check for a wallet scalar (handles None, pd.NA, np.nan, '')."""
+    if v is None:
+        return True
+    if bool(pd.isna(v)):   # pd.isna returns a plain bool for scalars (pd.NA, nan -> True)
+        return True
+    return v == ""
+
+
+def _load_entities_by_fold(m04_dir: Path, folds: pd.DataFrame) -> dict[int, pd.DataFrame]:
+    out = {}
+    for fid in sorted(folds["fold_id"].astype(int).unique()):
+        p = m04_dir / f"m04_entities_f{fid}.parquet"
+        if not p.exists():
+            raise FileNotFoundError(f"missing fold-pure M4 entities file for fold {fid}: {p}")
+        out[int(fid)] = pd.read_parquet(p)
+    return out
+
+
+def _entity_maps(entities: pd.DataFrame) -> tuple[dict[int, object], dict[int, object], dict[int, object]]:
+    cop = dict(zip(entities["entity_id"].astype(int), entities["copyable"]))
+    prim = dict(zip(entities["entity_id"].astype(int), entities["primary_wallet"]))
+    alloc = dict(zip(entities["entity_id"].astype(int), entities["entity_alloc_weight"]))
+    return cop, prim, alloc
+
+
+# ---------------------------------------------------------------------------
+# Core run
+# ---------------------------------------------------------------------------
+def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
+        entities: pd.DataFrame | None, actions: pd.DataFrame, manifest: dict,
+        entities_by_fold: dict[int, pd.DataFrame] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    mode = manifest["mode"]
+    if mode not in ("shortlist", "rank_only"):
+        raise ValueError(f"manifest.mode must be 'shortlist' or 'rank_only', got {mode!r}")
+    recency_gate = bool(manifest["recency_gate"])
+    mver = manifest["manifest_version"]
+    contam = manifest.get("contamination_status", "clean_oos")
+    score_basis = manifest.get("score_basis", "equity_roe")
+    if score_basis not in ("equity_roe", "activity_only"):
+        raise ValueError(f"unknown score_basis {score_basis!r}")
+    # codex code-r1 #7: disabling the recency gate is a production-design change -> only in a
+    # non-clean (explicitly diagnostic) manifest.
+    if not recency_gate and contam == "clean_oos":
+        raise ValueError("recency_gate=False requires contamination_status != 'clean_oos' "
+                         "(disabling the stale-drop is a non-production diagnostic, not clean OOS).")
+    N = None
+    if mode == "shortlist":
+        # codex code-r1 #6: N must be a real positive int (reject bool/float/negative).
+        Nraw = manifest["shortlist_n_per_fold"]
+        if isinstance(Nraw, bool) or not isinstance(Nraw, int) or Nraw <= 0:
+            raise ValueError(f"shortlist_n_per_fold must be a positive int, got {Nraw!r}")
+        N = int(Nraw)
+
+    # AUDIT 2026-07-10 (codex m06a P1): `eligible` MUST be a strict bool. A NaN/non-bool slips PAST the I9
+    # precheck (`== True` is False for NaN) yet `bool(np.nan)` is True in the scoring loop -> the row can become
+    # rankable + shortlisted with NO copyability check. Fail CLOSED here (validate the column once, up front).
+    if "eligible" not in elig.columns:
+        raise AssertionError("M5 eligibility frame lacks the 'eligible' column")
+    _bad_elig = elig["eligible"].isna() | ~elig["eligible"].isin([True, False])
+    if bool(_bad_elig.any()):
+        raise AssertionError(
+            f"M5 eligibility has {int(_bad_elig.sum())} missing/non-bool 'eligible' values "
+            f"(e.g. entity_ids {elig.loc[_bad_elig, 'entity_id'].head(5).tolist()}); fail closed.")
+
+    # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
+    #     primary_wallet matching m04 (codex code-r1 #5). ---
+    if entities_by_fold is None:
+        if entities is None:
+            raise ValueError("run() requires either entities or entities_by_fold")
+        cop, prim, alloc = _entity_maps(entities)
+        maps_by_fold = None
+        logger.warning("LOUD WARNING: using a single M4 entities file for all folds; "
+
+exec
+/bin/zsh -lc 'pytest -q tests/v15/test_m06a_golden.py tests/v15/test_m06a.py' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc 'rg -n "score_basis|activity_only|equity_roe" -S .' in /Users/hermes/quants-lab
+ succeeded in 238ms:
+ succeeded in 1135ms:
+................................                                         [100%]
+32 passed in 0.64s
+
+codex
+The targeted M6a suite passes locally: `32 passed`. I found one remaining loose path in a supported manifest mode, so I’m checking whether broader V15 tests expose anything else before I write the verdict.
+exec
+/bin/zsh -lc "sed -n '150,190p' tests/v15/test_m06a.py && cat config/v15_m06a_activity_manifest.json" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+
+
+def test_eligible_nonpositive_roe_hardfails():
+    # codex code-r1 #4: M5 guarantees eligible->roe>0; a violation is an upstream contract breach.
+    eids = [1]
+    elig = pd.DataFrame([_elig_row(1, 1, roe=-0.3)])
+    with pytest.raises(AssertionError):
+        m6a.run(elig, _pool(eids), _folds(), _entities(eids), _actions(eids), _manifest())
+
+
+def test_eligible_nan_metric_hardfails():
+    eids = [1]
+    elig = pd.DataFrame([_elig_row(1, 1)]); elig.loc[0, "max_dd_pretest"] = np.nan
+    with pytest.raises(AssertionError):
+        m6a.run(elig, _pool(eids), _folds(), _entities(eids), _actions(eids), _manifest())
+
+
+def test_activity_only_shortlist_does_not_require_equity_metrics():
+    eids = [1]
+    elig = pd.DataFrame([_elig_row(1, 1, roe=np.nan, dd=np.nan)])
+    manifest = _manifest()
+    manifest["score_basis"] = "activity_only"
+    sl, _, wf = m6a.run(
+        elig, _pool(eids), _folds(), _entities(eids), _actions(eids), manifest
+    )
+    row = sl.iloc[0]
+    assert row["rankable"]
+    assert row["score_basis"] == "activity_only"
+    assert row["source_score_pretest"] > 0
+    assert wf["score_basis"] == "activity_only"
+
+
+# ---------------------------------------------------------------- recency gate drops stale
+def test_recency_gate_drops_stale_holder():
+    eids = [1, 2]
+    elig = pd.DataFrame([_elig_row(1, 1), _elig_row(2, 1)])
+    acts = pd.DataFrame([
+        {"wallet": "0xw1", "ts": ms("2026-01-20")},                 # recent -> rankable
+        {"wallet": "0xw2", "ts": ms("2025-12-05")},                 # only old -> stale
+    ])
+    sl, _, _ = m6a.run(elig, _pool(eids), _folds(), _entities(eids), acts, _manifest())
+{
+  "manifest_version": "v15-fixed-activity-v1",
+  "mode": "shortlist",
+  "shortlist_n_per_fold": 1000,
+  "recency_gate": true,
+  "contamination_status": "clean_oos",
+  "persistence_horizon_days": 168,
+  "score_basis": "activity_only"
+}
+
+exec
+/bin/zsh -lc 'pytest -q tests/v15' in /Users/hermes/quants-lab
+ exited 2 in 1049ms:
+
+==================================== ERRORS ====================================
+________ ERROR collecting tests/v15/test_equity_independent_actions.py _________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_equity_independent_actions.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_equity_independent_actions.py:5: in <module>
+    import v15_equity_independent_actions as ei  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_equity_independent_actions.py:23: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+______________ ERROR collecting tests/v15/test_fidelity_replay.py ______________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_fidelity_replay.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_fidelity_replay.py:7: in <module>
+    from fidelity_replay import roundtrips  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/fidelity_replay.py:17: in <module>
+    import leadlag_clean_rank_sim as S
+research/v15/leadlag_clean_rank_sim.py:62: in <module>
+    from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+__________ ERROR collecting tests/v15/test_fixed_notional_signals.py ___________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_fixed_notional_signals.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_fixed_notional_signals.py:7: in <module>
+    import v15_fixed_notional_signals as sig  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_fixed_notional_signals.py:28: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m02.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m02.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m02.py:22: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m04.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m04.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m04.py:9: in <module>
+    import v15_m025_authenticity_gate as g  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m025_authenticity_gate.py:37: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m09.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m09.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m09.py:13: in <module>
+    import v15_m09_sim as M9  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m09_sim.py:27: in <module>
+    from _streaming_io import ShardedParquetWriter, install_memory_guard
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+________________ ERROR collecting tests/v15/test_mem_budget.py _________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_mem_budget.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_mem_budget.py:16: in <module>
+    from _streaming_io import plan_memory_budget, MemoryBudgetError  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+=========================== short test summary info ============================
+ERROR tests/v15/test_equity_independent_actions.py
+ERROR tests/v15/test_fidelity_replay.py
+ERROR tests/v15/test_fixed_notional_signals.py
+ERROR tests/v15/test_m02.py
+ERROR tests/v15/test_m04.py
+ERROR tests/v15/test_m09.py
+ERROR tests/v15/test_mem_budget.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 7 errors during collection !!!!!!!!!!!!!!!!!!!!
+7 errors in 0.70s
+
+codex
+The full `tests/v15` collection cannot run in this environment because optional dependencies are missing (`pymongo`, `pyarrow`), so I’m limiting the executable verification to the M6a tests that can run here. The code review finding is independent of that environment issue.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m06a_shortlist.py | sed -n '60,75p;200,215p;310,335p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    60	# === Constants (LOCKED by design r6) ===
+    61	BLOCK_DAYS = 14
+    62	HORIZON_DAYS = 168            # ~6mo intended persistence lookback (archive is 174d -> natural cap)
+    63	PERS_SAT_BLOCKS = 6           # codex#7 "6-block saturation": min(6, possible_blocks) denominator
+    64	DD_LO = 0.20                  # clamp floor; aligns with M5 max_dd<=0.80 (no-op rail)
+    65	# M5 upstream-contract rails asserted for eligible rows (codex m06a P2). Mirror m05 MIN_JOURNEYS_PRETEST /
+    66	# MAXDD_CAP; these are non-perf blocking gates M5 enforces in BOTH strict and COPYABILITY_ONLY mode.
+    67	MIN_JOURNEYS_M5 = 3
+    68	MAXDD_M5 = 0.80
+    69	MS_DAY = 86_400_000
+    70	BLOCK_MS = BLOCK_DAYS * MS_DAY
+    71	HORIZON_MS = HORIZON_DAYS * MS_DAY
+    72	HORIZON_BLOCKS = HORIZON_DAYS // BLOCK_DAYS   # 12 (denominator for persistence_coverage)
+    73	
+    74	DEFAULT_MANIFEST = {
+    75	    "manifest_version": "v1",
+   200	        N = int(Nraw)
+   201	
+   202	    # AUDIT 2026-07-10 (codex m06a P1): `eligible` MUST be a strict bool. A NaN/non-bool slips PAST the I9
+   203	    # precheck (`== True` is False for NaN) yet `bool(np.nan)` is True in the scoring loop -> the row can become
+   204	    # rankable + shortlisted with NO copyability check. Fail CLOSED here (validate the column once, up front).
+   205	    if "eligible" not in elig.columns:
+   206	        raise AssertionError("M5 eligibility frame lacks the 'eligible' column")
+   207	    _bad_elig = elig["eligible"].isna() | ~elig["eligible"].isin([True, False])
+   208	    if bool(_bad_elig.any()):
+   209	        raise AssertionError(
+   210	            f"M5 eligibility has {int(_bad_elig.sum())} missing/non-bool 'eligible' values "
+   211	            f"(e.g. entity_ids {elig.loc[_bad_elig, 'entity_id'].head(5).tolist()}); fail closed.")
+   212	
+   213	    # --- I9 rankable contract: every M5-eligible row must be a copyable primary with a canonical
+   214	    #     primary_wallet matching m04 (codex code-r1 #5). ---
+   215	    if entities_by_fold is None:
+   310	                # AUDIT 2026-07-10 (codex m06a P2): finiteness is not enough -- assert the M5 RANGE contract so
+   311	                # an upstream floor breach fails CLOSED here instead of being silently clamped (dd=1.5 -> 0.20
+   312	                # dd_term hides the breach). n_journeys>=3 and max_dd<=0.80 are non-perf blocking gates that
+   313	                # M5 enforces in BOTH strict AND COPYABILITY_ONLY mode (only net_pnl/roe/days_green relax).
+   314	                if not (njr_finite and njr_n >= MIN_JOURNEYS_M5):
+   315	                    raise AssertionError(
+   316	                        f"ELIGIBLE row entity {eid} fold {fid} has n_journeys={njr_n} (< M5 floor {MIN_JOURNEYS_M5})."
+   317	                    )
+   318	                if score_basis == "activity_only":
+   319	                    # Equity-independent high-recall bouncer. Performance is
+   320	                    # deliberately deferred to fixed-position M7 and M6b.
+   321	                    dd_term = 1.0
+   322	                    score = pr.persistence_term * math.log1p(njr)
+   323	                else:
+   324	                    if not np.isfinite(roe):
+   325	                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has non-finite roe={roe_n}.")
+   326	                    if not np.isfinite(dd):
+   327	                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has invalid dd={dd_n}.")
+   328	                    if dd > MAXDD_M5:
+   329	                        raise AssertionError(
+   330	                            f"ELIGIBLE row entity {eid} fold {fid} has max_dd={dd_n} (> M5 cap {MAXDD_M5}); "
+   331	                            f"upstream floor breach, fail closed (not silently clamped).")
+   332	                    if not COPYABILITY_ONLY and roe <= 0:
+   333	                        raise AssertionError(f"ELIGIBLE row entity {eid} fold {fid} has roe={roe_n} (strict M5 guarantees roe>0).")
+   334	                    # monotone-in-roe score; sign-preserving so roe<=0 ranks below positives without crashing log1p.
+   335	                    score = roe * pr.persistence_term * math.log1p(njr) * dd_term
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m05_eligibility.py | sed -n '280,335p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   280	        if eqm["structural_ruin"]:
+   281	            f.append("structural_ruin")
+   282	        elif eqm["roe"] <= 0:
+   283	            f.append(f"roe<=0 ({eqm['roe']:.2%})")
+   284	        # absolute pretest equity floor: drop tiny degen accounts that merely survived (fold-pure)
+   285	        me = eqm.get("median_equity", 0.0)
+   286	        if me < MIN_EQUITY_USD:
+   287	            f.append(f"equity_too_small (${me:.0f}<{MIN_EQUITY_USD:.0f})")
+   288	        if eqm["max_dd"] > MAXDD_CAP:
+   289	            f.append(f"max_dd>{MAXDD_CAP:.0%} ({eqm['max_dd']:.0%})")
+   290	    if jm["n_journeys"] < MIN_JOURNEYS_PRETEST:
+   291	        f.append(f"n_journeys<{MIN_JOURNEYS_PRETEST} ({jm['n_journeys']})")
+   292	    _mh = jm["median_hold_s"]
+   293	    # AUDIT 2026-07-10 (codex P0#5): NaN hold (bad/missing durations) makes `NaN <= floor` False -> the hold
+   294	    # floor silently doesn't fire. In strict mode a non-finite hold FAILS closed (no usable copyability evidence).
+   295	    if (strict and not (_mh == _mh)) or _mh <= HOLD_FLOOR_S:
+   296	        f.append(f"median_hold<={HOLD_FLOOR_S:.0f}s ({_mh:.0f}s)" if _mh == _mh else "median_hold_nonfinite")
+   297	    # upper hold gate: V15 copies fast directional; reject multi-day/week holders
+   298	    if jm["median_hold_s"] > SWING_MAX_HOLD_S:
+   299	        f.append(f"hold_too_long (>{SWING_MAX_HOLD_S:.0f}s, {jm['median_hold_s']:.0f}s)")
+   300	    # boundary-straddling week-holder (codex finding a): a position opened in pretest still OPEN at
+   301	    # test_start whose CENSORED hold already exceeds the swing cap is a week-holder invisible to the
+   302	    # median (the close lands after the boundary). Reject on the censored lower-bound alone.
+   303	    cmh = jm.get("censored_max_hold_s", 0.0)
+   304	    if cmh > SWING_MAX_HOLD_S:
+   305	        f.append(f"hold_too_long_censored (>{SWING_MAX_HOLD_S:.0f}s, open-at-test_start {cmh:.0f}s)")
+   306	    if jm["share_below_latency"] > SHARE_BELOW_LATENCY_CAP:
+   307	        f.append(f"share_below_latency>{SHARE_BELOW_LATENCY_CAP:.0%} ({jm['share_below_latency']:.0%})")
+   308	    # LEVERAGE gate (Alberto spec): copy high but not ultra-high; reject median daily leverage > 10x.
+   309	    mlev = eqm.get("median_leverage", 0.0)
+   310	    if equity_required and mlev > LEVERAGE_CAP:
+   311	        f.append(f"leverage>{LEVERAGE_CAP:.0f}x ({mlev:.1f}x)")
+   312	    # CONSISTENCY gate (Alberto spec): >=80% of active days green, enforced only when enough active days
+   313	    # exist to judge it (short fold windows can't prove consistency; thin history caught by other gates).
+   314	    nad = int(eqm.get("n_active_days", 0))
+   315	    fdg = eqm.get("frac_days_green", 0.0)
+   316	    if equity_required and nad >= MIN_ACTIVE_DAYS_GREEN and fdg < DAYS_GREEN_MIN:
+   317	        f.append(f"days_green<{DAYS_GREEN_MIN:.0%} ({fdg:.0%} over {nad}d)")
+   318	    # accessibility (codex P0#3/#4): loose mode = unknown (NaN) does NOT fire; STRICT mode = unknown/unreliable
+   319	    # accessibility (no --accessible-coins for this fold, or NaN notional weighting) FAILS closed -> a wallet
+   320	    # trading exotic/unavailable coins can't slip through on missing data.
+   321	    af = jm["accessible_frac_notional"]
+   322	    if (strict and not (af == af)) or (af == af and af < ACCESSIBLE_FRAC_MIN):
+   323	        f.append(f"accessible_frac<{ACCESSIBLE_FRAC_MIN:.0%} ({af:.0%})" if af == af
+   324	                 else "accessible_frac_unknown(strict)")
+   325	    if not equity_required:
+   326	        # Fixed-notional/direction-only lane: M1-derived equity, DD, leverage,
+   327	        # and consistency are intentionally absent. Source net PnL is recorded
+   328	        # but final performance judgment belongs to after-cost M7/M6b.
+   329	        blocking = [x for x in f if not x.startswith("net_pnl<=0")]
+   330	        return (len(blocking) == 0, f)
+   331	    if COPYABILITY_ONLY:
+   332	        # eligible if NO risk/copyability fail; performance fails recorded but non-blocking.
+   333	        blocking = [x for x in f if not x.startswith(_PERF_FAIL_PREFIXES)]
+   334	        return (len(blocking) == 0, f)
+   335	    return (len(f) == 0, f)
+
+exec
+/bin/zsh -lc "nl -ba config/v15_m06a_activity_manifest.json && nl -ba tests/v15/test_m06a.py | sed -n '165,180p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	{
+     2	  "manifest_version": "v15-fixed-activity-v1",
+     3	  "mode": "shortlist",
+     4	  "shortlist_n_per_fold": 1000,
+     5	  "recency_gate": true,
+     6	  "contamination_status": "clean_oos",
+     7	  "persistence_horizon_days": 168,
+     8	  "score_basis": "activity_only"
+     9	}
+   165	
+   166	
+   167	def test_activity_only_shortlist_does_not_require_equity_metrics():
+   168	    eids = [1]
+   169	    elig = pd.DataFrame([_elig_row(1, 1, roe=np.nan, dd=np.nan)])
+   170	    manifest = _manifest()
+   171	    manifest["score_basis"] = "activity_only"
+   172	    sl, _, wf = m6a.run(
+   173	        elig, _pool(eids), _folds(), _entities(eids), _actions(eids), manifest
+   174	    )
+   175	    row = sl.iloc[0]
+   176	    assert row["rankable"]
+   177	    assert row["score_basis"] == "activity_only"
+   178	    assert row["source_score_pretest"] > 0
+   179	    assert wf["score_basis"] == "activity_only"
+   180	
+
+codex
+Verdict: **not fully closed for all supported M6a modes.**
+
+Finding:
+
+- **P1 is closed.** Missing/non-bool `eligible` now fails up front at [research/v15/v15_m06a_shortlist.py:205](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:205), and the scoring loop uses `r["eligible"] == True` at [line 287](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:287). I do not see a remaining `bool(np.nan)`-style route to `rankable` / `in_shortlist`.
+
+- **P2 is only closed for `score_basis == "equity_roe"`.** `n_journeys >= 3` is asserted before both branches at [line 314](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:314), but `max_dd <= 0.80` is asserted only inside the `equity_roe` branch at [lines 323-331](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:323). In `activity_only`, the code sets `dd_term = 1.0` and scores the row at [lines 318-322](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:318), so an eligible row with `max_dd_pretest=1.5` can still become rankable/shortlisted under the supported clean manifest [config/v15_m06a_activity_manifest.json:8](/Users/hermes/quants-lab/config/v15_m06a_activity_manifest.json:8).
+
+On COPYABILITY_ONLY: for equity-required M5 rows, asserting `n_journeys >= 3` and `max_dd <= 0.80` is correct. M5 only relaxes prefixes `net_pnl<=0`, `roe<=0`, and `days_green<` in COPYABILITY_ONLY at [research/v15/v15_m05_eligibility.py:331](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:331); `max_dd` and `n_journeys` remain blocking at [lines 288-291](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:288).
+
+New regression risk: the comments now overstate the implementation for `max_dd`; they say both range rails are enforced for eligible rows, but `activity_only` skips the DD rail. Also, `activity_only` currently has a test that permits `dd=np.nan` to rank [tests/v15/test_m06a.py:167](/Users/hermes/quants-lab/tests/v15/test_m06a.py:167), so a truly unconditional DD assertion would likely false-positive for the equity-independent lane unless scoped carefully.
+
+Verification run:
+
+- `pytest -q tests/v15/test_m06a_golden.py tests/v15/test_m06a.py` passed: `32 passed`.
+- `pytest -q tests/v15` did not collect fully here due missing environment deps: `pymongo`, `pyarrow`.
+
+OVERALL: **m06a is look-ahead-safe and P1 fail-closed, but not fully fail-CLOSED/TRUSTED yet across supported modes.** Remaining item: close or explicitly exempt the `activity_only` `max_dd_pretest` breach path.
+tokens used
+34.332
+Verdict: **not fully closed for all supported M6a modes.**
+
+Finding:
+
+- **P1 is closed.** Missing/non-bool `eligible` now fails up front at [research/v15/v15_m06a_shortlist.py:205](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:205), and the scoring loop uses `r["eligible"] == True` at [line 287](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:287). I do not see a remaining `bool(np.nan)`-style route to `rankable` / `in_shortlist`.
+
+- **P2 is only closed for `score_basis == "equity_roe"`.** `n_journeys >= 3` is asserted before both branches at [line 314](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:314), but `max_dd <= 0.80` is asserted only inside the `equity_roe` branch at [lines 323-331](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:323). In `activity_only`, the code sets `dd_term = 1.0` and scores the row at [lines 318-322](/Users/hermes/quants-lab/research/v15/v15_m06a_shortlist.py:318), so an eligible row with `max_dd_pretest=1.5` can still become rankable/shortlisted under the supported clean manifest [config/v15_m06a_activity_manifest.json:8](/Users/hermes/quants-lab/config/v15_m06a_activity_manifest.json:8).
+
+On COPYABILITY_ONLY: for equity-required M5 rows, asserting `n_journeys >= 3` and `max_dd <= 0.80` is correct. M5 only relaxes prefixes `net_pnl<=0`, `roe<=0`, and `days_green<` in COPYABILITY_ONLY at [research/v15/v15_m05_eligibility.py:331](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:331); `max_dd` and `n_journeys` remain blocking at [lines 288-291](/Users/hermes/quants-lab/research/v15/v15_m05_eligibility.py:288).
+
+New regression risk: the comments now overstate the implementation for `max_dd`; they say both range rails are enforced for eligible rows, but `activity_only` skips the DD rail. Also, `activity_only` currently has a test that permits `dd=np.nan` to rank [tests/v15/test_m06a.py:167](/Users/hermes/quants-lab/tests/v15/test_m06a.py:167), so a truly unconditional DD assertion would likely false-positive for the equity-independent lane unless scoped carefully.
+
+Verification run:
+
+- `pytest -q tests/v15/test_m06a_golden.py tests/v15/test_m06a.py` passed: `32 passed`.
+- `pytest -q tests/v15` did not collect fully here due missing environment deps: `pymongo`, `pyarrow`.
+
+OVERALL: **m06a is look-ahead-safe and P1 fail-closed, but not fully fail-CLOSED/TRUSTED yet across supported modes.** Remaining item: close or explicitly exempt the `activity_only` `max_dd_pretest` breach path.
