@@ -564,6 +564,12 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         & (df["n_active_subsplits"] >= m.min_active_subsplits_support)
         & round_trip_gate
         & df["roe_adj"].notna() & df["max_dd_pretest"].notna()
+        # AUDIT 2026-07-10 (codex P1#5): ALL score inputs must be finite. capacity_health / survivability_penalty
+        # derive from capacity_capped_frac / n_backstop_transfer / account_ruin; a NaN there makes m6b_score NaN,
+        # and the pool cut (`& m6b_score.notna()`) would SILENTLY drop a "rankable" row with a blank reason.
+        # Require them finite here so such a row is explicitly excluded (data-gap), not vanished.
+        & np.isfinite(pd.to_numeric(df["capacity_health"], errors="coerce").to_numpy(dtype="float64"))
+        & np.isfinite(pd.to_numeric(df["survivability_penalty"], errors="coerce").to_numpy(dtype="float64"))
     )
     df["m6b_rankable"] = rankable
     excl = []
@@ -588,6 +594,9 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
                 reasons.append(f"n_round_trips<{MIN_ROUND_TRIPS}")
         if pd.isna(r["roe_adj"]) or pd.isna(r["max_dd_pretest"]):
             reasons.append("missing_m07_row")
+        if not np.isfinite(pd.to_numeric(pd.Series([r["capacity_health"]]), errors="coerce").iloc[0]) \
+                or not np.isfinite(pd.to_numeric(pd.Series([r["survivability_penalty"]]), errors="coerce").iloc[0]):
+            reasons.append("nonfinite_score_component")  # codex P1#5: was a silent blank-reason drop
         excl.append("|".join(reasons) or "excluded")
     df["excluded_reason"] = excl
 

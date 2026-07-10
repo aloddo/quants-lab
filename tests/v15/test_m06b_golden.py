@@ -39,3 +39,21 @@ def test_p0_3_duplicate_entity_fold_fails_closed(_patch_exposure):
     inp["m07_summary"] = pd.concat([inp["m07_summary"], inp["m07_summary"].iloc[[0]]], ignore_index=True)
     with pytest.raises((ValueError, Exception)):
         M.build_ranking(inp, m)
+
+
+def test_p1_5_nonfinite_score_component_excluded_not_silent(_patch_exposure):
+    import numpy as np
+    m = M.M6bManifest(fee_schedule_version="hl-v1", slippage_calibration_version="v11-fills-v1")
+    folds = _folds(1)
+    eq = _equity_all_active(60, m, folds, positive=True)
+    inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
+                       realized=True, fold_pure=True)
+    summ = inp["m07_summary"]
+    col = "n_backstop_transfer" if "n_backstop_transfer" in summ.columns else "capacity_capped_frac"
+    ent = int(summ["entity_id"].iloc[0])
+    summ.loc[summ["entity_id"] == ent, col] = np.nan  # NaN a score input for one entity
+    out, _ = M.build_ranking(inp, m)
+    row = out[out["entity_id"] == ent].iloc[0]
+    assert bool(row["in_pool"]) is False                       # must not silently sit in the pool
+    assert "nonfinite_score_component" in str(row["excluded_reason"])  # explicit reason, not blank
+
