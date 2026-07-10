@@ -1,0 +1,2430 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c99-8bb6-7930-aa78-1414108a6828
+--------
+user
+# Round-2 m02 — closing the 4 P1s + P2
+
+Your audit found 4 P1 fail-opens + 1 P2. All fixed; verify. Read research/v15/v15_m02_journey_trace.py
+(sizing ~L526-545; carry-in finite guard ~L365-405; open-at-window-end ~L588-600; driver ~L789-820) +
+tests/v15/test_m02_golden.py.
+
+## Applied
+1. P1 open-at-window-end: trace_wallet now takes end_ms (default None = old peak_ts fallback, byte-identical).
+   Open journeys finalize through end_ms (real duration + funding), clamped to >= open_ts; exit_ts stays None.
+   process_wallet passes end_ms.
+2. P1 non-finite startPosition/size/price: a finite guard (sp_finite / inputs_finite) sets
+   lifecycle_valid=False + state_discontinuity=True; a non-finite startPosition neutralizes sp=0 for the math
+   but tags carry_in_status="UNKNOWN" (never a clean SEEDED flat). stream_replay_valid -> False downstream.
+3. P1 NaN/inf mark: require np.isfinite(mark) AND finite non-trivial equity before target_exposure_pct; else
+   mark=None, sizing_mark_ts=None, target=None (unsizeable).
+4. P1 fail-open batch: worker errors now write an <actions_out>.errors.json manifest and raise SystemExit(1)
+   (no silent partial universe + exit 0).
+5. P2 determinism: pool.imap (ordered) instead of imap_unordered.
+Golden: tests/v15/test_m02_golden.py (6 cases). 6 golden + 29 existing m02 + full v15 pass.
+
+## Verify
+- Are all 4 P1s fully closed? Any remaining path where a non-finite input, NaN mark, truncated open journey,
+  or swallowed worker error slips through?
+- Is end_ms threading byte-identical for existing callers (end_ms omitted) -- confirm no behavior change when
+  not passed.
+- Is the finite-guard placement correct (does it run before the state machine consumes signed/price/sp)? Any
+  case where lifecycle_valid should be False but isn't, or a false-positive invalidation of a clean fill?
+- Any NEW bug from these edits.
+
+## Output
+Verdict. End OVERALL: is m02 now look-ahead-safe AND fail-CLOSED with correct lifecycle/PnL accounting and
+ready to be marked TRUSTED (yes/no + exactly what remains).
+codex
+I’ll review this as a code audit, focusing on the named ranges and golden coverage before making any verdict. I’ll first inspect the relevant file slices and tests, then run the targeted tests if the repo setup allows it.
+exec
+/bin/zsh -lc "sed -n '340,425p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    # Walk events in event_order (already sorted).
+    for ee in events:
+        if ee.type != "fill":
+            continue
+        f = ee.fill  # exact payload for THIS ordered fill event (no rematch)
+        if f is None:
+            continue
+
+        coin = f["coin"]
+        # Defensive parity with M1 and M7/live: the research strategy copies
+        # perps only. Spot must not affect journey/ranking metrics even if an
+        # externally supplied event stream contains it.
+        if m01.coin_is_spot(coin):
+            continue
+        st = coin_state.setdefault(coin, _new_state())
+        signed = f["signed_sz"]
+        if abs(signed) <= EPS:
+            continue
+        price = float(f["price"]) or 0.0
+        ts = ee.ts
+        is_liq = bool(f.get("is_liquidation"))
+        row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
+        actual_fee = _fill_fee_usd_actual(f)
+
+        position = st["position"]
+        cost_basis = st["cost_basis"]
+
+        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+        first_fill = not coin_seen_first_fill.get(coin, False)
+        sp = float(f.get("startPosition", 0.0) or 0.0)
+        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+        # True (fabricated pre-position). Fail CLOSED: non-finite inputs invalidate the lifecycle so downstream
+        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
+        sp_finite = bool(np.isfinite(sp))
+        inputs_finite = sp_finite and bool(np.isfinite(signed)) and bool(np.isfinite(price))
+        if not inputs_finite:
+            st["lifecycle_valid"] = False
+            st["state_discontinuity"] = True
+            if not sp_finite:
+                sp = 0.0   # neutralize the denominator math; carry_in tagged UNKNOWN below (not SEEDED)
+        state_resynced = False
+        if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+            # Missing/ambiguous fills: never continue a fabricated lifecycle.
+            # Close the interrupted journey as INVALID, then causally reseed
+            # from the current fill's authoritative pre-position.
+            if st["open"]:
+                st["lifecycle_valid"] = False
+                st["state_discontinuity"] = True
+                j = _finalize(coin, st, ts)
+                if j is not None:
+                    journeys.append(j)
+            st = _new_state()
+            coin_state[coin] = st
+            position = 0.0
+            cost_basis = 0.0
+            first_fill = True
+            state_resynced = True
+        if first_fill:
+            coin_seen_first_fill[coin] = True
+            if abs(sp) > EPS:
+                # Open an already-in-progress journey, sized causally.
+                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+                st.update(
+                    position=sp, cost_basis=price,  # best causal cost proxy = first observed px
+                    open=True, side=(1 if sp > 0 else -1),
+                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+                    max_notional=abs(sp) * price, n_carry_in=1,
+                    carry_in_status="SEEDED", fee_scope=row_scope,
+                )
+                position = sp
+                cost_basis = price
+            else:
+                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+                st["carry_in_status"] = "SEEDED" if sp_finite else "UNKNOWN"
+
+        if not bool(f.get("causal_order_ok", True)):
+            st["lifecycle_valid"] = False
+
+        # closedPnl ground truth (fallback to cost-basis derived).
+        raw_pnl = f.get("closedPnl", None)
+        new_pos_preview = position + signed
+        if raw_pnl is None or (isinstance(raw_pnl, float) and raw_pnl != raw_pnl):
+            if (position > 0 and signed < 0) or (position < 0 and signed > 0):
+                if abs(new_pos_preview) < EPS:
+                    closed_qty = position
+
+exec
+/bin/zsh -lc "sed -n '510,610p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            split_total = abs(position) + abs(new_pos)
+            if actual_fee is not None and split_total > EPS:
+                closing_fee = actual_fee * (abs(position) / split_total)
+                opening_fee = actual_fee * (abs(new_pos) / split_total)
+            else:
+                closing_fee = abs(position) * price * FEE_RATE
+                opening_fee = abs(new_pos) * price * FEE_RATE
+            st["fees_paid"] += closing_fee
+            closing_jid = st["journey_id"]
+            j = _finalize(coin, st, ts)
+            if j is not None:
+                journeys.append(j)
+            # open the new (reversed) leg
+            coin_journey_counter[coin] += 1
+            st.update(_new_state())
+            st.update(
+                journey_id=coin_journey_counter[coin], open=True,
+                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+                n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
+                fees_paid=opening_fee, fee_scope=row_scope,
+                carry_in_status="SEEDED",
+            )
+            coin_state[coin] = st
+            action_type = "REVERSE"
+            opening_jid = st["journey_id"]
+
+        st["position"] = new_pos
+
+        # ---- optional equity basis + action row ----
+        # Core M02 deliberately does not read M01, anchors, or market marks.
+        if equity_enriched:
+            basis = select_equity_basis(ee)
+            # SIZING signal: use only a bar that has closed by ts.
+            _raw_mark = m01.get_mark(coin, ts, causal=True)
+            # AUDIT 2026-07-10 (codex m02 P1): a NaN/inf mark (or NaN/inf equity) must NOT survive into
+            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
+            # Require FINITE mark AND finite non-trivial equity, else the action is unsizeable (target=None).
+            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
+            mark = float(_raw_mark) if mark_ok else None
+            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark_ok else None
+            eq_ok = (basis.equity is not None and np.isfinite(basis.equity) and abs(basis.equity) > EPS)
+            if basis.mode == "NO_ANCHOR" or not eq_ok or not mark_ok:
+                target_pct = None
+            else:
+                target_pct = (new_pos * mark) / basis.equity
+        else:
+            basis = EquityBasis(
+                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+                anchor_ts=None, mark_ts=None, degraded=False,
+                frozen_value=0.0, frozen_age_s=0.0,
+                frozen_materiality_frac=float("nan"),
+            )
+            mark = None
+            sizing_mark_ts = None
+            target_pct = None
+
+        actions.append({
+            "wallet": wallet, "coin": coin, "ts": ts,
+            "fill_id": int(f.get("tid", 0) or 0),
+            "event_order": ee.event_order,
+            "action_type": action_type,
+            "signed_size": signed, "price": price,
+            "position_after": new_pos,
+            "mark": mark, "mark_ts": sizing_mark_ts,
+            "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
+            "anchor_ts": basis.anchor_ts,
+            "equity_basis_mode": basis.mode,
+            "equity_degraded": basis.degraded,
+            "frozen_component_value": basis.frozen_value,
+            "frozen_component_age_s": basis.frozen_age_s,
+            "frozen_materiality_frac": basis.frozen_materiality_frac,
+            "target_exposure_pct": target_pct,
+            "is_liquidation": is_liq,
+            "opening_journey_id": opening_jid,
+            "closing_journey_id": closing_jid,
+            "journey_id": opening_jid,  # back-compat = opening side
+            "carry_in_status": st["carry_in_status"],
+            "state_resynced": state_resynced,
+            "causal_order_ok": bool(f.get("causal_order_ok", True)),
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            # Final value is recomputed after every journey has been finalized.
+            # A future gap can retroactively invalidate earlier actions in the
+            # interrupted journey; a raw live trade stream also cannot repair
+            # the resync row because it does not carry startPosition.
+            "stream_replay_valid": bool(
+                st.get("lifecycle_valid", True)
+                and bool(f.get("causal_order_ok", True))
+                and not state_resynced
+            ),
+        })
+
+    # Positions still open at window end → flag (not finalized).
+    # AUDIT 2026-07-10 (codex m02 P1): finalize an OPEN journey through the WINDOW END (end_ms), not peak_ts.
+    # Using peak_ts truncated duration to 0 and dropped funding accrued between peak and window end. exit_ts
+    # stays None (still open). Falls back to the old peak_ts behavior only when end_ms is not supplied.
+    for coin, st in coin_state.items():
+        if st["open"] and st["open_ts"] is not None:
+            _close_ts = end_ms if end_ms is not None else (st["peak_ts"] or st["open_ts"])
+            _close_ts = max(_close_ts, st["open_ts"])   # never negative duration
+            j = _finalize(coin, st, _close_ts)
+            if j is not None:
+
+exec
+/bin/zsh -lc "sed -n '1,260p' tests/v15/test_m02_golden.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '760,835p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 115ms:
+    t0 = time.time()
+
+    # PRECOMPUTE marks cache ONCE (perf: avoids N workers each re-scanning Mongo for coin price
+    # series, which left the pool ~74% I/O-idle). Freshness-checked (codex perf-r1 #3): rebuild if
+    # the coin-set or latest candle changed since the cache was built.
+    if args.equity_enrichment and not args.skip_marks_cache:
+        tmc = time.time()
+        st = m01.marks_cache_status()
+        force = args.rebuild_marks_cache or not st["fresh"]
+        if force:
+            logger.info(f"marks cache rebuild (fresh={st['fresh']}, reason={st['reason']}, "
+                        f"age_days={st['age_days']})")
+            # force a full refresh when explicitly requested OR when stale due to NEW candles /
+            # changed coin-set (else force=False would skip the already-present-but-stale coins).
+            m01.build_marks_cache(force=True)
+        else:
+            logger.info(f"marks cache FRESH (age_days={st['age_days']:.1f}); reusing")
+        logger.info(f"marks cache ready in {time.time()-tmc:.0f}s")
+
+    # MANDATORY memory-safe streaming (decisions/2026-05-31-mandatory-streaming-io): never hold the
+    # full result set in RAM. Stream per-wallet actions/journeys to disk in bounded chunks; memory
+    # stays flat regardless of universe size. Backstop watchdog aborts loud (not silent SIGKILL).
+    # AGGREGATE memory budget (2026-06-10 OOM fix): per-process guards do not compose; cap worker
+    # count from ACTUAL free RAM so N x per_worker + baseline cannot blow past physical RAM.
+    # --mem-soft-gb acts as the upper cap on the main-process guard.
+    per_worker_gb = args.per_worker_gb
+    if per_worker_gb is None:
+        per_worker_gb = 2.0 if args.equity_enrichment else 0.5
+    headroom_gb = args.headroom_gb
+    if headroom_gb is None:
+        headroom_gb = 6.0 if args.equity_enrichment else 2.0
+    budget = plan_memory_budget(requested_procs=args.procs, per_worker_gb=per_worker_gb,
+                                headroom_gb=headroom_gb, main_soft_cap=args.mem_soft_gb)
+    install_memory_guard(soft_gb=budget.main_soft_gb, label="m02")
+    Path(args.actions_out).parent.mkdir(parents=True, exist_ok=True)
+    aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
+    jw = ShardedParquetWriter(args.journeys_out, flush_rows=args.flush_rows)
+    errors: list[tuple] = []
+
+    def _consume(r: dict) -> None:
+        if "error" in r:
+            errors.append((r["wallet"], r["error"]))
+        else:
+            aw.add_many(r.get("actions"))
+            jw.add_many(r.get("journeys"))
+        _log_one(r, len(wallets))
+
+    # ALWAYS run via a Pool (even procs=1) with maxtasksperchild so the worker process is RECYCLED
+    # periodically -> the per-coin marks cache (m01._coin_series, which grows unbounded as a long-lived
+    # worker touches more of the 1830-coin universe) is RESET, keeping RSS under worker_soft_gb. Without
+    # this the procs=1 in-process loop blew the 2.5G soft cap at ~153 wallets (memory-guard abort, exit
+    # 137) once the marks cache grew (1830 coins to 06-24). maxtasksperchild forks a fresh worker every
+    # N wallets; on macOS spawn this re-imports m01 -> empty cache. (Fix 2026-06-25, codex marks-rebuild.)
+    MAXTASKS_PER_CHILD = 40
+    with Pool(max(1, budget.procs), initializer=_init_worker,
+              initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
+              maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
+        # AUDIT 2026-07-10 (codex m02 P2): ORDERED imap so physical output row/shard order is deterministic
+        # run-to-run (same wallets file -> byte-stable parts). Rows are identical either way; determinism only.
+        for r in pool.imap(process_wallet, tasks):
+            _consume(r)
+
+    n_actions = aw.close()
+    n_journeys = jw.close()
+    logger.info(f"Wrote {args.actions_out}: {n_actions:,} actions")
+    logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
+    logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")
+    # AUDIT 2026-07-10 (codex m02 P1): a worker exception used to be logged and swallowed -> a PARTIAL wallet
+    # universe was written and the process exited 0, so downstream consumed an incomplete set as if complete.
+    # Fail CLOSED: write an explicit error manifest and exit non-zero so the pipeline halts on any wallet error.
+    if errors:
+        manifest = str(Path(args.actions_out).with_suffix(".errors.json"))
+        try:
+            Path(manifest).write_text(json.dumps(
+                {"n_errors": len(errors), "n_wallets": len(wallets),
+                 "errors": [{"wallet": w, "error": e} for w, e in errors]}, indent=2))
+
+ succeeded in 122ms:
+"""GOLDEN regression test for v15_m02_journey_trace trust-audit fixes (2026-07-10).
+
+Locks the fail-CLOSED / accounting fixes from the codex m02 audit:
+- P1 open-at-window-end: an open journey finalizes through END_MS (real duration + funding), not peak_ts (0).
+- P1 non-finite startPosition/size/price: fails CLOSED (lifecycle_valid=False, carry_in UNKNOWN, not a
+  fabricated clean flat SEEDED).
+- P1 NaN/inf mark (or equity): does NOT survive into target_exposure_pct -> unsizeable (None), mark None.
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m02_journey_trace as m02  # noqa: E402
+from v15_m02_journey_trace import LifecycleFillEvent  # noqa: E402
+from test_m02 import _fill  # noqa: E402
+
+
+def _core_events(fills):
+    return [LifecycleFillEvent(ts=int(f["time"]), event_order=i, fill=f) for i, f in enumerate(fills)]
+
+
+def test_p1_open_journey_finalizes_at_window_end():
+    # one open BTC long at ts=1000; funding +5 at t=2000; window end 3000. Journey stays open (exit_ts None)
+    # but duration + funding must run to 3000, not collapse to peak_ts (0 duration / 0 funding).
+    fills = [_fill(1000, "BTC", "B", 1, 100, 0, tid=1)]
+    funding = [{"time": 2000, "delta": {"type": "funding", "coin": "BTC", "usdc": 5.0}}]
+    _a, journeys = m02.trace_wallet("0x", _core_events(fills), fills, funding,
+                                    equity_enriched=False, end_ms=3000)
+    assert len(journeys) == 1
+    j = journeys[0]
+    assert j["open_at_window_end"] is True and j["exit_ts"] is None
+    assert j["duration_h"] > 0.0                       # (3000-1000)/3600e3, NOT 0
+    assert abs(j["funding_net"] - 5.0) < 1e-9          # funding through window end included
+
+
+def test_p1_open_journey_without_end_ms_is_backward_compatible():
+    # end_ms omitted -> old peak_ts behavior (byte-identical for existing callers).
+    fills = [_fill(1000, "BTC", "B", 1, 100, 0, tid=1)]
+    _a, journeys = m02.trace_wallet("0x", _core_events(fills), fills, [], equity_enriched=False)
+    assert journeys[0]["duration_h"] == 0.0            # peak_ts == open_ts -> 0 (unchanged)
+
+
+def test_p1_nonfinite_startposition_fails_closed():
+    f = _fill(1000, "BTC", "A", 1, 100, 0, tid=1, closed=10.0)
+    f["startPosition"] = float("nan")                  # unknown pre-position
+    actions, _j = m02.trace_wallet("0x", _core_events([f]), [f], [], equity_enriched=False)
+    assert len(actions) == 1
+    assert actions[0]["lifecycle_valid"] is False
+    assert actions[0]["stream_replay_valid"] is False
+    assert actions[0]["carry_in_status"] == "UNKNOWN"
+
+
+def test_p1_nonfinite_price_fails_closed():
+    f = _fill(1000, "BTC", "B", 1, 100, 0, tid=1)
+    f["price"] = float("inf")
+    actions, _j = m02.trace_wallet("0x", _core_events([f]), [f], [], equity_enriched=False)
+    assert actions[0]["lifecycle_valid"] is False and actions[0]["stream_replay_valid"] is False
+
+
+class _EE:
+    """Minimal EventEquity stand-in: anchored, finite equity, fully markable."""
+    type = "fill"
+    event_order = 0
+    ts = 120_000
+    has_past_anchor = True
+    equity_post = 1000.0
+    frozen_component_value = 0.0
+    frozen_component_age_ms = 0
+    age_since_anchor_ms = 60_000
+    anchor_equity = 1000.0
+    anchor_ts = 60_000
+    mark_ts = 60_000
+    n_unmarkable = 0
+    markable_all = True
+    no_extradex_without_anchor = True
+
+    def __init__(self, fill):
+        self.fill = fill
+
+
+def test_p1_nonfinite_mark_is_unsizeable(monkeypatch):
+    f = _fill(120_000, "BTC", "B", 1, 100, 0, tid=1)
+    for bad in (float("nan"), float("inf")):
+        monkeypatch.setattr(m02.m01, "get_mark", lambda *a, **k: bad)
+        actions, _j = m02.trace_wallet("0x", [_EE(f)], [f], [], equity_enriched=True)
+        assert actions[0]["target_exposure_pct"] is None   # NaN/inf mark never becomes a target
+        assert actions[0]["mark"] is None
+
+
+def test_p1_finite_mark_still_sizes(monkeypatch):
+    f = _fill(120_000, "BTC", "B", 1, 100, 0, tid=1)
+    monkeypatch.setattr(m02.m01, "get_mark", lambda *a, **k: 100.0)
+    actions, _j = m02.trace_wallet("0x", [_EE(f)], [f], [], equity_enriched=True)
+    # position_after=1, mark=100, equity=1000 -> target 0.1
+    assert actions[0]["target_exposure_pct"] is not None
+    assert abs(actions[0]["target_exposure_pct"] - 0.1) < 1e-9
+
+codex
+The first pass shows the intended guards are present, but I need to verify the surrounding state-machine paths, not just the inserted lines. I’m checking function signatures, finalize semantics, worker return handling, and existing tests for edge cases that could bypass these fixes.
+exec
+/bin/zsh -lc "sed -n '1,140p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""V15 M02 — Causal fill lifecycles with optional equity enrichment.
+
+Converts each source wallet's Hyperliquid PERP fills into:
+  (1) PRIMARY: an equity-independent per-ACTION stream (one row per ordered
+      fill event) suitable for lifecycle and fixed-notional research.
+  (2) DERIVED: a per-JOURNEY summary (groupby journey_id) driving ranking (M04).
+
+M01 is NOT a prerequisite for the default M02 path.  ``--equity-enrichment``
+is an optional lane that adds causal whole-account equity-% sizing targets for
+strategies that explicitly require leader-equity-relative sizing.
+
+This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
+ENTRY/ADDON/TRIM/EXIT/REVERSE state machine and its realized-PnL / fee / funding /
+cost-basis accounting VERBATIM in spirit, and REPLACES exactly two things that made
+V13 look-ahead-contaminated:
+
+  (A) EQUITY BASIS. V13 sizes ``max_position_pct_equity`` by a single present-day
+      scalar (``spot_usdc_today``) — a look-ahead defect. V15 sizes EVERY action by
+      ``source_equity_post`` from M01's per-event causal equity series:
+          target_exposure_pct = position_after * mark / source_equity_post
+      where source_equity_post uses ONLY events with event-order <= k (POST-fill,
+      consistent with position_after). The equity basis is chosen per-event from a
+      4-mode HYBRID (INTRAWEEK / PARTIAL_MTM / ANCHOR_FALLBACK / NO_ANCHOR) decided
+      ONLY from data <= k — never from per-segment drift or whole-window recon-PASS.
+
+  (B) CARRY-IN. V13 back-walks carry-in from CURRENT position state (look-ahead).
+      V15 uses the causal ``startPosition`` field on the FIRST in-window fill per
+      coin (HL reports the position held JUST BEFORE each fill = known at that fill's
+      time). carry_in_status SEEDED / UNKNOWN.
+
+NON-LOOK-AHEAD INVARIANTS (asserted in tests/v15/test_m02.py):
+  anchor_ts < ts (strict) ; equity_ts <= ts ; mark_ts <= ts ;
+  event_order strictly monotone per wallet ; NO_ANCHOR ⇒ target_exposure_pct null.
+
+CLI:
+    python v15_m02_journey_trace.py --wallets-file W.txt \
+        --start 2025-12-01 --end 2026-05-23 \
+        --actions-out actions.parquet --journeys-out journeys.parquet [--procs N]
+        [--equity-enrichment]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, asdict
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+# Import M01 (same dir) — reuse loaders, cash deltas, marks, and the additive
+# per-event equity bridge. NO M01 reconstruction MATH is changed here.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import v15_m01_equity_reconstruct as m01  # noqa: E402
+from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402  MANDATORY (decisions/2026-05-31-mandatory-streaming-io)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("v15_m02")
+
+EPS = 1e-9
+
+# Journey classification thresholds (inherited from V13).
+SCALP_THRESHOLD_S = 30 * 60
+SWING_THRESHOLD_S = 24 * 60 * 60
+
+# Equity-basis hybrid tunables (spec). STALE_CAP = one weekly anchor cycle.
+STALE_CAP_MS = m01.STALE_CAP_MS
+# Force ANCHOR_FALLBACK when the frozen unmarkable component exceeds this
+# fraction of equity (material unmarkable exposure) OR is staler than STALE_CAP.
+FROZEN_MATERIALITY_CAP = 0.10
+# Causal equity-floor (codex/subagent gap 2026-05-31): a reconstructed source_equity_post
+# that is <= 0 or implausibly small vs the last EXACT past anchor is a degenerate sizing
+# denominator (produces absurd target_exposure_pct, e.g. 200000x on near-zero equity). This
+# is a per-event, LOOK-AHEAD-FREE red flag (uses only equity_post(k) + the past anchor at
+# anchor_ts < ts). When tripped, fall back to the last exact anchor equity (sane denominator)
+# or mark unsizeable if the anchor is also degenerate.
+EQUITY_FLOOR_ABS = 10.0    # below HL min-order scale -> sizing meaningless
+EQUITY_FLOOR_FRAC = 0.02   # < 2% of the last exact anchor -> reconstruction lost the plot
+
+
+# --------------------------------------------------------------------------- #
+# Equity-basis mode selection — causal, per-event (codex r1 Q1/Q2/Q3/Q4)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class EquityBasis:
+    mode: str                 # INTRAWEEK | PARTIAL_MTM | ANCHOR_FALLBACK | NO_ANCHOR
+    equity: Optional[float]   # source_equity_post (None for NO_ANCHOR)
+    equity_ts: Optional[int]
+    anchor_ts: Optional[int]
+    mark_ts: Optional[int]
+    degraded: bool
+    frozen_value: float
+    frozen_age_s: float
+    frozen_materiality_frac: float
+
+
+@dataclass
+class LifecycleFillEvent:
+    """Minimal M02 event contract; deliberately contains no leader equity."""
+
+    ts: int
+    event_order: int
+    fill: dict
+    type: str = "fill"
+
+
+def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+    """Pick the causal equity basis for one event, using ONLY data <= the event.
+
+    Per-segment drift and whole-window recon-PASS are NEVER consulted (look-ahead).
+    """
+    if not ee.has_past_anchor:
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None,
+            anchor_ts=None, mark_ts=None, degraded=True,
+            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+        )
+
+    eq = ee.equity_post
+    frozen = ee.frozen_component_value
+    frozen_age_ms = ee.frozen_component_age_ms
+    materiality = (abs(frozen) / abs(eq)) if (eq and abs(eq) > EPS) else float("nan")
+    age = ee.age_since_anchor_ms or 0
+    anchor_eq = ee.anchor_equity
+
+    # EQUITY-FLOOR (causal): a non-positive or implausibly-small reconstructed equity is a
+    # degenerate denominator -> never emit a huge target off it. Uses only equity_post(k)
+
+exec
+/bin/zsh -lc "sed -n '140,260p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    # degenerate denominator -> never emit a huge target off it. Uses only equity_post(k)
+    # and the last PAST exact anchor (anchor_ts < ts), so no look-ahead. Falls back to the
+    # exact anchor equity when sane, else marks the event unsizeable.
+    eq_floor = EQUITY_FLOOR_ABS
+    if anchor_eq is not None and anchor_eq == anchor_eq:
+        eq_floor = max(EQUITY_FLOOR_ABS, EQUITY_FLOOR_FRAC * abs(anchor_eq))
+    if eq is None or eq != eq or eq <= eq_floor:
+        if anchor_eq is not None and anchor_eq == anchor_eq and anchor_eq > EQUITY_FLOOR_ABS:
+            return EquityBasis(
+                mode="ANCHOR_FALLBACK", equity=anchor_eq, equity_ts=ee.anchor_ts,
+                anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+                frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+                frozen_materiality_frac=materiality,
+            )
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+            mark_ts=ee.mark_ts, degraded=True, frozen_value=frozen,
+            frozen_age_s=frozen_age_ms / 1000.0, frozen_materiality_frac=materiality,
+        )
+
+    # ANCHOR_FALLBACK: base anchor too stale AND material unmarkable exposure, OR
+    # the frozen component is itself stale/material. Hold last PAST anchor flat.
+    stale_anchor = age > STALE_CAP_MS
+    material_frozen = (materiality == materiality and materiality > FROZEN_MATERIALITY_CAP)
+    stale_frozen = frozen_age_ms > STALE_CAP_MS
+    if (stale_anchor and ee.n_unmarkable > 0) or material_frozen or stale_frozen:
+        return EquityBasis(
+            mode="ANCHOR_FALLBACK", equity=ee.anchor_equity,
+            equity_ts=ee.anchor_ts, anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts,
+            degraded=True, frozen_value=frozen,
+            frozen_age_s=frozen_age_ms / 1000.0,
+            frozen_materiality_frac=materiality,
+        )
+
+    if ee.markable_all and ee.no_extradex_without_anchor:
+        # INTRAWEEK: reconstruction fully reliable at this event.
+        return EquityBasis(
+            mode="INTRAWEEK", equity=eq, equity_ts=ee.ts,
+            anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=False,
+            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=0.0,
+        )
+
+    # PARTIAL_MTM: some positions unmarkable → equity_post already marks the
+    # markable book + cash/funding/realized and FREEZES the unmarkable component
+    # at its last known value (handled in M01). Flag degraded.
+    return EquityBasis(
+        mode="PARTIAL_MTM", equity=eq, equity_ts=ee.ts,
+        anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+        frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+        frozen_materiality_frac=materiality,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Fee / funding helpers (ported from V13; actual v2-fills fees preferred)
+# --------------------------------------------------------------------------- #
+
+SOURCE_ASSUMED_TAKER_FEE_BPS = 4.32
+FEE_RATE = SOURCE_ASSUMED_TAKER_FEE_BPS / 10000.0
+
+
+def _fill_fee_usd_actual(f: dict) -> Optional[float]:
+    """Return the signed total wallet fee reported by Hyperliquid.
+
+    ``builderFee`` and ``deployerFee`` are component disclosures already
+    included in ``fee``. They are deliberately ignored here.
+    """
+    v = f.get("fee")
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if fv != fv else fv
+
+
+def _fill_fee_usd(notional: float) -> float:
+    return abs(notional) * FEE_RATE
+
+
+def _classify_fee_scope(dir_val: str, coin: str) -> str:
+    if isinstance(coin, str) and coin.startswith("xyz:"):
+        return "builder_perp"
+    if ":" in coin:
+        return "builder_perp"
+    if dir_val in ("Buy", "Sell"):
+        return "spot"
+    if dir_val in (
+        "Open Long", "Close Long", "Open Short", "Close Short",
+        "Long > Short", "Short > Long",
+    ):
+        return "standard_perp"
+    return "other"
+
+
+def _funding_for_interval(
+    funding: list[dict], coin: str, entry_ts: int, exit_ts: int
+) -> float:
+    """Sum funding usdc for (coin, (entry_ts, exit_ts]) half-open (codex r16 #6)."""
+    if not funding or not coin:
+        return 0.0
+    total = 0.0
+    for e in funding:
+        d = e.get("delta", {})
+        if d.get("type") != "funding" or str(d.get("coin", "")) != coin:
+            continue
+        t = int(e.get("time", 0))
+        if entry_ts < t <= exit_ts:
+            total += float(d.get("usdc", 0) or 0)
+    return total
+
+
+def _classify_duration(duration_s: float, n_addon: int, n_trim: int) -> str:
+    if duration_s < SCALP_THRESHOLD_S:
+        return "scalp"
+    if duration_s < SWING_THRESHOLD_S:
+        return "swing"
+    if n_trim == 0 and n_addon == 0:
+        return "fast-flip"
+    if n_trim == 0:
+
+exec
+/bin/zsh -lc "sed -n '610,760p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            if j is not None:
+                j["open_at_window_end"] = True
+                j["exit_ts"] = None
+                journeys.append(j)
+
+    # Lifecycle validity is only known once the whole wallet has been walked.
+    # If a later position discontinuity interrupts a journey, propagate that
+    # failure back to every already-emitted action belonging to that journey.
+    # Without this pass, downstream code can filter lifecycle_valid=True and
+    # still ingest the beginning of a journey proven broken later.
+    invalid_journeys = {
+        (str(j["coin"]), int(j["journey_id"]))
+        for j in journeys
+        if not bool(j.get("lifecycle_valid", True)) and j.get("journey_id") is not None
+    }
+    invalid_stream_journeys = set(invalid_journeys)
+    for action in actions:
+        if action.get("state_resynced", False):
+            invalid_stream_journeys.update(
+                (str(action["coin"]), int(jid))
+                for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+                if jid is not None
+            )
+    for action in actions:
+        involved = {
+            (str(action["coin"]), int(jid))
+            for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+            if jid is not None
+        }
+        lifecycle_valid = bool(action.get("causal_order_ok", True)) and not bool(
+            involved & invalid_journeys
+        )
+        action["lifecycle_valid"] = lifecycle_valid
+        action["stream_replay_valid"] = bool(
+            lifecycle_valid
+            and not action.get("state_resynced", False)
+            and not bool(involved & invalid_stream_journeys)
+        )
+    for journey in journeys:
+        key = (str(journey["coin"]), int(journey["journey_id"]))
+        journey["stream_replay_valid"] = bool(
+            journey.get("lifecycle_valid", True)
+            and key not in invalid_stream_journeys
+        )
+
+    return actions, journeys
+
+
+# --------------------------------------------------------------------------- #
+# Worker
+# --------------------------------------------------------------------------- #
+
+_ANCHOR_DF = None
+
+
+def _init_worker(
+    anchor_parquet: str, worker_mem_gb: float = 3.0,
+    equity_enriched: bool = False,
+) -> None:
+    global _ANCHOR_DF
+    _ANCHOR_DF = pd.read_parquet(anchor_parquet) if equity_enriched else None
+    # codex perf-r1 #5: guard WORKERS too (per-wallet reconstruction + per-process mark-series cache
+    # live here). Backstop: abort a runaway worker loudly instead of a silent aggregate OS OOM.
+    install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
+
+
+def process_wallet(args: tuple) -> dict:
+    wallet, start_ms, end_ms, equity_enriched = args
+    try:
+        if equity_enriched:
+            anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
+            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+            if "error" in res:
+                return {"wallet": wallet, "error": res["error"]}
+            events = res["events"]
+            fills = res["fills"]
+            funding = res["funding"]
+            n_anchors = len(res["weekly_anchors"])
+            inter_drift = res["inter_anchor_drift"]
+        else:
+            fills = m01.load_wallet_fills(wallet, start_ms, end_ms)
+            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+            events = [
+                LifecycleFillEvent(
+                    ts=int(fill["time"]),
+                    event_order=int(fill.get("fill_seq", i)),
+                    fill=fill,
+                )
+                for i, fill in enumerate(fills)
+            ]
+            n_anchors = None
+            inter_drift = None
+        actions, journeys = trace_wallet(
+            wallet, events, fills, funding, equity_enriched=equity_enriched, end_ms=end_ms
+        )
+        return {
+            "wallet": wallet, "actions": actions, "journeys": journeys,
+            "n_anchors": n_anchors,
+            "inter_drift": inter_drift,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"wallet": wallet, "error": f"exception:{e!r}"}
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="V15 M02 causal journey_trace")
+    ap.add_argument("--wallets-file", required=True)
+    ap.add_argument("--start", default="2025-12-01")
+    ap.add_argument("--end", default="2026-05-23")
+    ap.add_argument("--actions-out", required=True)
+    ap.add_argument("--journeys-out", required=True)
+    ap.add_argument("--procs", type=int, default=4,
+                    help="REQUESTED workers (ceiling; auto-capped to fit RAM by the aggregate budget).")
+    ap.add_argument(
+        "--per-worker-gb", type=float, default=None,
+        help="Per-worker peak RSS. Default: 0.5GB for core fill lifecycles; 2.0GB "
+             "for optional M01 equity reconstruction/mark caches.",
+    )
+    ap.add_argument(
+        "--headroom-gb", type=float, default=None,
+        help="RAM reserved outside M02. Default: 2GB core; 6GB equity-enriched.",
+    )
+    ap.add_argument("--anchor-parquet", default=str(m01.ANCHOR_PARQUET))
+    ap.add_argument(
+        "--equity-enrichment", action="store_true",
+        help="Opt in to M01 causal equity targets. Core actions/journeys do not require M01.",
+    )
+    ap.add_argument("--flush-rows", type=int, default=2_000_000,
+                    help="MANDATORY streaming: flush a parquet part + free RAM every N buffered rows.")
+    ap.add_argument("--mem-soft-gb", type=float, default=12.0,
+                    help="Memory-guard soft cap (GB); abort loud above this instead of silent OOM kill.")
+    ap.add_argument("--skip-marks-cache", action="store_true",
+                    help="Skip the one-time marks-cache precompute (assumes app/data/v15/marks_cache is built+fresh).")
+    ap.add_argument("--rebuild-marks-cache", action="store_true",
+                    help="Force full rebuild of every coin's marks cache (use after a candle backfill).")
+    args = ap.parse_args()
+
+    start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
+    end_ms = int((pd.Timestamp(args.end, tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000 - 1)
+
+    with open(args.wallets_file) as fh:
+        wallets = [l.strip().lower() for l in fh if l.strip() and not l.startswith("#")]
+    logger.info(f"Loaded {len(wallets):,} wallets")
+
+    tasks = [(w, start_ms, end_ms, args.equity_enrichment) for w in wallets]
+    t0 = time.time()
+
+exec
+/bin/zsh -lc "sed -n '835,875p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+                 "errors": [{"wallet": w, "error": e} for w, e in errors]}, indent=2))
+        except Exception as _me:  # noqa: BLE001
+            logger.error(f"could not write error manifest {manifest}: {_me!r}")
+        logger.error(f"{len(errors)}/{len(wallets)} wallet ERRORS -> partial universe. manifest={manifest}. "
+                     f"first: {errors[:10]}")
+        raise SystemExit(1)
+
+
+def _log_one(r: dict, n: int) -> None:
+    if "error" in r:
+        logger.warning(f"  {r['wallet'][:12]} -> {r['error']}")
+    else:
+        logger.info(
+            f"  {r['wallet'][:12]} -> {len(r['actions'])} actions, "
+            f"{len(r['journeys'])} journeys"
+            + (f", {r['n_anchors']} anchors" if r.get("n_anchors") is not None else "")
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+exec
+/bin/zsh -lc "sed -n '260,340p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    if n_trim == 0:
+        return "accumulation"
+    if n_addon == 0:
+        return "scale-out"
+    return "position"
+
+
+# --------------------------------------------------------------------------- #
+# Per-wallet causal journey tracer (per-action stream + derived journeys)
+# --------------------------------------------------------------------------- #
+
+
+def trace_wallet(
+    wallet: str,
+    events: list["m01.EventEquity"],
+    fills: list[dict],
+    funding: list[dict],
+    *,
+    equity_enriched: bool = True,
+    end_ms: Optional[int] = None,
+) -> tuple[list[dict], list[dict]]:
+    """Walk the ordered FILL events for one wallet and emit (actions, journeys).
+
+    In the default/core lane, ``events`` contains only ``LifecycleFillEvent``
+    rows and no M01 reconstruction is consulted.  In the optional enriched
+    lane it is M01's total event stream so each fill can receive its causal
+    source-equity target. Funding/ledger rows never emit actions.
+    """
+    # Fill events in `events` carry type=='fill' AND the EXACT fill payload on
+    # ee.fill (codex r4 BUG 2). We consume that payload DIRECTLY off the ordered
+    # stream — never rematching by (ts, tid), which collided for same-ms fills
+    # lacking a tid (S3 by-wallet partition has none) and silently overwrote
+    # duplicates. Funding/ledger advance equity but emit no action rows.
+    funding_payloads = funding
+
+    actions: list[dict] = []
+    journeys: list[dict] = []
+
+    # Per-coin state machines (independent books per coin).
+    coin_state: dict[str, dict] = {}
+    coin_journey_counter: dict[str, int] = {}
+    coin_seen_first_fill: dict[str, bool] = {}
+
+    def _new_state() -> dict:
+        return {
+            "position": 0.0, "cost_basis": 0.0, "open": False, "side": 0,
+            "journey_id": None, "open_ts": None, "peak_ts": None,
+            "max_notional": 0.0, "n_entry": 0, "n_addon": 0, "n_trim": 0,
+            "n_exit": 0, "n_reverse": 0, "n_carry_in": 0,
+            "realized_pnl": 0.0, "fees_paid": 0.0, "fee_scope": "standard_perp",
+            "carry_in_status": None, "liq_closed": False,
+            "lifecycle_valid": True, "state_discontinuity": False,
+        }
+
+    def _finalize(coin: str, st: dict, close_ts: int) -> Optional[dict]:
+        if not st["open"] or st["open_ts"] is None:
+            return None
+        duration_s = max(0, (close_ts - st["open_ts"]) / 1000)
+        max_notional = max(st["max_notional"], EPS)
+        funding_net = _funding_for_interval(funding_payloads, coin, st["open_ts"], close_ts)
+        net_realized = st["realized_pnl"] - st["fees_paid"] + funding_net
+        return {
+            "wallet": wallet, "coin": coin, "journey_id": st["journey_id"],
+            "side": "long" if st["side"] > 0 else "short",
+            "entry_ts": st["open_ts"], "exit_ts": close_ts, "peak_ts": st["peak_ts"],
+            "duration_h": duration_s / 3600.0,
+            "n_entry_fills": st["n_entry"], "n_addon_fills": st["n_addon"],
+            "n_trim_fills": st["n_trim"], "n_exit_fills": st["n_exit"],
+            "n_reverse_fills": st["n_reverse"], "n_carry_in_seeds": st["n_carry_in"],
+            "max_position_notional": max_notional,
+            "realized_pnl": st["realized_pnl"], "fees": st["fees_paid"],
+            "funding_net": funding_net, "net_realized_pnl": net_realized,
+            "journey_class": _classify_duration(duration_s, st["n_addon"], st["n_trim"]),
+            "liq_closed": st["liq_closed"],
+            "open_at_window_end": False,
+            "carry_in_status": st["carry_in_status"] or "SEEDED",
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            "state_discontinuity": bool(st.get("state_discontinuity", False)),
+        }
+
+    # Walk events in event_order (already sorted).
+
+exec
+/bin/zsh -lc 'rg -n "def trace_wallet|def process_wallet|end_ms|errors|imap|_finalize|lifecycle_valid|stream_replay_valid|target_exposure_pct|startPosition" research/v15/v15_m02_journey_trace.py tests/v15/test_m02*.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m02_golden.py:5:- P1 non-finite startPosition/size/price: fails CLOSED (lifecycle_valid=False, carry_in UNKNOWN, not a
+tests/v15/test_m02_golden.py:7:- P1 NaN/inf mark (or equity): does NOT survive into target_exposure_pct -> unsizeable (None), mark None.
+tests/v15/test_m02_golden.py:24:def test_p1_open_journey_finalizes_at_window_end():
+tests/v15/test_m02_golden.py:30:                                    equity_enriched=False, end_ms=3000)
+tests/v15/test_m02_golden.py:38:def test_p1_open_journey_without_end_ms_is_backward_compatible():
+tests/v15/test_m02_golden.py:39:    # end_ms omitted -> old peak_ts behavior (byte-identical for existing callers).
+tests/v15/test_m02_golden.py:47:    f["startPosition"] = float("nan")                  # unknown pre-position
+tests/v15/test_m02_golden.py:50:    assert actions[0]["lifecycle_valid"] is False
+tests/v15/test_m02_golden.py:51:    assert actions[0]["stream_replay_valid"] is False
+tests/v15/test_m02_golden.py:59:    assert actions[0]["lifecycle_valid"] is False and actions[0]["stream_replay_valid"] is False
+tests/v15/test_m02_golden.py:88:        assert actions[0]["target_exposure_pct"] is None   # NaN/inf mark never becomes a target
+tests/v15/test_m02_golden.py:97:    assert actions[0]["target_exposure_pct"] is not None
+tests/v15/test_m02_golden.py:98:    assert abs(actions[0]["target_exposure_pct"] - 0.1) < 1e-9
+research/v15/v15_m02_journey_trace.py:21:          target_exposure_pct = position_after * mark / source_equity_post
+research/v15/v15_m02_journey_trace.py:28:      V15 uses the causal ``startPosition`` field on the FIRST in-window fill per
+research/v15/v15_m02_journey_trace.py:34:  event_order strictly monotone per wallet ; NO_ANCHOR ⇒ target_exposure_pct null.
+research/v15/v15_m02_journey_trace.py:84:# denominator (produces absurd target_exposure_pct, e.g. 200000x on near-zero equity). This
+research/v15/v15_m02_journey_trace.py:272:def trace_wallet(
+research/v15/v15_m02_journey_trace.py:279:    end_ms: Optional[int] = None,
+research/v15/v15_m02_journey_trace.py:311:            "lifecycle_valid": True, "state_discontinuity": False,
+research/v15/v15_m02_journey_trace.py:314:    def _finalize(coin: str, st: dict, close_ts: int) -> Optional[dict]:
+research/v15/v15_m02_journey_trace.py:336:            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+research/v15/v15_m02_journey_trace.py:367:        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+research/v15/v15_m02_journey_trace.py:369:        sp = float(f.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m02_journey_trace.py:370:        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+research/v15/v15_m02_journey_trace.py:371:        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+research/v15/v15_m02_journey_trace.py:373:        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
+research/v15/v15_m02_journey_trace.py:377:            st["lifecycle_valid"] = False
+research/v15/v15_m02_journey_trace.py:387:                st["lifecycle_valid"] = False
+research/v15/v15_m02_journey_trace.py:389:                j = _finalize(coin, st, ts)
+research/v15/v15_m02_journey_trace.py:413:                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+research/v15/v15_m02_journey_trace.py:417:            st["lifecycle_valid"] = False
+research/v15/v15_m02_journey_trace.py:489:            j = _finalize(coin, st, ts)
+research/v15/v15_m02_journey_trace.py:519:            j = _finalize(coin, st, ts)
+research/v15/v15_m02_journey_trace.py:545:            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
+research/v15/v15_m02_journey_trace.py:581:            "target_exposure_pct": target_pct,
+research/v15/v15_m02_journey_trace.py:589:            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+research/v15/v15_m02_journey_trace.py:593:            # the resync row because it does not carry startPosition.
+research/v15/v15_m02_journey_trace.py:594:            "stream_replay_valid": bool(
+research/v15/v15_m02_journey_trace.py:595:                st.get("lifecycle_valid", True)
+research/v15/v15_m02_journey_trace.py:602:    # AUDIT 2026-07-10 (codex m02 P1): finalize an OPEN journey through the WINDOW END (end_ms), not peak_ts.
+research/v15/v15_m02_journey_trace.py:604:    # stays None (still open). Falls back to the old peak_ts behavior only when end_ms is not supplied.
+research/v15/v15_m02_journey_trace.py:607:            _close_ts = end_ms if end_ms is not None else (st["peak_ts"] or st["open_ts"])
+research/v15/v15_m02_journey_trace.py:609:            j = _finalize(coin, st, _close_ts)
+research/v15/v15_m02_journey_trace.py:618:    # Without this pass, downstream code can filter lifecycle_valid=True and
+research/v15/v15_m02_journey_trace.py:623:        if not bool(j.get("lifecycle_valid", True)) and j.get("journey_id") is not None
+research/v15/v15_m02_journey_trace.py:639:        lifecycle_valid = bool(action.get("causal_order_ok", True)) and not bool(
+research/v15/v15_m02_journey_trace.py:642:        action["lifecycle_valid"] = lifecycle_valid
+research/v15/v15_m02_journey_trace.py:643:        action["stream_replay_valid"] = bool(
+research/v15/v15_m02_journey_trace.py:644:            lifecycle_valid
+research/v15/v15_m02_journey_trace.py:650:        journey["stream_replay_valid"] = bool(
+research/v15/v15_m02_journey_trace.py:651:            journey.get("lifecycle_valid", True)
+research/v15/v15_m02_journey_trace.py:676:def process_wallet(args: tuple) -> dict:
+research/v15/v15_m02_journey_trace.py:677:    wallet, start_ms, end_ms, equity_enriched = args
+research/v15/v15_m02_journey_trace.py:681:            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+research/v15/v15_m02_journey_trace.py:690:            fills = m01.load_wallet_fills(wallet, start_ms, end_ms)
+research/v15/v15_m02_journey_trace.py:691:            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+research/v15/v15_m02_journey_trace.py:703:            wallet, events, fills, funding, equity_enriched=equity_enriched, end_ms=end_ms
+research/v15/v15_m02_journey_trace.py:753:    end_ms = int((pd.Timestamp(args.end, tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000 - 1)
+research/v15/v15_m02_journey_trace.py:759:    tasks = [(w, start_ms, end_ms, args.equity_enrichment) for w in wallets]
+research/v15/v15_m02_journey_trace.py:797:    errors: list[tuple] = []
+research/v15/v15_m02_journey_trace.py:801:            errors.append((r["wallet"], r["error"]))
+research/v15/v15_m02_journey_trace.py:817:        # AUDIT 2026-07-10 (codex m02 P2): ORDERED imap so physical output row/shard order is deterministic
+research/v15/v15_m02_journey_trace.py:819:        for r in pool.imap(process_wallet, tasks):
+research/v15/v15_m02_journey_trace.py:830:    if errors:
+research/v15/v15_m02_journey_trace.py:831:        manifest = str(Path(args.actions_out).with_suffix(".errors.json"))
+research/v15/v15_m02_journey_trace.py:834:                {"n_errors": len(errors), "n_wallets": len(wallets),
+research/v15/v15_m02_journey_trace.py:835:                 "errors": [{"wallet": w, "error": e} for w, e in errors]}, indent=2))
+research/v15/v15_m02_journey_trace.py:838:        logger.error(f"{len(errors)}/{len(wallets)} wallet ERRORS -> partial universe. manifest={manifest}. "
+research/v15/v15_m02_journey_trace.py:839:                     f"first: {errors[:10]}")
+tests/v15/test_m02.py:48:        "closedPnl": float(closed), "startPosition": float(start_pos),
+tests/v15/test_m02.py:105:    assert all(a["target_exposure_pct"] is None for a in result["actions"])
+tests/v15/test_m02.py:155:    assert a0["target_exposure_pct"] is None
+tests/v15/test_m02.py:158:    assert a1["target_exposure_pct"] is not None
+tests/v15/test_m02.py:246:    # first in-window fill reports startPosition = +5 (carried in pre-window).
+tests/v15/test_m02.py:277:def test_target_exposure_pct_sane():
+tests/v15/test_m02.py:283:    assert a["target_exposure_pct"] is not None
+tests/v15/test_m02.py:284:    assert 0.0 < a["target_exposure_pct"] < 1.0
+tests/v15/test_m02.py:306:    earlier event t1, even if its first fill reports a nonzero startPosition
+tests/v15/test_m02.py:310:      BTC = 100, ALT = 50. ALT's first fill is at t2=3000 with startPosition=10.
+tests/v15/test_m02.py:465:    assert [f["startPosition"] for f in ordered] == [-573.0, -1428.0, -3011.0]
+tests/v15/test_m02.py:467:    assert [e["ev"]["startPosition"] for e in stream] == [-573.0, -1428.0, -3011.0]
+tests/v15/test_m02.py:482:    assert any(not j["lifecycle_valid"] and j["state_discontinuity"] for j in journeys)
+tests/v15/test_m02.py:485:    assert actions[0]["lifecycle_valid"] is False
+tests/v15/test_m02.py:487:    # authoritative startPosition, but a raw live stream cannot self-repair.
+tests/v15/test_m02.py:488:    assert actions[1]["lifecycle_valid"] is True
+tests/v15/test_m02.py:489:    assert actions[1]["stream_replay_valid"] is False
+tests/v15/test_m02.py:490:    assert actions[2]["lifecycle_valid"] is True
+tests/v15/test_m02.py:491:    assert actions[2]["stream_replay_valid"] is False
+tests/v15/test_m02.py:492:    assert all("stream_replay_valid" in j for j in journeys)
+tests/v15/test_m02.py:493:    assert not any(j["stream_replay_valid"] for j in journeys)
+
+exec
+/bin/zsh -lc "sed -n '425,525p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '220,330p' tests/v15/test_m02.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    assert m01.coin_is_allowed_perp(f["coin"]) is False
+    assert m01.build_event_stream([f], [], []) == []
+
+
+def test_reverse_two_journey_ids():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),                  # ENTRY long 1
+        _fill(2100, "BTC", "A", 3, 110, 1, tid=2, closed=10.0),     # REVERSE -> short 2
+        _fill(2200, "BTC", "B", 2, 105, -2, tid=3, closed=10.0),    # EXIT -> 0
+    ]
+    _, actions, journeys = _run(fills)
+    rev = next(a for a in actions if a["action_type"] == "REVERSE")
+    # one row, BOTH ids, and they differ (close prior, open new).
+    assert rev["closing_journey_id"] is not None
+    assert rev["opening_journey_id"] is not None
+    assert rev["closing_journey_id"] != rev["opening_journey_id"]
+    assert rev["journey_id"] == rev["opening_journey_id"]
+    # position flips sign
+    assert rev["position_after"] < 0
+    # two journeys: the closed long + the closed short
+    assert len(journeys) == 2
+    sides = sorted(j["side"] for j in journeys)
+    assert sides == ["long", "short"]
+
+
+def test_causal_carry_in_via_startposition():
+    # first in-window fill reports startPosition = +5 (carried in pre-window).
+    fills = [
+        _fill(3000, "BTC", "A", 2, 110, 5, tid=1, closed=20.0),   # TRIM of carried 5 -> 3
+        _fill(3100, "BTC", "A", 3, 110, 3, tid=2, closed=30.0),   # EXIT -> 0
+    ]
+    _, actions, journeys = _run(fills)
+    # carry-in opens an in-progress journey; first action is a TRIM (not ENTRY).
+    assert actions[0]["action_type"] == "TRIM"
+    assert actions[0]["carry_in_status"] == "SEEDED"
+    assert len(journeys) == 1
+    j = journeys[0]
+    assert j["n_carry_in_seeds"] == 1
+    assert j["side"] == "long"
+    assert j["carry_in_status"] == "SEEDED"
+    # position_after of first action = 5 - 2 = 3
+    assert abs(actions[0]["position_after"] - 3.0) < 1e-9
+
+
+def test_liquidation_flags_involuntary_exit():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(2100, "BTC", "A", 1, 80, 1, tid=2, closed=-20.0,
+              dir_="Liquidated Cross Long", liq=True),
+    ]
+    _, actions, journeys = _run(fills)
+    ex = actions[-1]
+    assert ex["action_type"] == "EXIT"
+    assert ex["is_liquidation"] is True
+    assert journeys[0]["liq_closed"] is True
+
+
+def test_target_exposure_pct_sane():
+    # equity ~1000, position 5 @ 100 = 500 notional -> ~0.5 (50%).
+    fills = [_fill(3000, "BTC", "B", 5, 100, 0, tid=1)]
+    _, actions, _ = _run(fills, anchors=[(2000, 1000.0)])
+    a = actions[0]
+    # equity_post after buying 5@100: cash = 1000 - 0(no seed) - 500 = 500; posval=500 -> eq 1000.
+    assert a["target_exposure_pct"] is not None
+    assert 0.0 < a["target_exposure_pct"] < 1.0
+
+
+def test_partial_mtm_on_unmarkable():
+    # An EXOTIC coin (no mark) held alongside cash -> PARTIAL_MTM / frozen comp.
+    fills = [
+        _fill(3000, "EXOTIC:FOO", "B", 1, 50, 0, tid=1),   # unmarkable position
+        _fill(3100, "BTC", "B", 1, 100, 0, tid=2),
+    ]
+    events, actions, _ = _run(fills, anchors=[(2000, 1000.0)])
+    btc = next(a for a in actions if a["coin"] == "BTC")
+    assert btc["equity_basis_mode"] in ("PARTIAL_MTM", "ANCHOR_FALLBACK")
+    assert btc["equity_degraded"] is True
+
+
+# --------------------------------------------------------------------------- #
+# CAUSALITY BUG 1 — no future-fill coin in earlier equity_post (look-ahead)
+# --------------------------------------------------------------------------- #
+
+
+def test_future_coin_does_not_affect_earlier_equity(monkeypatch):
+    """A coin first TRADED at t2 must NOT contribute a marked position at an
+    earlier event t1, even if its first fill reports a nonzero startPosition
+    (pre-anchor holding only LEARNED from the future fill = look-ahead).
+
+    Per-coin marks so the leak is observable in position_value:
+      BTC = 100, ALT = 50. ALT's first fill is at t2=3000 with startPosition=10.
+    Before the fix, seed_positions case 2 seeded ALT=10 at the anchor, so ALT was
+    in the book at t1=2000 (position_value would include 10*50=500). After the fix
+    ALT is absent at t1 and materialises only at its own fill (order <= k).
+    """
+    def per_coin_mark(coin, ts_ms, causal=False):
+        return 50.0 if coin == "ALT" else 100.0
+    monkeypatch.setattr(m01, "get_mark", per_coin_mark)
+    monkeypatch.setattr(m02.m01, "get_mark", per_coin_mark)
+
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),       # t1: BTC entry, ALT untraded
+        _fill(3000, "ALT", "A", 2, 50, 10, tid=2),       # t2: ALT first fill, startPos=10
+    ]
+    anchor = _Anchor()
+    ordered = m01.build_event_stream(fills, [], [])
+    events = m01.compute_event_equity(
+        ordered, fills, anchor, "0xtest", [(1000, 1000.0)], extradex_no_anchor=False
+    )
+    e_t1 = next(e for e in events if e.ts == 2000 and e.type == "fill")
+    # CAUSAL: at t1 only BTC (1 @ 100) is held; ALT (would be 10 @ 50 = 500) must
+
+ succeeded in 142ms:
+                    closed_qty = position
+                elif (position > 0 and new_pos_preview > 0) or (position < 0 and new_pos_preview < 0):
+                    closed_qty = -signed
+                else:
+                    closed_qty = position
+                closed_pnl = float((price - cost_basis) * closed_qty)
+            else:
+                closed_pnl = 0.0
+        else:
+            closed_pnl = float(raw_pnl)
+
+        # PRE-fill peak capture.
+        pre_notional = abs(position) * price
+        if abs(position) > EPS and pre_notional > st["max_notional"]:
+            st["max_notional"] = pre_notional
+            st["peak_ts"] = ts
+
+        new_pos = position + signed
+        notional_after = abs(new_pos) * price
+        fill_notional = abs(signed) * price
+        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
+
+        # ---- state machine ----
+        action_type = None
+        opening_jid = None
+        closing_jid = None
+
+        if abs(position) < EPS and abs(new_pos) > EPS:
+            # ENTRY
+            coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+            st.update(
+                journey_id=coin_journey_counter[coin], open=True,
+                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+                n_entry=1, n_addon=0, n_trim=0, n_exit=0, n_reverse=0, n_carry_in=0,
+                realized_pnl=0.0, max_notional=notional_after, cost_basis=price,
+                fees_paid=fill_fee, fee_scope=row_scope, liq_closed=False,
+                carry_in_status=st["carry_in_status"] or "SEEDED",
+            )
+            action_type = "ENTRY"
+            opening_jid = st["journey_id"]
+            closing_jid = None
+
+        elif (position > 0 and signed > 0) or (position < 0 and signed < 0):
+            # ADDON
+            st["n_addon"] += 1
+            st["cost_basis"] = (cost_basis * abs(position) + price * abs(signed)) / abs(new_pos)
+            if notional_after > st["max_notional"]:
+                st["max_notional"] = notional_after
+                st["peak_ts"] = ts
+            st["fees_paid"] += fill_fee
+            action_type = "ADDON"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+
+        elif abs(new_pos) < EPS:
+            # EXACT EXIT
+            st["n_exit"] += 1
+            st["realized_pnl"] += closed_pnl
+            st["fees_paid"] += fill_fee
+            if is_liq:
+                st["liq_closed"] = True
+            action_type = "EXIT"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+            j = _finalize(coin, st, ts)
+            if j is not None:
+                journeys.append(j)
+            st.update(_new_state())
+            coin_state[coin] = st
+
+        elif (position > 0 and new_pos > 0 and signed < 0) or (position < 0 and new_pos < 0 and signed > 0):
+            # TRIM
+            st["n_trim"] += 1
+            st["realized_pnl"] += closed_pnl
+            st["fees_paid"] += fill_fee
+            action_type = "TRIM"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+
+        else:
+            # REVERSE (crosses zero): one action row, two journey ids.
+            st["n_reverse"] += 1
+            st["realized_pnl"] += closed_pnl
+            if is_liq:
+                st["liq_closed"] = True
+            split_total = abs(position) + abs(new_pos)
+            if actual_fee is not None and split_total > EPS:
+                closing_fee = actual_fee * (abs(position) / split_total)
+                opening_fee = actual_fee * (abs(new_pos) / split_total)
+            else:
+                closing_fee = abs(position) * price * FEE_RATE
+                opening_fee = abs(new_pos) * price * FEE_RATE
+            st["fees_paid"] += closing_fee
+            closing_jid = st["journey_id"]
+            j = _finalize(coin, st, ts)
+            if j is not None:
+                journeys.append(j)
+            # open the new (reversed) leg
+            coin_journey_counter[coin] += 1
+            st.update(_new_state())
+            st.update(
+
+exec
+/bin/zsh -lc "sed -n '450,500p' tests/v15/test_m02.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc 'pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q' in /Users/hermes/quants-lab
+ succeeded in 141ms:
+    assert btc[0]["event_order"] != btc[1]["event_order"]
+    # signed sizes preserved per fill (not both = the overwritten last payload)
+    assert abs(btc[0]["signed_size"] - 1.0) < 1e-9
+    assert abs(btc[1]["signed_size"] - 2.0) < 1e-9
+
+
+def test_same_ms_tid_is_identity_not_causal_order():
+    # Real S3 pattern: numerical tid order differs from position evolution.
+    # Correct chain: -573 -> -1428 -> -3011 -> -3584.
+    fills = [
+        _fill(3000, "BTC", "A", 855, 100, -573, tid=10, dir_="Open Short"),
+        _fill(3000, "BTC", "A", 573, 100, -3011, tid=20, dir_="Open Short"),
+        _fill(3000, "BTC", "A", 1583, 100, -1428, tid=30, dir_="Open Short"),
+    ]
+    ordered = m01.order_wallet_fills_causally(fills)
+    assert [f["startPosition"] for f in ordered] == [-573.0, -1428.0, -3011.0]
+    stream = m01.build_event_stream(fills, [], [])
+    assert [e["ev"]["startPosition"] for e in stream] == [-573.0, -1428.0, -3011.0]
+    assert all(e["ev"]["causal_order_ok"] for e in stream)
+
+
+def test_position_gap_resyncs_and_invalidates_interrupted_journey():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1, dir_="Open Long"),
+        # Missing fills moved the real position from 1 to 5 before this trim.
+        _fill(3000, "BTC", "A", 1, 100, 5, tid=2, dir_="Close Long"),
+        _fill(4000, "BTC", "A", 4, 100, 4, tid=3, dir_="Close Long"),
+    ]
+    _, actions, journeys = _run(fills, anchors=[(1000, 1000.0)])
+    assert actions[1]["state_resynced"] is True
+    assert actions[1]["position_after"] == pytest.approx(4.0)
+    assert actions[1]["action_type"] == "TRIM"
+    assert any(not j["lifecycle_valid"] and j["state_discontinuity"] for j in journeys)
+    # The gap is learned after action 0 was emitted, so validity must propagate
+    # backward to the entire interrupted journey.
+    assert actions[0]["lifecycle_valid"] is False
+    # The current transition can seed a new historical journey from its
+    # authoritative startPosition, but a raw live stream cannot self-repair.
+    assert actions[1]["lifecycle_valid"] is True
+    assert actions[1]["stream_replay_valid"] is False
+    assert actions[2]["lifecycle_valid"] is True
+    assert actions[2]["stream_replay_valid"] is False
+    assert all("stream_replay_valid" in j for j in journeys)
+    assert not any(j["stream_replay_valid"] for j in journeys)
+
+
+# --------------------------------------------------------------------------- #
+# M01 spot/collateral invariant
+# --------------------------------------------------------------------------- #
+
+
+
+ exited 2 in 5762ms:
+
+==================================== ERRORS ====================================
+________________ ERROR collecting tests/v15/test_m02_golden.py _________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m02_golden.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m02_golden.py:15: in <module>
+    import v15_m02_journey_trace as m02  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m02_journey_trace.py:61: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m02.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m02.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m02.py:22: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+=========================== short test summary info ============================
+ERROR tests/v15/test_m02_golden.py
+ERROR tests/v15/test_m02.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!
+2 errors in 3.38s
+
+codex
+Targeted test execution is blocked in this environment because `pymongo` is not installed, so I’m treating the user-reported passing suite as external and continuing with static/path review. One edge path worth testing manually is non-finite `signed_sz`, because it exercises different branches than non-finite price/startPosition.
+exec
+/bin/zsh -lc "rg --files | rg 'requirements|pyproject|setup|tox|environment|Pipfile|poetry'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+pyproject.toml
+environment.yml
+
+exec
+/bin/zsh -lc "python - <<'PY'
+import math
+print(abs(float('nan')) <= 1e-9)
+print(abs(float('nan')) > 1e-9)
+PY" in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: command not found: python
+
+exec
+/bin/zsh -lc 'rg -n "pymongo|requirements|pyproject|poetry|environment|pytest" -S .' in /Users/hermes/quants-lab
+ succeeded in 885ms:
+./archive/codex_decision_adl_accept.txt:167:    import pymongo
+./archive/codex_decision_adl_accept.txt:169:    db = pymongo.MongoClient(mongo_uri)["quants_lab"]
+./archive/codex_audit_m06a_r2.txt:44:I’ll review the targeted code and tests in a code-review stance, then run the relevant test slice if the environment allows it.
+./archive/codex_audit_m06a_r2.txt:613:import pytest
+./archive/codex_audit_m06a_r2.txt:626:    with pytest.raises(AssertionError, match="non-bool"):
+./archive/codex_audit_m06a_r2.txt:634:    with pytest.raises(AssertionError, match="n_journeys"):
+./archive/codex_audit_m06a_r2.txt:642:    with pytest.raises(AssertionError, match="max_dd"):
+./archive/codex_audit_m06a_r2.txt:1096:/bin/zsh -lc 'pytest -q tests/v15/test_m06a_golden.py tests/v15/test_m06a.py' in /Users/hermes/quants-lab
+./archive/codex_audit_m06a_r2.txt:1115:    with pytest.raises(AssertionError):
+./archive/codex_audit_m06a_r2.txt:1122:    with pytest.raises(AssertionError):
+./archive/codex_audit_m06a_r2.txt:1161:/bin/zsh -lc 'pytest -q tests/v15' in /Users/hermes/quants-lab
+./archive/codex_audit_m06a_r2.txt:1179:    import pymongo
+./archive/codex_audit_m06a_r2.txt:1180:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m06a_r2.txt:1213:    import pymongo
+./archive/codex_audit_m06a_r2.txt:1214:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m06a_r2.txt:1226:    import pymongo
+./archive/codex_audit_m06a_r2.txt:1227:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m06a_r2.txt:1242:    import pymongo
+./archive/codex_audit_m06a_r2.txt:1243:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m06a_r2.txt:1284:The full `tests/v15` collection cannot run in this environment because optional dependencies are missing (`pymongo`, `pyarrow`), so I’m limiting the executable verification to the M6a tests that can run here. The code review finding is independent of that environment issue.
+./archive/codex_audit_m06a_r2.txt:1451:- `pytest -q tests/v15/test_m06a_golden.py tests/v15/test_m06a.py` passed: `32 passed`.
+./archive/codex_audit_m06a_r2.txt:1452:- `pytest -q tests/v15` did not collect fully here due missing environment deps: `pymongo`, `pyarrow`.
+./archive/codex_audit_m06a_r2.txt:1471:- `pytest -q tests/v15/test_m06a_golden.py tests/v15/test_m06a.py` passed: `32 passed`.
+./archive/codex_audit_m06a_r2.txt:1472:- `pytest -q tests/v15` did not collect fully here due missing environment deps: `pymongo`, `pyarrow`.
+./archive/data_pipeline/backfill_bybit_derivatives.py:28:from pymongo import MongoClient, UpdateOne
+./archive/codex_audit_m05.txt:1807:     8	import pytest
+./archive/codex_audit_m05.txt:1860:    61	    assert r["roe"] == pytest.approx(0.10)
+./archive/codex_audit_m05.txt:1872:    73	    assert m5.flow_adjusted_twr(df)["median_leverage"] == pytest.approx(20.0)
+./archive/codex_audit_m05.txt:2000:   201	    assert jm["net_pnl"] == pytest.approx(100.0)
+./research/v13/v13_extract_oracle_marks.py:32:from pymongo import MongoClient, UpdateOne
+./scripts/knet_bypass_tracker.py:14:from pymongo import MongoClient
+./archive/codex_audit_m03.txt:258:     8	import pytest
+./archive/codex_audit_m03.txt:264:    14	@pytest.fixture
+./archive/codex_audit_m03.txt:1026:tests/v15/test_m09.py:177:    assert r["fold_end_equity"] == pytest.approx(45.0)   # frozen at kill, NOT the 120 recovery
+./archive/codex_audit_m03.txt:1028:tests/v15/test_m09.py:184:    assert r["killed"] is False and r["g4_pass"] is True and r["fold_end_equity"] == pytest.approx(90.0)
+./archive/codex_audit_m03.txt:1077:tests/v15/test_m09.py:591:    assert f0["fold_end_equity"] == pytest.approx(0.30 * f0["fold_initial"], rel=1e-6)
+./archive/codex_audit_m03.txt:1078:tests/v15/test_m09.py:594:    assert out["per_fold"][1]["fold_initial"] == pytest.approx(0.30 * f0["fold_initial"], rel=1e-6)
+./archive/codex_audit_m03.txt:1083:tests/v15/test_m09.py:638:    assert f0["fold_end_equity"] == pytest.approx(0.64 * f0["fold_initial"], rel=1e-6)
+./archive/codex_audit_m03.txt:2503:A concrete risk is emerging around timestamp serialization: M3 writes naive `Timestamp` dates, while consumers convert them to epoch milliseconds with `.timestamp()`. I’m verifying how that behaves in this environment because a timezone-dependent shift would move every fold boundary.
+./archive/codex_audit_m03.txt:2571:The system Python lacks project dependencies. I’m locating the project environment so I can test the exact pandas behavior instead of relying on memory.
+./archive/codex_audit_m03.txt:2573:/bin/zsh -lc "rg --files -g 'pyproject.toml' -g 'requirements*.txt' -g 'Pipfile' -g 'poetry.lock' -g 'uv.lock' -g '.venv' -g 'venv' -g 'environment.yml'" in /Users/hermes/quants-lab
+./archive/codex_audit_m03.txt:2575:pyproject.toml
+./archive/codex_audit_m03.txt:2576:environment.yml
+./archive/codex_audit_m03.txt:2599:drwxr-xr-x    6 hermes  staff    192 Apr  9 11:07 .pytest_cache
+./archive/codex_audit_m03.txt:2619:-rw-r--r--    1 hermes  staff    737 Mar 26 07:41 environment.yml
+./archive/codex_audit_m03.txt:2624:-rw-r--r--    1 hermes  staff   1813 Mar 26 07:41 pyproject.toml
+./scripts/skill_granular_tracker.py:16:from pymongo import MongoClient
+./research/v15/v15_slippage_calib.py:62:    from pymongo import MongoClient
+./research/v15/v15_slippage_calib.py:87:    from pymongo import MongoClient
+./scripts/scaling_verdict_computer.py:21:from pymongo import MongoClient
+./scripts/data_freshness_check.py:97:        from pymongo import MongoClient
+./archive/codex_audit_m01_DEFERRED.txt:288:    93	import pymongo
+./archive/codex_audit_m01_DEFERRED.txt:382:   187	_mongo: Optional[pymongo.database.Database] = None
+./archive/codex_audit_m01_DEFERRED.txt:391:   196	def get_mongo() -> pymongo.database.Database:
+./archive/codex_audit_m01_DEFERRED.txt:394:   199	        _mongo = pymongo.MongoClient(MONGO_URI)["quants_lab"]
+./archive/codex_audit_m01_DEFERRED.txt:2973:   187	_mongo: Optional[pymongo.database.Database] = None
+./archive/codex_audit_m01_DEFERRED.txt:2982:   196	def get_mongo() -> pymongo.database.Database:
+./archive/codex_audit_m01_DEFERRED.txt:2985:   199	        _mongo = pymongo.MongoClient(MONGO_URI)["quants_lab"]
+./archive/codex_audit_m01_DEFERRED.txt:5454:    15	from pymongo import MongoClient
+./archive/codex_audit_m08.txt:302:tests/v15/test_m08.py:3:Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py -q
+./archive/codex_audit_m08.txt:411:     3	Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py -q
+./archive/codex_audit_m08.txt:418:    10	import pytest
+./archive/codex_audit_m08.txt:517:   109	    assert v == pytest.approx(0.02 * 1.0 * 1.0 * m.m9_static_per_entity_cap * m.nominal_capital)
+./archive/codex_audit_m08.txt:523:   115	    assert v == pytest.approx(0.02 * 1.0 * 1.0 * m.m9_static_per_entity_cap * 518.0)
+./archive/codex_audit_m08.txt:536:   128	    assert fw["mean_roe"] == pytest.approx(0.4)   # only the present entity, NOT (0.4+0)/2
+./archive/codex_audit_m08.txt:575:   167	    assert fw["n_entities"] == 1 and fw["mean_roe"] == pytest.approx(0.5)
+./archive/codex_audit_m08.txt:843:   119	    import pymongo
+./archive/codex_audit_m08.txt:845:   121	    db = pymongo.MongoClient(mongo_uri)["quants_lab"]
+./scripts/pull_oracle_targeted.py:38:from pymongo import MongoClient, UpdateOne  # noqa: E402
+./archive/codex_audit_m07_fix_r2.txt:167:    import pymongo
+./archive/codex_audit_m07_fix_r2.txt:169:    db = pymongo.MongoClient(mongo_uri)["quants_lab"]
+./scripts/scan_fast_levered.py:19:from pymongo import MongoClient
+./archive/app/services/services/hl_mm/pair_screener.py:31:from pymongo import MongoClient, DESCENDING
+./archive/app/services/services/hl_mm/pair_screener.py:32:from pymongo.collection import Collection
+./scripts/hb_check.py:13:from pymongo import MongoClient
+./archive/codex_audit_m07_fix_r3_consensus.txt:412:tests/v15/test_m07.py:4:  /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m07.py -q
+./archive/codex_audit_m07_fix_r3_consensus.txt:1698:     4	  /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m07.py -q
+./archive/codex_audit_m07_fix_r3_consensus.txt:1705:    11	import pytest
+./archive/codex_audit_m07_fix_r3_consensus.txt:1834:   140	    with pytest.raises(ValueError, match="rebuilt causal M2"):
+./archive/codex_audit_m07_fix_r3_consensus.txt:1846:   152	        pytest.skip("HL meta cache not present")
+./archive/codex_audit_m07_fix_r3_consensus.txt:1860:   166	    assert f.taker("BTC") == pytest.approx(0.00045)
+./archive/codex_audit_m07_fix_r3_consensus.txt:1861:   167	    assert f.taker("xyz:TEST") == pytest.approx(0.0009)
+./archive/codex_audit_m07_fix_r3_consensus.txt:1873:   179	    assert liq["adv"] == pytest.approx(600.0)
+./archive/codex_audit_m07_fix_r3_consensus.txt:1886:   192	    assert liq["adv"] == pytest.approx(200.0)
+./archive/codex_audit_m07_fix_r3_consensus.txt:2041:/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m07.py -q' in /Users/hermes/quants-lab
+./archive/research/v13/v13_wallet_metrics.py:50:from pymongo import MongoClient
+./archive/research/v13/v13_full_pool_sweep.py:29:import pymongo
+./archive/research/v13/v13_full_pool_sweep.py:117:    client = pymongo.MongoClient("mongodb://localhost:27017")
+./archive/app/controllers/generic/grid_strike.py:118:    def get_balance_requirements(self) -> List[TokenAmount]:
+./archive/codex_audit_m025_r1.txt:1825:import pytest
+./archive/research/v13/v13_preload_marks.py:22:import pymongo
+./archive/research/v13/v13_preload_marks.py:43:    client = pymongo.MongoClient("mongodb://localhost:27017")
+./archive/research/v13/v13_equity_reconstruct.py:82:from pymongo import MongoClient
+./archive/codex_audit_m08_staleness.txt:63:import pytest
+./archive/codex_audit_m08_staleness.txt:138:    with pytest.raises(ValueError, match="look-ahead"):
+./archive/codex_audit_m08_staleness.txt:631:Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m08.py -q
+./archive/codex_audit_m08_staleness.txt:638:import pytest
+./archive/codex_audit_m08_staleness.txt:738:    assert v == pytest.approx(0.02 * 1.0 * 1.0 * m.m9_static_per_entity_cap * m.nominal_capital)
+./archive/codex_audit_m08_staleness.txt:744:    assert v == pytest.approx(0.02 * 1.0 * 1.0 * m.m9_static_per_entity_cap * 518.0)
+./archive/codex_audit_m08_staleness.txt:757:    assert fw["mean_roe"] == pytest.approx(0.4)   # only the present entity, NOT (0.4+0)/2
+./archive/codex_audit_m08_staleness.txt:884:/bin/zsh -lc 'pytest tests/v15/test_m08.py tests/v15/test_m08_golden.py -q' in /Users/hermes/quants-lab
+./archive/codex_audit_m08_staleness.txt:890:tmp_path = PosixPath('/private/var/folders/b3/f0nqzyqs4h3cs71g_xn2rs0c0000gp/T/pytest-of-hermes/pytest-307/test_p0_3_global_m04_lookahead0')
+./archive/codex_audit_m08_staleness.txt:951:-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+./archive/codex_audit_m08_staleness.txt:957:The focused M8 tests passed through the staleness cases; the only local failure is environmental: this Python environment lacks `pyarrow`/`fastparquet`, so the existing parquet-based golden test cannot set up its fixture. That does not implicate the staleness guard.
+./archive/codex_audit_m08_staleness.txt:1133:Tests: `pytest tests/v15/test_m08.py tests/v15/test_m08_golden.py -q` produced 17 passes and 1 environment failure because this Python env lacks `pyarrow`/`fastparquet` for an existing parquet fixture. The staleness tests themselves passed.
+./archive/codex_audit_m08_staleness.txt:1147:Tests: `pytest tests/v15/test_m08.py tests/v15/test_m08_golden.py -q` produced 17 passes and 1 environment failure because this Python env lacks `pyarrow`/`fastparquet` for an existing parquet fixture. The staleness tests themselves passed.
+./archive/research/v18/replay_feeder.py:18:from pymongo import MongoClient
+./archive/app/controllers/directional_trading/x8_defi_cex_funding_spread.py:235:            from pymongo import MongoClient as _MongoClient
+./archive/app/controllers/directional_trading/x8_defi_cex_funding_spread.py:274:            from pymongo import MongoClient as _MongoClient
+./archive/research/v13/v13_walk_forward.py:64:from pymongo import MongoClient
+./archive/research/v13/v13_walk_forward.py:524:    # avoid leaking PyMongo monitor threads (not fork-safe). Use context manager.
+./archive/codex_audit_m025_r2.txt:1012:/bin/zsh -lc 'pytest -q tests/v15/test_m025_golden.py' in /Users/hermes/quants-lab
+./archive/codex_audit_m025_r2.txt:1014:/bin/zsh -lc 'pytest -q tests/v15' in /Users/hermes/quants-lab
+./archive/codex_audit_m025_r2.txt:1032:    import pymongo
+./archive/codex_audit_m025_r2.txt:1033:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m025_r2.txt:1056:    import pymongo
+./archive/codex_audit_m025_r2.txt:1057:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m025_r2.txt:1090:    import pymongo
+./archive/codex_audit_m025_r2.txt:1091:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m025_r2.txt:1103:    import pymongo
+./archive/codex_audit_m025_r2.txt:1104:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m025_r2.txt:1119:    import pymongo
+./archive/codex_audit_m025_r2.txt:1120:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m025_r2.txt:1135:    import pymongo
+./archive/codex_audit_m025_r2.txt:1136:E   ModuleNotFoundError: No module named 'pymongo'
+./archive/codex_audit_m025_r2.txt:1178:The test commands are blocked in this environment before executing assertions: `pymongo` and `pyarrow` are missing from the active Python. I’ll still complete static verification and, if there’s a local venv or alternate runner in the repo, use that.
+./archive/codex_audit_m025_r2.txt:1201:drwxr-xr-x    6 hermes  staff    192 Apr  9 11:07 .pytest_cache
+./archive/codex_audit_m025_r2.txt:1221:-rw-r--r--    1 hermes  staff    737 Mar 26 07:41 environment.yml
+./archive/codex_audit_m025_r2.txt:1226:-rw-r--r--    1 hermes  staff   1813 Mar 26 07:41 pyproject.toml
+./archive/codex_audit_m025_r2.txt:1242:/bin/zsh -lc "rg --files -g 'pyproject.toml' -g 'requirements*.txt' -g 'uv.lock' -g 'poetry.lock' -g 'Pipfile' -g '.venv' -g 'venv'" in /Users/hermes/quants-lab
+./archive/codex_audit_m025_r2.txt:1244:pyproject.toml
+./archive/codex_audit_m025_r2.txt:1249:for m in ['numpy','pandas','pymongo','pyarrow']:
+./archive/codex_audit_m025_r2.txt:1260:There is a `.venv` in the repo, and the shell’s bare `python` is not on PATH while `pytest` was. I’m switching to the project venv to avoid auditing against the wrong interpreter.
+./archive/codex_audit_m025_r2.txt:1262:/bin/zsh -lc '.venv/bin/pytest -q tests/v15/test_m025_golden.py' in /Users/hermes/quants-lab
+./archive/codex_audit_m025_r2.txt:1264:zsh:1: no such file or directory: .venv/bin/pytest
+./archive/codex_audit_m025_r2.txt:1270:for m in ['numpy','pandas','pymongo','pyarrow','pytest']:
+./archive/codex_audit_m025_r2.txt:1281:pymongo ModuleNotFoundError No module named 'pymongo'
+./archive/codex_audit_m025_r2.txt:1283:pytest ModuleNotFoundError No module named 'pytest'
+./archive/codex_audit_m025_r2.txt:1286:/bin/zsh -lc '.venv/bin/pytest -q tests/v15' in /Users/hermes/quants-lab
+./archive/codex_audit_m025_r2.txt:1288:zsh:1: no such file or directory: .venv/bin/pytest
+./archive/codex_audit_m025_r2.txt:1291:The repo venv is empty for this slice, so it cannot run the tests either. For the golden test specifically, the only missing import hit is `pymongo` through `m01`; I’m checking whether a minimal temporary stub is enough to execute the pure decision tests without touching repo files.
+./archive/codex_audit_m025_r2.txt:1308:import pymongo
+./archive/codex_audit_m025_r2.txt:1333:/bin/zsh -lc "which pytest && pytest --version && which python3 && python3 - <<'PY'
+./archive/codex_audit_m025_r2.txt:1334:for m in ['numpy','pandas','pytest','dotenv','requests']:
+./archive/codex_audit_m025_r2.txt:1342:pytest 9.0.3
+./archive/codex_audit_m025_r2.txt:1348:pytest ModuleNotFoundError No module named 'pytest'
+./archive/codex_audit_m025_r2.txt:1460:Rather than polluting imports for pytest collection, I’m going to run a small direct harness that preloads harmless stubs for `pymongo` and `_streaming_io`, imports the audited module, and exercises the same golden cases. That avoids repo edits and avoids pretending the full dependency stack is installed.
+./archive/codex_audit_m025_r2.txt:1462:/bin/zsh -lc 'head -1 $(which pytest) && /opt/homebrew/bin/python3.11 - <<'"'PY'
+./archive/codex_audit_m025_r2.txt:1465:sys.modules['pymongo'] = types.ModuleType('pymongo')
+./archive/codex_audit_m025_r2.txt:1622:- Full `pytest` was blocked in this environment by missing `pymongo`/`pyarrow`; repo `.venv` also lacks pytest/numpy/pandas.
+./archive/codex_audit_m025_r2.txt:1641:- Full `pytest` was blocked in this environment by missing `pymongo`/`pyarrow`; repo `.venv` also lacks pytest/numpy/pandas.
+./archive/codex_audit_m06a_r3.txt:144:tests/v15/test_m06a_golden.py:35:    with pytest.raises(AssertionError, match="n_journeys"):
+./archive/codex_audit_m06a_r3.txt:145:tests/v15/test_m06a_golden.py:43:    with pytest.raises(AssertionError, match="max_dd"):
+./archive/codex_audit_m06a_r3.txt:152:tests/v15/test_m06a_golden.py:59:    with pytest.raises(AssertionError, match="n_journeys"):
+./archive/codex_audit_m06a_r3.txt:170:import pytest
+./archive/codex_audit_m06a_r3.txt:183:    with pytest.raises(AssertionError, match="non-bool"):
+./archive/codex_audit_m06a_r3.txt:191:    with pytest.raises(AssertionError, match="n_journeys"):
+./archive/codex_audit_m06a_r3.txt:199:    with pytest.raises(AssertionError, match="max_dd"):
+./archive/codex_audit_m06a_r3.txt:215:    with pytest.raises(AssertionError, match="n_journeys"):
+./archive/codex_audit_m06a_r3.txt:688:    14	import pytest
+./archive/codex_audit_m06a_r3.txt:701:    27	    with pytest.raises(AssertionError, match="non-bool"):
+./archive/codex_audit_m06a_r3.txt:709:    35	    with pytest.raises(AssertionError, match="n_journeys"):
+./archive/codex_audit_m06a_r3.txt:717:    43	    with pytest.raises(AssertionError, match="max_dd"):
+./archive/codex_audit_m06a_r3.txt:733:    59	    with pytest.raises(AssertionError, match="n_journeys"):
+./archive/codex_audit_m06a_r3.txt:748:/bin/zsh -lc 'pytest tests/v15/test_m06a_golden.py -q' in /Users/hermes/quants-lab
+./archive/codex_audit_m06a_r3.txt:768:pytest tests/v15/test_m06a_golden.py -q
+./archive/codex_audit_m06a_r3.txt:791:pytest tests/v15/test_m06a_golden.py -q
+./archive/research/v18/v18_validation_sim.py:392:    from pymongo import MongoClient
+./archive/ops/launchd/com.quantslab.hl-wallet-collector.plist:18:  <key>EnvironmentVariables</key>
+./archive/app/controllers/directional_trading/x12_hl_price_lead.py:238:            from pymongo import MongoClient as _MongoClient
+./archive/ops/launchd/com.quantslab.pipeline.plist:5:	<key>EnvironmentVariables</key>
+./archive/ops/launchd/com.quantslab.pipeline.plist:11:		<key>ENVIRONMENT</key>
+./archive/app/services/services/hl_mm/orchestrator_v4.py:32:from pymongo import MongoClient
+./archive/codex_audit_m10_fix.txt:255:import pytest
+./archive/codex_audit_m10_fix.txt:277:@pytest.mark.parametrize("field", ["g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"])
+./archive/codex_audit_m10_fix.txt:278:@pytest.mark.parametrize("bad", [np.nan, "yes", 1, None])
+./archive/codex_audit_m10_fix.txt:284:@pytest.mark.parametrize("field,bad", [
+./archive/codex_audit_m10_fix.txt:294:@pytest.mark.parametrize("nf", [6, 7, 9, 0])
+./archive/codex_audit_m10_fix.txt:379:Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py -q
+./archive/codex_audit_m10_fix.txt:386:import pytest
+./archive/codex_audit_m10_fix.txt:399:    assert lad["p95"] == pytest.approx(np.percentile(null, 95), abs=1e-6)
+./archive/codex_audit_m10_fix.txt:401:    assert lad["p_value"] == pytest.approx(4 / 101, abs=1e-6)   # null>=0.97 -> 3 -> 4/101
+./archive/codex_audit_m10_fix.txt:425:    assert sorted(nd.tolist()) == pytest.approx([0.1, 0.2, 0.3])
+./archive/codex_audit_m10_fix.txt:518:    assert m.g1_chained_roe == pytest.approx(0.5302) and m.g3_max_chained_dd == 0.50
+./archive/codex_audit_m10_fix.txt:697:/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py tests/v15/test_m10_golden.py -q' in /Users/hermes/quants-lab
+./archive/codex_audit_m10_fix.txt:985:    15	import pytest
+./archive/codex_audit_m10_fix.txt:1007:    37	@pytest.mark.parametrize("field", ["g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"])
+./archive/codex_audit_m10_fix.txt:1008:    38	@pytest.mark.parametrize("bad", [np.nan, "yes", 1, None])
+./archive/codex_audit_m10_fix.txt:1014:    44	@pytest.mark.parametrize("field,bad", [
+./archive/codex_audit_m10_fix.txt:1024:    54	@pytest.mark.parametrize("nf", [6, 7, 9, 0])
+./archive/codex_audit_m10_fix.txt:1083:`/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py tests/v15/test_m10_golden.py -q`
+./archive/codex_audit_m10_fix.txt:1115:`/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py tests/v15/test_m10_golden.py -q`
+./archive/research/v18/v18_forward_holdout.py:93:    from pymongo import MongoClient
+./archive/ops/launchd/com.quantslab.arb-collector.plist:18:  <key>EnvironmentVariables</key>
+./archive/tests/test_phase1_strategy_factory.py:15:import pytest
+./archive/tests/test_phase1_strategy_factory.py:40:        with pytest.raises(KeyError):
+./archive/tests/test_phase1_strategy_factory.py:177:    pytest.main([__file__, "-v"])
+./archive/research/v13/v13_reconstruct_1m_candles_from_fills.py:29:from pymongo import MongoClient, UpdateOne
+./archive/ops/launchd/com.quantslab.listing-monitor.plist:18:  <key>EnvironmentVariables</key>
+./archive/app/services/services/hl_mm/orchestrator.py:36:from pymongo import MongoClient, UpdateOne
+./archive/research/v13/v13_pool_sweep_shard.py:32:import pymongo
+./archive/research/v13/v13_pool_sweep_shard.py:42:    client = pymongo.MongoClient("mongodb://localhost:27017")
+./archive/ops/launchd/com.quantslab.docker-stack.plist:22:	<key>EnvironmentVariables</key>
+./archive/tests/arb/test_v2_execution_engine.py:13:Run: MONGO_URI=mongodb://localhost:27017/quants_lab python -m pytest tests/arb/test_v2_execution_engine.py -v
+./archive/tests/arb/test_v2_execution_engine.py:17:import pytest
+./archive/tests/arb/test_v2_execution_engine.py:41:    @pytest.fixture(autouse=True)
+./archive/tests/arb/test_v2_execution_engine.py:507:import pytest_asyncio
+./archive/tests/arb/test_v2_execution_engine.py:579:@pytest.mark.asyncio
+./archive/tests/arb/test_v2_execution_engine.py:583:    @pytest_asyncio.fixture(autouse=True)
+./archive/tests/arb/test_v2_execution_engine.py:741:@pytest.mark.asyncio
+./archive/tests/arb/test_v2_execution_engine.py:745:    @pytest_asyncio.fixture(autouse=True)
+./archive/tests/arb/test_v2_execution_engine.py:928:@pytest.mark.asyncio
+./archive/tests/arb/test_v2_execution_engine.py:932:    @pytest_asyncio.fixture(autouse=True)
+./archive/tests/arb/test_v2_execution_engine.py:1087:@pytest.mark.asyncio
+./archive/tests/arb/test_v2_execution_engine.py:1091:    @pytest_asyncio.fixture(autouse=True)
+./archive/tests/arb/test_v2_execution_engine.py:1421:    pytest.main([__file__, "-v", "--tb=short"])
+./archive/research/v18/v18_raw_rebuild.py:893:    from pymongo import MongoClient
+./archive/ops/launchd/com.quantslab.api.plist:5:	<key>EnvironmentVariables</key>
+./archive/ops/launchd/com.quantslab.api.plist:11:		<key>ENVIRONMENT</key>
+./archive/app/controllers/directional_trading/e3_funding_carry.py:92:    # low-OI environments have worst WR across most pairs)
+./archive/tests/v26/test_freeze_labels.py:13:import pytest
+./archive/tests/v26/test_freeze_labels.py:33:@pytest.fixture
+./archive/tests/v26/test_freeze_labels.py:81:        with pytest.raises(SystemExit, match="sha mismatch"):
+./archive/tests/v26/test_freeze_labels.py:89:        with pytest.raises(SystemExit, match="sha mismatch"):
+./archive/tests/v26/test_freeze_labels.py:97:        with pytest.raises(SystemExit, match="does not match"):
+./archive/ops/launchd/com.quantslab.colima.plist:31:	<key>EnvironmentVariables</key>
+./archive/research/v13/v13_equity_reconstruct_v8.py:89:import pymongo
+./archive/research/v13/v13_equity_reconstruct_v8.py:116:        _mongo = pymongo.MongoClient(MONGO_URI)['quants_lab']
+./archive/tests/v26/test_corrections.py:8:import pytest
+./archive/tests/v26/test_corrections.py:77:        with pytest.raises(RuntimeError, match="non-finite"):
+./archive/app/services/services/hl_mm/__init__.py:25:  - pymongo (for logging + pair rankings)
+./archive/tests/v26/test_overlays.py:6:import pytest
+./archive/scripts/cleanup_tasks.py:9:from pymongo import MongoClient
+./archive/scripts/cleanup_tasks.py:12:# Load environment variables from .env file
+./archive/scripts/cleanup_tasks.py:19:        # Connect to MongoDB - use MONGO_URI from environment
+./archive/scripts/cleanup_tasks.py:24:            print("✗ MONGO_URI environment variable not set")
+./archive/scripts/cleanup_tasks.py:74:        # Connect to MongoDB - use MONGO_URI from environment
+./archive/scripts/cleanup_tasks.py:79:            print("✗ MONGO_URI environment variable not set")
+./archive/scripts/copy_rate_monitor.py:189:        print("ERROR: TG_BOT_TOKEN not set in environment")
+./archive/research/v16/engine_replay.py:211:    from pymongo import MongoClient
+./archive/tests/v26/test_fees.py:57:        import pytest
+./archive/tests/v26/test_fees.py:72:        with pytest.raises(RuntimeError, match="tier-departure assertion"):
+./archive/scripts/analyze_execution.py:20:from pymongo import MongoClient
+./archive/research/v16/knet_derisk_replay.py:21:from pymongo import MongoClient
+./archive/research/v13/v13_validate_reconstructed_candles.py:29:from pymongo import MongoClient
+./archive/research/v13/v13_validate_reconstructed_candles.py:216:    from pymongo import MongoClient
+./archive/tests/v26/conftest.py:5:import pytest
+./archive/tests/v26/conftest.py:13:@pytest.fixture
+./archive/tests/v26/conftest.py:31:@pytest.fixture
+./archive/tests/v26/conftest.py:38:@pytest.fixture
+./archive/scripts/x7_lp_withdrawal_eda.py:314:        from pymongo import MongoClient
+./archive/tests/v26/test_registry.py:4:import pytest
+./archive/tests/v26/test_registry.py:61:        with pytest.raises(ValueError):
+./archive/tests/hl_mm/test_fill_tracker.py:3:import pytest
+./archive/tests/hl_mm/test_fill_tracker.py:8:@pytest.fixture
+./archive/tests/hl_mm/test_wallet_scorer.py:3:import pytest
+./archive/tests/hl_mm/test_wallet_scorer.py:8:@pytest.fixture
+./archive/tests/hl_mm/test_wallet_scorer.py:20:        assert stats.total_notional == pytest.approx(5.5, abs=0.01)
+./archive/tests/hl_mm/test_wallet_scorer.py:51:        assert stats.ewma_markout == pytest.approx(-3.0, abs=0.1)
+./archive/tests/hl_mm/test_wallet_scorer.py:61:        assert stats.ewma_markout == pytest.approx(-4.0, abs=0.1)
+./archive/tests/hl_mm/test_mm_tracker.py:4:import pytest
+./archive/tests/hl_mm/test_mm_tracker.py:9:@pytest.fixture
+./archive/tests/hl_mm/test_pair_screener.py:5:import pytest
+./archive/tests/hl_mm/test_pair_screener.py:12:@pytest.fixture
+./archive/research/options_v4/regime/__init__.py:10:from pymongo import MongoClient
+./archive/tests/hl_mm/test_config_and_notifier.py:5:import pytest
+./archive/research/options_v4/risk/__init__.py:10:from pymongo import MongoClient
+./research/v15/v15_m01_equity_reconstruct.py:93:import pymongo
+./research/v15/v15_m01_equity_reconstruct.py:187:_mongo: Optional[pymongo.database.Database] = None
+./research/v15/v15_m01_equity_reconstruct.py:196:def get_mongo() -> pymongo.database.Database:
+./research/v15/v15_m01_equity_reconstruct.py:199:        _mongo = pymongo.MongoClient(MONGO_URI)["quants_lab"]
+./archive/app/controllers/directional_trading/x5_liq_cascade.py:185:        Only imports pymongo when called (not at module level) to keep the
+./archive/app/controllers/directional_trading/x5_liq_cascade.py:189:            from pymongo import MongoClient as _MongoClient
+./archive/app/services/services/arb_notifier.py:139:    from pymongo import MongoClient
+./archive/app/controllers/directional_trading/x9_funding_crowding.py:166:        into the same losing environment. Check both active and closed
+./archive/tests/hl_mm/test_quote_engine.py:6:import pytest
+./archive/tests/hl_mm/test_quote_engine.py:13:@pytest.fixture
+./archive/tests/hl_mm/test_quote_engine.py:203:        assert fills[0]["size"] == pytest.approx(50.0, abs=0.1)
+./archive/scripts/close_options_spread.py:64:    from pymongo import MongoClient
+./archive/app/services/services/arb_screener.py:20:from pymongo import MongoClient
+./archive/tests/hl_mm/test_ev_gate.py:7:import pytest
+./archive/tests/hl_mm/test_ev_gate.py:64:        assert ev_clean - ev_adverse == pytest.approx(3.0, abs=0.01)
+./archive/tests/hl_mm/test_ev_gate.py:70:        assert ev_favorable == pytest.approx(ev_zero, abs=0.01)
+./archive/tests/hl_mm/test_ev_gate.py:78:        assert ev_low_inv - ev_high_inv == pytest.approx(1.05, abs=0.01)
+./archive/app/services/services/portfolio_risk.py:20:from pymongo import MongoClient
+./archive/app/controllers/directional_trading/x10_liq_exhaust_revert.py:313:            from pymongo import MongoClient as _MongoClient
+./archive/tests/hl_mm/test_orchestrator.py:5:import pytest
+./archive/tests/hl_mm/test_signal_engine.py:6:import pytest
+./archive/tests/hl_mm/test_signal_engine.py:11:@pytest.fixture
+./archive/app/services/services/thin_executor.py:26:from pymongo import MongoClient
+./archive/app/data_sources/merge.py:44:    """Merge one flat data source into a candle DataFrame (sync/pymongo).
+./archive/app/data_sources/merge.py:47:        db: pymongo Database instance (caller manages lifecycle).
+./archive/app/data_sources/merge.py:194:        db: pymongo Database instance.
+./archive/tests/hl_mm/test_state_machine.py:3:import pytest
+./archive/tests/hl_mm/test_state_machine.py:8:@pytest.fixture
+./archive/app/services/services/arb_hlbb/orchestrator.py:24:from pymongo import MongoClient
+./archive/research/v16/entry_style.py:18:from pymongo import MongoClient
+./archive/app/data_sources/catalog.py:17:from pymongo import MongoClient
+./archive/app/services/services/arb_engine.py:126:        from pymongo import MongoClient
+./archive/tests/hl_mm/test_inventory_manager.py:6:import pytest
+./archive/tests/hl_mm/test_inventory_manager.py:13:@pytest.fixture
+./archive/tests/hl_mm/test_inventory_manager.py:83:        assert pos.notional_usd == pytest.approx(10.0, abs=0.1)
+./archive/scripts/codex_eda_prompt.md:38:from pymongo import MongoClient
+./archive/scripts/codex_eda_prompt.md:55:Python is at `/Users/hermes/miniforge3/envs/quants-lab/bin/python`. scipy and pymongo are available.
+./archive/app/services/services/arb_executor.py:30:from pymongo import MongoClient
+./archive/research/options_v4/execution/__init__.py:16:from pymongo import MongoClient
+./archive/tests/v13/test_module_02_journey_trace.py:9:import pytest
+./archive/tests/hl_mm/test_risk_manager.py:5:import pytest
+./archive/tests/hl_mm/test_risk_manager.py:10:@pytest.fixture
+./archive/app/engines/strategy_registry.py:678:        bot_image="quants-lab/hummingbot:demo-client-v2",  # pymongo + FARTCOIN/HYPE rate limiter
+./archive/tests/v13/test_module_01_equity_reconstruct.py:11:import pytest
+./archive/app/engines/research_tracker.py:55:PHASE_REQUIREMENTS = {
+./archive/app/engines/research_tracker.py:126:        """db: motor AsyncIOMotorDatabase or pymongo Database."""
+./archive/app/engines/research_tracker.py:157:            True if phase was recorded, False if requirements not met.
+./archive/app/engines/research_tracker.py:165:        # Check requirements
+./archive/app/engines/research_tracker.py:166:        required = PHASE_REQUIREMENTS.get(phase_enum, [])
+./archive/app/engines/research_tracker.py:250:        Handles both pymongo (sync) and motor (async) clients.
+./archive/app/services/services/arb_hlbb/instrument_rules.py:103:        """Check if qty meets minimum requirements on both venues."""
+./archive/tests/v13/test_module_11_strict_random_null.py:5:import pytest
+./archive/tests/v13/test_module_11_strict_random_null.py:78:    assert out["p95_sharpe"] == pytest.approx(0.42)
+./archive/tests/v13/test_module_11_strict_random_null.py:79:    assert out["median_sharpe"] == pytest.approx(0.42)
+./archive/tests/v13/test_module_11_strict_random_null.py:112:    assert out["p95_sharpe"] == pytest.approx(0.5)
+./archive/tests/v13/test_module_11_strict_random_null.py:148:    assert agg["median_sharpe"] == pytest.approx(0.4)
+./archive/tests/v13/test_module_11_strict_random_null.py:150:    assert agg["p95_sharpe"] == pytest.approx(0.58)
+./archive/app/services/services/arb_hlbb/signal_engine.py:22:from pymongo import MongoClient
+./archive/tests/v13/test_module_08_portfolio_simulator.py:5:import pytest
+./archive/scripts/x12_time_limit_sweep.py:54:from pymongo import MongoClient
+./archive/tests/v13/test_module_04_ranker_aggregation.py:8:import pytest
+./archive/tests/v13/test_module_04_ranker_aggregation.py:37:    assert score == pytest.approx(expected, rel=0.01)
+./archive/tests/v13/test_module_04_ranker_aggregation.py:56:    assert capped_jpd(100, 30) == pytest.approx(100/30)  # 3.33 < 5 → not capped
+./archive/tests/v13/test_module_04_ranker_aggregation.py:68:    assert pf == pytest.approx(0.2, rel=0.01)
+./archive/scripts/wallet_profiler.py:26:from pymongo import MongoClient
+./archive/tests/v13/test_module_05_execution_realism.py:6:import pytest
+./archive/tests/v13/test_module_05_execution_realism.py:13:@pytest.fixture
+./archive/tests/v13/test_module_05_execution_realism.py:19:@pytest.fixture
+./archive/tests/v13/test_module_05_execution_realism.py:25:@pytest.fixture
+./archive/tests/v13/test_module_05_execution_realism.py:31:@pytest.fixture
+./archive/tests/v13/test_module_05_execution_realism.py:67:    assert res.leg.executable_px == pytest.approx(expected_px)
+./archive/tests/v13/test_module_05_execution_realism.py:83:    assert res.leg.executable_px == pytest.approx(expected_px)
+./archive/tests/v13/test_module_05_execution_realism.py:126:    assert leg.cashflow_usd == pytest.approx(-leg.side * leg.qty * leg.executable_px)
+./archive/tests/v13/test_module_05_execution_realism.py:128:    assert leg.slip_attribution_usd == pytest.approx((leg.executable_px - mark) * leg.side * leg.qty)
+./archive/tests/v13/test_module_05_execution_realism.py:132:    assert (leg.cashflow_usd - naive_no_slip_cashflow) == pytest.approx(-leg.slip_attribution_usd)
+./archive/tests/v13/test_module_05_execution_realism.py:145:    assert res.leg.executable_px == pytest.approx(expected_px)
+./archive/tests/v13/test_module_05_execution_realism.py:287:    assert qty == pytest.approx(n_steps * coin_info_btc.qty_step, abs=1e-12)
+./archive/app/services/arb/position_store.py:16:import pymongo.errors
+./archive/app/services/arb/position_store.py:17:from pymongo import MongoClient
+./archive/app/services/arb/position_store.py:18:from pymongo.collection import Collection
+./archive/app/services/arb/position_store.py:193:        except pymongo.errors.DuplicateKeyError:
+./archive/tests/v13/test_module_06_cold_start.py:5:import pytest
+./archive/research/v16/exit_trail_v2_backtest.py:21:from pymongo import MongoClient
+./archive/research/v25/v25_r1_causal.py:3:API-FREE and CAUSAL (spec-frozen; gate-b blocker #4 fidelity requirements).
+./archive/scripts/research_options_macro_signals.py:23:from pymongo import MongoClient
+./archive/scripts/research_options_macro_signals.py:24:import pymongo
+./archive/scripts/research_options_macro_signals.py:74:    sort=[("timestamp_utc", pymongo.ASCENDING)]
+./archive/scripts/research_options_macro_signals.py:150:    sort=[("timestamp_utc", pymongo.ASCENDING)]
+./archive/scripts/research_options_macro_signals.py:161:    sort=[("timestamp_utc", pymongo.ASCENDING)]
+./archive/scripts/research_options_macro_signals.py:183:    sort=[("timestamp_utc", pymongo.ASCENDING)]
+./archive/tests/v13/test_module_07_portfolio_ledger.py:11:import pytest
+./archive/tests/v13/test_module_07_portfolio_ledger.py:78:    assert led.cash_usd == pytest.approx(10_000.0 - 5.0 - 10.2)
+./archive/tests/v13/test_module_07_portfolio_ledger.py:106:    with pytest.raises(ValueError, match="side"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:108:    with pytest.raises(ValueError, match="side"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:111:    with pytest.raises(ValueError, match="qty"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:114:    with pytest.raises(ValueError, match="qty"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:117:    with pytest.raises(ValueError, match="executable_px"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:119:    with pytest.raises(ValueError, match="executable_px"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:122:    with pytest.raises(ValueError, match="executable_px"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:125:    with pytest.raises(ValueError, match="fee_usd"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:141:    assert led.cash_usd == pytest.approx(10_000.0 - 0.6)
+./archive/tests/v13/test_module_07_portfolio_ledger.py:173:    with pytest.raises(ValueError, match="overflow"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:188:    with pytest.raises(ValueError, match="overflow"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:194:    with pytest.raises(ValueError, match="overflow"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:202:    with pytest.raises(ValueError, match="dust qty"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:216:    with pytest.raises(ValueError, match="cash_usd not finite"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:228:    with pytest.raises(ValueError, match="overflow"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:244:    with pytest.raises(ValueError, match="overflow"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:258:    with pytest.raises(ValueError, match="cash_usd not finite"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:270:    with pytest.raises(ValueError):  # not OverflowError
+./archive/tests/v13/test_module_07_portfolio_ledger.py:272:    with pytest.raises(ValueError):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:275:    with pytest.raises(ValueError):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:277:    with pytest.raises(ValueError):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:285:    with pytest.raises(ValueError, match="cash_usd"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:288:    with pytest.raises(ValueError, match="position_qty"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:292:    with pytest.raises(ValueError, match="side"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:294:    with pytest.raises(ValueError, match="qty"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:303:    with pytest.raises(ValueError, match="cash_usd"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:306:    with pytest.raises(ValueError, match="cash_usd"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:309:    with pytest.raises(ValueError, match="position_qty"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:312:    with pytest.raises(ValueError, match="position_qty"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:324:    with pytest.raises(ValueError, match="amount_usd"):
+./archive/tests/v13/test_module_07_portfolio_ledger.py:326:    with pytest.raises(ValueError, match="amount_usd"):
+./archive/app/services/arb/inventory_ledger.py:21:from pymongo import MongoClient
+./archive/app/services/arb/inventory_ledger.py:22:from pymongo.collection import Collection
+./archive/research/v16/blocked_trades_counterfactual.py:16:from pymongo import MongoClient
+./archive/tests/v13/conftest.py:1:"""V13 test infrastructure — pytest fixtures shared across all module tests.
+./archive/tests/v13/conftest.py:13:import pytest
+./archive/tests/v13/conftest.py:19:@pytest.fixture
+./archive/tests/v13/conftest.py:31:@pytest.fixture
+./archive/tests/v13/conftest.py:54:@pytest.fixture
+./archive/tests/v13/conftest.py:73:@pytest.fixture
+./archive/tests/v13/conftest.py:92:@pytest.fixture
+./archive/tests/v13/conftest.py:122:@pytest.fixture
+./archive/tests/v13/conftest.py:140:def pytest_addoption(parser):
+./archive/tests/v13/conftest.py:144:def pytest_collection_modifyitems(config, items):
+./archive/tests/v13/conftest.py:147:    skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
+./archive/research/v16/antifreeze_netx_backtest.py:17:from pymongo import MongoClient
+./archive/tests/v13/test_module_09_walk_forward_folds.py:5:import pytest
+./archive/app/services/services/arb_safety.py:14:from pymongo import MongoClient
+./archive/app/services/services/arb_safety.py:98:        """Check if an order meets exchange requirements."""
+./archive/tests/v13/test_module_10_pass_fail_gates.py:5:import pytest
+./archive/tests/test_phase0_fixes.py:10:import pytest
+./archive/tests/test_phase0_fixes.py:116:    pytest.main([__file__, "-v"])
+./archive/app/services/arb/entry_flow.py:21:from pymongo import MongoClient
+./archive/tests/v25/test_gates.py:4:import pytest
+./archive/tests/v25/test_gates.py:36:        assert e["overlap_frac"] == pytest.approx(0.1)
+./archive/tests/v25/test_gates.py:160:        assert row["unmarkable_frac"] == pytest.approx(2 / 25)
+./archive/tests/v25/test_gates.py:171:        assert row["unmarkable_frac"] == pytest.approx(1 / 25)
+./archive/tests/v25/test_gates.py:186:        assert row["unmarkable_frac"] == pytest.approx(0.0)   # NOT 1/26
+./archive/tests/v25/test_gates.py:204:        assert row["trail30_abs_pnl"] == pytest.approx(100.0)
+./archive/tests/v25/test_gates.py:205:        assert row["open_mtm_usd"] == pytest.approx(-10.0)
+./archive/tests/arb_hlbb/test_safety_fixes.py:4:import pytest
+./archive/tests/arb_hlbb/test_safety_fixes.py:67:@pytest.mark.asyncio
+./archive/tests/arb_hlbb/test_safety_fixes.py:91:@pytest.mark.asyncio
+./archive/tests/v25/conftest.py:5:import pytest
+./archive/tests/v25/conftest.py:12:@pytest.fixture
+./archive/tests/v25/test_bootstrap.py:4:import pytest
+./archive/tests/v25/test_bootstrap.py:15:        assert hurdle_daily_usd(100, 100) == pytest.approx(0.15)
+./archive/tests/v25/test_bootstrap.py:16:        assert hurdle_daily_usd(206, 103) == pytest.approx(0.30)
+./archive/tests/v25/test_bootstrap.py:65:        with pytest.raises(ValueError):
+./archive/tests/v25/test_bootstrap.py:83:        assert a["alpha_per_rule"] == pytest.approx(0.025)
+./archive/tests/v25/test_bootstrap.py:146:        assert r["lcb_bps"] in (10.0, -np.inf) or r["lcb_bps"] == pytest.approx(10.0)
+./archive/scripts/arb_h2_live_v3.py:309:        from pymongo import MongoClient
+./archive/scripts/arb_h2_live_v3.py:1656:                            from pymongo import MongoClient
+./archive/tests/v25/test_journeys.py:6:import pytest
+./archive/tests/v25/test_journeys.py:39:        assert j1["realized_pnl"] == pytest.approx(10.0)
+./archive/tests/v25/test_journeys.py:45:        assert j2["realized_pnl"] == pytest.approx(5.0)
+./archive/tests/v25/test_journeys.py:56:        assert j1["fees_paid"] == pytest.approx(fee_j1)
+./archive/tests/v25/test_journeys.py:57:        assert j2["fees_paid"] == pytest.approx(fee_j2)
+./archive/tests/v25/test_journeys.py:58:        assert j1["net_realized_pnl"] == pytest.approx(10.0 - fee_j1)
+./archive/tests/v25/test_journeys.py:59:        assert j2["net_realized_pnl"] == pytest.approx(5.0 - fee_j2)
+./archive/tests/v25/test_journeys.py:80:        assert r["realized_pnl"] == pytest.approx(10.0 + 20.0)
+./archive/tests/v25/test_journeys.py:82:        assert r["max_notional"] == pytest.approx(220.0)
+./archive/tests/v25/test_journeys.py:83:        assert r["duration_h"] == pytest.approx(2.0)
+./archive/tests/v25/test_journeys.py:92:        assert j.iloc[0]["realized_pnl"] == pytest.approx(2 * (130 - 110))  # basis 110
+./archive/tests/v25/test_journeys.py:108:        assert np.isnan(r["exit_ts"]) and r["open_size"] == pytest.approx(1.0)
+./archive/tests/v25/test_run_folds.py:8:import pytest
+./archive/research/v16/cap_level_sweep_v2.py:20:from pymongo import MongoClient
+./archive/scripts/x9_multi_hypothesis_factory.py:39:from pymongo import MongoClient
+./archive/scripts/x9_broad_hypothesis_sweep.py:28:from pymongo import MongoClient
+./research/v15/v15_m07_engine.py:119:    import pymongo
+./research/v15/v15_m07_engine.py:121:    db = pymongo.MongoClient(mongo_uri)["quants_lab"]
+./research/v15/v15_m07_engine.py:285:            import pymongo
+./research/v15/v15_m07_engine.py:286:            self._db = pymongo.MongoClient(self._mongo_uri)["quants_lab"]
+./archive/app/data_engine.py:38:from pymongo import MongoClient
+./archive/tests/v25/test_sim.py:7:import pytest
+./archive/tests/v25/test_sim.py:114:        assert t.iloc[0]["net_pnl"] == pytest.approx(0.0)     # flat marks, zero cost
+./archive/tests/v25/test_sim.py:115:        assert t.iloc[0]["entry_notional"] == pytest.approx(150.0)
+./archive/tests/v25/test_sim.py:210:        assert t.iloc[0]["net_pnl"] == pytest.approx(15.0)
+./archive/tests/v25/test_sim.py:211:        assert res["total_pnl"] == pytest.approx(15.0)
+./archive/tests/v25/test_sim.py:356:        assert d["daily_pnl"].sum() == pytest.approx(res["total_pnl"])
+./archive/tests/v25/test_sim.py:357:        assert res["final_equity"] == pytest.approx(INITIAL_EQUITY + res["total_pnl"])
+./archive/tests/v25/test_sim.py:358:        assert res["total_pnl"] == pytest.approx(15.0)
+./archive/tests/v25/test_sim.py:381:        assert res["max_mtm_dd_frac"] == pytest.approx(15.0 / 500.0, rel=1e-6)
+./archive/tests/v25/test_sim.py:399:        assert res["max_mtm_dd_frac"] == pytest.approx(15.0 / 500.0, rel=1e-6)
+./archive/tests/v25/test_sim.py:414:        assert res["max_mtm_dd_frac"] == pytest.approx(30.0 / 500.0, rel=1e-6)
+./archive/tests/v25/test_sim.py:461:        assert b.fee_oneway("BTC") == pytest.approx(4.32e-4)
+./archive/tests/v25/test_sim.py:462:        assert b.fee_oneway("xyz:FOO") == pytest.approx(8.64e-4)
+./archive/tests/v25/test_sim.py:463:        assert w.fee_oneway("BTC") == pytest.approx(4.5e-4)
+./archive/tests/v25/test_sim.py:464:        assert w.fee_oneway("xyz:FOO") == pytest.approx(9.0e-4)
+./archive/tests/v25/test_sim.py:465:        assert w.slip_oneway("BTC") == pytest.approx(7.0e-4)   # flat everywhere in WORST
+./archive/tests/v25/test_sim.py:466:        assert b.slip_oneway("UNCALIBRATED_COIN") == pytest.approx(4.7e-4)
+./archive/scripts/wallet_swi_backtest.py:15:from pymongo import MongoClient
+./archive/app/services/arb/signal_engine.py:22:from pymongo import MongoClient
+./archive/scripts/arb_bitvavo_queue_model.py:33:from pymongo import MongoClient
+./archive/scripts/arb_bitvavo_queue_model.py:299:        raise SystemExit("No symbols satisfy sample requirements.")
+./archive/research/v16/freeze_and_leader_perf.py:24:from pymongo import MongoClient
+./archive/research/v16/netx_sweep.py:6:from pymongo import MongoClient
+./archive/scripts/v11_performance_report.py:18:from pymongo import MongoClient
+./archive/scripts/analyze_arb_spreads.py:21:from pymongo import MongoClient
+./archive/scripts/hl_mm_shadow_quoter.py:30:from pymongo import MongoClient
+./archive/scripts/v11_heal_drift.py:27:from pymongo import MongoClient
+./archive/research/v16/entry_style_per_wallet.py:17:from pymongo import MongoClient
+./archive/research/v16/archetype_weighted_replay.py:21:from pymongo import MongoClient
+./archive/scripts/options_regime_monitor.py:22:from pymongo import MongoClient
+./archive/scripts/hl_measure_latency.py:457:    # Try .env first, then environment
+./archive/scripts/hl_measure_latency.py:473:        print("ERROR: HL_PRIVATE_KEY and HL_ADDRESS not found in .env or environment")
+./archive/research/v16/cap_level_sweep.py:16:from pymongo import MongoClient
+./archive/app/services/arb/tier_engine.py:20:from pymongo import MongoClient
+./archive/research/v16/capital_ladder.py:38:from pymongo import MongoClient
+./archive/scripts/hl_mm_live_canary.py:32:from pymongo import MongoClient
+./archive/research/v16/funding_session_check.py:15:from pymongo import MongoClient
+./archive/app/services/arb/inventory_risk_guard.py:26:from pymongo import MongoClient
+./archive/research/v15/live_cohort_forward_track_v2.py:25:from pymongo import MongoClient
+./archive/scripts/arb_hl_bybit_perp_v1.py:38:from pymongo import MongoClient
+./archive/scripts/e3_robustness.py:35:from pymongo import MongoClient
+./archive/research/v15/live_cohort_forward_track.py:23:from pymongo import MongoClient
+./archive/scripts/copy_target_analysis.py:24:from pymongo import MongoClient
+./archive/app/services/arb/exit_flow.py:23:from pymongo import MongoClient
+./archive/scripts/hl_x17_simulation.py:40:from pymongo import MongoClient
+./archive/scripts/x10_phase0_validation.py:35:from pymongo import MongoClient
+./archive/scripts/research_microstructure_signals.py:17:from pymongo import MongoClient
+./archive/research/v16/archetype_edge.py:17:from pymongo import MongoClient
+./archive/app/web/dashboard.py:33:from pymongo import MongoClient
+./archive/app/tasks/data_collection/okx_funding_task.py:28:from pymongo import MongoClient, UpdateOne
+./archive/scripts/hl_copy_trader_v10.py:31:from pymongo import MongoClient
+./archive/scripts/copyability_overlay.py:66:from pymongo import MongoClient
+./archive/research/v16/exit_capture_sim.py:24:from pymongo import MongoClient
+./archive/scripts/codex_eda_h2_prompt.md:21:from pymongo import MongoClient
+./archive/scripts/codex_eda_h2_prompt.md:29:Python: `/Users/hermes/miniforge3/envs/quants-lab/bin/python`. scipy, pymongo available.
+./archive/app/tasks/data_collection/bybit_derivatives_task.py:14:from pymongo import UpdateOne
+./archive/scripts/wallet_copytrade_backtest.py:16:from pymongo import MongoClient
+./archive/scripts/arb_independent_eda.py:9:from pymongo import MongoClient
+./archive/scripts/x12_long_short_analysis.py:60:from pymongo import MongoClient
+./archive/app/tasks/data_collection/binance_top_trader_task.py:21:from pymongo import MongoClient, UpdateOne
+./archive/scripts/x12_regime_stress.py:61:from pymongo import MongoClient
+./archive/app/tasks/data_collection/binance_funding_task.py:15:from pymongo import UpdateOne
+./archive/scripts/pairs_research.py:17:from pymongo import MongoClient
+./archive/codex_review_phase2.txt:772:environment.yml
+./archive/codex_review_phase2.txt:1060:pyproject.toml
+./archive/codex_review_phase2.txt:3542:    33	from pymongo import MongoClient
+./archive/codex_review_phase2.txt:3709:  4547	        from pymongo import MongoClient as _MC
+./archive/codex_review_phase2.txt:3847:    18	  <key>EnvironmentVariables</key>
+./archive/codex_review_phase2.txt:3943:    15	# Load environment
+./archive/codex_review_phase2.txt:4107:    21	# Make RUN commands use the new environment
+./archive/cli.py:17:# Load environment variables from .env file
+./archive/cli.py:35:    from pymongo import MongoClient
+./archive/cli.py:62:    from pymongo import MongoClient
+./archive/cli.py:631:    from pymongo import MongoClient
+./archive/cli.py:632:    from app.engines.research_tracker import ResearchTracker, ResearchPhase, PHASE_REQUIREMENTS
+./archive/cli.py:647:        # Show requirements for next phase
+./archive/cli.py:652:            reqs = PHASE_REQUIREMENTS.get(next_phase, [])
+./archive/cli.py:670:        reqs = PHASE_REQUIREMENTS.get(phase_enum, [])
+./archive/cli.py:684:            print(f"Failed to advance — check requirements")
+./archive/cli.py:720:    from pymongo import MongoClient
+./archive/scripts/arb_h2_paper.py:27:from pymongo import MongoClient
+./archive/scripts/bitvavo_eur_edge_discovery.py:27:from pymongo import MongoClient
+./archive/scripts/unlock_event_study.py:9:from pymongo import MongoClient
+./archive/app/tasks/tasks/watchdog_task.py:24:from pymongo import MongoClient
+./archive/scripts/x9_phase0_validation.py:36:from pymongo import MongoClient
+./archive/scripts/x9_phase0_validation.py:649:        print("\n  ❌ PHASE 0 FAILED — Signal does not meet governance requirements")
+./archive/scripts/research_whale_xsect_signals.py:23:from pymongo import MongoClient
+./archive/app/tasks/tasks/backtesting/bulk_backtest_task.py:88:        Uses the sync merge engine (pymongo) since the parent process only needs this
+./archive/app/tasks/tasks/backtesting/bulk_backtest_task.py:99:        from pymongo import MongoClient as SyncClient
+./archive/app/tasks/tasks/risk_state_task.py:22:from pymongo import MongoClient
+./archive/app/tasks/tasks/risk_state_task.py:27:# to do `MongoClient(uri)[db]` per run and never close() -> pymongo's monitor threads keep each client
+./archive/scripts/bitvavo_arb_1m_sweep.py:26:from pymongo import MongoClient
+./archive/scripts/options_regime_adaptive_backtest.py:42:from pymongo import MongoClient
+./archive/app/tasks/tasks/backtesting/_backtest_worker.py:26:from pymongo import MongoClient
+./archive/scripts/x7_cex_subsecond_eda.py:21:from pymongo import MongoClient
+./archive/scripts/v13/v13_equity_reconstruct_v5.py:53:import pymongo
+./archive/scripts/v13/v13_equity_reconstruct_v5.py:77:        _mongo = pymongo.MongoClient(MONGO_URI)['quants_lab']
+./archive/app/tasks/tasks/backtesting/walk_forward_task.py:196:                from pymongo import MongoClient
+./archive/app/tasks/tasks/backtesting/walk_forward_task.py:273:            from pymongo import MongoClient as SyncClient
+./archive/scripts/v13/v13_equity_reconstruct_v7.py:56:import pymongo
+./archive/scripts/v13/v13_equity_reconstruct_v7.py:83:        _mongo = pymongo.MongoClient(MONGO_URI)['quants_lab']
+./archive/scripts/collect_hyperliquid_micro_1s.py:31:from pymongo import MongoClient, UpdateOne
+./archive/scripts/copyability_eval.py:40:from pymongo import MongoClient
+./archive/scripts/hl_mm_v2_live.py:19:Environment:
+./archive/scripts/hl_mm_v2_live.py:93:    # Load environment
+./archive/scripts/hl_copy_trader.py:27:from pymongo import MongoClient
+./archive/app/tasks/tasks/backtesting/continuous_validation_task.py:21:from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/fear_greed_task.py:15:from pymongo import UpdateOne
+./archive/scripts/arb_h2_usdc_paper.py:29:from pymongo import MongoClient
+./archive/app/tasks/tasks/notebook/notebook_task.py:378:            # Run in subprocess with proper environment
+./archive/app/tasks/tasks/notebook/notebook_task.py:383:                env=None  # Inherit current environment
+./archive/app/tasks/tasks/notebook/notebook_task.py:419:                # Try to execute with fresh kernel environment
+./archive/scripts/copy_trade_backtest.py:21:from pymongo import MongoClient
+./archive/scripts/x7_smart_money_ic_analysis.py:213:    from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/hyperliquid_funding_task.py:14:from pymongo import UpdateOne
+./archive/scripts/x12_discriminator.py:65:from pymongo import MongoClient
+./archive/scripts/e3_filter_ab_test.py:220:    from pymongo import MongoClient
+./archive/scripts/options_vrp_monitor.py:19:from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/defillama_task.py:18:from pymongo import UpdateOne
+./archive/app/tasks/tasks/data_collection/data_retention_task.py:19:from pymongo import MongoClient
+./archive/scripts/kill_switch_logic.py:14:from pymongo import MongoClient
+./archive/app/tasks/tasks/telegram_bot_task.py:296:        from pymongo import MongoClient
+./archive/app/tasks/tasks/telegram_bot_task.py:376:        from pymongo import MongoClient
+./archive/scripts/x9_regime_validation.py:33:from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/storage_guard_task.py:12:from pymongo import MongoClient
+./archive/scripts/arb_paper_report.py:26:from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/deribit_dvol_task.py:16:from pymongo import UpdateOne
+./archive/scripts/x11_hyperliquid_signal_eda.py:33:from pymongo import MongoClient
+./archive/scripts/options_iron_condor_backtest.py:22:from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/hyperliquid_microstructure_task.py:30:from pymongo import UpdateOne
+./archive/scripts/live_mainnet.py:37:from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/tick_aggregation_task.py:44:from pymongo import MongoClient, UpdateOne
+./archive/scripts/d1_hl_whale_ic_backtest.py:23:from pymongo import MongoClient
+./archive/app/tasks/tasks/data_collection/hyperliquid_candles_task.py:24:from pymongo import UpdateOne
+./archive/scripts/v12_dashboard.py:18:from pymongo import MongoClient
+./archive/app/research/queries/README.md:13:Requires DUNE_API_KEY in environment. Use `dune_client` Python package:
+./archive/scripts/crypto_options_strategy_research.py:12:    uv run --no-project --with pymongo --with pandas --with numpy \
+./archive/scripts/crypto_options_strategy_research.py:31:from pymongo import MongoClient
+./archive/app/tasks/tasks/deployment/deployment_base_task.py:120:        requirements, or operational constraints.
+./archive/app/tasks/tasks/data_collection/coinalyze_task.py:18:from pymongo import UpdateOne
+./archive/app/tasks/tasks/execution/thin_executor_task.py:15:from pymongo import MongoClient
+./archive/app/tasks/tasks/execution/thin_executor_task.py:20:# per run with no close() -> pymongo monitor threads keep each alive -> unbounded leak (same class as
+./archive/app/research/wallet_alpha/phase3_features.py:20:from pymongo import MongoClient
+./archive/tests/arb_hlbb/test_live_readiness_fixes.py:13:import pytest
+./archive/app/tasks/tasks/resolution/reconciliation.py:32:    """Query MongoDB collection, handling both sync (pymongo) and async (motor)."""
+./archive/app/research/wallet_alpha/regime_tagger.py:19:from pymongo import MongoClient
+
+codex
+There is a project conda interpreter referenced in the repo docs/tests. I’ll use that for verification instead of the system Python, since the system environment is missing dependencies.
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path('research/v15').resolve()))
+import v15_m02_journey_trace as m02
+sys.path.insert(0, str(Path('tests/v15').resolve()))
+from test_m02 import _fill
+from v15_m02_journey_trace import LifecycleFillEvent
+f=_fill(1000,'BTC','B',1,100,0,tid=1)
+f['sz']=float('nan')
+f['signed_sz']=float('nan')
+e=[LifecycleFillEvent(ts=int(f['time']), event_order=0, fill=f)]
+try:
+    actions, journeys = m02.trace_wallet('0x', e, [f], [], equity_enriched=False)
+    print('returned', actions, journeys)
+except Exception as exc:
+    print('raised', type(exc).__name__, repr(exc))
+PY" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q' in /Users/hermes/quants-lab
+ succeeded in 3023ms:
+raised KeyError KeyError('BTC')
+
+ succeeded in 3537ms:
+...................................                                      [100%]
+35 passed in 1.92s
+
+codex
+The targeted suite passes under the project interpreter. Static review found one remaining non-finite `signed_sz` path that does not produce a clean invalid row; it raises inside the state machine. That is fail-closed in the batch driver, but it contradicts the stated “non-finite size tags lifecycle invalid” behavior for direct `trace_wallet` callers.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '360,455p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   360	        is_liq = bool(f.get("is_liquidation"))
+   361	        row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
+   362	        actual_fee = _fill_fee_usd_actual(f)
+   363	
+   364	        position = st["position"]
+   365	        cost_basis = st["cost_basis"]
+   366	
+   367	        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+   368	        first_fill = not coin_seen_first_fill.get(coin, False)
+   369	        sp = float(f.get("startPosition", 0.0) or 0.0)
+   370	        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+   371	        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+   372	        # True (fabricated pre-position). Fail CLOSED: non-finite inputs invalidate the lifecycle so downstream
+   373	        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
+   374	        sp_finite = bool(np.isfinite(sp))
+   375	        inputs_finite = sp_finite and bool(np.isfinite(signed)) and bool(np.isfinite(price))
+   376	        if not inputs_finite:
+   377	            st["lifecycle_valid"] = False
+   378	            st["state_discontinuity"] = True
+   379	            if not sp_finite:
+   380	                sp = 0.0   # neutralize the denominator math; carry_in tagged UNKNOWN below (not SEEDED)
+   381	        state_resynced = False
+   382	        if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+   383	            # Missing/ambiguous fills: never continue a fabricated lifecycle.
+   384	            # Close the interrupted journey as INVALID, then causally reseed
+   385	            # from the current fill's authoritative pre-position.
+   386	            if st["open"]:
+   387	                st["lifecycle_valid"] = False
+   388	                st["state_discontinuity"] = True
+   389	                j = _finalize(coin, st, ts)
+   390	                if j is not None:
+   391	                    journeys.append(j)
+   392	            st = _new_state()
+   393	            coin_state[coin] = st
+   394	            position = 0.0
+   395	            cost_basis = 0.0
+   396	            first_fill = True
+   397	            state_resynced = True
+   398	        if first_fill:
+   399	            coin_seen_first_fill[coin] = True
+   400	            if abs(sp) > EPS:
+   401	                # Open an already-in-progress journey, sized causally.
+   402	                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+   403	                st.update(
+   404	                    position=sp, cost_basis=price,  # best causal cost proxy = first observed px
+   405	                    open=True, side=(1 if sp > 0 else -1),
+   406	                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+   407	                    max_notional=abs(sp) * price, n_carry_in=1,
+   408	                    carry_in_status="SEEDED", fee_scope=row_scope,
+   409	                )
+   410	                position = sp
+   411	                cost_basis = price
+   412	            else:
+   413	                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+   414	                st["carry_in_status"] = "SEEDED" if sp_finite else "UNKNOWN"
+   415	
+   416	        if not bool(f.get("causal_order_ok", True)):
+   417	            st["lifecycle_valid"] = False
+   418	
+   419	        # closedPnl ground truth (fallback to cost-basis derived).
+   420	        raw_pnl = f.get("closedPnl", None)
+   421	        new_pos_preview = position + signed
+   422	        if raw_pnl is None or (isinstance(raw_pnl, float) and raw_pnl != raw_pnl):
+   423	            if (position > 0 and signed < 0) or (position < 0 and signed > 0):
+   424	                if abs(new_pos_preview) < EPS:
+   425	                    closed_qty = position
+   426	                elif (position > 0 and new_pos_preview > 0) or (position < 0 and new_pos_preview < 0):
+   427	                    closed_qty = -signed
+   428	                else:
+   429	                    closed_qty = position
+   430	                closed_pnl = float((price - cost_basis) * closed_qty)
+   431	            else:
+   432	                closed_pnl = 0.0
+   433	        else:
+   434	            closed_pnl = float(raw_pnl)
+   435	
+   436	        # PRE-fill peak capture.
+   437	        pre_notional = abs(position) * price
+   438	        if abs(position) > EPS and pre_notional > st["max_notional"]:
+   439	            st["max_notional"] = pre_notional
+   440	            st["peak_ts"] = ts
+   441	
+   442	        new_pos = position + signed
+   443	        notional_after = abs(new_pos) * price
+   444	        fill_notional = abs(signed) * price
+   445	        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
+   446	
+   447	        # ---- state machine ----
+   448	        action_type = None
+   449	        opening_jid = None
+   450	        closing_jid = None
+   451	
+   452	        if abs(position) < EPS and abs(new_pos) > EPS:
+   453	            # ENTRY
+   454	            coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+   455	            st.update(
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '515,655p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   515	                closing_fee = abs(position) * price * FEE_RATE
+   516	                opening_fee = abs(new_pos) * price * FEE_RATE
+   517	            st["fees_paid"] += closing_fee
+   518	            closing_jid = st["journey_id"]
+   519	            j = _finalize(coin, st, ts)
+   520	            if j is not None:
+   521	                journeys.append(j)
+   522	            # open the new (reversed) leg
+   523	            coin_journey_counter[coin] += 1
+   524	            st.update(_new_state())
+   525	            st.update(
+   526	                journey_id=coin_journey_counter[coin], open=True,
+   527	                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+   528	                n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
+   529	                fees_paid=opening_fee, fee_scope=row_scope,
+   530	                carry_in_status="SEEDED",
+   531	            )
+   532	            coin_state[coin] = st
+   533	            action_type = "REVERSE"
+   534	            opening_jid = st["journey_id"]
+   535	
+   536	        st["position"] = new_pos
+   537	
+   538	        # ---- optional equity basis + action row ----
+   539	        # Core M02 deliberately does not read M01, anchors, or market marks.
+   540	        if equity_enriched:
+   541	            basis = select_equity_basis(ee)
+   542	            # SIZING signal: use only a bar that has closed by ts.
+   543	            _raw_mark = m01.get_mark(coin, ts, causal=True)
+   544	            # AUDIT 2026-07-10 (codex m02 P1): a NaN/inf mark (or NaN/inf equity) must NOT survive into
+   545	            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
+   546	            # Require FINITE mark AND finite non-trivial equity, else the action is unsizeable (target=None).
+   547	            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
+   548	            mark = float(_raw_mark) if mark_ok else None
+   549	            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark_ok else None
+   550	            eq_ok = (basis.equity is not None and np.isfinite(basis.equity) and abs(basis.equity) > EPS)
+   551	            if basis.mode == "NO_ANCHOR" or not eq_ok or not mark_ok:
+   552	                target_pct = None
+   553	            else:
+   554	                target_pct = (new_pos * mark) / basis.equity
+   555	        else:
+   556	            basis = EquityBasis(
+   557	                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+   558	                anchor_ts=None, mark_ts=None, degraded=False,
+   559	                frozen_value=0.0, frozen_age_s=0.0,
+   560	                frozen_materiality_frac=float("nan"),
+   561	            )
+   562	            mark = None
+   563	            sizing_mark_ts = None
+   564	            target_pct = None
+   565	
+   566	        actions.append({
+   567	            "wallet": wallet, "coin": coin, "ts": ts,
+   568	            "fill_id": int(f.get("tid", 0) or 0),
+   569	            "event_order": ee.event_order,
+   570	            "action_type": action_type,
+   571	            "signed_size": signed, "price": price,
+   572	            "position_after": new_pos,
+   573	            "mark": mark, "mark_ts": sizing_mark_ts,
+   574	            "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
+   575	            "anchor_ts": basis.anchor_ts,
+   576	            "equity_basis_mode": basis.mode,
+   577	            "equity_degraded": basis.degraded,
+   578	            "frozen_component_value": basis.frozen_value,
+   579	            "frozen_component_age_s": basis.frozen_age_s,
+   580	            "frozen_materiality_frac": basis.frozen_materiality_frac,
+   581	            "target_exposure_pct": target_pct,
+   582	            "is_liquidation": is_liq,
+   583	            "opening_journey_id": opening_jid,
+   584	            "closing_journey_id": closing_jid,
+   585	            "journey_id": opening_jid,  # back-compat = opening side
+   586	            "carry_in_status": st["carry_in_status"],
+   587	            "state_resynced": state_resynced,
+   588	            "causal_order_ok": bool(f.get("causal_order_ok", True)),
+   589	            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+   590	            # Final value is recomputed after every journey has been finalized.
+   591	            # A future gap can retroactively invalidate earlier actions in the
+   592	            # interrupted journey; a raw live trade stream also cannot repair
+   593	            # the resync row because it does not carry startPosition.
+   594	            "stream_replay_valid": bool(
+   595	                st.get("lifecycle_valid", True)
+   596	                and bool(f.get("causal_order_ok", True))
+   597	                and not state_resynced
+   598	            ),
+   599	        })
+   600	
+   601	    # Positions still open at window end → flag (not finalized).
+   602	    # AUDIT 2026-07-10 (codex m02 P1): finalize an OPEN journey through the WINDOW END (end_ms), not peak_ts.
+   603	    # Using peak_ts truncated duration to 0 and dropped funding accrued between peak and window end. exit_ts
+   604	    # stays None (still open). Falls back to the old peak_ts behavior only when end_ms is not supplied.
+   605	    for coin, st in coin_state.items():
+   606	        if st["open"] and st["open_ts"] is not None:
+   607	            _close_ts = end_ms if end_ms is not None else (st["peak_ts"] or st["open_ts"])
+   608	            _close_ts = max(_close_ts, st["open_ts"])   # never negative duration
+   609	            j = _finalize(coin, st, _close_ts)
+   610	            if j is not None:
+   611	                j["open_at_window_end"] = True
+   612	                j["exit_ts"] = None
+   613	                journeys.append(j)
+   614	
+   615	    # Lifecycle validity is only known once the whole wallet has been walked.
+   616	    # If a later position discontinuity interrupts a journey, propagate that
+   617	    # failure back to every already-emitted action belonging to that journey.
+   618	    # Without this pass, downstream code can filter lifecycle_valid=True and
+   619	    # still ingest the beginning of a journey proven broken later.
+   620	    invalid_journeys = {
+   621	        (str(j["coin"]), int(j["journey_id"]))
+   622	        for j in journeys
+   623	        if not bool(j.get("lifecycle_valid", True)) and j.get("journey_id") is not None
+   624	    }
+   625	    invalid_stream_journeys = set(invalid_journeys)
+   626	    for action in actions:
+   627	        if action.get("state_resynced", False):
+   628	            invalid_stream_journeys.update(
+   629	                (str(action["coin"]), int(jid))
+   630	                for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+   631	                if jid is not None
+   632	            )
+   633	    for action in actions:
+   634	        involved = {
+   635	            (str(action["coin"]), int(jid))
+   636	            for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+   637	            if jid is not None
+   638	        }
+   639	        lifecycle_valid = bool(action.get("causal_order_ok", True)) and not bool(
+   640	            involved & invalid_journeys
+   641	        )
+   642	        action["lifecycle_valid"] = lifecycle_valid
+   643	        action["stream_replay_valid"] = bool(
+   644	            lifecycle_valid
+   645	            and not action.get("state_resynced", False)
+   646	            and not bool(involved & invalid_stream_journeys)
+   647	        )
+   648	    for journey in journeys:
+   649	        key = (str(journey["coin"]), int(journey["journey_id"]))
+   650	        journey["stream_replay_valid"] = bool(
+   651	            journey.get("lifecycle_valid", True)
+   652	            and key not in invalid_stream_journeys
+   653	        )
+   654	
+   655	    return actions, journeys
+
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15 -q' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '675,710p;795,845p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   675	
+   676	def process_wallet(args: tuple) -> dict:
+   677	    wallet, start_ms, end_ms, equity_enriched = args
+   678	    try:
+   679	        if equity_enriched:
+   680	            anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
+   681	            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+   682	            if "error" in res:
+   683	                return {"wallet": wallet, "error": res["error"]}
+   684	            events = res["events"]
+   685	            fills = res["fills"]
+   686	            funding = res["funding"]
+   687	            n_anchors = len(res["weekly_anchors"])
+   688	            inter_drift = res["inter_anchor_drift"]
+   689	        else:
+   690	            fills = m01.load_wallet_fills(wallet, start_ms, end_ms)
+   691	            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+   692	            events = [
+   693	                LifecycleFillEvent(
+   694	                    ts=int(fill["time"]),
+   695	                    event_order=int(fill.get("fill_seq", i)),
+   696	                    fill=fill,
+   697	                )
+   698	                for i, fill in enumerate(fills)
+   699	            ]
+   700	            n_anchors = None
+   701	            inter_drift = None
+   702	        actions, journeys = trace_wallet(
+   703	            wallet, events, fills, funding, equity_enriched=equity_enriched, end_ms=end_ms
+   704	        )
+   705	        return {
+   706	            "wallet": wallet, "actions": actions, "journeys": journeys,
+   707	            "n_anchors": n_anchors,
+   708	            "inter_drift": inter_drift,
+   709	        }
+   710	    except Exception as e:  # noqa: BLE001
+   795	    aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
+   796	    jw = ShardedParquetWriter(args.journeys_out, flush_rows=args.flush_rows)
+   797	    errors: list[tuple] = []
+   798	
+   799	    def _consume(r: dict) -> None:
+   800	        if "error" in r:
+   801	            errors.append((r["wallet"], r["error"]))
+   802	        else:
+   803	            aw.add_many(r.get("actions"))
+   804	            jw.add_many(r.get("journeys"))
+   805	        _log_one(r, len(wallets))
+   806	
+   807	    # ALWAYS run via a Pool (even procs=1) with maxtasksperchild so the worker process is RECYCLED
+   808	    # periodically -> the per-coin marks cache (m01._coin_series, which grows unbounded as a long-lived
+   809	    # worker touches more of the 1830-coin universe) is RESET, keeping RSS under worker_soft_gb. Without
+   810	    # this the procs=1 in-process loop blew the 2.5G soft cap at ~153 wallets (memory-guard abort, exit
+   811	    # 137) once the marks cache grew (1830 coins to 06-24). maxtasksperchild forks a fresh worker every
+   812	    # N wallets; on macOS spawn this re-imports m01 -> empty cache. (Fix 2026-06-25, codex marks-rebuild.)
+   813	    MAXTASKS_PER_CHILD = 40
+   814	    with Pool(max(1, budget.procs), initializer=_init_worker,
+   815	              initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
+   816	              maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
+   817	        # AUDIT 2026-07-10 (codex m02 P2): ORDERED imap so physical output row/shard order is deterministic
+   818	        # run-to-run (same wallets file -> byte-stable parts). Rows are identical either way; determinism only.
+   819	        for r in pool.imap(process_wallet, tasks):
+   820	            _consume(r)
+   821	
+   822	    n_actions = aw.close()
+   823	    n_journeys = jw.close()
+   824	    logger.info(f"Wrote {args.actions_out}: {n_actions:,} actions")
+   825	    logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
+   826	    logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")
+   827	    # AUDIT 2026-07-10 (codex m02 P1): a worker exception used to be logged and swallowed -> a PARTIAL wallet
+   828	    # universe was written and the process exited 0, so downstream consumed an incomplete set as if complete.
+   829	    # Fail CLOSED: write an explicit error manifest and exit non-zero so the pipeline halts on any wallet error.
+   830	    if errors:
+   831	        manifest = str(Path(args.actions_out).with_suffix(".errors.json"))
+   832	        try:
+   833	            Path(manifest).write_text(json.dumps(
+   834	                {"n_errors": len(errors), "n_wallets": len(wallets),
+   835	                 "errors": [{"wallet": w, "error": e} for w, e in errors]}, indent=2))
+   836	        except Exception as _me:  # noqa: BLE001
+   837	            logger.error(f"could not write error manifest {manifest}: {_me!r}")
+   838	        logger.error(f"{len(errors)}/{len(wallets)} wallet ERRORS -> partial universe. manifest={manifest}. "
+   839	                     f"first: {errors[:10]}")
+   840	        raise SystemExit(1)
+   841	
+   842	
+   843	def _log_one(r: dict, n: int) -> None:
+   844	    if "error" in r:
+   845	        logger.warning(f"  {r['wallet'][:12]} -> {r['error']}")
+
+ succeeded in 14695ms:
+........................................................................ [ 18%]
+........................................................................ [ 37%]
+........................................................................ [ 56%]
+........................................................................ [ 75%]
+........................................................................ [ 94%]
+...................                                                      [100%]
+379 passed in 13.45s
+
+codex
+Verdict: **not quite trusted yet**.
+
+I found one remaining bug:
+
+- [research/v15/v15_m02_journey_trace.py:375](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:375): non-finite `signed_sz` is detected, but execution continues into the state machine with `new_pos = NaN`. For a first flat fill, all normal branches fail and it falls into `REVERSE`, then [line 523](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:523) does `coin_journey_counter[coin] += 1` before the coin has a counter, raising `KeyError`.
+  - I reproduced this with `signed_sz = NaN`: `trace_wallet(...)` raises `KeyError('BTC')`.
+  - In batch mode this becomes a worker error and now fails closed via the manifest/nonzero exit, so it does not silently slip downstream.
+  - But it does not satisfy the stated fix that non-finite size produces an invalid lifecycle/action row, and it is not covered by the golden tests.
+
+Everything else reviewed cleanly:
+
+- Open-at-window-end: looks closed. `end_ms` is threaded from `process_wallet`, open journeys accrue duration/funding through window end, and `exit_ts` remains `None`.
+- `end_ms` omitted: backward-compatible path is preserved via `peak_ts or open_ts`; golden covers this.
+- Non-finite `startPosition`: now invalidates lifecycle and tags `carry_in_status="UNKNOWN"` instead of fabricating clean flat carry-in.
+- NaN/inf mark and equity: sizing is blocked with `mark=None`, `mark_ts=None`, `target_exposure_pct=None`.
+- Worker errors: no longer swallowed; ordered `imap` keeps deterministic output order.
+- Finite guard placement is mostly correct: it runs before the state machine consumes `sp`/`signed`/`price`, but it still allows non-finite `signed`/`price` to flow into arithmetic. `price` is survivable because invalid journeys propagate; `signed_sz=NaN` is the remaining bad path.
+
+Verification run:
+
+```text
+/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q
+35 passed
+
+/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15 -q
+379 passed
+```
+
+OVERALL: **m02 is look-ahead-safe and batch fail-CLOSED, but not ready to mark TRUSTED yet**. Remaining item: handle non-finite `signed_sz` explicitly before state-machine arithmetic, and add a golden test for it.
+tokens used
+48.127
+Verdict: **not quite trusted yet**.
+
+I found one remaining bug:
+
+- [research/v15/v15_m02_journey_trace.py:375](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:375): non-finite `signed_sz` is detected, but execution continues into the state machine with `new_pos = NaN`. For a first flat fill, all normal branches fail and it falls into `REVERSE`, then [line 523](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:523) does `coin_journey_counter[coin] += 1` before the coin has a counter, raising `KeyError`.
+  - I reproduced this with `signed_sz = NaN`: `trace_wallet(...)` raises `KeyError('BTC')`.
+  - In batch mode this becomes a worker error and now fails closed via the manifest/nonzero exit, so it does not silently slip downstream.
+  - But it does not satisfy the stated fix that non-finite size produces an invalid lifecycle/action row, and it is not covered by the golden tests.
+
+Everything else reviewed cleanly:
+
+- Open-at-window-end: looks closed. `end_ms` is threaded from `process_wallet`, open journeys accrue duration/funding through window end, and `exit_ts` remains `None`.
+- `end_ms` omitted: backward-compatible path is preserved via `peak_ts or open_ts`; golden covers this.
+- Non-finite `startPosition`: now invalidates lifecycle and tags `carry_in_status="UNKNOWN"` instead of fabricating clean flat carry-in.
+- NaN/inf mark and equity: sizing is blocked with `mark=None`, `mark_ts=None`, `target_exposure_pct=None`.
+- Worker errors: no longer swallowed; ordered `imap` keeps deterministic output order.
+- Finite guard placement is mostly correct: it runs before the state machine consumes `sp`/`signed`/`price`, but it still allows non-finite `signed`/`price` to flow into arithmetic. `price` is survivable because invalid journeys propagate; `signed_sz=NaN` is the remaining bad path.
+
+Verification run:
+
+```text
+/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q
+35 passed
+
+/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15 -q
+379 passed
+```
+
+OVERALL: **m02 is look-ahead-safe and batch fail-CLOSED, but not ready to mark TRUSTED yet**. Remaining item: handle non-finite `signed_sz` explicitly before state-machine arithmetic, and add a golden test for it.

@@ -1,0 +1,3397 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c92-b355-75b3-9346-4e0a46047f56
+--------
+user
+# ADVERSARIAL TRUST AUDIT — m02 journey_trace (v15_m02_journey_trace.py)
+
+Context: Alberto does not trust the v15 m1-m10 selection engine. I audit each module for LOOK-AHEAD leaks and
+FAIL-OPEN / accounting bugs, fix codex-looped to consensus, pin a golden test. Already TRUSTED: m03 m10 m08 m07
+m06b m05 m06a m025.
+
+m02 converts each source wallet's HL PERP fills into (1) a causal per-ACTION stream and (2) a per-JOURNEY
+summary that drives ranking (M04). It is the V15 port of v13_journey_trace, whose TWO look-ahead defects it
+claims to fix: (A) equity basis sized per-event from M01's causal source_equity_post using only events with
+order<=k; (B) carry-in from the causal HL `startPosition` field, not back-walked from current state. It reuses
+the V13 ENTRY/ADDON/TRIM/EXIT/REVERSE state machine + realized-PnL/fee/funding/cost-basis accounting.
+
+Read research/v15/v15_m02_journey_trace.py IN FULL. (It reuses m01 loaders/marks/equity bridge; assume those
+are correct -- audit m02's OWN lifecycle + causal-sizing logic.)
+
+## Adversarially hunt (report ONLY real defects: file:line, severity P0/P1/P2, concrete failing input -> wrong output):
+1. LOOK-AHEAD (the whole point of the port): verify the stated invariants actually hold in code --
+   anchor_ts < ts (STRICT), equity_ts <= ts, mark_ts <= ts, event_order strictly monotone per wallet,
+   NO_ANCHOR => target_exposure_pct null. Any place a future fill/mark/anchor/equity leaks into an action at
+   time k? The 4-mode equity-basis hybrid (INTRAWEEK/PARTIAL_MTM/ANCHOR_FALLBACK/NO_ANCHOR) -- is the mode
+   EVER decided using data > k (per-segment drift, whole-window recon-PASS, end-of-window MTM)? carry-in
+   startPosition on the FIRST in-window fill per coin -- can a later fill's startPosition be used?
+2. STATE MACHINE correctness: ENTRY/ADDON/TRIM/EXIT/REVERSE transitions, cost-basis on ADDON, realized PnL on
+   TRIM/EXIT, sign flips on REVERSE (does a reverse correctly close the old leg at the fill price and open the
+   residual?), journey_id boundaries (does a full EXIT then re-ENTRY start a new journey?). Any fill dropped or
+   double-counted? funding attribution to the right journey/action.
+3. FAIL-OPEN / degenerate sizing: the causal equity floor (EQUITY_FLOOR_ABS/FRAC) -- does a <=0 / tiny
+   source_equity_post produce an absurd target_exposure_pct that survives, or is it caught? NaN/inf mark, zero
+   equity, missing anchor, single-fill coin, all-same-ts fills, zero-size fill, startPosition NaN.
+4. STREAMING I/O (mandatory per decisions/2026-05-31): does it use ShardedParquetWriter + install_memory_guard
+   and avoid building one all-rows DataFrame in RAM? Any per-row DB/mark round-trip in the hot path?
+5. MULTIPROCESSING determinism: Pool over wallets -- any shared mutable state, ordering nondeterminism, or a
+   worker that silently swallows an exception and emits a partial/empty journey set (fail-open)?
+6. DTYPE/boundary: ts equality (<= vs <), ms/seconds magnitude, tz, journey duration classification
+   (SCALP/SWING thresholds) boundary correctness.
+
+## Output
+Per finding: file:line, severity, exact failing input, wrong output, minimal fix. If a suspected issue is
+correct-by-design, say so. End OVERALL: is m02 look-ahead-safe AND fail-CLOSED with correct lifecycle/PnL
+accounting, or list the blocking P0/P1 before it can be TRUSTED.
+codex
+I’ll audit `v15_m02_journey_trace.py` directly against the invariants you listed, then verify suspicious paths with focused reads/tests rather than guessing from names.
+exec
+/bin/zsh -lc "wc -l research/v15/v15_m02_journey_trace.py && sed -n '1,260p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     816 research/v15/v15_m02_journey_trace.py
+#!/usr/bin/env python3
+"""V15 M02 — Causal fill lifecycles with optional equity enrichment.
+
+Converts each source wallet's Hyperliquid PERP fills into:
+  (1) PRIMARY: an equity-independent per-ACTION stream (one row per ordered
+      fill event) suitable for lifecycle and fixed-notional research.
+  (2) DERIVED: a per-JOURNEY summary (groupby journey_id) driving ranking (M04).
+
+M01 is NOT a prerequisite for the default M02 path.  ``--equity-enrichment``
+is an optional lane that adds causal whole-account equity-% sizing targets for
+strategies that explicitly require leader-equity-relative sizing.
+
+This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
+ENTRY/ADDON/TRIM/EXIT/REVERSE state machine and its realized-PnL / fee / funding /
+cost-basis accounting VERBATIM in spirit, and REPLACES exactly two things that made
+V13 look-ahead-contaminated:
+
+  (A) EQUITY BASIS. V13 sizes ``max_position_pct_equity`` by a single present-day
+      scalar (``spot_usdc_today``) — a look-ahead defect. V15 sizes EVERY action by
+      ``source_equity_post`` from M01's per-event causal equity series:
+          target_exposure_pct = position_after * mark / source_equity_post
+      where source_equity_post uses ONLY events with event-order <= k (POST-fill,
+      consistent with position_after). The equity basis is chosen per-event from a
+      4-mode HYBRID (INTRAWEEK / PARTIAL_MTM / ANCHOR_FALLBACK / NO_ANCHOR) decided
+      ONLY from data <= k — never from per-segment drift or whole-window recon-PASS.
+
+  (B) CARRY-IN. V13 back-walks carry-in from CURRENT position state (look-ahead).
+      V15 uses the causal ``startPosition`` field on the FIRST in-window fill per
+      coin (HL reports the position held JUST BEFORE each fill = known at that fill's
+      time). carry_in_status SEEDED / UNKNOWN.
+
+NON-LOOK-AHEAD INVARIANTS (asserted in tests/v15/test_m02.py):
+  anchor_ts < ts (strict) ; equity_ts <= ts ; mark_ts <= ts ;
+  event_order strictly monotone per wallet ; NO_ANCHOR ⇒ target_exposure_pct null.
+
+CLI:
+    python v15_m02_journey_trace.py --wallets-file W.txt \
+        --start 2025-12-01 --end 2026-05-23 \
+        --actions-out actions.parquet --journeys-out journeys.parquet [--procs N]
+        [--equity-enrichment]
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, asdict
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+# Import M01 (same dir) — reuse loaders, cash deltas, marks, and the additive
+# per-event equity bridge. NO M01 reconstruction MATH is changed here.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import v15_m01_equity_reconstruct as m01  # noqa: E402
+from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402  MANDATORY (decisions/2026-05-31-mandatory-streaming-io)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("v15_m02")
+
+EPS = 1e-9
+
+# Journey classification thresholds (inherited from V13).
+SCALP_THRESHOLD_S = 30 * 60
+SWING_THRESHOLD_S = 24 * 60 * 60
+
+# Equity-basis hybrid tunables (spec). STALE_CAP = one weekly anchor cycle.
+STALE_CAP_MS = m01.STALE_CAP_MS
+# Force ANCHOR_FALLBACK when the frozen unmarkable component exceeds this
+# fraction of equity (material unmarkable exposure) OR is staler than STALE_CAP.
+FROZEN_MATERIALITY_CAP = 0.10
+# Causal equity-floor (codex/subagent gap 2026-05-31): a reconstructed source_equity_post
+# that is <= 0 or implausibly small vs the last EXACT past anchor is a degenerate sizing
+# denominator (produces absurd target_exposure_pct, e.g. 200000x on near-zero equity). This
+# is a per-event, LOOK-AHEAD-FREE red flag (uses only equity_post(k) + the past anchor at
+# anchor_ts < ts). When tripped, fall back to the last exact anchor equity (sane denominator)
+# or mark unsizeable if the anchor is also degenerate.
+EQUITY_FLOOR_ABS = 10.0    # below HL min-order scale -> sizing meaningless
+EQUITY_FLOOR_FRAC = 0.02   # < 2% of the last exact anchor -> reconstruction lost the plot
+
+
+# --------------------------------------------------------------------------- #
+# Equity-basis mode selection — causal, per-event (codex r1 Q1/Q2/Q3/Q4)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class EquityBasis:
+    mode: str                 # INTRAWEEK | PARTIAL_MTM | ANCHOR_FALLBACK | NO_ANCHOR
+    equity: Optional[float]   # source_equity_post (None for NO_ANCHOR)
+    equity_ts: Optional[int]
+    anchor_ts: Optional[int]
+    mark_ts: Optional[int]
+    degraded: bool
+    frozen_value: float
+    frozen_age_s: float
+    frozen_materiality_frac: float
+
+
+@dataclass
+class LifecycleFillEvent:
+    """Minimal M02 event contract; deliberately contains no leader equity."""
+
+    ts: int
+    event_order: int
+    fill: dict
+    type: str = "fill"
+
+
+def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+    """Pick the causal equity basis for one event, using ONLY data <= the event.
+
+    Per-segment drift and whole-window recon-PASS are NEVER consulted (look-ahead).
+    """
+    if not ee.has_past_anchor:
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None,
+            anchor_ts=None, mark_ts=None, degraded=True,
+            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+        )
+
+    eq = ee.equity_post
+    frozen = ee.frozen_component_value
+    frozen_age_ms = ee.frozen_component_age_ms
+    materiality = (abs(frozen) / abs(eq)) if (eq and abs(eq) > EPS) else float("nan")
+    age = ee.age_since_anchor_ms or 0
+    anchor_eq = ee.anchor_equity
+
+    # EQUITY-FLOOR (causal): a non-positive or implausibly-small reconstructed equity is a
+    # degenerate denominator -> never emit a huge target off it. Uses only equity_post(k)
+    # and the last PAST exact anchor (anchor_ts < ts), so no look-ahead. Falls back to the
+    # exact anchor equity when sane, else marks the event unsizeable.
+    eq_floor = EQUITY_FLOOR_ABS
+    if anchor_eq is not None and anchor_eq == anchor_eq:
+        eq_floor = max(EQUITY_FLOOR_ABS, EQUITY_FLOOR_FRAC * abs(anchor_eq))
+    if eq is None or eq != eq or eq <= eq_floor:
+        if anchor_eq is not None and anchor_eq == anchor_eq and anchor_eq > EQUITY_FLOOR_ABS:
+            return EquityBasis(
+                mode="ANCHOR_FALLBACK", equity=anchor_eq, equity_ts=ee.anchor_ts,
+                anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+                frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+                frozen_materiality_frac=materiality,
+            )
+        return EquityBasis(
+            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+            mark_ts=ee.mark_ts, degraded=True, frozen_value=frozen,
+            frozen_age_s=frozen_age_ms / 1000.0, frozen_materiality_frac=materiality,
+        )
+
+    # ANCHOR_FALLBACK: base anchor too stale AND material unmarkable exposure, OR
+    # the frozen component is itself stale/material. Hold last PAST anchor flat.
+    stale_anchor = age > STALE_CAP_MS
+    material_frozen = (materiality == materiality and materiality > FROZEN_MATERIALITY_CAP)
+    stale_frozen = frozen_age_ms > STALE_CAP_MS
+    if (stale_anchor and ee.n_unmarkable > 0) or material_frozen or stale_frozen:
+        return EquityBasis(
+            mode="ANCHOR_FALLBACK", equity=ee.anchor_equity,
+            equity_ts=ee.anchor_ts, anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts,
+            degraded=True, frozen_value=frozen,
+            frozen_age_s=frozen_age_ms / 1000.0,
+            frozen_materiality_frac=materiality,
+        )
+
+    if ee.markable_all and ee.no_extradex_without_anchor:
+        # INTRAWEEK: reconstruction fully reliable at this event.
+        return EquityBasis(
+            mode="INTRAWEEK", equity=eq, equity_ts=ee.ts,
+            anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=False,
+            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=0.0,
+        )
+
+    # PARTIAL_MTM: some positions unmarkable → equity_post already marks the
+    # markable book + cash/funding/realized and FREEZES the unmarkable component
+    # at its last known value (handled in M01). Flag degraded.
+    return EquityBasis(
+        mode="PARTIAL_MTM", equity=eq, equity_ts=ee.ts,
+        anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+        frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+        frozen_materiality_frac=materiality,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Fee / funding helpers (ported from V13; actual v2-fills fees preferred)
+# --------------------------------------------------------------------------- #
+
+SOURCE_ASSUMED_TAKER_FEE_BPS = 4.32
+FEE_RATE = SOURCE_ASSUMED_TAKER_FEE_BPS / 10000.0
+
+
+def _fill_fee_usd_actual(f: dict) -> Optional[float]:
+    """Return the signed total wallet fee reported by Hyperliquid.
+
+    ``builderFee`` and ``deployerFee`` are component disclosures already
+    included in ``fee``. They are deliberately ignored here.
+    """
+    v = f.get("fee")
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if fv != fv else fv
+
+
+def _fill_fee_usd(notional: float) -> float:
+    return abs(notional) * FEE_RATE
+
+
+def _classify_fee_scope(dir_val: str, coin: str) -> str:
+    if isinstance(coin, str) and coin.startswith("xyz:"):
+        return "builder_perp"
+    if ":" in coin:
+        return "builder_perp"
+    if dir_val in ("Buy", "Sell"):
+        return "spot"
+    if dir_val in (
+        "Open Long", "Close Long", "Open Short", "Close Short",
+        "Long > Short", "Short > Long",
+    ):
+        return "standard_perp"
+    return "other"
+
+
+def _funding_for_interval(
+    funding: list[dict], coin: str, entry_ts: int, exit_ts: int
+) -> float:
+    """Sum funding usdc for (coin, (entry_ts, exit_ts]) half-open (codex r16 #6)."""
+    if not funding or not coin:
+        return 0.0
+    total = 0.0
+    for e in funding:
+        d = e.get("delta", {})
+        if d.get("type") != "funding" or str(d.get("coin", "")) != coin:
+            continue
+        t = int(e.get("time", 0))
+        if entry_ts < t <= exit_ts:
+            total += float(d.get("usdc", 0) or 0)
+    return total
+
+
+def _classify_duration(duration_s: float, n_addon: int, n_trim: int) -> str:
+    if duration_s < SCALP_THRESHOLD_S:
+        return "scalp"
+    if duration_s < SWING_THRESHOLD_S:
+        return "swing"
+    if n_trim == 0 and n_addon == 0:
+        return "fast-flip"
+    if n_trim == 0:
+        return "accumulation"
+
+exec
+/bin/zsh -lc 'rg -n "journey|anchor|equity|source_equity|startPosition|ShardedParquetWriter|install_memory_guard|Pool|funding|REVERSE|ENTRY|ADDON|TRIM|EXIT|event_order|mark|target_exposure|EQUITY_FLOOR|duration|SCALP|SWING" research/v15/v15_m02_journey_trace.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+2:"""V15 M02 — Causal fill lifecycles with optional equity enrichment.
+5:  (1) PRIMARY: an equity-independent per-ACTION stream (one row per ordered
+7:  (2) DERIVED: a per-JOURNEY summary (groupby journey_id) driving ranking (M04).
+9:M01 is NOT a prerequisite for the default M02 path.  ``--equity-enrichment``
+10:is an optional lane that adds causal whole-account equity-% sizing targets for
+11:strategies that explicitly require leader-equity-relative sizing.
+13:This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
+14:ENTRY/ADDON/TRIM/EXIT/REVERSE state machine and its realized-PnL / fee / funding /
+18:  (A) EQUITY BASIS. V13 sizes ``max_position_pct_equity`` by a single present-day
+20:      ``source_equity_post`` from M01's per-event causal equity series:
+21:          target_exposure_pct = position_after * mark / source_equity_post
+22:      where source_equity_post uses ONLY events with event-order <= k (POST-fill,
+23:      consistent with position_after). The equity basis is chosen per-event from a
+28:      V15 uses the causal ``startPosition`` field on the FIRST in-window fill per
+33:  anchor_ts < ts (strict) ; equity_ts <= ts ; mark_ts <= ts ;
+34:  event_order strictly monotone per wallet ; NO_ANCHOR ⇒ target_exposure_pct null.
+37:    python v15_m02_journey_trace.py --wallets-file W.txt \
+39:        --actions-out actions.parquet --journeys-out journeys.parquet [--procs N]
+40:        [--equity-enrichment]
+50:from multiprocessing import Pool
+57:# Import M01 (same dir) — reuse loaders, cash deltas, marks, and the additive
+58:# per-event equity bridge. NO M01 reconstruction MATH is changed here.
+60:import v15_m01_equity_reconstruct as m01  # noqa: E402
+61:from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402  MANDATORY (decisions/2026-05-31-mandatory-streaming-io)
+73:SCALP_THRESHOLD_S = 30 * 60
+74:SWING_THRESHOLD_S = 24 * 60 * 60
+76:# Equity-basis hybrid tunables (spec). STALE_CAP = one weekly anchor cycle.
+78:# Force ANCHOR_FALLBACK when the frozen unmarkable component exceeds this
+79:# fraction of equity (material unmarkable exposure) OR is staler than STALE_CAP.
+81:# Causal equity-floor (codex/subagent gap 2026-05-31): a reconstructed source_equity_post
+82:# that is <= 0 or implausibly small vs the last EXACT past anchor is a degenerate sizing
+83:# denominator (produces absurd target_exposure_pct, e.g. 200000x on near-zero equity). This
+84:# is a per-event, LOOK-AHEAD-FREE red flag (uses only equity_post(k) + the past anchor at
+85:# anchor_ts < ts). When tripped, fall back to the last exact anchor equity (sane denominator)
+86:# or mark unsizeable if the anchor is also degenerate.
+87:EQUITY_FLOOR_ABS = 10.0    # below HL min-order scale -> sizing meaningless
+88:EQUITY_FLOOR_FRAC = 0.02   # < 2% of the last exact anchor -> reconstruction lost the plot
+99:    equity: Optional[float]   # source_equity_post (None for NO_ANCHOR)
+100:    equity_ts: Optional[int]
+101:    anchor_ts: Optional[int]
+102:    mark_ts: Optional[int]
+111:    """Minimal M02 event contract; deliberately contains no leader equity."""
+114:    event_order: int
+119:def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+120:    """Pick the causal equity basis for one event, using ONLY data <= the event.
+124:    if not ee.has_past_anchor:
+126:            mode="NO_ANCHOR", equity=None, equity_ts=None,
+127:            anchor_ts=None, mark_ts=None, degraded=True,
+131:    eq = ee.equity_post
+135:    age = ee.age_since_anchor_ms or 0
+136:    anchor_eq = ee.anchor_equity
+138:    # EQUITY-FLOOR (causal): a non-positive or implausibly-small reconstructed equity is a
+139:    # degenerate denominator -> never emit a huge target off it. Uses only equity_post(k)
+140:    # and the last PAST exact anchor (anchor_ts < ts), so no look-ahead. Falls back to the
+141:    # exact anchor equity when sane, else marks the event unsizeable.
+142:    eq_floor = EQUITY_FLOOR_ABS
+143:    if anchor_eq is not None and anchor_eq == anchor_eq:
+144:        eq_floor = max(EQUITY_FLOOR_ABS, EQUITY_FLOOR_FRAC * abs(anchor_eq))
+146:        if anchor_eq is not None and anchor_eq == anchor_eq and anchor_eq > EQUITY_FLOOR_ABS:
+148:                mode="ANCHOR_FALLBACK", equity=anchor_eq, equity_ts=ee.anchor_ts,
+149:                anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+154:            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+155:            mark_ts=ee.mark_ts, degraded=True, frozen_value=frozen,
+159:    # ANCHOR_FALLBACK: base anchor too stale AND material unmarkable exposure, OR
+160:    # the frozen component is itself stale/material. Hold last PAST anchor flat.
+161:    stale_anchor = age > STALE_CAP_MS
+164:    if (stale_anchor and ee.n_unmarkable > 0) or material_frozen or stale_frozen:
+166:            mode="ANCHOR_FALLBACK", equity=ee.anchor_equity,
+167:            equity_ts=ee.anchor_ts, anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts,
+173:    if ee.markable_all and ee.no_extradex_without_anchor:
+176:            mode="INTRAWEEK", equity=eq, equity_ts=ee.ts,
+177:            anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=False,
+181:    # PARTIAL_MTM: some positions unmarkable → equity_post already marks the
+182:    # markable book + cash/funding/realized and FREEZES the unmarkable component
+185:        mode="PARTIAL_MTM", equity=eq, equity_ts=ee.ts,
+186:        anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+193:# Fee / funding helpers (ported from V13; actual v2-fills fees preferred)
+235:def _funding_for_interval(
+236:    funding: list[dict], coin: str, entry_ts: int, exit_ts: int
+238:    """Sum funding usdc for (coin, (entry_ts, exit_ts]) half-open (codex r16 #6)."""
+239:    if not funding or not coin:
+242:    for e in funding:
+244:        if d.get("type") != "funding" or str(d.get("coin", "")) != coin:
+252:def _classify_duration(duration_s: float, n_addon: int, n_trim: int) -> str:
+253:    if duration_s < SCALP_THRESHOLD_S:
+255:    if duration_s < SWING_THRESHOLD_S:
+267:# Per-wallet causal journey tracer (per-action stream + derived journeys)
+275:    funding: list[dict],
+277:    equity_enriched: bool = True,
+279:    """Walk the ordered FILL events for one wallet and emit (actions, journeys).
+284:    source-equity target. Funding/ledger rows never emit actions.
+290:    # duplicates. Funding/ledger advance equity but emit no action rows.
+291:    funding_payloads = funding
+294:    journeys: list[dict] = []
+298:    coin_journey_counter: dict[str, int] = {}
+304:            "journey_id": None, "open_ts": None, "peak_ts": None,
+315:        duration_s = max(0, (close_ts - st["open_ts"]) / 1000)
+317:        funding_net = _funding_for_interval(funding_payloads, coin, st["open_ts"], close_ts)
+318:        net_realized = st["realized_pnl"] - st["fees_paid"] + funding_net
+320:            "wallet": wallet, "coin": coin, "journey_id": st["journey_id"],
+323:            "duration_h": duration_s / 3600.0,
+329:            "funding_net": funding_net, "net_realized_pnl": net_realized,
+330:            "journey_class": _classify_duration(duration_s, st["n_addon"], st["n_trim"]),
+338:    # Walk events in event_order (already sorted).
+348:        # perps only. Spot must not affect journey/ranking metrics even if an
+365:        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+367:        sp = float(f.get("startPosition", 0.0) or 0.0)
+371:            # Close the interrupted journey as INVALID, then causally reseed
+378:                    journeys.append(j)
+388:                # Open an already-in-progress journey, sized causally.
+389:                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+393:                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+439:            # ENTRY
+440:            coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+442:                journey_id=coin_journey_counter[coin], open=True,
+449:            action_type = "ENTRY"
+450:            opening_jid = st["journey_id"]
+454:            # ADDON
+461:            action_type = "ADDON"
+462:            opening_jid = st["journey_id"]
+463:            closing_jid = st["journey_id"]
+466:            # EXACT EXIT
+472:            action_type = "EXIT"
+473:            opening_jid = st["journey_id"]
+474:            closing_jid = st["journey_id"]
+477:                journeys.append(j)
+482:            # TRIM
+486:            action_type = "TRIM"
+487:            opening_jid = st["journey_id"]
+488:            closing_jid = st["journey_id"]
+491:            # REVERSE (crosses zero): one action row, two journey ids.
+504:            closing_jid = st["journey_id"]
+507:                journeys.append(j)
+509:            coin_journey_counter[coin] += 1
+512:                journey_id=coin_journey_counter[coin], open=True,
+519:            action_type = "REVERSE"
+520:            opening_jid = st["journey_id"]
+524:        # ---- optional equity basis + action row ----
+525:        # Core M02 deliberately does not read M01, anchors, or market marks.
+526:        if equity_enriched:
+527:            basis = select_equity_basis(ee)
+529:            mark = m01.get_mark(coin, ts, causal=True)
+530:            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
+531:            if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
+534:                target_pct = (new_pos * mark) / basis.equity
+537:                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+538:                anchor_ts=None, mark_ts=None, degraded=False,
+542:            mark = None
+543:            sizing_mark_ts = None
+549:            "event_order": ee.event_order,
+553:            "mark": mark, "mark_ts": sizing_mark_ts,
+554:            "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
+555:            "anchor_ts": basis.anchor_ts,
+556:            "equity_basis_mode": basis.mode,
+557:            "equity_degraded": basis.degraded,
+561:            "target_exposure_pct": target_pct,
+563:            "opening_journey_id": opening_jid,
+564:            "closing_journey_id": closing_jid,
+565:            "journey_id": opening_jid,  # back-compat = opening side
+570:            # Final value is recomputed after every journey has been finalized.
+572:            # interrupted journey; a raw live trade stream also cannot repair
+573:            # the resync row because it does not carry startPosition.
+588:                journeys.append(j)
+591:    # If a later position discontinuity interrupts a journey, propagate that
+592:    # failure back to every already-emitted action belonging to that journey.
+594:    # still ingest the beginning of a journey proven broken later.
+595:    invalid_journeys = {
+596:        (str(j["coin"]), int(j["journey_id"]))
+597:        for j in journeys
+598:        if not bool(j.get("lifecycle_valid", True)) and j.get("journey_id") is not None
+600:    invalid_stream_journeys = set(invalid_journeys)
+603:            invalid_stream_journeys.update(
+605:                for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+611:            for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+615:            involved & invalid_journeys
+621:            and not bool(involved & invalid_stream_journeys)
+623:    for journey in journeys:
+624:        key = (str(journey["coin"]), int(journey["journey_id"]))
+625:        journey["stream_replay_valid"] = bool(
+626:            journey.get("lifecycle_valid", True)
+627:            and key not in invalid_stream_journeys
+630:    return actions, journeys
+641:    anchor_parquet: str, worker_mem_gb: float = 3.0,
+642:    equity_enriched: bool = False,
+645:    _ANCHOR_DF = pd.read_parquet(anchor_parquet) if equity_enriched else None
+646:    # codex perf-r1 #5: guard WORKERS too (per-wallet reconstruction + per-process mark-series cache
+648:    install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
+652:    wallet, start_ms, end_ms, equity_enriched = args
+654:        if equity_enriched:
+655:            anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
+656:            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+661:            funding = res["funding"]
+662:            n_anchors = len(res["weekly_anchors"])
+663:            inter_drift = res["inter_anchor_drift"]
+666:            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+670:                    event_order=int(fill.get("fill_seq", i)),
+675:            n_anchors = None
+677:        actions, journeys = trace_wallet(
+678:            wallet, events, fills, funding, equity_enriched=equity_enriched
+681:            "wallet": wallet, "actions": actions, "journeys": journeys,
+682:            "n_anchors": n_anchors,
+695:    ap = argparse.ArgumentParser(description="V15 M02 causal journey_trace")
+700:    ap.add_argument("--journeys-out", required=True)
+706:             "for optional M01 equity reconstruction/mark caches.",
+710:        help="RAM reserved outside M02. Default: 2GB core; 6GB equity-enriched.",
+712:    ap.add_argument("--anchor-parquet", default=str(m01.ANCHOR_PARQUET))
+714:        "--equity-enrichment", action="store_true",
+715:        help="Opt in to M01 causal equity targets. Core actions/journeys do not require M01.",
+721:    ap.add_argument("--skip-marks-cache", action="store_true",
+722:                    help="Skip the one-time marks-cache precompute (assumes app/data/v15/marks_cache is built+fresh).")
+723:    ap.add_argument("--rebuild-marks-cache", action="store_true",
+724:                    help="Force full rebuild of every coin's marks cache (use after a candle backfill).")
+734:    tasks = [(w, start_ms, end_ms, args.equity_enrichment) for w in wallets]
+737:    # PRECOMPUTE marks cache ONCE (perf: avoids N workers each re-scanning Mongo for coin price
+740:    if args.equity_enrichment and not args.skip_marks_cache:
+742:        st = m01.marks_cache_status()
+743:        force = args.rebuild_marks_cache or not st["fresh"]
+745:            logger.info(f"marks cache rebuild (fresh={st['fresh']}, reason={st['reason']}, "
+749:            m01.build_marks_cache(force=True)
+751:            logger.info(f"marks cache FRESH (age_days={st['age_days']:.1f}); reusing")
+752:        logger.info(f"marks cache ready in {time.time()-tmc:.0f}s")
+755:    # full result set in RAM. Stream per-wallet actions/journeys to disk in bounded chunks; memory
+762:        per_worker_gb = 2.0 if args.equity_enrichment else 0.5
+765:        headroom_gb = 6.0 if args.equity_enrichment else 2.0
+768:    install_memory_guard(soft_gb=budget.main_soft_gb, label="m02")
+770:    aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
+771:    jw = ShardedParquetWriter(args.journeys_out, flush_rows=args.flush_rows)
+779:            jw.add_many(r.get("journeys"))
+782:    # ALWAYS run via a Pool (even procs=1) with maxtasksperchild so the worker process is RECYCLED
+783:    # periodically -> the per-coin marks cache (m01._coin_series, which grows unbounded as a long-lived
+786:    # 137) once the marks cache grew (1830 coins to 06-24). maxtasksperchild forks a fresh worker every
+787:    # N wallets; on macOS spawn this re-imports m01 -> empty cache. (Fix 2026-06-25, codex marks-rebuild.)
+789:    with Pool(max(1, budget.procs), initializer=_init_worker,
+790:              initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
+796:    n_journeys = jw.close()
+798:    logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
+810:            f"{len(r['journeys'])} journeys"
+811:            + (f", {r['n_anchors']} anchors" if r.get("n_anchors") is not None else "")
+
+codex
+The top-level contract and helpers are loaded. I’m reading the lifecycle body and worker/main code now, because the likely defects are in ordering, carry-in seeding, and end-of-wallet finalization.
+exec
+/bin/zsh -lc "sed -n '260,640p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '640,840p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+def _init_worker(
+    anchor_parquet: str, worker_mem_gb: float = 3.0,
+    equity_enriched: bool = False,
+) -> None:
+    global _ANCHOR_DF
+    _ANCHOR_DF = pd.read_parquet(anchor_parquet) if equity_enriched else None
+    # codex perf-r1 #5: guard WORKERS too (per-wallet reconstruction + per-process mark-series cache
+    # live here). Backstop: abort a runaway worker loudly instead of a silent aggregate OS OOM.
+    install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
+
+
+def process_wallet(args: tuple) -> dict:
+    wallet, start_ms, end_ms, equity_enriched = args
+    try:
+        if equity_enriched:
+            anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
+            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+            if "error" in res:
+                return {"wallet": wallet, "error": res["error"]}
+            events = res["events"]
+            fills = res["fills"]
+            funding = res["funding"]
+            n_anchors = len(res["weekly_anchors"])
+            inter_drift = res["inter_anchor_drift"]
+        else:
+            fills = m01.load_wallet_fills(wallet, start_ms, end_ms)
+            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+            events = [
+                LifecycleFillEvent(
+                    ts=int(fill["time"]),
+                    event_order=int(fill.get("fill_seq", i)),
+                    fill=fill,
+                )
+                for i, fill in enumerate(fills)
+            ]
+            n_anchors = None
+            inter_drift = None
+        actions, journeys = trace_wallet(
+            wallet, events, fills, funding, equity_enriched=equity_enriched
+        )
+        return {
+            "wallet": wallet, "actions": actions, "journeys": journeys,
+            "n_anchors": n_anchors,
+            "inter_drift": inter_drift,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"wallet": wallet, "error": f"exception:{e!r}"}
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="V15 M02 causal journey_trace")
+    ap.add_argument("--wallets-file", required=True)
+    ap.add_argument("--start", default="2025-12-01")
+    ap.add_argument("--end", default="2026-05-23")
+    ap.add_argument("--actions-out", required=True)
+    ap.add_argument("--journeys-out", required=True)
+    ap.add_argument("--procs", type=int, default=4,
+                    help="REQUESTED workers (ceiling; auto-capped to fit RAM by the aggregate budget).")
+    ap.add_argument(
+        "--per-worker-gb", type=float, default=None,
+        help="Per-worker peak RSS. Default: 0.5GB for core fill lifecycles; 2.0GB "
+             "for optional M01 equity reconstruction/mark caches.",
+    )
+    ap.add_argument(
+        "--headroom-gb", type=float, default=None,
+        help="RAM reserved outside M02. Default: 2GB core; 6GB equity-enriched.",
+    )
+    ap.add_argument("--anchor-parquet", default=str(m01.ANCHOR_PARQUET))
+    ap.add_argument(
+        "--equity-enrichment", action="store_true",
+        help="Opt in to M01 causal equity targets. Core actions/journeys do not require M01.",
+    )
+    ap.add_argument("--flush-rows", type=int, default=2_000_000,
+                    help="MANDATORY streaming: flush a parquet part + free RAM every N buffered rows.")
+    ap.add_argument("--mem-soft-gb", type=float, default=12.0,
+                    help="Memory-guard soft cap (GB); abort loud above this instead of silent OOM kill.")
+    ap.add_argument("--skip-marks-cache", action="store_true",
+                    help="Skip the one-time marks-cache precompute (assumes app/data/v15/marks_cache is built+fresh).")
+    ap.add_argument("--rebuild-marks-cache", action="store_true",
+                    help="Force full rebuild of every coin's marks cache (use after a candle backfill).")
+    args = ap.parse_args()
+
+    start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
+    end_ms = int((pd.Timestamp(args.end, tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000 - 1)
+
+    with open(args.wallets_file) as fh:
+        wallets = [l.strip().lower() for l in fh if l.strip() and not l.startswith("#")]
+    logger.info(f"Loaded {len(wallets):,} wallets")
+
+    tasks = [(w, start_ms, end_ms, args.equity_enrichment) for w in wallets]
+    t0 = time.time()
+
+    # PRECOMPUTE marks cache ONCE (perf: avoids N workers each re-scanning Mongo for coin price
+    # series, which left the pool ~74% I/O-idle). Freshness-checked (codex perf-r1 #3): rebuild if
+    # the coin-set or latest candle changed since the cache was built.
+    if args.equity_enrichment and not args.skip_marks_cache:
+        tmc = time.time()
+        st = m01.marks_cache_status()
+        force = args.rebuild_marks_cache or not st["fresh"]
+        if force:
+            logger.info(f"marks cache rebuild (fresh={st['fresh']}, reason={st['reason']}, "
+                        f"age_days={st['age_days']})")
+            # force a full refresh when explicitly requested OR when stale due to NEW candles /
+            # changed coin-set (else force=False would skip the already-present-but-stale coins).
+            m01.build_marks_cache(force=True)
+        else:
+            logger.info(f"marks cache FRESH (age_days={st['age_days']:.1f}); reusing")
+        logger.info(f"marks cache ready in {time.time()-tmc:.0f}s")
+
+    # MANDATORY memory-safe streaming (decisions/2026-05-31-mandatory-streaming-io): never hold the
+    # full result set in RAM. Stream per-wallet actions/journeys to disk in bounded chunks; memory
+    # stays flat regardless of universe size. Backstop watchdog aborts loud (not silent SIGKILL).
+    # AGGREGATE memory budget (2026-06-10 OOM fix): per-process guards do not compose; cap worker
+    # count from ACTUAL free RAM so N x per_worker + baseline cannot blow past physical RAM.
+    # --mem-soft-gb acts as the upper cap on the main-process guard.
+    per_worker_gb = args.per_worker_gb
+    if per_worker_gb is None:
+        per_worker_gb = 2.0 if args.equity_enrichment else 0.5
+    headroom_gb = args.headroom_gb
+    if headroom_gb is None:
+        headroom_gb = 6.0 if args.equity_enrichment else 2.0
+    budget = plan_memory_budget(requested_procs=args.procs, per_worker_gb=per_worker_gb,
+                                headroom_gb=headroom_gb, main_soft_cap=args.mem_soft_gb)
+    install_memory_guard(soft_gb=budget.main_soft_gb, label="m02")
+    Path(args.actions_out).parent.mkdir(parents=True, exist_ok=True)
+    aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
+    jw = ShardedParquetWriter(args.journeys_out, flush_rows=args.flush_rows)
+    errors: list[tuple] = []
+
+    def _consume(r: dict) -> None:
+        if "error" in r:
+            errors.append((r["wallet"], r["error"]))
+        else:
+            aw.add_many(r.get("actions"))
+            jw.add_many(r.get("journeys"))
+        _log_one(r, len(wallets))
+
+    # ALWAYS run via a Pool (even procs=1) with maxtasksperchild so the worker process is RECYCLED
+    # periodically -> the per-coin marks cache (m01._coin_series, which grows unbounded as a long-lived
+    # worker touches more of the 1830-coin universe) is RESET, keeping RSS under worker_soft_gb. Without
+    # this the procs=1 in-process loop blew the 2.5G soft cap at ~153 wallets (memory-guard abort, exit
+    # 137) once the marks cache grew (1830 coins to 06-24). maxtasksperchild forks a fresh worker every
+    # N wallets; on macOS spawn this re-imports m01 -> empty cache. (Fix 2026-06-25, codex marks-rebuild.)
+    MAXTASKS_PER_CHILD = 40
+    with Pool(max(1, budget.procs), initializer=_init_worker,
+              initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
+              maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
+        for r in pool.imap_unordered(process_wallet, tasks):
+            _consume(r)
+
+    n_actions = aw.close()
+    n_journeys = jw.close()
+    logger.info(f"Wrote {args.actions_out}: {n_actions:,} actions")
+    logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
+    if errors:
+        logger.warning(f"{len(errors)} wallet errors: {errors[:10]}")
+    logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")
+
+
+def _log_one(r: dict, n: int) -> None:
+    if "error" in r:
+        logger.warning(f"  {r['wallet'][:12]} -> {r['error']}")
+    else:
+        logger.info(
+            f"  {r['wallet'][:12]} -> {len(r['actions'])} actions, "
+            f"{len(r['journeys'])} journeys"
+            + (f", {r['n_anchors']} anchors" if r.get("n_anchors") is not None else "")
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+ succeeded in 0ms:
+        return "accumulation"
+    if n_addon == 0:
+        return "scale-out"
+    return "position"
+
+
+# --------------------------------------------------------------------------- #
+# Per-wallet causal journey tracer (per-action stream + derived journeys)
+# --------------------------------------------------------------------------- #
+
+
+def trace_wallet(
+    wallet: str,
+    events: list["m01.EventEquity"],
+    fills: list[dict],
+    funding: list[dict],
+    *,
+    equity_enriched: bool = True,
+) -> tuple[list[dict], list[dict]]:
+    """Walk the ordered FILL events for one wallet and emit (actions, journeys).
+
+    In the default/core lane, ``events`` contains only ``LifecycleFillEvent``
+    rows and no M01 reconstruction is consulted.  In the optional enriched
+    lane it is M01's total event stream so each fill can receive its causal
+    source-equity target. Funding/ledger rows never emit actions.
+    """
+    # Fill events in `events` carry type=='fill' AND the EXACT fill payload on
+    # ee.fill (codex r4 BUG 2). We consume that payload DIRECTLY off the ordered
+    # stream — never rematching by (ts, tid), which collided for same-ms fills
+    # lacking a tid (S3 by-wallet partition has none) and silently overwrote
+    # duplicates. Funding/ledger advance equity but emit no action rows.
+    funding_payloads = funding
+
+    actions: list[dict] = []
+    journeys: list[dict] = []
+
+    # Per-coin state machines (independent books per coin).
+    coin_state: dict[str, dict] = {}
+    coin_journey_counter: dict[str, int] = {}
+    coin_seen_first_fill: dict[str, bool] = {}
+
+    def _new_state() -> dict:
+        return {
+            "position": 0.0, "cost_basis": 0.0, "open": False, "side": 0,
+            "journey_id": None, "open_ts": None, "peak_ts": None,
+            "max_notional": 0.0, "n_entry": 0, "n_addon": 0, "n_trim": 0,
+            "n_exit": 0, "n_reverse": 0, "n_carry_in": 0,
+            "realized_pnl": 0.0, "fees_paid": 0.0, "fee_scope": "standard_perp",
+            "carry_in_status": None, "liq_closed": False,
+            "lifecycle_valid": True, "state_discontinuity": False,
+        }
+
+    def _finalize(coin: str, st: dict, close_ts: int) -> Optional[dict]:
+        if not st["open"] or st["open_ts"] is None:
+            return None
+        duration_s = max(0, (close_ts - st["open_ts"]) / 1000)
+        max_notional = max(st["max_notional"], EPS)
+        funding_net = _funding_for_interval(funding_payloads, coin, st["open_ts"], close_ts)
+        net_realized = st["realized_pnl"] - st["fees_paid"] + funding_net
+        return {
+            "wallet": wallet, "coin": coin, "journey_id": st["journey_id"],
+            "side": "long" if st["side"] > 0 else "short",
+            "entry_ts": st["open_ts"], "exit_ts": close_ts, "peak_ts": st["peak_ts"],
+            "duration_h": duration_s / 3600.0,
+            "n_entry_fills": st["n_entry"], "n_addon_fills": st["n_addon"],
+            "n_trim_fills": st["n_trim"], "n_exit_fills": st["n_exit"],
+            "n_reverse_fills": st["n_reverse"], "n_carry_in_seeds": st["n_carry_in"],
+            "max_position_notional": max_notional,
+            "realized_pnl": st["realized_pnl"], "fees": st["fees_paid"],
+            "funding_net": funding_net, "net_realized_pnl": net_realized,
+            "journey_class": _classify_duration(duration_s, st["n_addon"], st["n_trim"]),
+            "liq_closed": st["liq_closed"],
+            "open_at_window_end": False,
+            "carry_in_status": st["carry_in_status"] or "SEEDED",
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            "state_discontinuity": bool(st.get("state_discontinuity", False)),
+        }
+
+    # Walk events in event_order (already sorted).
+    for ee in events:
+        if ee.type != "fill":
+            continue
+        f = ee.fill  # exact payload for THIS ordered fill event (no rematch)
+        if f is None:
+            continue
+
+        coin = f["coin"]
+        # Defensive parity with M1 and M7/live: the research strategy copies
+        # perps only. Spot must not affect journey/ranking metrics even if an
+        # externally supplied event stream contains it.
+        if m01.coin_is_spot(coin):
+            continue
+        st = coin_state.setdefault(coin, _new_state())
+        signed = f["signed_sz"]
+        if abs(signed) <= EPS:
+            continue
+        price = float(f["price"]) or 0.0
+        ts = ee.ts
+        is_liq = bool(f.get("is_liquidation"))
+        row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
+        actual_fee = _fill_fee_usd_actual(f)
+
+        position = st["position"]
+        cost_basis = st["cost_basis"]
+
+        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+        first_fill = not coin_seen_first_fill.get(coin, False)
+        sp = float(f.get("startPosition", 0.0) or 0.0)
+        state_resynced = False
+        if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+            # Missing/ambiguous fills: never continue a fabricated lifecycle.
+            # Close the interrupted journey as INVALID, then causally reseed
+            # from the current fill's authoritative pre-position.
+            if st["open"]:
+                st["lifecycle_valid"] = False
+                st["state_discontinuity"] = True
+                j = _finalize(coin, st, ts)
+                if j is not None:
+                    journeys.append(j)
+            st = _new_state()
+            coin_state[coin] = st
+            position = 0.0
+            cost_basis = 0.0
+            first_fill = True
+            state_resynced = True
+        if first_fill:
+            coin_seen_first_fill[coin] = True
+            if abs(sp) > EPS:
+                # Open an already-in-progress journey, sized causally.
+                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+                st.update(
+                    position=sp, cost_basis=price,  # best causal cost proxy = first observed px
+                    open=True, side=(1 if sp > 0 else -1),
+                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+                    max_notional=abs(sp) * price, n_carry_in=1,
+                    carry_in_status="SEEDED", fee_scope=row_scope,
+                )
+                position = sp
+                cost_basis = price
+            else:
+                st["carry_in_status"] = "SEEDED"  # flat carry-in = cleanly known
+
+        if not bool(f.get("causal_order_ok", True)):
+            st["lifecycle_valid"] = False
+
+        # closedPnl ground truth (fallback to cost-basis derived).
+        raw_pnl = f.get("closedPnl", None)
+        new_pos_preview = position + signed
+        if raw_pnl is None or (isinstance(raw_pnl, float) and raw_pnl != raw_pnl):
+            if (position > 0 and signed < 0) or (position < 0 and signed > 0):
+                if abs(new_pos_preview) < EPS:
+                    closed_qty = position
+                elif (position > 0 and new_pos_preview > 0) or (position < 0 and new_pos_preview < 0):
+                    closed_qty = -signed
+                else:
+                    closed_qty = position
+                closed_pnl = float((price - cost_basis) * closed_qty)
+            else:
+                closed_pnl = 0.0
+        else:
+            closed_pnl = float(raw_pnl)
+
+        # PRE-fill peak capture.
+        pre_notional = abs(position) * price
+        if abs(position) > EPS and pre_notional > st["max_notional"]:
+            st["max_notional"] = pre_notional
+            st["peak_ts"] = ts
+
+        new_pos = position + signed
+        notional_after = abs(new_pos) * price
+        fill_notional = abs(signed) * price
+        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
+
+        # ---- state machine ----
+        action_type = None
+        opening_jid = None
+        closing_jid = None
+
+        if abs(position) < EPS and abs(new_pos) > EPS:
+            # ENTRY
+            coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+            st.update(
+                journey_id=coin_journey_counter[coin], open=True,
+                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+                n_entry=1, n_addon=0, n_trim=0, n_exit=0, n_reverse=0, n_carry_in=0,
+                realized_pnl=0.0, max_notional=notional_after, cost_basis=price,
+                fees_paid=fill_fee, fee_scope=row_scope, liq_closed=False,
+                carry_in_status=st["carry_in_status"] or "SEEDED",
+            )
+            action_type = "ENTRY"
+            opening_jid = st["journey_id"]
+            closing_jid = None
+
+        elif (position > 0 and signed > 0) or (position < 0 and signed < 0):
+            # ADDON
+            st["n_addon"] += 1
+            st["cost_basis"] = (cost_basis * abs(position) + price * abs(signed)) / abs(new_pos)
+            if notional_after > st["max_notional"]:
+                st["max_notional"] = notional_after
+                st["peak_ts"] = ts
+            st["fees_paid"] += fill_fee
+            action_type = "ADDON"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+
+        elif abs(new_pos) < EPS:
+            # EXACT EXIT
+            st["n_exit"] += 1
+            st["realized_pnl"] += closed_pnl
+            st["fees_paid"] += fill_fee
+            if is_liq:
+                st["liq_closed"] = True
+            action_type = "EXIT"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+            j = _finalize(coin, st, ts)
+            if j is not None:
+                journeys.append(j)
+            st.update(_new_state())
+            coin_state[coin] = st
+
+        elif (position > 0 and new_pos > 0 and signed < 0) or (position < 0 and new_pos < 0 and signed > 0):
+            # TRIM
+            st["n_trim"] += 1
+            st["realized_pnl"] += closed_pnl
+            st["fees_paid"] += fill_fee
+            action_type = "TRIM"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+
+        else:
+            # REVERSE (crosses zero): one action row, two journey ids.
+            st["n_reverse"] += 1
+            st["realized_pnl"] += closed_pnl
+            if is_liq:
+                st["liq_closed"] = True
+            split_total = abs(position) + abs(new_pos)
+            if actual_fee is not None and split_total > EPS:
+                closing_fee = actual_fee * (abs(position) / split_total)
+                opening_fee = actual_fee * (abs(new_pos) / split_total)
+            else:
+                closing_fee = abs(position) * price * FEE_RATE
+                opening_fee = abs(new_pos) * price * FEE_RATE
+            st["fees_paid"] += closing_fee
+            closing_jid = st["journey_id"]
+            j = _finalize(coin, st, ts)
+            if j is not None:
+                journeys.append(j)
+            # open the new (reversed) leg
+            coin_journey_counter[coin] += 1
+            st.update(_new_state())
+            st.update(
+                journey_id=coin_journey_counter[coin], open=True,
+                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+                n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
+                fees_paid=opening_fee, fee_scope=row_scope,
+                carry_in_status="SEEDED",
+            )
+            coin_state[coin] = st
+            action_type = "REVERSE"
+            opening_jid = st["journey_id"]
+
+        st["position"] = new_pos
+
+        # ---- optional equity basis + action row ----
+        # Core M02 deliberately does not read M01, anchors, or market marks.
+        if equity_enriched:
+            basis = select_equity_basis(ee)
+            # SIZING signal: use only a bar that has closed by ts.
+            mark = m01.get_mark(coin, ts, causal=True)
+            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
+            if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
+                target_pct = None
+            else:
+                target_pct = (new_pos * mark) / basis.equity
+        else:
+            basis = EquityBasis(
+                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+                anchor_ts=None, mark_ts=None, degraded=False,
+                frozen_value=0.0, frozen_age_s=0.0,
+                frozen_materiality_frac=float("nan"),
+            )
+            mark = None
+            sizing_mark_ts = None
+            target_pct = None
+
+        actions.append({
+            "wallet": wallet, "coin": coin, "ts": ts,
+            "fill_id": int(f.get("tid", 0) or 0),
+            "event_order": ee.event_order,
+            "action_type": action_type,
+            "signed_size": signed, "price": price,
+            "position_after": new_pos,
+            "mark": mark, "mark_ts": sizing_mark_ts,
+            "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
+            "anchor_ts": basis.anchor_ts,
+            "equity_basis_mode": basis.mode,
+            "equity_degraded": basis.degraded,
+            "frozen_component_value": basis.frozen_value,
+            "frozen_component_age_s": basis.frozen_age_s,
+            "frozen_materiality_frac": basis.frozen_materiality_frac,
+            "target_exposure_pct": target_pct,
+            "is_liquidation": is_liq,
+            "opening_journey_id": opening_jid,
+            "closing_journey_id": closing_jid,
+            "journey_id": opening_jid,  # back-compat = opening side
+            "carry_in_status": st["carry_in_status"],
+            "state_resynced": state_resynced,
+            "causal_order_ok": bool(f.get("causal_order_ok", True)),
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            # Final value is recomputed after every journey has been finalized.
+            # A future gap can retroactively invalidate earlier actions in the
+            # interrupted journey; a raw live trade stream also cannot repair
+            # the resync row because it does not carry startPosition.
+            "stream_replay_valid": bool(
+                st.get("lifecycle_valid", True)
+                and bool(f.get("causal_order_ok", True))
+                and not state_resynced
+            ),
+        })
+
+    # Positions still open at window end → flag (not finalized).
+    for coin, st in coin_state.items():
+        if st["open"] and st["open_ts"] is not None:
+            j = _finalize(coin, st, st["peak_ts"] or st["open_ts"])
+            if j is not None:
+                j["open_at_window_end"] = True
+                j["exit_ts"] = None
+                journeys.append(j)
+
+    # Lifecycle validity is only known once the whole wallet has been walked.
+    # If a later position discontinuity interrupts a journey, propagate that
+    # failure back to every already-emitted action belonging to that journey.
+    # Without this pass, downstream code can filter lifecycle_valid=True and
+    # still ingest the beginning of a journey proven broken later.
+    invalid_journeys = {
+        (str(j["coin"]), int(j["journey_id"]))
+        for j in journeys
+        if not bool(j.get("lifecycle_valid", True)) and j.get("journey_id") is not None
+    }
+    invalid_stream_journeys = set(invalid_journeys)
+    for action in actions:
+        if action.get("state_resynced", False):
+            invalid_stream_journeys.update(
+                (str(action["coin"]), int(jid))
+                for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+                if jid is not None
+            )
+    for action in actions:
+        involved = {
+            (str(action["coin"]), int(jid))
+            for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+            if jid is not None
+        }
+        lifecycle_valid = bool(action.get("causal_order_ok", True)) and not bool(
+            involved & invalid_journeys
+        )
+        action["lifecycle_valid"] = lifecycle_valid
+        action["stream_replay_valid"] = bool(
+            lifecycle_valid
+            and not action.get("state_resynced", False)
+            and not bool(involved & invalid_stream_journeys)
+        )
+    for journey in journeys:
+        key = (str(journey["coin"]), int(journey["journey_id"]))
+        journey["stream_replay_valid"] = bool(
+            journey.get("lifecycle_valid", True)
+            and key not in invalid_stream_journeys
+        )
+
+    return actions, journeys
+
+
+# --------------------------------------------------------------------------- #
+# Worker
+# --------------------------------------------------------------------------- #
+
+_ANCHOR_DF = None
+
+
+def _init_worker(
+
+exec
+/bin/zsh -lc "ls tests/v15 2>/dev/null && rg -n \"m02|journey_trace|target_exposure|startPosition|REVERSE|funding|NO_ANCHOR|event_order\" tests research/v15 -g '*.py'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+__pycache__
+test_equity_independent_actions.py
+test_execution_model.py
+test_fidelity_replay.py
+test_fixed_notional_signals.py
+test_m02.py
+test_m025_golden.py
+test_m03.py
+test_m03_golden.py
+test_m04.py
+test_m05.py
+test_m05_golden.py
+test_m06a.py
+test_m06a_golden.py
+test_m06b.py
+test_m06b_golden.py
+test_m07.py
+test_m08.py
+test_m08_golden.py
+test_m09.py
+test_m10.py
+test_m10_golden.py
+test_mem_budget.py
+test_slippage_calib.py
+tests/test_phase1_data_audit.py:22:            "startPosition": ["0"] * 4,
+tests/test_phase1_data_audit.py:53:        "startPosition": ["0"],
+research/v15/v15_slippage_calib.py:235:    ap.add_argument("--traded-coins", default=str(DATA_DIR / "m02_actions.parquet"),
+research/v15/_streaming_io.py:17:    install_memory_guard(soft_gb=12, label="m02")
+research/v15/v15_m09_sim.py:50:    fixed_target_exposure: float = 0.10
+research/v15/v15_m09_sim.py:156:    fixed_target_exposure: float = 0.10,
+research/v15/v15_m09_sim.py:159:    absolute target exposure (target_exposure_pct is SIGNED gross exposure as a fraction of equity; M7
+research/v15/v15_m09_sim.py:160:    sizes notional = target_exposure_pct x subaccount_equity, so |target_exposure_pct| IS the per-leader
+research/v15/v15_m09_sim.py:161:    leverage we copy). Uses the 75th percentile of |target_exposure_pct| over the fold window (a
+research/v15/v15_m09_sim.py:174:        order = [c for c in ("ts", "event_order") if c in adf.columns]
+research/v15/v15_m09_sim.py:185:            gross.append(len(open_coins) * abs(float(fixed_target_exposure)))
+research/v15/v15_m09_sim.py:189:    if "target_exposure_pct" not in adf.columns:
+research/v15/v15_m09_sim.py:191:    te = pd.to_numeric(adf["target_exposure_pct"], errors="coerce").abs().dropna()
+research/v15/v15_m09_sim.py:395:                "coin": coin, "ts": int(ts_ms), "event_order": order,
+research/v15/v15_m09_sim.py:397:                "position_after": 0.0, "target_exposure_pct": 0.0,
+research/v15/v15_m09_sim.py:404:        params.fixed_target_exposure = m.fixed_target_exposure
+research/v15/v15_m09_sim.py:482:        # per-entity expected leverage (leader's copied target_exposure) STRICTLY from the PRETEST/causal
+research/v15/v15_m09_sim.py:494:                pre_adf, m.sizing_mode, m.fixed_target_exposure
+research/v15/v15_m09_sim.py:508:        params.fixed_target_exposure = m.fixed_target_exposure
+tests/v15/test_m06b.py:46:        "n_backstop_transfer": 0, "total_fees": 50.0, "total_funding": 0.0,
+tests/v15/test_m06b.py:117:        "m02_journeys_path": journeys, "m07_equity": equity,
+research/v15/v15_m06a_shortlist.py:28:m02_actions ts. This deliberately REWARDS active, turn-it-over traders and down-ranks one-burst
+research/v15/v15_m06a_shortlist.py:108:    """ts_ms: the PRIMARY wallet's m02_actions timestamps (ms). Counts distinct 14d blocks in
+research/v15/v15_m06a_shortlist.py:464:    ap.add_argument("--actions", required=True, help="m02_actions.parquet")
+research/v15/copy_edge_2026_07_01/maker_taker.py:5:pf=pq.ParquetFile("app/data/v15/m02_actions.parquet")
+research/v15/copy_edge_2026_07_01/oos_holdout.py:15:pf=pq.ParquetFile("app/data/v15/m02_actions.parquet")
+tests/v15/test_equity_independent_actions.py:11:        "time": ts, "tid": tid, "startPosition": float(start),
+tests/v15/test_equity_independent_actions.py:41:    # The current transition is directly known from startPosition, but a live
+tests/v15/test_m025_golden.py:1:"""GOLDEN regression test for v15_m025_authenticity_gate trust-audit fixes (2026-07-10).
+tests/v15/test_m025_golden.py:3:m025 is the authenticity HARD GATE: conservative by design, an inauthentic wallet must NEVER PASS on
+tests/v15/test_m025_golden.py:5:- P1 funding-farm: NaN funding_frac (undefined evidence) -> REVIEW (not PASS); the funding-dominated case
+tests/v15/test_m025_golden.py:6:  (denom~0, funding present -> funding_frac=inf) -> EXCLUDE.
+tests/v15/test_m025_golden.py:15:import v15_m025_authenticity_gate as m025  # noqa: E402
+tests/v15/test_m025_golden.py:18:def _clean() -> "m025.WalletScores":
+tests/v15/test_m025_golden.py:20:    s = m025.WalletScores(wallet="0xclean")
+tests/v15/test_m025_golden.py:25:    s.funding_frac = 0.10             # <= FUNDING_FARM_FRAC(0.5)
+tests/v15/test_m025_golden.py:33:    return m025.decide_verdict(s, ent_reason, is_primary, n_members)
+tests/v15/test_m025_golden.py:40:def test_funding_nan_reviews_not_passes():
+tests/v15/test_m025_golden.py:41:    s = _clean(); s.funding_frac = float("nan")   # undefined funding evidence
+tests/v15/test_m025_golden.py:46:def test_funding_inf_excludes():
+tests/v15/test_m025_golden.py:47:    s = _clean(); s.funding_frac = float("inf")    # funding-dominated (denom~0, funding present)
+tests/v15/test_m025_golden.py:49:    assert verdict == "EXCLUDE" and "funding_farm" in codes
+tests/v15/test_m025_golden.py:53:    s = _clean(); s.wash_frac = m025.WASH_EXCLUDE   # exactly 0.50 -> EXCLUDE (conservative)
+tests/v15/test_m025_golden.py:59:    s = _clean(); s.wash_frac = m025.WASH_REVIEW    # exactly 0.20 -> REVIEW (not PASS)
+tests/v15/test_m025_golden.py:65:    s = _clean(); s.wash_frac = m025.WASH_EXCLUDE - 1e-6   # 0.4999... -> REVIEW, not EXCLUDE
+tests/v15/test_m025_golden.py:83:    s = _clean(); s.days_since_last_fill = m025.STALE_DAYS + 0.5
+research/v15/copy_edge_2026_07_01/latency_pass.py:13:pf=pq.ParquetFile("app/data/v15/m02_actions.parquet")
+research/v15/wallet_maker_scorer.py:65:    wf = S.load_events_from_m02(set(uni), start - hold_ms, end)
+research/v15/wallet_maker_scorer.py:80:    # locate the V11 hand-picked wallets (score via API for any not in m02)
+research/v15/copy_edge_2026_07_01/journey_score2.py:15:pf=pq.ParquetFile("app/data/v15/m02_actions.parquet")
+research/v15/leadlag_clean_rank_sim.py:240:M02_ACTIONS = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15" / "m02_actions.parquet"
+research/v15/leadlag_clean_rank_sim.py:243:def load_events_from_m02(wallet_set: set[str], start_ms: int, end_ms: int,
+research/v15/leadlag_clean_rank_sim.py:245:    """Full-universe open/close events from the m02 journey-trace output (NO API). Reads only the
+research/v15/leadlag_clean_rank_sim.py:256:    # MEMORY: m02 has ~86M rows. Accumulating per-wallet as Python tuple-lists peaked ~5.5GB (and
+research/v15/leadlag_clean_rank_sim.py:303:    FILL-LEVEL copy model (EVERY open fill incl adds = a lot) -- the opposite extreme from m02's
+research/v15/leadlag_clean_rank_sim.py:305:    m02-based WHO-kill reproduces (data-fidelity check, 2026-07-06)."""
+research/v15/leadlag_clean_rank_sim.py:516:        out_path: str, source: str = "m02", step_hours: int = 1, maker: bool = False,
+research/v15/leadlag_clean_rank_sim.py:522:    if source == "m02":
+research/v15/leadlag_clean_rank_sim.py:523:        # FULL-UNIVERSE open/close from the m02 journey-trace parquet (no API). One streamed pass.
+research/v15/leadlag_clean_rank_sim.py:524:        log.info(f"loading m02 events for {len(candidates)} wallets from {M02_ACTIONS.name} ...")
+research/v15/leadlag_clean_rank_sim.py:525:        wf = load_events_from_m02(set(candidates), load_lo, load_hi)
+research/v15/leadlag_clean_rank_sim.py:529:        # re-run of WHO vs the m02 position-initiation events (2026-07-06 check).
+research/v15/leadlag_clean_rank_sim.py:706:    ap.add_argument("--source", choices=["m02", "api", "s3"], default="m02",
+research/v15/leadlag_clean_rank_sim.py:707:                    help="m02 = full-universe position-ENTRY/EXIT from m02_actions.parquet (no API, default); "
+research/v15/leadlag_clean_rank_sim.py:710:    ap.add_argument("--start", default="2025-12-01", help="default Dec 1 (full m02 history).")
+research/v15/leadlag_clean_rank_sim.py:715:                    help="full-universe wallet list for --source m02 (one address/line).")
+research/v15/leadlag_clean_rank_sim.py:730:                    help="main-process peak-RSS estimate. m02 full-universe load is ~2-3GB (events for "
+research/v15/leadlag_clean_rank_sim.py:767:    elif args.source == "m02":
+tests/v15/test_m04.py:9:import v15_m025_authenticity_gate as g  # noqa: E402
+tests/v15/test_m04.py:18:    s.funding_frac = kw.pop("funding_frac", 0.1)
+tests/v15/test_m04.py:61:    assert m4._own_tier(mk(funding_frac=0.8))[0] == "KILL"
+research/v15/copy_edge_2026_07_01/oos_holdout_loose.py:15:pf=pq.ParquetFile("app/data/v15/m02_actions.parquet")
+research/v15/fidelity_oos.py:52:    print(f"loading m02 fills for {len(uni)} wallets ...")
+tests/v15/test_fixed_notional_signals.py:13:        "time": ts, "tid": tid, "startPosition": float(start),
+research/v15/copy_edge_2026_07_01/journey_universe_2wk.py:15:pf=pq.ParquetFile("app/data/v15/m02_actions.parquet")
+tests/v15/test_m09.py:215:        {"ts": 1, "event_order": 0, "coin": "BTC", "position_after": 1.0},
+tests/v15/test_m09.py:216:        {"ts": 2, "event_order": 1, "coin": "ETH", "position_after": -2.0},
+tests/v15/test_m09.py:217:        {"ts": 3, "event_order": 2, "coin": "BTC", "position_after": 0.0},
+tests/v15/test_m09.py:228:def test_expected_leverage_uses_abs_target_exposure():
+tests/v15/test_m09.py:229:    adf = pd.DataFrame({"target_exposure_pct": [2.0, -3.0, 4.0, -1.0]})
+tests/v15/test_m09.py:250:    """Minimal engine stub: each subaccount ends flat at start_eq x (1 + ret). target_exposure_pct in
+tests/v15/test_m09.py:313:        return pd.DataFrame({"target_exposure_pct": [target_exp, target_exp]})
+tests/v15/test_m09.py:383:        return pd.DataFrame({"target_exposure_pct": [exp, exp]})
+tests/v15/test_m09.py:454:        return pd.DataFrame({"target_exposure_pct": [1.0]})
+tests/v15/test_m09.py:488:                                              "cum_funding": 0.0, "isolated_margin": 0.0}},
+research/v15/balanced_step3_riskparity.py:201:    j = pd.read_parquet("app/data/v15/m02_journeys.parquet", columns=cols)
+research/v15/copy_edge_2026_07_01/beta_neutral.py:13:pf=pq.ParquetFile("app/data/v15/m02_actions.parquet")
+research/v15/s3_taker_verify.py:4:consistency gate (fixes the m02 position-event infidelity, 2026-07-08).
+tests/v15/test_m07.py:44:    """Inject per-coin minute grids + OHLC + funding. Deterministic, no Mongo. `mark()` is causal
+tests/v15/test_m07.py:46:    def __init__(self, ohlc=None, funding=None, maxlev=10.0, adv=1e12, half_spread_bps=1.0):
+tests/v15/test_m07.py:48:        self._funding = funding or {}
+tests/v15/test_m07.py:76:    def funding_rate_at(self, coin, ts_ms):
+tests/v15/test_m07.py:77:        s = self._funding.get(coin)
+tests/v15/test_m07.py:96:    return {"coin": coin, "ts": ts, "event_order": 0, "action_type": action_type,
+tests/v15/test_m07.py:98:            "target_exposure_pct": target_pct, "is_liquidation": False, "carry_in_status": carry_in_status}
+tests/v15/test_m07.py:127:        copy_latency_ms=0, sizing_mode="fixed_position", fixed_target_exposure=0.25
+tests/v15/test_m07.py:357:def test_funding_sign_long_pays_positive_rate():
+tests/v15/test_m07.py:362:                        funding={"BTC": (np.array([T0 + 30 * E.MS_MIN], "int64"), np.array([0.0001]))},
+tests/v15/test_m07.py:368:    assert _run(acts, md)["summary"]["total_funding"] < 0
+tests/v15/test_m07.py:439:def test_funding_stops_after_liquidation():
+tests/v15/test_m07.py:440:    # chronological: a position liquidated early should not keep accruing funding to fold end.
+tests/v15/test_m07.py:445:                        funding={"BTC": (np.array([T0 + h * E.MS_HOUR for h in range(1, 7)], "int64"),
+tests/v15/test_m07.py:451:    # liquidated around the crash; funding only accrues on hours BEFORE liquidation, not all 6
+tests/v15/test_m07.py:455:def test_post_funding_boundary_liquidation():
+tests/v15/test_m07.py:456:    # codex code-r4 #1: a settled funding payment at the fold boundary can push below maintenance;
+tests/v15/test_m07.py:458:    # positive funding at the last hour, position sized so funding eats the maintenance buffer.
+tests/v15/test_m07.py:464:                        funding={"BTC": (np.array([last_h], "int64"), np.array([0.5]))},  # huge rate
+tests/v15/test_m07.py:471:    assert s["total_funding"] < 0                       # paid the funding
+tests/v15/test_m07.py:491:def test_no_same_ts_double_when_funding_at_fold_end():
+tests/v15/test_m07.py:492:    # codex code-r6 #1: when the funding settlement == fold end (t1), the in-loop post-funding check
+tests/v15/test_m07.py:495:    t1 = ((T0 // E.MS_HOUR) + 1) * E.MS_HOUR        # a funding hour that we also use as fold end
+tests/v15/test_m07.py:500:                        funding={"BTC": (np.array([t1], "int64"), np.array([0.5]))}, maxlev=10.0)
+tests/v15/test_m07.py:506:    assert len(liq_ts) == len(set(liq_ts))           # no same-ts double at the funding==fold-end boundary
+research/v15/v15_m05_eligibility.py:11:  1. net realized PnL (incl fees+funding) > 0
+research/v15/v15_m05_eligibility.py:22:    python v15_m05_eligibility.py --folds m03_folds.parquet --journeys m02_journeys.parquet \
+research/v15/v15_m05_eligibility.py:190:    dur_s = (j["duration_h"].astype(float) * 3600.0)   # m02 emits duration_h (not duration_hours)
+research/v15/v15_m03_fold_geometry.py:21:        --actions app/data/v15/m02_actions.parquet \
+research/v15/v15_m03_fold_geometry.py:22:        --journeys app/data/v15/m02_journeys.parquet \
+research/v15/v15_m03_fold_geometry.py:400:    # m02_actions is 86M rows x 25 cols (~4.6GB on disk); loading all of it would strain RAM. M3
+research/v15/our_drawdown_scorer.py:19:  target_exposure_pct directly (both longs AND shorts), exactly like the LIVE V17 exposure-copy book
+research/v15/our_drawdown_scorer.py:56:MEMORY: m02_actions (4.6GB) is NEVER fully loaded. We pyarrow-scan each wallet's window rows ONCE
+research/v15/our_drawdown_scorer.py:114:    (ts, event_order). Touches parquet only for wallets not yet cached."""
+research/v15/our_drawdown_scorer.py:126:    return out.sort_values(["ts", "event_order"], kind="mergesort").reset_index(drop=True)
+tests/v15/test_m02.py:9:    /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02.py -q
+tests/v15/test_m02.py:23:import v15_m02_journey_trace as m02  # noqa: E402
+tests/v15/test_m02.py:41:    monkeypatch.setattr(m02.m01, "get_mark", fake_mark)
+tests/v15/test_m02.py:48:        "closedPnl": float(closed), "startPosition": float(start_pos),
+tests/v15/test_m02.py:67:def _run(fills, funding=None, anchors=None):
+tests/v15/test_m02.py:68:    funding = funding or []
+tests/v15/test_m02.py:72:    ordered = m01.build_event_stream(fills, funding, [])
+tests/v15/test_m02.py:76:    actions, journeys = m02.trace_wallet("0xtest", events, fills, funding)
+tests/v15/test_m02.py:80:def test_core_m02_does_not_reconstruct_equity(monkeypatch):
+tests/v15/test_m02.py:89:    monkeypatch.setattr(m02.m01, "load_wallet_fills", lambda *_: fills)
+tests/v15/test_m02.py:90:    monkeypatch.setattr(m02.m01, "load_wallet_funding", lambda *_: [])
+tests/v15/test_m02.py:95:    monkeypatch.setattr(m02.m01, "reconstruct_wallet_event_equity", forbidden)
+tests/v15/test_m02.py:96:    result = m02.process_wallet(("0xtest", 0, 10_000, False))
+tests/v15/test_m02.py:105:    assert all(a["target_exposure_pct"] is None for a in result["actions"])
+tests/v15/test_m02.py:113:def test_event_order_strictly_monotone():
+tests/v15/test_m02.py:119:    orders = [a["event_order"] for a in actions]
+tests/v15/test_m02.py:147:    # first fill is BEFORE any anchor -> NO_ANCHOR, target null.
+tests/v15/test_m02.py:154:    assert a0["equity_basis_mode"] == "NO_ANCHOR"
+tests/v15/test_m02.py:155:    assert a0["target_exposure_pct"] is None
+tests/v15/test_m02.py:158:    assert a1["target_exposure_pct"] is not None
+tests/v15/test_m02.py:193:    assert m02._fill_fee_usd_actual(f) == pytest.approx(0.40)
+tests/v15/test_m02.py:227:        _fill(2100, "BTC", "A", 3, 110, 1, tid=2, closed=10.0),     # REVERSE -> short 2
+tests/v15/test_m02.py:231:    rev = next(a for a in actions if a["action_type"] == "REVERSE")
+tests/v15/test_m02.py:246:    # first in-window fill reports startPosition = +5 (carried in pre-window).
+tests/v15/test_m02.py:277:def test_target_exposure_pct_sane():
+tests/v15/test_m02.py:283:    assert a["target_exposure_pct"] is not None
+tests/v15/test_m02.py:284:    assert 0.0 < a["target_exposure_pct"] < 1.0
+tests/v15/test_m02.py:306:    earlier event t1, even if its first fill reports a nonzero startPosition
+tests/v15/test_m02.py:310:      BTC = 100, ALT = 50. ALT's first fill is at t2=3000 with startPosition=10.
+tests/v15/test_m02.py:318:    monkeypatch.setattr(m02.m01, "get_mark", per_coin_mark)
+tests/v15/test_m02.py:449:    # strictly distinct event_order despite identical (ts, tid)
+tests/v15/test_m02.py:450:    assert btc[0]["event_order"] != btc[1]["event_order"]
+tests/v15/test_m02.py:465:    assert [f["startPosition"] for f in ordered] == [-573.0, -1428.0, -3011.0]
+tests/v15/test_m02.py:467:    assert [e["ev"]["startPosition"] for e in stream] == [-573.0, -1428.0, -3011.0]
+tests/v15/test_m02.py:487:    # authoritative startPosition, but a raw live stream cannot self-repair.
+tests/v15/test_m02.py:601:    monkeypatch.setattr(m02.m01, "get_mark", mark)
+research/v15/revalidate_api_execmodel.py:38:    # integrity gate: startPosition chain (complete-fill check) on plain perps (@spot/xyz move via transfers)
+research/v15/revalidate_api_execmodel.py:44:            sp=float(f.get('startPosition',0) or 0); ss=float(f['sz'])*(1 if f['side']=='B' else -1)
+research/v15/v15_m07_engine.py:22:  loop (market/funding/liquidity/tier precomputed once into shared in-memory asof indices; the runner
+research/v15/v15_m07_engine.py:269:        self._funding: dict[str, tuple] = {}
+research/v15/v15_m07_engine.py:354:    def funding_series(self, coin: str) -> tuple:
+research/v15/v15_m07_engine.py:355:        # NOTE (codex code-r3): funding is NOT gated by require_cache. It is loaded ONCE per coin from
+research/v15/v15_m07_engine.py:358:        s = self._funding.get(coin)
+research/v15/v15_m07_engine.py:364:            cur = self._mongo().hyperliquid_funding_rates.find(
+research/v15/v15_m07_engine.py:365:                {"coin": coin}, projection={"timestamp_utc": 1, "funding_rate": 1, "_id": 0},
+research/v15/v15_m07_engine.py:372:                ts.append(int(t)); r.append(_f(d.get("funding_rate")))
+research/v15/v15_m07_engine.py:374:        self._funding[coin] = s
+research/v15/v15_m07_engine.py:377:    def funding_rate_at(self, coin: str, ts_ms: int) -> float:
+research/v15/v15_m07_engine.py:378:        ts, r = self.funding_series(coin)
+research/v15/v15_m07_engine.py:452:    cum_funding: float = 0.0
+research/v15/v15_m07_engine.py:487:    fixed_target_exposure: float = 0.10         # signed direction gets this absolute follower exposure
+research/v15/v15_m07_engine.py:490:    # every action boundary + fold-end using REAL engine equity (fills/fees/funding/liq priced in).
+research/v15/v15_m07_engine.py:496:        return _f(action.get("target_exposure_pct"))
+research/v15/v15_m07_engine.py:503:        return float(np.sign(pa) * abs(params.fixed_target_exposure))
+research/v15/v15_m07_engine.py:516:    start_state positions accrue funding/MTM/liquidation even when there are no actions (M9 chaining).
+research/v15/v15_m07_engine.py:620:    rows = actions.sort_values(["ts", "event_order"]).to_dict("records") if not actions.empty else []
+research/v15/v15_m07_engine.py:644:    # forced-liq slippage + funding/MTM + backstop wipe; it EXCLUDES ADL/socialized deleveraging (a known, bounded
+research/v15/v15_m07_engine.py:767:    # FINAL-HORIZON RISK (design §1.7/codex code-r1 #1): advance funding + liquidation to fold end.
+research/v15/v15_m07_engine.py:777:        # fold, a single-action fold, or a post-last-action drawdown via funding/MTM/liquidation that the
+research/v15/v15_m07_engine.py:830:        "total_fees": 0.0, "total_funding": 0.0, "slip_bps_notional_sum": 0.0, "notional_traded": 0.0,
+research/v15/v15_m07_engine.py:834:        "fixed_target_exposure": (
+research/v15/v15_m07_engine.py:835:            float(params.fixed_target_exposure) if params.sizing_mode == "fixed_position" else None
+research/v15/v15_m07_engine.py:849:        # accumulator (realized + funding - fees) since the position last opened from flat; finalized
+research/v15/v15_m07_engine.py:852:        # realized PnL is genuinely after fees+funding+latency.
+research/v15/v15_m07_engine.py:938:            pre_pct = float(np.sign(pre_pos) * abs(params.fixed_target_exposure))
+research/v15/v15_m07_engine.py:941:            # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
+research/v15/v15_m07_engine.py:1124:    summary["_rt"][coin] = {"realized": 0.0, "fee": 0.0, "funding": 0.0}
+research/v15/v15_m07_engine.py:1127:def _rt_add(summary: dict, coin: str, realized: float = 0.0, fee: float = 0.0, funding: float = 0.0):
+research/v15/v15_m07_engine.py:1128:    """Accumulate realized PnL / fee / funding onto the open round-trip for `coin` (no-op if no open
+research/v15/v15_m07_engine.py:1135:    acc["funding"] += funding
+research/v15/v15_m07_engine.py:1141:    realized_pnl_total + round_trip_win_rate (otherwise the RT had only entry-fee/funding and could
+research/v15/v15_m07_engine.py:1156:    """Finalize a CLOSED round-trip: realized PnL after OUR costs = realized - fees + funding (funding
+research/v15/v15_m07_engine.py:1161:    pnl = acc["realized"] - acc["fee"] + acc["funding"]
+research/v15/v15_m07_engine.py:1171:    isolated realized/funding/fees route to the position's isolated bucket; closing returns isolated
+research/v15/v15_m07_engine.py:1255:def _apply_funding(st, md, h, summary):
+research/v15/v15_m07_engine.py:1256:    """Apply the hourly funding settlement to every open position (design §5/D10)."""
+research/v15/v15_m07_engine.py:1259:        rate = md.funding_rate_at(coin, h)
+research/v15/v15_m07_engine.py:1268:        p.cum_funding += -fund
+research/v15/v15_m07_engine.py:1269:        summary["total_funding"] += fund
+research/v15/v15_m07_engine.py:1270:        _rt_add(summary, coin, funding=fund)   # CHANGE A: funding is a round-trip cost (signed)
+research/v15/v15_m07_engine.py:1274:    """CHRONOLOGICAL event loop over (t0,t1] (codex code-r2 #1/#5): interleave hourly funding
+research/v15/v15_m07_engine.py:1276:    liquidated early stops accruing later funding; a partial-liquidation survivor is rescanned to
+research/v15/v15_m07_engine.py:1297:        next_funding = ((cursor // MS_HOUR) + 1) * MS_HOUR
+research/v15/v15_m07_engine.py:1298:        seg_end = min(next_funding, t1_ms)
+research/v15/v15_m07_engine.py:1315:            # funding into pretest ROE). But do NOT skip funding at an INTERIOR action boundary that merely
+research/v15/v15_m07_engine.py:1318:            if seg_end == next_funding and (fold_end_ms is None or seg_end != int(fold_end_ms)):
+research/v15/v15_m07_engine.py:1319:                _apply_funding(st, md, seg_end, summary)
+research/v15/v15_m07_engine.py:1327:    # cooldown guard makes this safe even if a post-funding liquidation just fired within 30s of t1.
+research/v15/v15_m07_engine.py:1419:    used after funding settlements and at the fold boundary, where a settled cash move (not a price
+research/v15/v15_m07_engine.py:1535:    # cooling down. This makes it IMPOSSIBLE for any caller path (price breach, post-funding, terminal
+research/v15/v15_m07_engine.py:1684:        "wallet", "coin", "ts", "event_order", "action_type", "signed_size",
+research/v15/v15_m07_engine.py:1685:        "position_after", "target_exposure_pct", "is_liquidation",
+research/v15/v15_m07_engine.py:1701:                  fixed_target_exposure: float = 0.10):
+research/v15/v15_m07_engine.py:1744:    cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size", "position_after",
+research/v15/v15_m07_engine.py:1745:            "target_exposure_pct", "is_liquidation", "carry_in_status",
+research/v15/v15_m07_engine.py:1760:    logger.info("M7 runner: preloading OHLC+funding caches for %d coins", len(coins))
+research/v15/v15_m07_engine.py:1763:    for c in sorted(coins):           # warm funding series into memo (one Mongo pass each, precompute)
+research/v15/v15_m07_engine.py:1764:        md.funding_series(c)
+research/v15/v15_m07_engine.py:1782:        fixed_target_exposure=fixed_target_exposure,
+research/v15/v15_m07_engine.py:1809:    ap.add_argument("--actions", default=str(DATA_DIR / "m02_actions.parquet"))
+research/v15/v15_m07_engine.py:1837:                  fixed_target_exposure=args.fixed_target_exposure)
+research/v15/v15_equity_independent_actions.py:38:        return "REVERSE"
+research/v15/v15_equity_independent_actions.py:49:    ``startPosition`` is authoritative for the current transition.  A gap from
+research/v15/v15_equity_independent_actions.py:62:        before = float(fill["startPosition"])
+research/v15/v15_equity_independent_actions.py:99:                # Strict stream-replay validity.  A historical startPosition
+research/v15/v15_equity_independent_actions.py:122:        before = float(first["startPosition"])
+research/v15/v15_equity_independent_actions.py:123:        after = float(last["startPosition"] + last["signed_sz"])
+research/v15/v15_m06b_ranking.py:143:        # wallet -> entity_id map (for per-block journey-open counts from m02 when equity is present)
+research/v15/v15_m06b_ranking.py:150:    m02_journeys_path = data_dir / "m02_journeys.parquet"
+research/v15/v15_m06b_ranking.py:171:        "m02_journeys_path": m02_journeys_path,
+research/v15/v15_m06b_ranking.py:192:def _blocks_activity(fills_path, m02_journeys_path: Path, m04_auth: pd.DataFrame,
+research/v15/v15_m06b_ranking.py:201:    m02 journeys (wallet, entry_ts) mapped to entity via m04_auth (wallet->entity_id) -> per-block
+research/v15/v15_m06b_ranking.py:226:    # --- journey opens per (entity, fold, block) from m02 entry_ts ---
+research/v15/v15_m06b_ranking.py:237:        jdf = _read_parquet_maybe_parts(Path(m02_journeys_path)) if not isinstance(
+research/v15/v15_m06b_ranking.py:238:            m02_journeys_path, pd.DataFrame) else m02_journeys_path
+research/v15/v15_m06b_ranking.py:241:            if not isinstance(m02_journeys_path, pd.DataFrame):
+research/v15/v15_m06b_ranking.py:495:        blocks_act = _blocks_activity(inputs["m07_fills_path"], inputs["m02_journeys_path"],
+research/v15/v15_m02_journey_trace.py:13:This is the V15 port of research/v13/v13_journey_trace.py. It REUSES V13's proven
+research/v15/v15_m02_journey_trace.py:14:ENTRY/ADDON/TRIM/EXIT/REVERSE state machine and its realized-PnL / fee / funding /
+research/v15/v15_m02_journey_trace.py:21:          target_exposure_pct = position_after * mark / source_equity_post
+research/v15/v15_m02_journey_trace.py:24:      4-mode HYBRID (INTRAWEEK / PARTIAL_MTM / ANCHOR_FALLBACK / NO_ANCHOR) decided
+research/v15/v15_m02_journey_trace.py:28:      V15 uses the causal ``startPosition`` field on the FIRST in-window fill per
+research/v15/v15_m02_journey_trace.py:32:NON-LOOK-AHEAD INVARIANTS (asserted in tests/v15/test_m02.py):
+research/v15/v15_m02_journey_trace.py:34:  event_order strictly monotone per wallet ; NO_ANCHOR ⇒ target_exposure_pct null.
+research/v15/v15_m02_journey_trace.py:37:    python v15_m02_journey_trace.py --wallets-file W.txt \
+research/v15/v15_m02_journey_trace.py:68:logger = logging.getLogger("v15_m02")
+research/v15/v15_m02_journey_trace.py:83:# denominator (produces absurd target_exposure_pct, e.g. 200000x on near-zero equity). This
+research/v15/v15_m02_journey_trace.py:98:    mode: str                 # INTRAWEEK | PARTIAL_MTM | ANCHOR_FALLBACK | NO_ANCHOR
+research/v15/v15_m02_journey_trace.py:99:    equity: Optional[float]   # source_equity_post (None for NO_ANCHOR)
+research/v15/v15_m02_journey_trace.py:114:    event_order: int
+research/v15/v15_m02_journey_trace.py:126:            mode="NO_ANCHOR", equity=None, equity_ts=None,
+research/v15/v15_m02_journey_trace.py:154:            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+research/v15/v15_m02_journey_trace.py:182:    # markable book + cash/funding/realized and FREEZES the unmarkable component
+research/v15/v15_m02_journey_trace.py:193:# Fee / funding helpers (ported from V13; actual v2-fills fees preferred)
+research/v15/v15_m02_journey_trace.py:235:def _funding_for_interval(
+research/v15/v15_m02_journey_trace.py:236:    funding: list[dict], coin: str, entry_ts: int, exit_ts: int
+research/v15/v15_m02_journey_trace.py:238:    """Sum funding usdc for (coin, (entry_ts, exit_ts]) half-open (codex r16 #6)."""
+research/v15/v15_m02_journey_trace.py:239:    if not funding or not coin:
+research/v15/v15_m02_journey_trace.py:242:    for e in funding:
+research/v15/v15_m02_journey_trace.py:244:        if d.get("type") != "funding" or str(d.get("coin", "")) != coin:
+research/v15/v15_m02_journey_trace.py:275:    funding: list[dict],
+research/v15/v15_m02_journey_trace.py:291:    funding_payloads = funding
+research/v15/v15_m02_journey_trace.py:317:        funding_net = _funding_for_interval(funding_payloads, coin, st["open_ts"], close_ts)
+research/v15/v15_m02_journey_trace.py:318:        net_realized = st["realized_pnl"] - st["fees_paid"] + funding_net
+research/v15/v15_m02_journey_trace.py:329:            "funding_net": funding_net, "net_realized_pnl": net_realized,
+research/v15/v15_m02_journey_trace.py:338:    # Walk events in event_order (already sorted).
+research/v15/v15_m02_journey_trace.py:365:        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+research/v15/v15_m02_journey_trace.py:367:        sp = float(f.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m02_journey_trace.py:491:            # REVERSE (crosses zero): one action row, two journey ids.
+research/v15/v15_m02_journey_trace.py:519:            action_type = "REVERSE"
+research/v15/v15_m02_journey_trace.py:531:            if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
+research/v15/v15_m02_journey_trace.py:549:            "event_order": ee.event_order,
+research/v15/v15_m02_journey_trace.py:561:            "target_exposure_pct": target_pct,
+research/v15/v15_m02_journey_trace.py:573:            # the resync row because it does not carry startPosition.
+research/v15/v15_m02_journey_trace.py:648:    install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
+research/v15/v15_m02_journey_trace.py:661:            funding = res["funding"]
+research/v15/v15_m02_journey_trace.py:666:            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+research/v15/v15_m02_journey_trace.py:670:                    event_order=int(fill.get("fill_seq", i)),
+research/v15/v15_m02_journey_trace.py:678:            wallet, events, fills, funding, equity_enriched=equity_enriched
+research/v15/v15_m02_journey_trace.py:695:    ap = argparse.ArgumentParser(description="V15 M02 causal journey_trace")
+research/v15/v15_m02_journey_trace.py:768:    install_memory_guard(soft_gb=budget.main_soft_gb, label="m02")
+research/v15/v15_forward_select.py:76:    acts = ds.dataset(str(DATA / "m02_actions.parquet"))
+research/v15/v15_m04_authenticity.py:8:REUSES the codex-SHIP m025 gate helpers VERBATIM (STAGE A scalars, STAGE B entity union-find,
+research/v15/v15_m04_authenticity.py:38:import v15_m025_authenticity_gate as g  # noqa: E402  (codex-SHIP helpers)
+research/v15/v15_m04_authenticity.py:65:    if s.funding_frac == s.funding_frac and s.funding_frac > g.FUNDING_FARM_FRAC:
+research/v15/v15_m04_authenticity.py:66:        kill.append("carry_pnl")                # funding-dominated; out-of-scope by strategy def
+research/v15/v15_m04_authenticity.py:272:            "funding_frac": s.funding_frac, "wash_frac": s.wash_frac, "sharpe": s.sharpe,
+research/v15/fidelity_replay.py:4:For each wallet, reconstruct their ACTUAL round-trips from m02 fills (position 0 -> nonzero -> 0:
+research/v15/fidelity_replay.py:72:    print(f"loading m02 fills for {len(uni)} wallets {args.start}..{args.end} ...")
+research/v15/balanced_step4_netted_sim.py:19:    (a) chosen leaders' m02_actions rows within [month_start, month_end), sorted by (ts, event_order);
+research/v15/balanced_step4_netted_sim.py:26:    new_tgt_frac = 0 if (is_liquidation or position_after==0 or action_type is an exit) else target_exposure_pct
+research/v15/balanced_step4_netted_sim.py:52:MEMORY: m02_actions (4.6GB) is NEVER fully loaded. Per fold we pyarrow-scan ONLY the chosen leaders'
+research/v15/balanced_step4_netted_sim.py:83:ACTIONS_PATH = "app/data/v15/m02_actions.parquet"
+research/v15/balanced_step4_netted_sim.py:95:    """Stream ONLY the chosen leaders' m02_actions rows in month tm (wallet isin + ts range + column
+research/v15/balanced_step4_netted_sim.py:96:    projection). Never loads the full 4.6GB file. Returns a small DataFrame sorted by (ts, event_order).
+research/v15/balanced_step4_netted_sim.py:102:            columns=["wallet", "coin", "ts", "event_order", "action_type", "signed_size",
+research/v15/balanced_step4_netted_sim.py:103:                     "position_after", "mark", "target_exposure_pct", "is_liquidation"])
+research/v15/balanced_step4_netted_sim.py:109:    cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size",
+research/v15/balanced_step4_netted_sim.py:110:            "position_after", "mark", "target_exposure_pct", "is_liquidation"]
+research/v15/balanced_step4_netted_sim.py:115:    df = df.sort_values(["ts", "event_order"], kind="mergesort").reset_index(drop=True)
+research/v15/balanced_step4_netted_sim.py:137:    (wallet, sleeve_is_long)). faithful_copy=True copies each leader's FULL SIGNED target_exposure_pct
+research/v15/balanced_step4_netted_sim.py:146:    target_exposure_pct > 0, and exits from a prior positive target); a SHORT-sleeve leader copies ONLY
+research/v15/balanced_step4_netted_sim.py:149:    (wallet, sleeve_is_long, coin). target_exposure_pct is signed upstream (NOT re-signed).
+research/v15/balanced_step4_netted_sim.py:228:        tgt_pct = row.target_exposure_pct
+research/v15/balanced_step4_netted_sim.py:415:    """Replicates balanced_step3_riskparity.main() loading preamble (m02_journeys -> legs/exph)."""
+research/v15/balanced_step4_netted_sim.py:417:    j = pd.read_parquet("app/data/v15/m02_journeys.parquet", columns=cols)
+research/v15/v15_m025_authenticity_gate.py:8:Spec: brain projects/quant/v15/m025-authenticity-gate-spec (codex 3-round APPROVED).
+research/v15/v15_m025_authenticity_gate.py:15:Reuses M01 proven loaders (fills/funding/ledger/anchors). Weekly anchors come from the
+research/v15/v15_m025_authenticity_gate.py:19:    python v15_m025_authenticity_gate.py --wallets-file W.txt \
+research/v15/v15_m025_authenticity_gate.py:20:        --output app/data/v15/m025_authenticity.parquet [--lookback-days 90]
+research/v15/v15_m025_authenticity_gate.py:39:logging.basicConfig(level=logging.INFO, format="%(asctime)s [m025] %(message)s",
+research/v15/v15_m025_authenticity_gate.py:41:log = logging.getLogger("m025")
+research/v15/v15_m025_authenticity_gate.py:56:                 # Kept for back-compat/reporting. Codex m025 audit flagged it "computed but unused" -> this is
+research/v15/v15_m025_authenticity_gate.py:72:FUNDING_FARM_FRAC = 0.5  # FIX 7(b): |funding| as fraction of |total pnl| above this -> EXCLUDE
+research/v15/v15_m025_authenticity_gate.py:84:    funding_frac: float = float("nan")
+research/v15/v15_m025_authenticity_gate.py:140:def _weekly_anchor_series(wallet, fills, funding, ledger, lo_ms, hi_ms):
+research/v15/v15_m025_authenticity_gate.py:141:    """Return (anchor_ts, total_change, funding_in_week, residual) arrays.
+research/v15/v15_m025_authenticity_gate.py:143:    residual = total_change - funding - net_external_flow  (trading/price PnL).
+research/v15/v15_m025_authenticity_gate.py:144:    Uses TRUE perpAllTime anchor values (cached) + funding + ledger ext-flow.
+research/v15/v15_m025_authenticity_gate.py:161:    # funding usdc per week bucket (prev, cur]
+research/v15/v15_m025_authenticity_gate.py:162:    fund_ev = sorted((int(e["time"]), m01.funding_cash_delta(e)) for e in funding)
+research/v15/v15_m025_authenticity_gate.py:181:    ``resid = total_change - funding - external_flow``; adding funding back
+research/v15/v15_m025_authenticity_gate.py:182:    yields trading+funding PnL while leaving deposits/withdrawals neutralized.
+research/v15/v15_m025_authenticity_gate.py:321:    funding = m01.load_wallet_funding(wallet, lo_ms, hi_ms)
+research/v15/v15_m025_authenticity_gate.py:351:    wk = _weekly_anchor_series(wallet, fills, funding, ledger, lo_ms, hi_ms)
+research/v15/v15_m025_authenticity_gate.py:362:        # FIX 7(a) + ISSUE F: absolute funding contribution as a fraction of the
+research/v15/v15_m025_authenticity_gate.py:364:        # total_change - fund_week - ext_flow (trading/price pnl), so trading+funding
+research/v15/v15_m025_authenticity_gate.py:365:        # pnl per week = resid + fund_week. funding_frac = sum(|fund_week|) /
+research/v15/v15_m025_authenticity_gate.py:370:        # AUDIT 2026-07-10 (codex m025 P1): a ~0 trade+funding denominator must NOT fail OPEN. Two cases:
+research/v15/v15_m025_authenticity_gate.py:371:        #  (a) denom~0 AND funding present (|fund|>eps) -> funding EXACTLY offsets trading every week: this is
+research/v15/v15_m025_authenticity_gate.py:372:        #      the funding-farm signature. funding_frac = +inf so the funding_farm hard-exclude fires (conservative).
+research/v15/v15_m025_authenticity_gate.py:373:        #  (b) denom~0 AND ~no funding -> genuinely undefined -> NaN, routed to the nan_metric REVIEW path below.
+research/v15/v15_m025_authenticity_gate.py:375:            s.funding_frac = _fund_abs / denom
+research/v15/v15_m025_authenticity_gate.py:377:            s.funding_frac = float("inf")   # funding-dominated, trade+funding nets to ~0 -> funding_farm EXCLUDE
+research/v15/v15_m025_authenticity_gate.py:379:            s.funding_frac = float("nan")   # no evidence either way -> REVIEW (fail closed, not PASS)
+research/v15/v15_m025_authenticity_gate.py:382:        # a fabricated Sharpe/primary ranking. Use flow-neutral trading+funding
+research/v15/v15_m025_authenticity_gate.py:601:    if s.wash_frac >= WASH_EXCLUDE:                       # codex m025 P2: exact 0.50 -> EXCLUDE
+research/v15/v15_m025_authenticity_gate.py:606:    if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:  # inf trips this -> EXCLUDE
+research/v15/v15_m025_authenticity_gate.py:607:        hard_codes.append("funding_farm")
+research/v15/v15_m025_authenticity_gate.py:618:    if ng != ng or pv != pv or s.funding_frac != s.funding_frac:  # codex m025 P1: NaN funding_frac -> REVIEW
+research/v15/v15_m025_authenticity_gate.py:622:    if WASH_REVIEW <= s.wash_frac < WASH_EXCLUDE:         # codex m025 P2: exact 0.20 -> REVIEW (not PASS)
+research/v15/v15_m025_authenticity_gate.py:718:            "funding_frac": s.funding_frac, "wash_frac": s.wash_frac,
+research/v15/v15_m025_authenticity_gate.py:747:            "wash", "unexecutable_dex", "stale", "funding_farm"}
+research/v15/wallet_persistence.py:25:    """TAKER copy edge on m02 events, matching v17 deployment + revalidate_api_execmodel.edge():
+research/v15/wallet_persistence.py:108:                         "2-window persistence test. Spans the m02-covered range only (Dec1..Jun11).")
+research/v15/wallet_persistence.py:132:        M02_MAX = ms("2026-06-11")  # m02_actions.parquet coverage ceiling (verified 2026-07-08)
+research/v15/wallet_persistence.py:134:            raise SystemExit(f"--windows end {breaks[-1]} exceeds m02 coverage (Jun11). Refresh m02 first.")
+research/v15/wallet_persistence.py:139:        wf = S.load_events_from_m02(set(uni), span_lo - hold_ms, span_hi)
+research/v15/wallet_persistence.py:163:    wf = S.load_events_from_m02(set(uni), start - hold_ms, end)
+research/v15/wallet_persistence.py:190:        else: print(f"  {p[:12]} not in both-window set (insufficient m02 trades)")
+research/v15/v15_m08_survival.py:63:    fixed_target_exposure: float = 0.10
+research/v15/v15_m08_survival.py:79:        fixed_target_exposure=m.fixed_target_exposure,
+research/v15/v15_m08_survival.py:319:    acts_ds = ds.dataset(str(data_dir / "m02_actions.parquet"))
+research/v15/v15_m08_survival.py:434:        fixed_target_exposure=args.fixed_target_exposure,
+research/v15/v15_m01_equity_reconstruct.py:36:      walk the merged fill/ledger/funding event stream in (t_a, t]:
+research/v15/v15_m01_equity_reconstruct.py:40:        funding-> cash += usdc
+research/v15/v15_m01_equity_reconstruct.py:52:  - Funding: app/data/v13/raw_funding_cache_20k/{wallet}_*.json (S3 bulk).
+research/v15/v15_m01_equity_reconstruct.py:65:    wallet, n_fills, n_funding, n_ledger, n_weekly_anchors_in_window,
+research/v15/v15_m01_equity_reconstruct.py:113:FUNDING_DIR = Path("/Users/hermes/quants-lab/app/data/v13/raw_funding_cache_20k")
+research/v15/v15_m01_equity_reconstruct.py:230:        # resort (still imperfect on thin books, but never the funding oracle).
+research/v15/v15_m01_equity_reconstruct.py:248:    # than CANDLE_MAX_AGE_MS, return None so the caller flags it (degraded / NO_ANCHOR) instead of
+research/v15/v15_m01_equity_reconstruct.py:262:# -> caller flags degraded/NO_ANCHOR. The pre/post-05-24 coverage+staleness AUDIT validates the cap does
+research/v15/v15_m01_equity_reconstruct.py:321:# setOracle MARK price (markPxs[0]) -- the price HL uses for accountValue/uPnL (oracle is funding-only).
+research/v15/v15_m01_equity_reconstruct.py:756:    startPosition and signed size define an edge in the actual position path.
+research/v15/v15_m01_equity_reconstruct.py:762:    starts = [_position_key(f["startPosition"]) for f in group]
+research/v15/v15_m01_equity_reconstruct.py:763:    ends = [_position_key(f["startPosition"] + f["signed_sz"]) for f in group]
+research/v15/v15_m01_equity_reconstruct.py:821:        "closedPnl", "startPosition", "fee", "builderFee", "deployerFee",
+research/v15/v15_m01_equity_reconstruct.py:845:                "startPosition": float(rec.get("startPosition", 0) or 0),
+research/v15/v15_m01_equity_reconstruct.py:895:def load_wallet_funding(wallet: str, t0: int, t1: int) -> list[dict]:
+research/v15/v15_m01_equity_reconstruct.py:896:    """Load + merge + dedup funding events from the local S3 bulk cache.
+research/v15/v15_m01_equity_reconstruct.py:900:    Records: {time, hash, delta:{type:'funding', coin, usdc(signed), ...}}.
+research/v15/v15_m01_equity_reconstruct.py:916:            if d.get("type") != "funding":
+research/v15/v15_m01_equity_reconstruct.py:1075:    Trading results (fills, funding, liquidation) are NOT in ext_flow.
+research/v15/v15_m01_equity_reconstruct.py:1211:def funding_cash_delta(e: dict) -> float:
+research/v15/v15_m01_equity_reconstruct.py:1215:    if d.get("type") != "funding":
+research/v15/v15_m01_equity_reconstruct.py:1218:    # Only funding on an included perp coin counts (parity with fills/positions).
+research/v15/v15_m01_equity_reconstruct.py:1230:    """Position per coin at time t = (EARLIEST fill's startPosition) + cumulative
+research/v15/v15_m01_equity_reconstruct.py:1234:    fill's startPosition + signed_sz. Large orders fill as a SAME-MILLISECOND
+research/v15/v15_m01_equity_reconstruct.py:1237:    mid-burst startPosition and invents a phantom open position (observed: a flat
+research/v15/v15_m01_equity_reconstruct.py:1239:    closing burst had startPosition=-105,010). The cumulative sum from the
+research/v15/v15_m01_equity_reconstruct.py:1240:    EARLIEST fill's startPosition is ORDER-INDEPENDENT and exact regardless of
+research/v15/v15_m01_equity_reconstruct.py:1249:        pos = fs[0]["startPosition"] + sum(x["signed_sz"] for x in fs)
+research/v15/v15_m01_equity_reconstruct.py:1292:      pre-first-fill carry) is taken from the clean earliest-fill startPosition, EXCEPT
+research/v15/v15_m01_equity_reconstruct.py:1294:      mid-burst garbage startPosition), in which case P0 is anchored to the authoritative
+research/v15/v15_m01_equity_reconstruct.py:1296:      phantom-seed leak (e2af8f54's 83-fill same-ms first DOGE fill read startPosition
+research/v15/v15_m01_equity_reconstruct.py:1322:    # leak: M1 took it from the earliest fill's startPosition, but large orders fill as
+research/v15/v15_m01_equity_reconstruct.py:1324:    # are in arbitrary order, so a burst startPosition is mid-burst GARBAGE. Observed
+research/v15/v15_m01_equity_reconstruct.py:1326:    # 83-fill same-ms burst reading startPosition 1,792,138 -> the old seed put 1.79M DOGE
+research/v15/v15_m01_equity_reconstruct.py:1332:    # snapshot. A CLEAN earliest fill keeps the forward startPosition (the snapshot carries
+research/v15/v15_m01_equity_reconstruct.py:1356:            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill
+research/v15/v15_m01_equity_reconstruct.py:1410:    # reveal a pre-anchor carry via its authoritative startPosition. In causal
+research/v15/v15_m01_equity_reconstruct.py:1426:                sp = float(ev.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m01_equity_reconstruct.py:1446:        elif typ == "funding":
+research/v15/v15_m01_equity_reconstruct.py:1447:            cash += funding_cash_delta(ev)
+research/v15/v15_m01_equity_reconstruct.py:1491:    in from pre-window history (seeded via startPosition, no fill at-or-before
+research/v15/v15_m01_equity_reconstruct.py:1556:    funding = load_wallet_funding(wallet, start_ms, load_end_ms)
+research/v15/v15_m01_equity_reconstruct.py:1564:    for e in funding:
+research/v15/v15_m01_equity_reconstruct.py:1565:        stream.append((int(e["time"]), "funding", e))
+research/v15/v15_m01_equity_reconstruct.py:1676:        "n_funding": len(funding),
+research/v15/v15_m01_equity_reconstruct.py:1737:        ext_funding = load_wallet_funding(wallet, start_ms, anchor.fetched_ms)
+research/v15/v15_m01_equity_reconstruct.py:1742:            + [(int(e["time"]), "funding", e) for e in ext_funding]
+research/v15/v15_m01_equity_reconstruct.py:1804:            ~= -sum(fees) + sum(funding)
+research/v15/v15_m01_equity_reconstruct.py:1821:        seg_funding = 0.0
+research/v15/v15_m01_equity_reconstruct.py:1829:            elif typ == "funding":
+research/v15/v15_m01_equity_reconstruct.py:1830:                seg_funding += funding_cash_delta(ev)
+research/v15/v15_m01_equity_reconstruct.py:1855:        rhs = -seg_fees + seg_funding + trading_pnl
+research/v15/v15_m01_equity_reconstruct.py:1994:# This block is ADDITIVE for V15 M02 (journey_trace). It does NOT touch the
+research/v15/v15_m01_equity_reconstruct.py:1996:# (seed_positions, get_mark, fill/ledger/funding cash deltas) to emit, per
+research/v15/v15_m01_equity_reconstruct.py:2000:#   event_order key = (ts_ms, type_rank, source_seq)
+research/v15/v15_m01_equity_reconstruct.py:2001:#     type_rank: ledger=0, fill=1, funding=2   (ledger settles, then trade,
+research/v15/v15_m01_equity_reconstruct.py:2002:#                then funding accrues on the post-trade position)
+research/v15/v15_m01_equity_reconstruct.py:2015:_TYPE_RANK = {"ledger": 0, "fill": 1, "funding": 2}
+research/v15/v15_m01_equity_reconstruct.py:2034:    funding: list[dict],
+research/v15/v15_m01_equity_reconstruct.py:2037:    """Merge fills+funding+ledger into the TOTAL EVENT ORDER (spec v4).
+research/v15/v15_m01_equity_reconstruct.py:2040:        ts, type ('fill'|'funding'|'ledger'), type_rank, source_seq, ev (payload)
+research/v15/v15_m01_equity_reconstruct.py:2046:    by chaining startPosition -> startPosition+signed_size. The fill payload is
+research/v15/v15_m01_equity_reconstruct.py:2074:    for i, e in enumerate(funding):
+research/v15/v15_m01_equity_reconstruct.py:2078:                "type": "funding",
+research/v15/v15_m01_equity_reconstruct.py:2079:                "type_rank": _TYPE_RANK["funding"],
+research/v15/v15_m01_equity_reconstruct.py:2092:    event_order: int           # strictly monotone index in the ordered stream
+research/v15/v15_m01_equity_reconstruct.py:2112:                                    # (ts, tid). None for funding/ledger events.
+research/v15/v15_m01_equity_reconstruct.py:2131:      * mark_ts <= ts(k); anchor_ts < ts(k); event_order strictly monotone.
+research/v15/v15_m01_equity_reconstruct.py:2159:        coin DID hold a pre-anchor position (its first fill's startPosition), which
+research/v15/v15_m01_equity_reconstruct.py:2162:        SAME way case 2 + the cash snap would have: add startPosition to the book
+research/v15/v15_m01_equity_reconstruct.py:2173:        sp = float(ev.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m01_equity_reconstruct.py:2198:            # advance the position book from startPosition-derived seeding so
+research/v15/v15_m01_equity_reconstruct.py:2200:            # has_past_anchor=False (M02 maps this to NO_ANCHOR).
+research/v15/v15_m01_equity_reconstruct.py:2202:            # uses startPosition + cumulative signed_sz, all <= ts).
+research/v15/v15_m01_equity_reconstruct.py:2210:                    event_order=order, ts=ts, type=item["type"],
+research/v15/v15_m01_equity_reconstruct.py:2227:            # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
+research/v15/v15_m01_equity_reconstruct.py:2243:            # re-fold a startPosition. Coins NOT seeded (first traded after anchor)
+research/v15/v15_m01_equity_reconstruct.py:2295:                event_order=order, ts=ts, type=item["type"],
+research/v15/v15_m01_equity_reconstruct.py:2332:    if t == "funding":
+research/v15/v15_m01_equity_reconstruct.py:2333:        return cash + funding_cash_delta(ev)
+research/v15/v15_m01_equity_reconstruct.py:2341:    'fills': [...], 'funding': [...], 'inter_anchor_drift': {...} (diagnostic
+research/v15/v15_m01_equity_reconstruct.py:2360:    funding = load_wallet_funding(wallet, start_ms, load_end_ms)
+research/v15/v15_m01_equity_reconstruct.py:2375:    ordered = build_event_stream(fills, funding, ledger)
+research/v15/v15_m01_equity_reconstruct.py:2393:        "funding": funding,
+
+codex
+The lifecycle code has a real resync path, but it appears to reseed only once per coin because `coin_seen_first_fill` is not reset after a discontinuity. I’m checking the tests and M01 event ordering assumptions before calling that a defect.
+exec
+/bin/zsh -lc "sed -n '220,520p' tests/v15/test_m02.py" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc "sed -n '1,220p' tests/v15/test_m02.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    assert m01.coin_is_allowed_perp(f["coin"]) is False
+    assert m01.build_event_stream([f], [], []) == []
+
+
+def test_reverse_two_journey_ids():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),                  # ENTRY long 1
+        _fill(2100, "BTC", "A", 3, 110, 1, tid=2, closed=10.0),     # REVERSE -> short 2
+        _fill(2200, "BTC", "B", 2, 105, -2, tid=3, closed=10.0),    # EXIT -> 0
+    ]
+    _, actions, journeys = _run(fills)
+    rev = next(a for a in actions if a["action_type"] == "REVERSE")
+    # one row, BOTH ids, and they differ (close prior, open new).
+    assert rev["closing_journey_id"] is not None
+    assert rev["opening_journey_id"] is not None
+    assert rev["closing_journey_id"] != rev["opening_journey_id"]
+    assert rev["journey_id"] == rev["opening_journey_id"]
+    # position flips sign
+    assert rev["position_after"] < 0
+    # two journeys: the closed long + the closed short
+    assert len(journeys) == 2
+    sides = sorted(j["side"] for j in journeys)
+    assert sides == ["long", "short"]
+
+
+def test_causal_carry_in_via_startposition():
+    # first in-window fill reports startPosition = +5 (carried in pre-window).
+    fills = [
+        _fill(3000, "BTC", "A", 2, 110, 5, tid=1, closed=20.0),   # TRIM of carried 5 -> 3
+        _fill(3100, "BTC", "A", 3, 110, 3, tid=2, closed=30.0),   # EXIT -> 0
+    ]
+    _, actions, journeys = _run(fills)
+    # carry-in opens an in-progress journey; first action is a TRIM (not ENTRY).
+    assert actions[0]["action_type"] == "TRIM"
+    assert actions[0]["carry_in_status"] == "SEEDED"
+    assert len(journeys) == 1
+    j = journeys[0]
+    assert j["n_carry_in_seeds"] == 1
+    assert j["side"] == "long"
+    assert j["carry_in_status"] == "SEEDED"
+    # position_after of first action = 5 - 2 = 3
+    assert abs(actions[0]["position_after"] - 3.0) < 1e-9
+
+
+def test_liquidation_flags_involuntary_exit():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(2100, "BTC", "A", 1, 80, 1, tid=2, closed=-20.0,
+              dir_="Liquidated Cross Long", liq=True),
+    ]
+    _, actions, journeys = _run(fills)
+    ex = actions[-1]
+    assert ex["action_type"] == "EXIT"
+    assert ex["is_liquidation"] is True
+    assert journeys[0]["liq_closed"] is True
+
+
+def test_target_exposure_pct_sane():
+    # equity ~1000, position 5 @ 100 = 500 notional -> ~0.5 (50%).
+    fills = [_fill(3000, "BTC", "B", 5, 100, 0, tid=1)]
+    _, actions, _ = _run(fills, anchors=[(2000, 1000.0)])
+    a = actions[0]
+    # equity_post after buying 5@100: cash = 1000 - 0(no seed) - 500 = 500; posval=500 -> eq 1000.
+    assert a["target_exposure_pct"] is not None
+    assert 0.0 < a["target_exposure_pct"] < 1.0
+
+
+def test_partial_mtm_on_unmarkable():
+    # An EXOTIC coin (no mark) held alongside cash -> PARTIAL_MTM / frozen comp.
+    fills = [
+        _fill(3000, "EXOTIC:FOO", "B", 1, 50, 0, tid=1),   # unmarkable position
+        _fill(3100, "BTC", "B", 1, 100, 0, tid=2),
+    ]
+    events, actions, _ = _run(fills, anchors=[(2000, 1000.0)])
+    btc = next(a for a in actions if a["coin"] == "BTC")
+    assert btc["equity_basis_mode"] in ("PARTIAL_MTM", "ANCHOR_FALLBACK")
+    assert btc["equity_degraded"] is True
+
+
+# --------------------------------------------------------------------------- #
+# CAUSALITY BUG 1 — no future-fill coin in earlier equity_post (look-ahead)
+# --------------------------------------------------------------------------- #
+
+
+def test_future_coin_does_not_affect_earlier_equity(monkeypatch):
+    """A coin first TRADED at t2 must NOT contribute a marked position at an
+    earlier event t1, even if its first fill reports a nonzero startPosition
+    (pre-anchor holding only LEARNED from the future fill = look-ahead).
+
+    Per-coin marks so the leak is observable in position_value:
+      BTC = 100, ALT = 50. ALT's first fill is at t2=3000 with startPosition=10.
+    Before the fix, seed_positions case 2 seeded ALT=10 at the anchor, so ALT was
+    in the book at t1=2000 (position_value would include 10*50=500). After the fix
+    ALT is absent at t1 and materialises only at its own fill (order <= k).
+    """
+    def per_coin_mark(coin, ts_ms, causal=False):
+        return 50.0 if coin == "ALT" else 100.0
+    monkeypatch.setattr(m01, "get_mark", per_coin_mark)
+    monkeypatch.setattr(m02.m01, "get_mark", per_coin_mark)
+
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),       # t1: BTC entry, ALT untraded
+        _fill(3000, "ALT", "A", 2, 50, 10, tid=2),       # t2: ALT first fill, startPos=10
+    ]
+    anchor = _Anchor()
+    ordered = m01.build_event_stream(fills, [], [])
+    events = m01.compute_event_equity(
+        ordered, fills, anchor, "0xtest", [(1000, 1000.0)], extradex_no_anchor=False
+    )
+    e_t1 = next(e for e in events if e.ts == 2000 and e.type == "fill")
+    # CAUSAL: at t1 only BTC (1 @ 100) is held; ALT (would be 10 @ 50 = 500) must
+    # NOT leak in. position_value is exactly the BTC leg.
+    assert abs(e_t1.position_value - 100.0) < 1e-6
+    assert e_t1.markable_all is True
+    # ALT only appears from t2 onward.
+    e_t2 = next(e for e in events if e.ts == 3000 and e.type == "fill")
+    # at t2 ALT pos = 10 (startPos) - 2 = 8 @ 50 = 400, plus BTC 100 -> 500.
+    assert abs(e_t2.position_value - 500.0) < 1e-6
+
+
+def test_daily_walk_gross_notional_does_not_net_opposing_coins(monkeypatch):
+    monkeypatch.setattr(m01, "get_mark", lambda coin, ts_ms, causal=False: 100.0)
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(2100, "ETH", "A", 1, 100, 0, tid=2),
+    ]
+    stream = [(f["time"], "fill", f) for f in fills]
+    wr = m01.compute_eq_at(stream, fills, _Anchor(), "0xtest", 3000, 1000, 1000.0)
+    assert wr.position_value == pytest.approx(0.0)
+    assert wr.gross_position_notional == pytest.approx(200.0)
+
+
+def test_inter_anchor_drift_validates_causal_not_future_snapshot_seed(monkeypatch):
+    """The quarantine audit must use the same causal seed as emitted equity.
+
+    A future snapshot says BTC=10, while the observed burst causally opens only
+    3 BTC in this segment.  The old audit-only ex-post path back-solved a
+    pre-anchor position of 7 from that future snapshot and measured a different
+    equity path from the one actually emitted.
+    """
+    monkeypatch.setattr(
+        m01,
+        "get_mark",
+        lambda coin, ts_ms, causal=False: 100.0 if ts_ms <= 1000 else 200.0,
+    )
+    fills = m01.order_wallet_fills_causally([
+        _fill(1500, "BTC", "B", 1, 100, 0, tid=20),
+        _fill(1500, "BTC", "B", 2, 100, 1, tid=10),
+    ])
+    stream = [(f["time"], "fill", f) for f in fills]
+    anchor = _Anchor()
+    anchor.positions = {"BTC": 10.0}
+    # Causal path: buy 3 at 100, mark at 200 -> +$300 equity.
+    out = m01.inter_anchor_drift(
+        stream, fills, anchor, "0xtest", [(1000, 1000.0), (2000, 1300.0)]
+    )
+    assert out["n_checks"] == 1
+    assert out["max_drift_pct"] == pytest.approx(0.0)
+
+    # Explicit diagnostic ex-post mode remains different and cannot be used to
+    # accept the causal artifact.
+    leaked = m01.inter_anchor_drift(
+        stream, fills, anchor, "0xtest", [(1000, 1000.0), (2000, 1300.0)],
+        causal_seed=False,
+    )
+    assert leaked["max_drift_pct"] > 0.5
+
+
+def test_daily_causal_walk_folds_carry_when_first_revealed(monkeypatch):
+    """Daily M1 must match the per-event bridge's causal carry-in behavior."""
+    monkeypatch.setattr(
+        m01,
+        "get_mark",
+        lambda coin, ts_ms, causal=False: 100.0 if ts_ms <= 1000 else 110.0,
+    )
+    # First observed fill is a trim of a long 10 position held at the anchor.
+    fill = _fill(2000, "BTC", "A", 2, 100, 10, tid=1)
+    wr = m01.compute_eq_at(
+        [(2000, "fill", fill)], [fill], _Anchor(), "0xtest",
+        t_ms=3000, anchor_ms=1000, anchor_eq=1000.0, causal_seed=True,
+    )
+    assert wr.positions["BTC"] == pytest.approx(8.0)
+    # Anchor: cash=0, position=10*$100. Trim receives $200; remaining
+    # position is worth 8*$110 => equity $1,080.
+    assert wr.cash == pytest.approx(200.0)
+    assert wr.position_value == pytest.approx(880.0)
+    assert wr.equity == pytest.approx(1080.0)
+
+
+def test_segment_reconcile_does_not_double_count_closed_pnl(monkeypatch):
+    monkeypatch.setattr(m01, "get_mark", lambda coin, ts_ms, causal=False: 100.0)
+    fills = [
+        _fill(1200, "BTC", "B", 1, 100, 0, tid=1, closed=0.0),
+        _fill(1800, "BTC", "A", 1, 110, 1, tid=2, closed=10.0),
+    ]
+    stream = [(f["time"], "fill", f) for f in fills]
+    out = m01.segment_reconcile(
+        stream, fills, _Anchor(), "0xtest",
+        [(1000, 1000.0), (2000, 1010.0)], fills,
+        causal_seed=True,
+    )
+    assert out["n_segments"] == 1
+    assert out["max_err_usd"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# CAUSALITY BUG 2 — same-ms fills (no tid) get distinct correct actions
+# --------------------------------------------------------------------------- #
+
+
+def test_same_ms_fills_distinct_correct_actions():
+    """Two same-ms fills on the same coin with NO tid (S3 partition drops tid)
+    must produce TWO distinct, correctly-ordered actions with correct
+    position_after — not collide on (ts, tid=0) and overwrite each other.
+
+    Both fills at ts=3000, tid=0. Fill A: buy 1 @100 (ENTRY, pos->1).
+    Fill B: buy 2 @100 (ADDON, pos->3). Their stable per-fill sequence (load
+    order) keeps them ordered and distinct on the event stream.
+    """
+    fills = [
+        _fill(3000, "BTC", "B", 1, 100, 0, tid=0),   # ENTRY -> 1
+        _fill(3000, "BTC", "B", 2, 100, 1, tid=0),   # ADDON -> 3 (startPos=1 = post-A)
+    ]
+    _, actions, _ = _run(fills, anchors=[(2000, 1000.0)])
+    btc = [a for a in actions if a["coin"] == "BTC"]
+    assert len(btc) == 2  # two distinct rows, no overwrite
+    assert [a["action_type"] for a in btc] == ["ENTRY", "ADDON"]
+    assert abs(btc[0]["position_after"] - 1.0) < 1e-9
+    assert abs(btc[1]["position_after"] - 3.0) < 1e-9
+    # strictly distinct event_order despite identical (ts, tid)
+    assert btc[0]["event_order"] != btc[1]["event_order"]
+    # signed sizes preserved per fill (not both = the overwritten last payload)
+    assert abs(btc[0]["signed_size"] - 1.0) < 1e-9
+    assert abs(btc[1]["signed_size"] - 2.0) < 1e-9
+
+
+def test_same_ms_tid_is_identity_not_causal_order():
+    # Real S3 pattern: numerical tid order differs from position evolution.
+    # Correct chain: -573 -> -1428 -> -3011 -> -3584.
+    fills = [
+        _fill(3000, "BTC", "A", 855, 100, -573, tid=10, dir_="Open Short"),
+        _fill(3000, "BTC", "A", 573, 100, -3011, tid=20, dir_="Open Short"),
+        _fill(3000, "BTC", "A", 1583, 100, -1428, tid=30, dir_="Open Short"),
+    ]
+    ordered = m01.order_wallet_fills_causally(fills)
+    assert [f["startPosition"] for f in ordered] == [-573.0, -1428.0, -3011.0]
+    stream = m01.build_event_stream(fills, [], [])
+    assert [e["ev"]["startPosition"] for e in stream] == [-573.0, -1428.0, -3011.0]
+    assert all(e["ev"]["causal_order_ok"] for e in stream)
+
+
+def test_position_gap_resyncs_and_invalidates_interrupted_journey():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1, dir_="Open Long"),
+        # Missing fills moved the real position from 1 to 5 before this trim.
+        _fill(3000, "BTC", "A", 1, 100, 5, tid=2, dir_="Close Long"),
+        _fill(4000, "BTC", "A", 4, 100, 4, tid=3, dir_="Close Long"),
+    ]
+    _, actions, journeys = _run(fills, anchors=[(1000, 1000.0)])
+    assert actions[1]["state_resynced"] is True
+    assert actions[1]["position_after"] == pytest.approx(4.0)
+    assert actions[1]["action_type"] == "TRIM"
+    assert any(not j["lifecycle_valid"] and j["state_discontinuity"] for j in journeys)
+    # The gap is learned after action 0 was emitted, so validity must propagate
+    # backward to the entire interrupted journey.
+    assert actions[0]["lifecycle_valid"] is False
+    # The current transition can seed a new historical journey from its
+    # authoritative startPosition, but a raw live stream cannot self-repair.
+    assert actions[1]["lifecycle_valid"] is True
+    assert actions[1]["stream_replay_valid"] is False
+    assert actions[2]["lifecycle_valid"] is True
+    assert actions[2]["stream_replay_valid"] is False
+    assert all("stream_replay_valid" in j for j in journeys)
+    assert not any(j["stream_replay_valid"] for j in journeys)
+
+
+# --------------------------------------------------------------------------- #
+# M01 spot/collateral invariant
+# --------------------------------------------------------------------------- #
+
+
+def test_m01_spot_collateral_invariant():
+    """Whole-account equity includes collateral (spot USDC) via the cash snap.
+
+    With NO open positions, equity_post == anchor_equity (pure collateral/cash).
+    A pure deposit-like cash addition must raise equity_post by that amount,
+    proving collateral is an explicit equity component (not dropped)."""
+    # one fill that immediately closes -> book flat, equity == cash == collateral.
+    fills = [
+        _fill(3000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(3100, "BTC", "A", 1, 100, 1, tid=2, closed=0.0),
+    ]
+    events, _, _ = _run(fills, anchors=[(2000, 1000.0)])
+    last = events[-1]
+    # flat book, no PnL, no fees -> equity == anchor collateral (1000).
+    assert abs(last.equity_post - 1000.0) < 1e-6
+    assert abs(last.position_value) < 1e-6  # nothing held
+    assert abs(last.cash - 1000.0) < 1e-6   # all equity is collateral/cash
+
+
+def test_spot_fill_cannot_create_perp_equity_or_ranking_action():
+
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""V15 M02 unit tests — NON-LOOK-AHEAD invariants + state machine correctness.
+
+Synthetic fixtures only; no network, no Mongo, no parquet. We monkeypatch
+m01.get_mark so equity reconstruction is deterministic, then drive
+trace_wallet / compute_event_equity directly.
+
+Run:
+    /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02.py -q
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "research" / "v15"))
+
+import v15_m01_equity_reconstruct as m01  # noqa: E402
+import v15_m02_journey_trace as m02  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures / helpers
+# --------------------------------------------------------------------------- #
+
+FIXED_MARK = 100.0
+
+
+@pytest.fixture(autouse=True)
+def _patch_marks(monkeypatch):
+    """Deterministic mark: $100 for BTC, None for an unmarkable exotic coin."""
+    def fake_mark(coin, ts_ms, causal=False):
+        if coin.startswith("EXOTIC"):
+            return None
+        return FIXED_MARK
+    monkeypatch.setattr(m01, "get_mark", fake_mark)
+    monkeypatch.setattr(m02.m01, "get_mark", fake_mark)
+
+
+def _fill(ts, coin, side, size, price, start_pos, tid, closed=0.0, dir_="", liq=False):
+    return {
+        "coin": coin, "side": side, "size": float(size), "price": float(price),
+        "time": int(ts), "tid": int(tid), "dir": dir_,
+        "closedPnl": float(closed), "startPosition": float(start_pos),
+        "fee": 0.0, "builderFee": 0.0, "deployerFee": 0.0,
+        "signed_sz": float(size) if side == "B" else -float(size),
+        "is_liquidation": liq,
+    }
+
+
+class _Anchor:
+    """Minimal AnchorState stand-in: no pre-anchor positions, far-future fetch."""
+    positions: dict = {}
+    entry_px: dict = {}
+    fetched_ms = 10**15
+    dexes_seen = {"main"}
+    has_flx_anchor = False
+    has_unmarkable_dex_anchor = False
+    acct_value_by_dex = {"main": 1000.0}
+    aggregate_acct_value = 1000.0
+
+
+def _run(fills, funding=None, anchors=None):
+    funding = funding or []
+    # default anchor strictly BEFORE the first fill so events are sizeable.
+    anchors = anchors if anchors is not None else [(fills[0]["time"] - 1000, 1000.0)]
+    anchor = _Anchor()
+    ordered = m01.build_event_stream(fills, funding, [])
+    events = m01.compute_event_equity(
+        ordered, fills, anchor, "0xtest", anchors, extradex_no_anchor=False
+    )
+    actions, journeys = m02.trace_wallet("0xtest", events, fills, funding)
+    return events, actions, journeys
+
+
+def test_core_m02_does_not_reconstruct_equity(monkeypatch):
+    """The default lifecycle lane must run while M01 is absent or distrusted."""
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(3000, "BTC", "A", 1, 110, 1, tid=2, closed=10.0),
+    ]
+    for i, fill in enumerate(fills):
+        fill["fill_seq"] = i
+        fill["causal_order_ok"] = True
+    monkeypatch.setattr(m02.m01, "load_wallet_fills", lambda *_: fills)
+    monkeypatch.setattr(m02.m01, "load_wallet_funding", lambda *_: [])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("core M02 consulted M01 equity reconstruction")
+
+    monkeypatch.setattr(m02.m01, "reconstruct_wallet_event_equity", forbidden)
+    result = m02.process_wallet(("0xtest", 0, 10_000, False))
+
+    assert "error" not in result
+    assert len(result["actions"]) == 2
+    assert len(result["journeys"]) == 1
+    assert result["n_anchors"] is None
+    assert result["inter_drift"] is None
+    assert all(a["equity_basis_mode"] == "NOT_REQUESTED" for a in result["actions"])
+    assert all(a["source_equity_post"] is None for a in result["actions"])
+    assert all(a["target_exposure_pct"] is None for a in result["actions"])
+
+
+# --------------------------------------------------------------------------- #
+# NON-LOOK-AHEAD INVARIANTS
+# --------------------------------------------------------------------------- #
+
+
+def test_event_order_strictly_monotone():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(3000, "BTC", "A", 1, 110, 1, tid=2, closed=10.0),
+    ]
+    events, actions, _ = _run(fills)
+    orders = [a["event_order"] for a in actions]
+    assert orders == sorted(orders)
+    assert len(set(orders)) == len(orders)  # strict
+
+
+def test_anchor_ts_strictly_before_ts():
+    fills = [_fill(5000, "BTC", "B", 1, 100, 0, tid=1)]
+    # anchor shares the action ms -> must NOT be chosen (strict <).
+    _, actions, _ = _run(fills, anchors=[(2000, 1000.0), (5000, 1100.0)])
+    a = actions[0]
+    assert a["anchor_ts"] == 2000
+    assert a["anchor_ts"] < a["ts"]
+
+
+def test_equity_ts_and_mark_ts_le_ts():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(4000, "BTC", "B", 1, 100, 1, tid=2),
+    ]
+    _, actions, _ = _run(fills)
+    for a in actions:
+        if a["equity_ts"] is not None:
+            assert a["equity_ts"] <= a["ts"]
+        if a["mark_ts"] is not None:
+            assert a["mark_ts"] <= a["ts"]
+
+
+def test_no_anchor_implies_null_target():
+    # first fill is BEFORE any anchor -> NO_ANCHOR, target null.
+    fills = [
+        _fill(1000, "BTC", "B", 1, 100, 0, tid=1),   # before anchor at 2000
+        _fill(3000, "BTC", "B", 1, 100, 1, tid=2),   # after anchor -> sizeable
+    ]
+    _, actions, _ = _run(fills, anchors=[(2000, 1000.0)])
+    a0 = next(a for a in actions if a["ts"] == 1000)
+    assert a0["equity_basis_mode"] == "NO_ANCHOR"
+    assert a0["target_exposure_pct"] is None
+    a1 = next(a for a in actions if a["ts"] == 3000)
+    assert a1["equity_basis_mode"] in ("INTRAWEEK", "PARTIAL_MTM")
+    assert a1["target_exposure_pct"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# STATE MACHINE CORRECTNESS
+# --------------------------------------------------------------------------- #
+
+
+def test_entry_addon_trim_exit_sequence():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),                 # ENTRY long 1
+        _fill(2100, "BTC", "B", 1, 100, 1, tid=2),                 # ADDON -> 2
+        _fill(2200, "BTC", "A", 1, 110, 2, tid=3, closed=10.0),    # TRIM -> 1
+        _fill(2300, "BTC", "A", 1, 120, 1, tid=4, closed=20.0),    # EXIT -> 0
+    ]
+    _, actions, journeys = _run(fills)
+    assert [a["action_type"] for a in actions] == ["ENTRY", "ADDON", "TRIM", "EXIT"]
+    assert len(journeys) == 1
+    j = journeys[0]
+    assert j["side"] == "long"
+    assert j["n_entry_fills"] == 1 and j["n_addon_fills"] == 1
+    assert j["n_trim_fills"] == 1 and j["n_exit_fills"] == 1
+    assert abs(j["realized_pnl"] - 30.0) < 1e-6
+    # position_after sanity
+    assert abs(actions[1]["position_after"] - 2.0) < 1e-9
+    assert abs(actions[3]["position_after"]) < 1e-9
+
+
+def test_fill_fee_components_are_not_double_counted():
+    f = _fill(2000, "BTC", "B", 1, 100, 0, tid=1)
+    f.update(fee=0.40, builderFee=0.10, deployerFee=0.05)
+
+    # Hyperliquid reports fee as the total; the two component fields are
+    # disclosures within that total.
+    assert m01.fill_cash_delta(f) == pytest.approx(-100.40)
+    assert m02._fill_fee_usd_actual(f) == pytest.approx(0.40)
+
+
+def test_liquidation_ledger_summary_is_recognized_as_non_cash():
+    e = {
+        "delta": {
+            "type": "liquidation",
+            "accountValue": "25.0",
+            "liquidatedNtlPos": "1000.0",
+            "liquidatedPositions": [{"coin": "BTC", "szi": "0.01"}],
+        }
+    }
+    d = m01.ledger_cash_delta(e, "0xtest")
+    assert d.cash == 0.0
+    assert d.ext_flow == 0.0
+    assert d.unknown is False
+
+
+def test_hip4_outcome_fills_are_not_perp_actions_or_cash_flows():
+    f = _fill(2000, "#42", "B", 10, 0.4, 0, tid=1, dir_="Buy")
+    assert m01.coin_is_allowed_perp(f["coin"]) is False
+    assert m01.fill_cash_delta(f) == 0.0
+    assert m01.build_event_stream([f], [], []) == []
+
+
+def test_named_spot_pair_is_not_a_perp():
+    f = _fill(2000, "PURR/USDC", "B", 10, 0.1, 0, tid=2, dir_="Buy")
+    assert m01.coin_is_allowed_perp(f["coin"]) is False
+
+exec
+/bin/zsh -lc "sed -n '520,760p' tests/v15/test_m02.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+def test_spot_fill_cannot_create_perp_equity_or_ranking_action():
+    """M1/M2/M7 are a perp-copy chain. A spot buy must be absent from both
+    reconstructed perp equity and wallet-ranking actions.
+
+    Regression: the whole-account experiment added the spot asset position but
+    charged zero cash, turning a 10 @ $5 buy into a fake +$50 equity gain.
+    """
+    fill = _fill(3000, "@107", "B", 10, 5, 0, tid=1, dir_="Buy")
+    fill["is_spot"] = True
+    events, actions, journeys = _run([fill], anchors=[(2000, 1000.0)])
+
+    assert events == []
+    assert actions == []
+    assert journeys == []
+
+
+def test_wallet_fill_loader_excludes_spot_fast_path(tmp_path, monkeypatch):
+    wallet = "0x" + "b" * 40
+    rows = [
+        _fill(3000, "@107", "B", 10, 5, 0, tid=1, dir_="Buy"),
+        _fill(4000, "BTC", "B", 0.01, 100_000, 0, tid=2, dir_="Open Long"),
+    ]
+    pd.DataFrame(rows).to_parquet(tmp_path / f"{wallet}.parquet", index=False)
+    monkeypatch.setattr(m01, "S3_BY_WALLET_DIR", tmp_path)
+
+    loaded = m01.load_wallet_fills(wallet, 0, 10_000)
+
+    assert [fill["coin"] for fill in loaded] == ["BTC"]
+
+
+def test_perp_ledger_transfer_scope_is_flow_neutralized():
+    wallet = "0x" + "a" * 40
+    into_perp = {"delta": {"type": "accountClassTransfer", "usdc": "250", "toPerp": True}}
+    out_of_perp = {"delta": {"type": "accountClassTransfer", "usdc": "250", "toPerp": False}}
+    spot_only = {"delta": {"type": "spotTransfer", "usdc": "250"}}
+
+    assert m01.ledger_cash_delta(into_perp, wallet).cash == 250.0
+    assert m01.ledger_cash_delta(into_perp, wallet).ext_flow == 250.0
+    assert m01.ledger_cash_delta(out_of_perp, wallet).cash == -250.0
+    assert m01.ledger_cash_delta(out_of_perp, wallet).ext_flow == -250.0
+    assert m01.ledger_cash_delta(spot_only, wallet).cash == 0.0
+
+
+def test_non_usdc_hip3_collateral_send_uses_usdc_value():
+    wallet = "0xtest"
+    into_flx = {"delta": {
+        "type": "send", "user": wallet, "destination": wallet,
+        "sourceDex": "spot", "destinationDex": "flx", "token": "USDH",
+        "amount": "100", "usdcValue": "99.5", "fee": "0",
+    }}
+    out_of_cash = {"delta": {
+        "type": "send", "user": wallet, "destination": wallet,
+        "sourceDex": "cash", "destinationDex": "spot", "token": "USDT0",
+        "amount": "50", "usdcValue": "50.1", "fee": "0",
+    }}
+    spot_only = {"delta": {
+        "type": "send", "user": wallet, "destination": "0xother",
+        "sourceDex": "spot", "destinationDex": "spot", "token": "HYPE",
+        "amount": "10", "usdcValue": "400", "fee": "0",
+    }}
+    assert m01.ledger_cash_delta(into_flx, wallet).cash == pytest.approx(99.5)
+    assert m01.ledger_cash_delta(into_flx, wallet).ext_flow == pytest.approx(99.5)
+    assert m01.ledger_cash_delta(out_of_cash, wallet).cash == pytest.approx(-50.1)
+    assert m01.ledger_cash_delta(spot_only, wallet).cash == 0.0
+
+
+def test_snapshot_seed_independent_of_future_fills(monkeypatch):
+    """codex code-review r2 BUG: a near-fetch anchor snapshot coin must be seeded
+    based on the snapshot alone, NOT suppressed by whether the wallet trades it
+    LATER. Equity at an early event must be identical whether or not a future fill
+    on the snapshot coin exists (else the seed reads fills with order > k = look-ahead).
+
+    Uses TIME-VARYING marks (ETH 100 at the anchor, 120 after) so the seeded ETH
+    contributes net PnL — otherwise a flat mark makes the seed net out of equity and
+    the test cannot observe the bug."""
+
+    def mark(coin, ts_ms, causal=False):
+        if coin == "ETH":
+            return 100.0 if ts_ms <= 1000 else 120.0
+        return 100.0  # BTC flat
+    monkeypatch.setattr(m01, "get_mark", mark)
+    monkeypatch.setattr(m02.m01, "get_mark", mark)
+
+    class _NearFetchAnchor(_Anchor):
+        positions = {"ETH": 5.0}   # 5 ETH held pre-window, in the fetch snapshot
+        fetched_ms = 1500          # near the anchor (1000) -> near_fetch True
+
+    def equity_at_btc_event(fills):
+        anchor = _NearFetchAnchor()
+        ordered = m01.build_event_stream(fills, [], [])
+        ev = m01.compute_event_equity(
+            ordered, fills, anchor, "0xt", [(1000, 1000.0)], extradex_no_anchor=False
+        )
+        e = [x for x in ev if x.ts == 2000][0]   # the BTC ENTRY event
+        return e.equity_post
+
+    base = [_fill(2000, "BTC", "B", 1, 100, 0, tid=1)]                       # never trades ETH
+    with_future = base + [_fill(3000, "ETH", "A", 1, 120, 5, tid=2)]         # trades ETH AFTER the event
+    eq_base = equity_at_btc_event(base)
+    eq_future = equity_at_btc_event(with_future)
+    # cash = 1000 - 5*100(ETH@anchor) = 500; BTC buy -100 -> 400; at t=2000:
+    # equity = 400 + ETH(5*120=600) + BTC(1*100) = 1100. ETH's +100 PnL is visible.
+    assert abs(eq_base - 1100.0) < 1e-6, eq_base
+    # THE LOOK-AHEAD CHECK: identical whether or not ETH is traded later.
+    assert abs(eq_base - eq_future) < 1e-6, (eq_base, eq_future)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))
+
+exec
+/bin/zsh -lc "sed -n '1990,2138p' research/v15/v15_m01_equity_reconstruct.py && sed -n '2138,2310p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+# --------------------------------------------------------------------------- #
+# M02 BRIDGE — additive per-event equity series (NO reconstruction-MATH change)
+# --------------------------------------------------------------------------- #
+#
+# This block is ADDITIVE for V15 M02 (journey_trace). It does NOT touch the
+# existing daily/audit reconstruction above; it reuses the SAME helpers
+# (seed_positions, get_mark, fill/ledger/funding cash deltas) to emit, per
+# wallet, a PER-EVENT equity_post series in the TOTAL EVENT ORDER required by
+# the M02 design spec:
+#
+#   event_order key = (ts_ms, type_rank, source_seq)
+#     type_rank: ledger=0, fill=1, funding=2   (ledger settles, then trade,
+#                then funding accrues on the post-trade position)
+#     source_seq: stable causal fill sequence; per-type append index otherwise.
+#
+# For each event k we re-anchor to the last weekly anchor with anchor_ts
+# STRICTLY < ts(k) (codex r3: an anchor sharing the action's ms is NOT a valid
+# base), walk forward applying every event with order <= k (incl. this one),
+# then mark-to-market at ts(k). equity_post(k) therefore uses ONLY data with
+# order <= k — no look-ahead. We also emit the per-event reliability fields M02
+# needs to pick its equity-basis mode (markable_all, n_unmarkable, frozen
+# component value/age, age_since_anchor, mark_ts, anchor_ts) — all derived from
+# data <= k only.
+
+# type_rank for the total event order (codex r3/r4).
+_TYPE_RANK = {"ledger": 0, "fill": 1, "funding": 2}
+
+# STALE_CAP: fall back if reconstruction base anchor is older than one anchor
+# cycle (7d) while material unmarkable exposure exists. Tunable (spec).
+STALE_CAP_MS = 7 * 86_400_000
+
+SPOT_USDC_INVARIANT_NOTE = (
+    "HL is a unified wallet: spot USDC IS perp margin. The weekly perpAllTime "
+    "anchor (marginSummary.accountValue summed across perp dexes) already "
+    "includes collateral (USDC) + uPnL. Re-anchoring snaps cash := anchor_eq - "
+    "Sum pos*mark, so the spot-USDC/collateral component is captured inside "
+    "`cash` and carried causally by ledger deposit/withdraw/transfer deltas. "
+    "equity_post is therefore whole-account (collateral-inclusive) by "
+    "construction; see test_m01_spot_collateral_invariant."
+)
+
+
+def build_event_stream(
+    fills: list[dict],
+    funding: list[dict],
+    ledger: list[dict],
+) -> list[dict]:
+    """Merge fills+funding+ledger into the TOTAL EVENT ORDER (spec v4).
+
+    Returns a list of event dicts each carrying:
+        ts, type ('fill'|'funding'|'ledger'), type_rank, source_seq, ev (payload)
+    sorted by (ts, type_rank, source_seq). source_seq is the causal per-wallet
+    fill sequence, else a stable per-type append index so the order is deterministic
+    and reproducible across M01 (equity) and M02 (actions).
+
+    SAME-MS FILL ORDER: tid is identity, not sequence. Partial fills are ordered
+    by chaining startPosition -> startPosition+signed_size. The fill payload is
+    carried directly so M2 never rematches on a lossy key.
+    """
+    out: list[dict] = []
+    ordered_fills = order_wallet_fills_causally(list(fills))
+    for i, f in enumerate(ordered_fills):
+        if not coin_is_allowed_perp(f["coin"]):
+            continue
+        seq = int(f.get("fill_seq", i))
+        out.append(
+            {
+                "ts": int(f["time"]),
+                "type": "fill",
+                "type_rank": _TYPE_RANK["fill"],
+                "source_seq": seq,
+                "ev": f,
+            }
+        )
+    for i, e in enumerate(ledger):
+        out.append(
+            {
+                "ts": int(e["time"]),
+                "type": "ledger",
+                "type_rank": _TYPE_RANK["ledger"],
+                "source_seq": i,
+                "ev": e,
+            }
+        )
+    for i, e in enumerate(funding):
+        out.append(
+            {
+                "ts": int(e["time"]),
+                "type": "funding",
+                "type_rank": _TYPE_RANK["funding"],
+                "source_seq": i,
+                "ev": e,
+            }
+        )
+    out.sort(key=lambda x: (x["ts"], x["type_rank"], x["source_seq"]))
+    return out
+
+
+@dataclass
+class EventEquity:
+    """Per-event reconstruction output (whole-account, causal)."""
+
+    event_order: int           # strictly monotone index in the ordered stream
+    ts: int
+    type: str
+    source_seq: int
+    equity_post: float         # whole-account equity AFTER this event
+    cash: float
+    position_value: float
+    anchor_ts: Optional[int]   # base anchor (strictly < ts); None if no past anchor
+    anchor_equity: Optional[float]
+    age_since_anchor_ms: Optional[int]
+    mark_ts: Optional[int]     # latest mark <= ts across marked positions
+    markable_all: bool         # every held nonzero position markable at ts
+    n_unmarkable: int
+    no_extradex_without_anchor: bool
+    frozen_component_value: float   # last-known value of unmarkable positions
+    frozen_component_age_ms: int    # staleness of the frozen value at ts
+    has_past_anchor: bool
+    fill: Optional[dict] = None     # for type=='fill': the EXACT fill payload of
+                                    # this event (codex r4 BUG 2) — M02 consumes it
+                                    # directly off the stream, never rematching by
+                                    # (ts, tid). None for funding/ledger events.
+
+
+def compute_event_equity(
+    ordered: list[dict],
+    fills: list[dict],
+    anchor: "AnchorState",
+    wallet_lc: str,
+    window_anchors: list[tuple[int, float]],
+    extradex_no_anchor: bool,
+    causal_mark: bool = True,
+) -> list[EventEquity]:
+    """Walk the ordered event stream ONCE and emit equity_post per event.
+
+    Causal contract (spec NON-LOOK-AHEAD INVARIANTS):
+      * base anchor for event k = last weekly anchor with anchor_ts STRICTLY < ts(k).
+      * equity_post(k) = cash + Sum pos*mark(ts(k)) using ONLY events order <= k.
+        By default the terminal live-position MTM uses closed causal marks so
+        M02's sizing denominator matches its causal numerator.
+      * mark_ts <= ts(k); anchor_ts < ts(k); event_order strictly monotone.
+
+    We re-seed/re-snap cash whenever the active base anchor changes (each weekly
+    anchor cycle), exactly like compute_eq_at, then incrementally apply each
+    event's cash/position delta. Mark-to-market is recomputed at each event ts
+    over the live positions, tracking unmarkable positions' last-known value
+    (the FROZEN component) so M02 can do PARTIAL_MTM without look-ahead.
+    """
+    """
+    results: list[EventEquity] = []
+
+    # Active base-anchor state. Re-initialised lazily when the base anchor for
+    # the current event differs from the one in force.
+    active_anchor_ts: Optional[int] = None
+    active_anchor_eq: Optional[float] = None
+    cash = 0.0
+    positions: dict[str, float] = {}
+    # last-known mark value per coin (for the frozen unmarkable component)
+    last_val: dict[str, float] = {}
+    last_val_ts: dict[str, int] = {}
+    # Coins whose carry-in (pre-anchor holding) has already been folded into the
+    # book+cash under the ACTIVE anchor. Reset per anchor cycle (codex r4 BUG 1).
+    carried_in: set[str] = set()
+
+    def _carry_in_fill(ev: dict) -> None:
+        """CAUSAL replacement for seed_positions case 2 (codex r4 BUG 1).
+
+        seed_positions(causal_cutoff=True) deliberately omits a coin first traded
+        AFTER the active anchor, to avoid look-ahead at earlier events. But that
+        coin DID hold a pre-anchor position (its first fill's startPosition), which
+        the anchor equity a_v already includes. The first time we REACH that coin's
+        fill in the ordered walk (order <= k = causal), we fold its carry-in in the
+        SAME way case 2 + the cash snap would have: add startPosition to the book
+        AND subtract its anchor-time value from cash (mark at active_anchor_ts < ts,
+        causal) so equity is not double-counted. Coins already in the anchor seed,
+        or already folded, are skipped. Identical end-state to compute_eq_at, but
+        revealed only at the causal moment instead of at the anchor (no leak at
+        earlier events)."""
+        nonlocal cash
+        coin = ev["coin"]
+        if coin in carried_in or active_anchor_ts is None:
+            return
+        carried_in.add(coin)
+        sp = float(ev.get("startPosition", 0.0) or 0.0)
+        if abs(sp) <= 1e-9:
+            return
+        positions[coin] = positions.get(coin, 0.0) + sp
+        m = get_mark(coin, active_anchor_ts)
+        if m is not None:
+            cash -= sp * m  # mirror the anchor cash snap for this carried-in coin
+            last_val[coin] = sp * m
+            last_val_ts.setdefault(coin, active_anchor_ts)
+
+    def _past_anchor(ts: int) -> Optional[tuple[int, float]]:
+        chosen = None
+        for a_t, a_v in window_anchors:
+            if a_t < ts:            # STRICT (codex r3)
+                chosen = (a_t, a_v)
+            else:
+                break
+        return chosen
+
+    for order, item in enumerate(ordered):
+        ts = item["ts"]
+        base = _past_anchor(ts)
+
+        if base is None:
+            # No past anchor → cannot reconstruct a causal denominator. Still
+            # advance the position book from startPosition-derived seeding so
+            # that once an anchor appears the book is correct, but emit
+            # has_past_anchor=False (M02 maps this to NO_ANCHOR).
+            # We seed positions at this ts from fills only (causal: positions_at
+            # uses startPosition + cumulative signed_sz, all <= ts).
+            ev = item["ev"]
+            if item["type"] == "fill":
+                positions[ev["coin"]] = positions.get(ev["coin"], 0.0) + ev["signed_sz"]
+                if abs(positions[ev["coin"]]) < 1e-9:
+                    positions.pop(ev["coin"], None)
+            results.append(
+                EventEquity(
+                    event_order=order, ts=ts, type=item["type"],
+                    source_seq=item["source_seq"], equity_post=float("nan"),
+                    cash=float("nan"), position_value=float("nan"),
+                    anchor_ts=None, anchor_equity=None, age_since_anchor_ms=None,
+                    mark_ts=None, markable_all=False, n_unmarkable=0,
+                    no_extradex_without_anchor=(not extradex_no_anchor),
+                    frozen_component_value=0.0, frozen_component_age_ms=0,
+                    has_past_anchor=False,
+                    fill=(item["ev"] if item["type"] == "fill" else None),
+                )
+            )
+            continue
+
+        a_t, a_v = base
+        if a_t != active_anchor_ts:
+            # New base anchor cycle → re-seed positions at the anchor and snap
+            # cash, identically to compute_eq_at. This rebuild uses only fills
+            # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
+            active_anchor_ts = a_t
+            active_anchor_eq = a_v
+            seeded = seed_positions(fills, anchor, a_t, causal_cutoff=True)
+            anchor_pos_value = 0.0
+            for c, sz in seeded.items():
+                if abs(sz) < 1e-9:
+                    continue
+                m = get_mark(c, a_t)
+                if m is not None:
+                    anchor_pos_value += sz * m
+                    last_val[c] = sz * m
+                    last_val_ts[c] = a_t
+            cash = a_v - anchor_pos_value
+            positions = {c: s for c, s in seeded.items() if abs(s) > 1e-9}
+            # Coins already in the anchor seed are carried-in; their fills must NOT
+            # re-fold a startPosition. Coins NOT seeded (first traded after anchor)
+            # get folded causally at their first fill via _carry_in_fill.
+            carried_in = set(seeded.keys())
+            # Replay events strictly between the anchor and this event (anchor_ts
+            # < e_ts < ts) so the book/cash reflect everything order <= current.
+            for prev in ordered:
+                p_ts = prev["ts"]
+                if p_ts <= a_t:
+                    continue
+                # stop once we reach the current event's order position
+                if (p_ts, prev["type_rank"], prev["source_seq"]) >= (
+                    ts, item["type_rank"], item["source_seq"]
+                ):
+                    break
+                if prev["type"] == "fill":
+                    _carry_in_fill(prev["ev"])
+                _apply(prev, positions, last_val, last_val_ts, _cash_ref=None)
+                cash = _apply_cash(prev, cash, wallet_lc)
+
+        # Apply THIS event (order == k included).
+        if item["type"] == "fill":
+            _carry_in_fill(item["ev"])
+        _apply(item, positions, last_val, last_val_ts, _cash_ref=None)
+        cash = _apply_cash(item, cash, wallet_lc)
+
+        # Mark-to-market at ts over live positions; track frozen component.
+        pos_value = 0.0
+        n_unmarkable = 0
+        mark_ts_latest: Optional[int] = None
+        frozen_value = 0.0
+        frozen_age = 0
+        for c, sz in positions.items():
+            if abs(sz) < 1e-9:
+                continue
+            m = get_mark(c, ts, causal=causal_mark)
+            if m is None:
+                n_unmarkable += 1
+                fv = last_val.get(c, 0.0)
+                frozen_value += fv
+                if c in last_val_ts:
+                    frozen_age = max(frozen_age, ts - last_val_ts[c])
+                continue
+            val = sz * m
+            pos_value += val
+            last_val[c] = val
+            mk = ts // 60_000 * 60_000 - (60_000 if causal_mark else 0)
+            last_val_ts[c] = mk
+            mark_ts_latest = mk if mark_ts_latest is None else max(mark_ts_latest, mk)
+
+        equity_post = cash + pos_value  # markable + cash; frozen excluded here
+        results.append(
+            EventEquity(
+                event_order=order, ts=ts, type=item["type"],
+                source_seq=item["source_seq"],
+                equity_post=equity_post + frozen_value,  # whole-account incl frozen
+                cash=cash, position_value=pos_value,
+                anchor_ts=a_t, anchor_equity=a_v,
+                age_since_anchor_ms=ts - a_t,
+                mark_ts=mark_ts_latest if mark_ts_latest is not None else (ts if not positions else None),
+                markable_all=(n_unmarkable == 0),
+                n_unmarkable=n_unmarkable,
+                no_extradex_without_anchor=(not extradex_no_anchor),
+                frozen_component_value=frozen_value,
+                frozen_component_age_ms=frozen_age,
+                has_past_anchor=True,
+                fill=(item["ev"] if item["type"] == "fill" else None),
+            )
+        )
+
+codex
+I found one accounting issue that looks independent of M01: open-at-window-end journeys are finalized at `peak_ts`, not the requested window end, so duration and funding after the peak are omitted. I’m checking whether the CLI passes the end time into `trace_wallet`; it currently does not.
+exec
+/bin/zsh -lc "sed -n '730,875p' research/v15/v15_m01_equity_reconstruct.py && sed -n '875,940p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            r = requests.post(HL_URL, json=body, timeout=20)
+            if r.status_code == 429:
+                time.sleep(2**i)
+                continue
+            if r.status_code == 200:
+                return r.json()
+            return None
+        except Exception:
+            time.sleep(1)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Local data loaders
+# --------------------------------------------------------------------------- #
+
+
+def _position_key(value: float) -> float:
+    """Stable key for decimal position values represented as float."""
+    return round(float(value), 10)
+
+
+def _order_fill_burst(group: list[dict]) -> tuple[list[dict], bool]:
+    """Order one same-wallet/coin/millisecond burst by position continuity.
+
+    ``tid`` identifies a trade but is not a causal sequence number. Each fill's
+    startPosition and signed size define an edge in the actual position path.
+    """
+    if len(group) <= 1:
+        return list(group), True
+    from collections import Counter
+
+    starts = [_position_key(f["startPosition"]) for f in group]
+    ends = [_position_key(f["startPosition"] + f["signed_sz"]) for f in group]
+    start_counts, end_counts = Counter(starts), Counter(ends)
+    path_starts = [k for k, n in start_counts.items() if n > end_counts.get(k, 0)]
+    if len(path_starts) == 1:
+        current = path_starts[0]
+    elif all(f["signed_sz"] > 0 for f in group):
+        current = min(starts)
+    elif all(f["signed_sz"] < 0 for f in group):
+        current = max(starts)
+    else:
+        current = min(starts, key=lambda x: (abs(x), x))
+
+    unused = set(range(len(group)))
+    ordered: list[dict] = []
+    complete = True
+    while unused:
+        candidates = [i for i in unused if starts[i] == current]
+        if not candidates:
+            complete = False
+            candidates = list(unused)
+        i = min(candidates, key=lambda j: (int(group[j].get("tid", 0) or 0), j))
+        ordered.append(group[i])
+        unused.remove(i)
+        current = ends[i]
+    return ordered, complete
+
+
+def order_wallet_fills_causally(fills: list[dict]) -> list[dict]:
+    """Causally order fills and attach a stable per-wallet ``fill_seq``."""
+    groups: dict[tuple[int, str], list[dict]] = {}
+    for f in fills:
+        groups.setdefault((int(f["time"]), str(f["coin"])), []).append(f)
+    out: list[dict] = []
+    for key in sorted(groups):
+        burst, complete = _order_fill_burst(groups[key])
+        for f in burst:
+            f["causal_order_ok"] = bool(complete)
+            out.append(f)
+    for seq, f in enumerate(out):
+        f["fill_seq"] = seq
+    return out
+
+
+def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
+    """Load ALL markable perp fills for one wallet in [t0, t1].
+
+    Includes every perp dex prefix except explicitly dropped prefixes. Spot
+    fills (@-prefix, USDC) are excluded: M1 is anchored to ``perpAllTime`` and
+    M7/live copy execution is perp-only.
+    Casts string numerics, computes signed_sz (+size if side=='B' else -size),
+    and tags liquidation fills via the `dir` column.
+
+    Fast path: per-wallet partitioned parquet if present; else scan dailies
+    filtering wallet (lowercased compare).
+    """
+    wallet_lc = wallet.lower()
+    cols = [
+        "wallet", "coin", "side", "size", "price", "time", "dir",
+        "closedPnl", "startPosition", "fee", "builderFee", "deployerFee",
+        "tid",
+    ]
+
+    def _normalize(df: pd.DataFrame) -> list[dict]:
+        out: list[dict] = []
+        for rec in df.to_dict("records"):
+            coin = str(rec["coin"])
+            if not coin_is_allowed_perp(coin):
+                continue
+            size = float(rec["size"])
+            try:
+                tid = int(rec.get("tid", 0) or 0)
+            except (TypeError, ValueError):
+                tid = 0
+            d = {
+                "coin": coin,
+                "side": rec["side"],
+                "size": size,
+                "price": float(rec["price"]),
+                "time": int(rec["time"]),
+                "tid": tid,
+                "dir": str(rec.get("dir", "") or ""),
+                "closedPnl": float(rec.get("closedPnl", 0) or 0),
+                "startPosition": float(rec.get("startPosition", 0) or 0),
+                "fee": float(rec.get("fee", 0) or 0),
+                "builderFee": float(rec.get("builderFee", 0) or 0),
+                "deployerFee": float(rec.get("deployerFee", 0) or 0),
+            }
+            d["signed_sz"] = size if rec["side"] == "B" else -size
+            d["is_liquidation"] = d["dir"] in LIQUIDATION_DIRS
+            d["is_spot"] = False
+            out.append(d)
+        return out
+
+    fills: list[dict] = []
+    by_wallet_path = S3_BY_WALLET_DIR / f"{wallet_lc}.parquet"
+    if by_wallet_path.exists():
+        try:
+            df = pd.read_parquet(by_wallet_path)
+            df = df[[c for c in cols if c in df.columns]].copy()
+            df["time"] = df["time"].astype("int64")
+            df = df[(df["time"] >= t0) & (df["time"] <= t1)]
+            return order_wallet_fills_causally(_normalize(df))
+        except Exception:
+            fills = []
+
+    for ff in sorted(glob.glob(str(S3_FILLS_DIR / "*.parquet"))):
+        try:
+            # Read only columns that actually exist (read_parquet with a fixed
+            # `columns=` list raises if ANY is absent, and the bare `except`
+            # below would then silently drop the WHOLE day of fills). Require
+            # the core accounting columns; tolerate missing optional fee cols.
+            avail = set(pd.ParquetFile(ff).schema_arrow.names)
+            required = {"wallet", "coin", "side", "size", "price", "time"}
+            required = {"wallet", "coin", "side", "size", "price", "time"}
+            missing_required = required - avail
+            if missing_required:
+                logger.warning(
+                    f"  skip {Path(ff).name}: missing required cols {sorted(missing_required)}"
+                )
+                continue
+            read_cols = [c for c in cols if c in avail]
+            df = pd.read_parquet(ff, columns=read_cols)
+            df["time"] = df["time"].astype("int64")
+            df["_w"] = df["wallet"].astype(str).str.lower()
+            m = df[(df["_w"] == wallet_lc) & (df["time"] >= t0) & (df["time"] <= t1)]
+            if not m.empty:
+                fills.extend(_normalize(m))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"  skip {Path(ff).name}: {e!r}")
+            continue
+    return order_wallet_fills_causally(fills)
+
+
+def load_wallet_funding(wallet: str, t0: int, t1: int) -> list[dict]:
+    """Load + merge + dedup funding events from the local S3 bulk cache.
+
+    Multiple {wallet}_{start}_{end}.json files may exist; merge them and dedup
+    by (time, coin) since overlapping windows can repeat the same record.
+    Records: {time, hash, delta:{type:'funding', coin, usdc(signed), ...}}.
+    """
+    wallet_lc = wallet.lower()
+    seen: set[tuple[int, str]] = set()
+    out: list[dict] = []
+    for fp in sorted(glob.glob(str(FUNDING_DIR / f"{wallet_lc}_*.json"))):
+        try:
+            with open(fp) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for rec in data:
+            t = int(rec.get("time", 0))
+            if t < t0 or t > t1:
+                continue
+            d = rec.get("delta", {})
+            if d.get("type") != "funding":
+                continue
+            coin = str(d.get("coin", ""))
+            key = (t, coin)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rec)
+    out.sort(key=lambda x: int(x["time"]))
+    return out
+
+
+def load_wallet_ledger(wallet: str, t0: int, t1: int) -> list[dict]:
+    """Load ledger entries from the local cache, dedup on the FULL delta payload.
+
+    Dedup key includes a canonical serialization of the whole delta (not just
+    its type), so two distinct deltas of the same type in one tx (same time +
+    hash) are NOT collapsed into one. Overlapping cache windows still dedup
+    identical records.
+    """
+    wallet_lc = wallet.lower()
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for lf in sorted(glob.glob(str(LEDGER_DIR / f"{wallet_lc}_*.json"))):
+        try:
+
+exec
+/bin/zsh -lc 'rg -n "def load_wallet_fills|order_wallet_fills_causally|fill_seq|startPosition|causal_order_ok" research/v15/v15_m01_equity_reconstruct.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+756:    startPosition and signed size define an edge in the actual position path.
+762:    starts = [_position_key(f["startPosition"]) for f in group]
+763:    ends = [_position_key(f["startPosition"] + f["signed_sz"]) for f in group]
+790:def order_wallet_fills_causally(fills: list[dict]) -> list[dict]:
+791:    """Causally order fills and attach a stable per-wallet ``fill_seq``."""
+799:            f["causal_order_ok"] = bool(complete)
+802:        f["fill_seq"] = seq
+806:def load_wallet_fills(wallet: str, t0: int, t1: int) -> list[dict]:
+821:        "closedPnl", "startPosition", "fee", "builderFee", "deployerFee",
+845:                "startPosition": float(rec.get("startPosition", 0) or 0),
+864:            return order_wallet_fills_causally(_normalize(df))
+892:    return order_wallet_fills_causally(fills)
+1230:    """Position per coin at time t = (EARLIEST fill's startPosition) + cumulative
+1234:    fill's startPosition + signed_sz. Large orders fill as a SAME-MILLISECOND
+1237:    mid-burst startPosition and invents a phantom open position (observed: a flat
+1239:    closing burst had startPosition=-105,010). The cumulative sum from the
+1240:    EARLIEST fill's startPosition is ORDER-INDEPENDENT and exact regardless of
+1249:        pos = fs[0]["startPosition"] + sum(x["signed_sz"] for x in fs)
+1292:      pre-first-fill carry) is taken from the clean earliest-fill startPosition, EXCEPT
+1294:      mid-burst garbage startPosition), in which case P0 is anchored to the authoritative
+1296:      phantom-seed leak (e2af8f54's 83-fill same-ms first DOGE fill read startPosition
+1322:    # leak: M1 took it from the earliest fill's startPosition, but large orders fill as
+1324:    # are in arbitrary order, so a burst startPosition is mid-burst GARBAGE. Observed
+1326:    # 83-fill same-ms burst reading startPosition 1,792,138 -> the old seed put 1.79M DOGE
+1332:    # snapshot. A CLEAN earliest fill keeps the forward startPosition (the snapshot carries
+1356:            p0 = float(fs[0]["startPosition"])         # forward: clean earliest fill
+1410:    # reveal a pre-anchor carry via its authoritative startPosition. In causal
+1426:                sp = float(ev.get("startPosition", 0.0) or 0.0)
+1491:    in from pre-window history (seeded via startPosition, no fill at-or-before
+2046:    by chaining startPosition -> startPosition+signed_size. The fill payload is
+2050:    ordered_fills = order_wallet_fills_causally(list(fills))
+2054:        seq = int(f.get("fill_seq", i))
+2159:        coin DID hold a pre-anchor position (its first fill's startPosition), which
+2162:        SAME way case 2 + the cash snap would have: add startPosition to the book
+2173:        sp = float(ev.get("startPosition", 0.0) or 0.0)
+2198:            # advance the position book from startPosition-derived seeding so
+2202:            # uses startPosition + cumulative signed_sz, all <= ts).
+2227:            # (startPosition + cumulative) at/<= anchor_ts, which is < ts → causal.
+2243:            # re-fold a startPosition. Coins NOT seeded (first traded after anchor)
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '119,190p;338,590p;641,690p;770,802p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   119	def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+   120	    """Pick the causal equity basis for one event, using ONLY data <= the event.
+   121	
+   122	    Per-segment drift and whole-window recon-PASS are NEVER consulted (look-ahead).
+   123	    """
+   124	    if not ee.has_past_anchor:
+   125	        return EquityBasis(
+   126	            mode="NO_ANCHOR", equity=None, equity_ts=None,
+   127	            anchor_ts=None, mark_ts=None, degraded=True,
+   128	            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+   129	        )
+   130	
+   131	    eq = ee.equity_post
+   132	    frozen = ee.frozen_component_value
+   133	    frozen_age_ms = ee.frozen_component_age_ms
+   134	    materiality = (abs(frozen) / abs(eq)) if (eq and abs(eq) > EPS) else float("nan")
+   135	    age = ee.age_since_anchor_ms or 0
+   136	    anchor_eq = ee.anchor_equity
+   137	
+   138	    # EQUITY-FLOOR (causal): a non-positive or implausibly-small reconstructed equity is a
+   139	    # degenerate denominator -> never emit a huge target off it. Uses only equity_post(k)
+   140	    # and the last PAST exact anchor (anchor_ts < ts), so no look-ahead. Falls back to the
+   141	    # exact anchor equity when sane, else marks the event unsizeable.
+   142	    eq_floor = EQUITY_FLOOR_ABS
+   143	    if anchor_eq is not None and anchor_eq == anchor_eq:
+   144	        eq_floor = max(EQUITY_FLOOR_ABS, EQUITY_FLOOR_FRAC * abs(anchor_eq))
+   145	    if eq is None or eq != eq or eq <= eq_floor:
+   146	        if anchor_eq is not None and anchor_eq == anchor_eq and anchor_eq > EQUITY_FLOOR_ABS:
+   147	            return EquityBasis(
+   148	                mode="ANCHOR_FALLBACK", equity=anchor_eq, equity_ts=ee.anchor_ts,
+   149	                anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+   150	                frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+   151	                frozen_materiality_frac=materiality,
+   152	            )
+   153	        return EquityBasis(
+   154	            mode="NO_ANCHOR", equity=None, equity_ts=None, anchor_ts=ee.anchor_ts,
+   155	            mark_ts=ee.mark_ts, degraded=True, frozen_value=frozen,
+   156	            frozen_age_s=frozen_age_ms / 1000.0, frozen_materiality_frac=materiality,
+   157	        )
+   158	
+   159	    # ANCHOR_FALLBACK: base anchor too stale AND material unmarkable exposure, OR
+   160	    # the frozen component is itself stale/material. Hold last PAST anchor flat.
+   161	    stale_anchor = age > STALE_CAP_MS
+   162	    material_frozen = (materiality == materiality and materiality > FROZEN_MATERIALITY_CAP)
+   163	    stale_frozen = frozen_age_ms > STALE_CAP_MS
+   164	    if (stale_anchor and ee.n_unmarkable > 0) or material_frozen or stale_frozen:
+   165	        return EquityBasis(
+   166	            mode="ANCHOR_FALLBACK", equity=ee.anchor_equity,
+   167	            equity_ts=ee.anchor_ts, anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts,
+   168	            degraded=True, frozen_value=frozen,
+   169	            frozen_age_s=frozen_age_ms / 1000.0,
+   170	            frozen_materiality_frac=materiality,
+   171	        )
+   172	
+   173	    if ee.markable_all and ee.no_extradex_without_anchor:
+   174	        # INTRAWEEK: reconstruction fully reliable at this event.
+   175	        return EquityBasis(
+   176	            mode="INTRAWEEK", equity=eq, equity_ts=ee.ts,
+   177	            anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=False,
+   178	            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=0.0,
+   179	        )
+   180	
+   181	    # PARTIAL_MTM: some positions unmarkable → equity_post already marks the
+   182	    # markable book + cash/funding/realized and FREEZES the unmarkable component
+   183	    # at its last known value (handled in M01). Flag degraded.
+   184	    return EquityBasis(
+   185	        mode="PARTIAL_MTM", equity=eq, equity_ts=ee.ts,
+   186	        anchor_ts=ee.anchor_ts, mark_ts=ee.mark_ts, degraded=True,
+   187	        frozen_value=frozen, frozen_age_s=frozen_age_ms / 1000.0,
+   188	        frozen_materiality_frac=materiality,
+   189	    )
+   190	
+   338	    # Walk events in event_order (already sorted).
+   339	    for ee in events:
+   340	        if ee.type != "fill":
+   341	            continue
+   342	        f = ee.fill  # exact payload for THIS ordered fill event (no rematch)
+   343	        if f is None:
+   344	            continue
+   345	
+   346	        coin = f["coin"]
+   347	        # Defensive parity with M1 and M7/live: the research strategy copies
+   348	        # perps only. Spot must not affect journey/ranking metrics even if an
+   349	        # externally supplied event stream contains it.
+   350	        if m01.coin_is_spot(coin):
+   351	            continue
+   352	        st = coin_state.setdefault(coin, _new_state())
+   353	        signed = f["signed_sz"]
+   354	        if abs(signed) <= EPS:
+   355	            continue
+   356	        price = float(f["price"]) or 0.0
+   357	        ts = ee.ts
+   358	        is_liq = bool(f.get("is_liquidation"))
+   359	        row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
+   360	        actual_fee = _fill_fee_usd_actual(f)
+   361	
+   362	        position = st["position"]
+   363	        cost_basis = st["cost_basis"]
+   364	
+   365	        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+   366	        first_fill = not coin_seen_first_fill.get(coin, False)
+   367	        sp = float(f.get("startPosition", 0.0) or 0.0)
+   368	        state_resynced = False
+   369	        if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+   370	            # Missing/ambiguous fills: never continue a fabricated lifecycle.
+   371	            # Close the interrupted journey as INVALID, then causally reseed
+   372	            # from the current fill's authoritative pre-position.
+   373	            if st["open"]:
+   374	                st["lifecycle_valid"] = False
+   375	                st["state_discontinuity"] = True
+   376	                j = _finalize(coin, st, ts)
+   377	                if j is not None:
+   378	                    journeys.append(j)
+   379	            st = _new_state()
+   380	            coin_state[coin] = st
+   381	            position = 0.0
+   382	            cost_basis = 0.0
+   383	            first_fill = True
+   384	            state_resynced = True
+   385	        if first_fill:
+   386	            coin_seen_first_fill[coin] = True
+   387	            if abs(sp) > EPS:
+   388	                # Open an already-in-progress journey, sized causally.
+   389	                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+   390	                st.update(
+   391	                    position=sp, cost_basis=price,  # best causal cost proxy = first observed px
+   392	                    open=True, side=(1 if sp > 0 else -1),
+   393	                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+   394	                    max_notional=abs(sp) * price, n_carry_in=1,
+   395	                    carry_in_status="SEEDED", fee_scope=row_scope,
+   396	                )
+   397	                position = sp
+   398	                cost_basis = price
+   399	            else:
+   400	                st["carry_in_status"] = "SEEDED"  # flat carry-in = cleanly known
+   401	
+   402	        if not bool(f.get("causal_order_ok", True)):
+   403	            st["lifecycle_valid"] = False
+   404	
+   405	        # closedPnl ground truth (fallback to cost-basis derived).
+   406	        raw_pnl = f.get("closedPnl", None)
+   407	        new_pos_preview = position + signed
+   408	        if raw_pnl is None or (isinstance(raw_pnl, float) and raw_pnl != raw_pnl):
+   409	            if (position > 0 and signed < 0) or (position < 0 and signed > 0):
+   410	                if abs(new_pos_preview) < EPS:
+   411	                    closed_qty = position
+   412	                elif (position > 0 and new_pos_preview > 0) or (position < 0 and new_pos_preview < 0):
+   413	                    closed_qty = -signed
+   414	                else:
+   415	                    closed_qty = position
+   416	                closed_pnl = float((price - cost_basis) * closed_qty)
+   417	            else:
+   418	                closed_pnl = 0.0
+   419	        else:
+   420	            closed_pnl = float(raw_pnl)
+   421	
+   422	        # PRE-fill peak capture.
+   423	        pre_notional = abs(position) * price
+   424	        if abs(position) > EPS and pre_notional > st["max_notional"]:
+   425	            st["max_notional"] = pre_notional
+   426	            st["peak_ts"] = ts
+   427	
+   428	        new_pos = position + signed
+   429	        notional_after = abs(new_pos) * price
+   430	        fill_notional = abs(signed) * price
+   431	        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
+   432	
+   433	        # ---- state machine ----
+   434	        action_type = None
+   435	        opening_jid = None
+   436	        closing_jid = None
+   437	
+   438	        if abs(position) < EPS and abs(new_pos) > EPS:
+   439	            # ENTRY
+   440	            coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+   441	            st.update(
+   442	                journey_id=coin_journey_counter[coin], open=True,
+   443	                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+   444	                n_entry=1, n_addon=0, n_trim=0, n_exit=0, n_reverse=0, n_carry_in=0,
+   445	                realized_pnl=0.0, max_notional=notional_after, cost_basis=price,
+   446	                fees_paid=fill_fee, fee_scope=row_scope, liq_closed=False,
+   447	                carry_in_status=st["carry_in_status"] or "SEEDED",
+   448	            )
+   449	            action_type = "ENTRY"
+   450	            opening_jid = st["journey_id"]
+   451	            closing_jid = None
+   452	
+   453	        elif (position > 0 and signed > 0) or (position < 0 and signed < 0):
+   454	            # ADDON
+   455	            st["n_addon"] += 1
+   456	            st["cost_basis"] = (cost_basis * abs(position) + price * abs(signed)) / abs(new_pos)
+   457	            if notional_after > st["max_notional"]:
+   458	                st["max_notional"] = notional_after
+   459	                st["peak_ts"] = ts
+   460	            st["fees_paid"] += fill_fee
+   461	            action_type = "ADDON"
+   462	            opening_jid = st["journey_id"]
+   463	            closing_jid = st["journey_id"]
+   464	
+   465	        elif abs(new_pos) < EPS:
+   466	            # EXACT EXIT
+   467	            st["n_exit"] += 1
+   468	            st["realized_pnl"] += closed_pnl
+   469	            st["fees_paid"] += fill_fee
+   470	            if is_liq:
+   471	                st["liq_closed"] = True
+   472	            action_type = "EXIT"
+   473	            opening_jid = st["journey_id"]
+   474	            closing_jid = st["journey_id"]
+   475	            j = _finalize(coin, st, ts)
+   476	            if j is not None:
+   477	                journeys.append(j)
+   478	            st.update(_new_state())
+   479	            coin_state[coin] = st
+   480	
+   481	        elif (position > 0 and new_pos > 0 and signed < 0) or (position < 0 and new_pos < 0 and signed > 0):
+   482	            # TRIM
+   483	            st["n_trim"] += 1
+   484	            st["realized_pnl"] += closed_pnl
+   485	            st["fees_paid"] += fill_fee
+   486	            action_type = "TRIM"
+   487	            opening_jid = st["journey_id"]
+   488	            closing_jid = st["journey_id"]
+   489	
+   490	        else:
+   491	            # REVERSE (crosses zero): one action row, two journey ids.
+   492	            st["n_reverse"] += 1
+   493	            st["realized_pnl"] += closed_pnl
+   494	            if is_liq:
+   495	                st["liq_closed"] = True
+   496	            split_total = abs(position) + abs(new_pos)
+   497	            if actual_fee is not None and split_total > EPS:
+   498	                closing_fee = actual_fee * (abs(position) / split_total)
+   499	                opening_fee = actual_fee * (abs(new_pos) / split_total)
+   500	            else:
+   501	                closing_fee = abs(position) * price * FEE_RATE
+   502	                opening_fee = abs(new_pos) * price * FEE_RATE
+   503	            st["fees_paid"] += closing_fee
+   504	            closing_jid = st["journey_id"]
+   505	            j = _finalize(coin, st, ts)
+   506	            if j is not None:
+   507	                journeys.append(j)
+   508	            # open the new (reversed) leg
+   509	            coin_journey_counter[coin] += 1
+   510	            st.update(_new_state())
+   511	            st.update(
+   512	                journey_id=coin_journey_counter[coin], open=True,
+   513	                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+   514	                n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
+   515	                fees_paid=opening_fee, fee_scope=row_scope,
+   516	                carry_in_status="SEEDED",
+   517	            )
+   518	            coin_state[coin] = st
+   519	            action_type = "REVERSE"
+   520	            opening_jid = st["journey_id"]
+   521	
+   522	        st["position"] = new_pos
+   523	
+   524	        # ---- optional equity basis + action row ----
+   525	        # Core M02 deliberately does not read M01, anchors, or market marks.
+   526	        if equity_enriched:
+   527	            basis = select_equity_basis(ee)
+   528	            # SIZING signal: use only a bar that has closed by ts.
+   529	            mark = m01.get_mark(coin, ts, causal=True)
+   530	            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
+   531	            if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
+   532	                target_pct = None
+   533	            else:
+   534	                target_pct = (new_pos * mark) / basis.equity
+   535	        else:
+   536	            basis = EquityBasis(
+   537	                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+   538	                anchor_ts=None, mark_ts=None, degraded=False,
+   539	                frozen_value=0.0, frozen_age_s=0.0,
+   540	                frozen_materiality_frac=float("nan"),
+   541	            )
+   542	            mark = None
+   543	            sizing_mark_ts = None
+   544	            target_pct = None
+   545	
+   546	        actions.append({
+   547	            "wallet": wallet, "coin": coin, "ts": ts,
+   548	            "fill_id": int(f.get("tid", 0) or 0),
+   549	            "event_order": ee.event_order,
+   550	            "action_type": action_type,
+   551	            "signed_size": signed, "price": price,
+   552	            "position_after": new_pos,
+   553	            "mark": mark, "mark_ts": sizing_mark_ts,
+   554	            "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
+   555	            "anchor_ts": basis.anchor_ts,
+   556	            "equity_basis_mode": basis.mode,
+   557	            "equity_degraded": basis.degraded,
+   558	            "frozen_component_value": basis.frozen_value,
+   559	            "frozen_component_age_s": basis.frozen_age_s,
+   560	            "frozen_materiality_frac": basis.frozen_materiality_frac,
+   561	            "target_exposure_pct": target_pct,
+   562	            "is_liquidation": is_liq,
+   563	            "opening_journey_id": opening_jid,
+   564	            "closing_journey_id": closing_jid,
+   565	            "journey_id": opening_jid,  # back-compat = opening side
+   566	            "carry_in_status": st["carry_in_status"],
+   567	            "state_resynced": state_resynced,
+   568	            "causal_order_ok": bool(f.get("causal_order_ok", True)),
+   569	            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+   570	            # Final value is recomputed after every journey has been finalized.
+   571	            # A future gap can retroactively invalidate earlier actions in the
+   572	            # interrupted journey; a raw live trade stream also cannot repair
+   573	            # the resync row because it does not carry startPosition.
+   574	            "stream_replay_valid": bool(
+   575	                st.get("lifecycle_valid", True)
+   576	                and bool(f.get("causal_order_ok", True))
+   577	                and not state_resynced
+   578	            ),
+   579	        })
+   580	
+   581	    # Positions still open at window end → flag (not finalized).
+   582	    for coin, st in coin_state.items():
+   583	        if st["open"] and st["open_ts"] is not None:
+   584	            j = _finalize(coin, st, st["peak_ts"] or st["open_ts"])
+   585	            if j is not None:
+   586	                j["open_at_window_end"] = True
+   587	                j["exit_ts"] = None
+   588	                journeys.append(j)
+   589	
+   590	    # Lifecycle validity is only known once the whole wallet has been walked.
+   641	    anchor_parquet: str, worker_mem_gb: float = 3.0,
+   642	    equity_enriched: bool = False,
+   643	) -> None:
+   644	    global _ANCHOR_DF
+   645	    _ANCHOR_DF = pd.read_parquet(anchor_parquet) if equity_enriched else None
+   646	    # codex perf-r1 #5: guard WORKERS too (per-wallet reconstruction + per-process mark-series cache
+   647	    # live here). Backstop: abort a runaway worker loudly instead of a silent aggregate OS OOM.
+   648	    install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
+   649	
+   650	
+   651	def process_wallet(args: tuple) -> dict:
+   652	    wallet, start_ms, end_ms, equity_enriched = args
+   653	    try:
+   654	        if equity_enriched:
+   655	            anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
+   656	            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+   657	            if "error" in res:
+   658	                return {"wallet": wallet, "error": res["error"]}
+   659	            events = res["events"]
+   660	            fills = res["fills"]
+   661	            funding = res["funding"]
+   662	            n_anchors = len(res["weekly_anchors"])
+   663	            inter_drift = res["inter_anchor_drift"]
+   664	        else:
+   665	            fills = m01.load_wallet_fills(wallet, start_ms, end_ms)
+   666	            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+   667	            events = [
+   668	                LifecycleFillEvent(
+   669	                    ts=int(fill["time"]),
+   670	                    event_order=int(fill.get("fill_seq", i)),
+   671	                    fill=fill,
+   672	                )
+   673	                for i, fill in enumerate(fills)
+   674	            ]
+   675	            n_anchors = None
+   676	            inter_drift = None
+   677	        actions, journeys = trace_wallet(
+   678	            wallet, events, fills, funding, equity_enriched=equity_enriched
+   679	        )
+   680	        return {
+   681	            "wallet": wallet, "actions": actions, "journeys": journeys,
+   682	            "n_anchors": n_anchors,
+   683	            "inter_drift": inter_drift,
+   684	        }
+   685	    except Exception as e:  # noqa: BLE001
+   686	        return {"wallet": wallet, "error": f"exception:{e!r}"}
+   687	
+   688	
+   689	# --------------------------------------------------------------------------- #
+   690	# Main
+   770	    aw = ShardedParquetWriter(args.actions_out, flush_rows=args.flush_rows)
+   771	    jw = ShardedParquetWriter(args.journeys_out, flush_rows=args.flush_rows)
+   772	    errors: list[tuple] = []
+   773	
+   774	    def _consume(r: dict) -> None:
+   775	        if "error" in r:
+   776	            errors.append((r["wallet"], r["error"]))
+   777	        else:
+   778	            aw.add_many(r.get("actions"))
+   779	            jw.add_many(r.get("journeys"))
+   780	        _log_one(r, len(wallets))
+   781	
+   782	    # ALWAYS run via a Pool (even procs=1) with maxtasksperchild so the worker process is RECYCLED
+   783	    # periodically -> the per-coin marks cache (m01._coin_series, which grows unbounded as a long-lived
+   784	    # worker touches more of the 1830-coin universe) is RESET, keeping RSS under worker_soft_gb. Without
+   785	    # this the procs=1 in-process loop blew the 2.5G soft cap at ~153 wallets (memory-guard abort, exit
+   786	    # 137) once the marks cache grew (1830 coins to 06-24). maxtasksperchild forks a fresh worker every
+   787	    # N wallets; on macOS spawn this re-imports m01 -> empty cache. (Fix 2026-06-25, codex marks-rebuild.)
+   788	    MAXTASKS_PER_CHILD = 40
+   789	    with Pool(max(1, budget.procs), initializer=_init_worker,
+   790	              initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
+   791	              maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
+   792	        for r in pool.imap_unordered(process_wallet, tasks):
+   793	            _consume(r)
+   794	
+   795	    n_actions = aw.close()
+   796	    n_journeys = jw.close()
+   797	    logger.info(f"Wrote {args.actions_out}: {n_actions:,} actions")
+   798	    logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
+   799	    if errors:
+   800	        logger.warning(f"{len(errors)} wallet errors: {errors[:10]}")
+   801	    logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")
+   802	
+
+codex
+The core state transitions for entry/add/trim/exit/reverse look coherent on the normal paths: reverse closes the old leg at the fill price, splits fees by closed/open notional, and starts a new journey id. I’m running small synthetic probes for the degenerate cases now.
+exec
+/bin/zsh -lc "python - <<'PY'
+import sys
+sys.path.insert(0,'/Users/hermes/quants-lab/research/v15')
+import v15_m02_journey_trace as m02
+from v15_m02_journey_trace import LifecycleFillEvent
+
+def fill(ts, side, size, price, start, tid, closed=0.0):
+    return {'coin':'BTC','side':side,'size':float(size),'price':float(price),'time':ts,'tid':tid,'dir':'','closedPnl':closed,'startPosition':float(start),'fee':0.0,'signed_sz':float(size) if side=='B' else -float(size),'is_liquidation':False}
+
+fills=[fill(1000,'B',1,100,0,1)]
+events=[LifecycleFillEvent(ts=1000,event_order=0,fill=fills[0])]
+funding=[{'time':2000,'delta':{'type':'funding','coin':'BTC','usdc':5.0}}]
+a,j=m02.trace_wallet('0x', events, fills, funding, equity_enriched=False)
+print('open journey funding/duration:', j)
+
+class EE:
+    type='fill'; event_order=0; ts=120000; fill=fills[0]
+    has_past_anchor=True; equity_post=1000.0; frozen_component_value=0.0; frozen_component_age_ms=0
+    age_since_anchor_ms=60000; anchor_equity=1000.0; anchor_ts=60000; mark_ts=60000
+    n_unmarkable=0; markable_all=True; no_extradex_without_anchor=True
+
+def nan_mark(*args, **kwargs): return float('nan')
+old=m02.m01.get_mark
+m02.m01.get_mark=nan_mark
+try:
+    a,j=m02.trace_wallet('0x',[EE()], [fills[0]], [], equity_enriched=True)
+    print('nan mark action:', a[0]['mark'], a[0]['target_exposure_pct'])
+finally:
+    m02.m01.get_mark=old
+PY" in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: command not found: python
+
+codex
+The default `python` binary is not on PATH in this shell, so I’m rerunning the probes with the project’s documented conda Python.
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import sys
+sys.path.insert(0,'/Users/hermes/quants-lab/research/v15')
+import v15_m02_journey_trace as m02
+from v15_m02_journey_trace import LifecycleFillEvent
+
+def fill(ts, side, size, price, start, tid, closed=0.0):
+    return {'coin':'BTC','side':side,'size':float(size),'price':float(price),'time':ts,'tid':tid,'dir':'','closedPnl':closed,'startPosition':float(start),'fee':0.0,'signed_sz':float(size) if side=='B' else -float(size),'is_liquidation':False}
+
+fills=[fill(1000,'B',1,100,0,1)]
+events=[LifecycleFillEvent(ts=1000,event_order=0,fill=fills[0])]
+funding=[{'time':2000,'delta':{'type':'funding','coin':'BTC','usdc':5.0}}]
+a,j=m02.trace_wallet('0x', events, fills, funding, equity_enriched=False)
+print('open journey funding/duration:', j)
+
+class EE:
+    type='fill'; event_order=0; ts=120000; fill=fills[0]
+    has_past_anchor=True; equity_post=1000.0; frozen_component_value=0.0; frozen_component_age_ms=0
+    age_since_anchor_ms=60000; anchor_equity=1000.0; anchor_ts=60000; mark_ts=60000
+    n_unmarkable=0; markable_all=True; no_extradex_without_anchor=True
+
+def nan_mark(*args, **kwargs): return float('nan')
+old=m02.m01.get_mark
+m02.m01.get_mark=nan_mark
+try:
+    a,j=m02.trace_wallet('0x',[EE()], [fills[0]], [], equity_enriched=True)
+    print('nan mark action:', a[0]['mark'], a[0]['target_exposure_pct'])
+finally:
+    m02.m01.get_mark=old
+PY" in /Users/hermes/quants-lab
+codex
+The probe is hanging during module import in this environment, likely due to M01’s heavy dependencies/cache initialization. I don’t need it to establish the code-path defects, so I’m stopping that probe and continuing from static evidence plus the line-referenced synthetic inputs.
+ exited 130 in 47567ms:
+codex
+Read `research/v15/v15_m02_journey_trace.py` in full.
+
+**Findings**
+
+1. `research/v15/v15_m02_journey_trace.py:581-588` — P1 accounting bug: open-at-window-end journeys are finalized at `peak_ts`, not window end.
+Failing input: one BTC fill at `ts=1000`, `signed_sz=+1`, `startPosition=0`, no exit; funding row `{time:2000, delta:{type:"funding", coin:"BTC", usdc:5}}`; CLI window end `3000`.
+Wrong output: open journey gets `open_at_window_end=True`, `exit_ts=None`, but `_finalize(..., st["peak_ts"])` makes `duration_h=0` and `funding_net=0`. It should account through the run/window end, so duration is about `(3000-1000)/3600e3` and funding includes `+5`.
+Minimal fix: pass `end_ms` into `trace_wallet`; finalize open journeys with `end_ms` for duration/funding while still emitting `exit_ts=None` if you want to mark them open.
+
+2. `research/v15/v15_m02_journey_trace.py:367-400` — P1 fail-open lifecycle bug: `startPosition=NaN` is silently treated as flat.
+Failing input: first BTC fill `{ts:1000, side:"A", signed_sz:-1, price:100, startPosition:NaN, closedPnl:10}`.
+Wrong output: `abs(NaN) > EPS` is false, so carry-in is marked `SEEDED`; the fill becomes a fresh short `ENTRY` with `lifecycle_valid=True`. That is fabricated: the pre-fill position is unknown/non-finite.
+Minimal fix: validate `startPosition`, `signed_sz`, and `price` are finite before state-machine use. Non-finite `startPosition` should invalidate the coin/wallet lifecycle fail-closed, not seed flat.
+
+3. `research/v15/v15_m02_journey_trace.py:529-534` — P1 degenerate sizing bug: NaN/inf marks survive into `target_exposure_pct`.
+Failing input: valid anchored `EventEquity` with `equity_post=1000`, BTC action `position_after=1`, and `m01.get_mark("BTC", ts, causal=True)` returning `NaN` or `inf`.
+Wrong output: `mark is not None` passes, so `target_exposure_pct` becomes `NaN` or `inf` instead of null/unsizeable.
+Minimal fix: require `np.isfinite(mark)` and `np.isfinite(basis.equity)` before emitting `target_exposure_pct`; otherwise set mark/target null or degraded unsizeable.
+
+4. `research/v15/v15_m02_journey_trace.py:685-686`, `774-800` — P1 fail-open batch output: worker exceptions produce partial artifacts and process success.
+Failing input: wallets file with `0xgood`, `0xbad`; `process_wallet("0xbad", ...)` hits loader/reconstruction exception.
+Wrong output: `_consume` records the error, still closes/writes parquet for only successful wallets, logs warning, and exits 0. Downstream can consume an incomplete universe as trusted.
+Minimal fix: after closing writers, if `errors`, raise `SystemExit(1)` and write an explicit error manifest; optionally write outputs to temp paths and only promote on zero errors.
+
+5. `research/v15/v15_m02_journey_trace.py:789-793` — P2 reproducibility defect: `imap_unordered` makes physical output order/shard composition nondeterministic.
+Failing input: two wallets with different runtime; runs can write wallet A then B or B then A.
+Wrong output: same rows, but parquet physical order/part boundaries are nondeterministic. If any downstream scan relies on encounter order before sorting, results can drift.
+Minimal fix: use ordered `imap`, or attach task index and consume in index order; otherwise document parquet row order as non-contractual and enforce downstream sorting.
+
+**Correct By Design / No Defect Found**
+
+The main look-ahead invariants are upheld by M02’s own code assuming M01’s `EventEquity` contract is correct: `select_equity_basis()` does not consult inter-anchor drift or whole-window reconciliation, `NO_ANCHOR` maps to null target, anchor/equity timestamps come from causal event state, and sizing mark uses a closed bar. Carry-in uses the current first observed fill’s `startPosition`; later fills are only used for resync after a detected position discontinuity, which is causal.
+
+The normal ENTRY/ADDON/TRIM/EXIT/REVERSE state machine is coherent: ADDON updates weighted cost basis, TRIM/EXIT add realized PnL, REVERSE closes the old leg and opens residual with a new journey id, and full EXIT then re-ENTRY starts a new journey.
+
+Streaming is mostly compliant: it uses `ShardedParquetWriter` and `install_memory_guard`, avoids one global all-rows DataFrame, and mark access is routed through M01/cache rather than obvious per-row DB scans in M02.
+
+**Overall**
+
+Not TRUSTED yet. I do not see a direct future-fill/anchor/equity look-ahead leak in M02’s causal sizing path, but it is not fail-closed and has a real open-journey funding/duration accounting bug. Blocking before trust: findings 1-4.
+tokens used
+62.493
+Read `research/v15/v15_m02_journey_trace.py` in full.
+
+**Findings**
+
+1. `research/v15/v15_m02_journey_trace.py:581-588` — P1 accounting bug: open-at-window-end journeys are finalized at `peak_ts`, not window end.
+Failing input: one BTC fill at `ts=1000`, `signed_sz=+1`, `startPosition=0`, no exit; funding row `{time:2000, delta:{type:"funding", coin:"BTC", usdc:5}}`; CLI window end `3000`.
+Wrong output: open journey gets `open_at_window_end=True`, `exit_ts=None`, but `_finalize(..., st["peak_ts"])` makes `duration_h=0` and `funding_net=0`. It should account through the run/window end, so duration is about `(3000-1000)/3600e3` and funding includes `+5`.
+Minimal fix: pass `end_ms` into `trace_wallet`; finalize open journeys with `end_ms` for duration/funding while still emitting `exit_ts=None` if you want to mark them open.
+
+2. `research/v15/v15_m02_journey_trace.py:367-400` — P1 fail-open lifecycle bug: `startPosition=NaN` is silently treated as flat.
+Failing input: first BTC fill `{ts:1000, side:"A", signed_sz:-1, price:100, startPosition:NaN, closedPnl:10}`.
+Wrong output: `abs(NaN) > EPS` is false, so carry-in is marked `SEEDED`; the fill becomes a fresh short `ENTRY` with `lifecycle_valid=True`. That is fabricated: the pre-fill position is unknown/non-finite.
+Minimal fix: validate `startPosition`, `signed_sz`, and `price` are finite before state-machine use. Non-finite `startPosition` should invalidate the coin/wallet lifecycle fail-closed, not seed flat.
+
+3. `research/v15/v15_m02_journey_trace.py:529-534` — P1 degenerate sizing bug: NaN/inf marks survive into `target_exposure_pct`.
+Failing input: valid anchored `EventEquity` with `equity_post=1000`, BTC action `position_after=1`, and `m01.get_mark("BTC", ts, causal=True)` returning `NaN` or `inf`.
+Wrong output: `mark is not None` passes, so `target_exposure_pct` becomes `NaN` or `inf` instead of null/unsizeable.
+Minimal fix: require `np.isfinite(mark)` and `np.isfinite(basis.equity)` before emitting `target_exposure_pct`; otherwise set mark/target null or degraded unsizeable.
+
+4. `research/v15/v15_m02_journey_trace.py:685-686`, `774-800` — P1 fail-open batch output: worker exceptions produce partial artifacts and process success.
+Failing input: wallets file with `0xgood`, `0xbad`; `process_wallet("0xbad", ...)` hits loader/reconstruction exception.
+Wrong output: `_consume` records the error, still closes/writes parquet for only successful wallets, logs warning, and exits 0. Downstream can consume an incomplete universe as trusted.
+Minimal fix: after closing writers, if `errors`, raise `SystemExit(1)` and write an explicit error manifest; optionally write outputs to temp paths and only promote on zero errors.
+
+5. `research/v15/v15_m02_journey_trace.py:789-793` — P2 reproducibility defect: `imap_unordered` makes physical output order/shard composition nondeterministic.
+Failing input: two wallets with different runtime; runs can write wallet A then B or B then A.
+Wrong output: same rows, but parquet physical order/part boundaries are nondeterministic. If any downstream scan relies on encounter order before sorting, results can drift.
+Minimal fix: use ordered `imap`, or attach task index and consume in index order; otherwise document parquet row order as non-contractual and enforce downstream sorting.
+
+**Correct By Design / No Defect Found**
+
+The main look-ahead invariants are upheld by M02’s own code assuming M01’s `EventEquity` contract is correct: `select_equity_basis()` does not consult inter-anchor drift or whole-window reconciliation, `NO_ANCHOR` maps to null target, anchor/equity timestamps come from causal event state, and sizing mark uses a closed bar. Carry-in uses the current first observed fill’s `startPosition`; later fills are only used for resync after a detected position discontinuity, which is causal.
+
+The normal ENTRY/ADDON/TRIM/EXIT/REVERSE state machine is coherent: ADDON updates weighted cost basis, TRIM/EXIT add realized PnL, REVERSE closes the old leg and opens residual with a new journey id, and full EXIT then re-ENTRY starts a new journey.
+
+Streaming is mostly compliant: it uses `ShardedParquetWriter` and `install_memory_guard`, avoids one global all-rows DataFrame, and mark access is routed through M01/cache rather than obvious per-row DB scans in M02.
+
+**Overall**
+
+Not TRUSTED yet. I do not see a direct future-fill/anchor/equity look-ahead leak in M02’s causal sizing path, but it is not fail-closed and has a real open-journey funding/duration accounting bug. Blocking before trust: findings 1-4.

@@ -42,6 +42,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -210,7 +211,9 @@ def _fill_fee_usd_actual(f: dict) -> Optional[float]:
         fv = float(v)
     except (TypeError, ValueError):
         return None
-    return None if fv != fv else fv
+    # codex m02 r3: reject NaN AND inf (a non-finite reported fee must fall back to the computed fee, never
+    # flow inf into fees_paid). np.isfinite catches both.
+    return fv if np.isfinite(fv) else None
 
 
 def _fill_fee_usd(notional: float) -> float:
@@ -245,7 +248,14 @@ def _funding_for_interval(
             continue
         t = int(e.get("time", 0))
         if entry_ts < t <= exit_ts:
-            total += float(d.get("usdc", 0) or 0)
+            # codex m02 r4: finite-guard funding usdc so an inf/NaN payload cannot make funding_net (and
+            # net_realized_pnl) non-finite in a trusted journey. Non-finite funding is dropped (garbage).
+            try:
+                u = float(d.get("usdc", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(u):
+                total += u
     return total
 
 
@@ -275,6 +285,7 @@ def trace_wallet(
     funding: list[dict],
     *,
     equity_enriched: bool = True,
+    end_ms: Optional[int] = None,
 ) -> tuple[list[dict], list[dict]]:
     """Walk the ordered FILL events for one wallet and emit (actions, journeys).
 
@@ -365,6 +376,26 @@ def trace_wallet(
         # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
         first_fill = not coin_seen_first_fill.get(coin, False)
         sp = float(f.get("startPosition", 0.0) or 0.0)
+        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+        # True (fabricated pre-position). Fail CLOSED: non-finite inputs invalidate the lifecycle so downstream
+        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
+        sp_finite = bool(np.isfinite(sp))
+        signed_finite = bool(np.isfinite(signed))
+        price_finite = bool(np.isfinite(price))
+        inputs_finite = sp_finite and signed_finite and price_finite
+        if not inputs_finite:
+            st["lifecycle_valid"] = False
+            st["state_discontinuity"] = True
+            if not sp_finite:
+                sp = 0.0   # neutralize the denominator math; carry_in tagged UNKNOWN below (not SEEDED)
+            if not (signed_finite and price_finite):
+                # codex r2/r3: a NaN/inf SIZE poisons new_pos (crashes REVERSE via coin_journey_counter
+                # KeyError); a NaN/inf PRICE poisons notional/cost_basis/fee arithmetic (inf into fees_paid /
+                # max_notional). DROP the garbage fill; the coin lifecycle stays invalid so every journey on
+                # it is stream_replay_valid=False (fail closed). Only a lone non-finite startPosition still
+                # emits an invalid audit row (sp neutralized to 0, carry_in UNKNOWN).
+                continue
         state_resynced = False
         if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
             # Missing/ambiguous fills: never continue a fabricated lifecycle.
@@ -397,15 +428,29 @@ def trace_wallet(
                 position = sp
                 cost_basis = price
             else:
-                st["carry_in_status"] = "SEEDED"  # flat carry-in = cleanly known
+                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+                st["carry_in_status"] = "SEEDED" if sp_finite else "UNKNOWN"
 
         if not bool(f.get("causal_order_ok", True)):
             st["lifecycle_valid"] = False
 
         # closedPnl ground truth (fallback to cost-basis derived).
+        # codex m02 r3: a reported closedPnl that is NaN OR inf must NOT flow into realized_pnl. Treat any
+        # non-finite reported pnl as MISSING (fall back to the cost-basis-derived value, always finite here
+        # since price is finite) AND invalidate the lifecycle (corrupt ground-truth -> exclude downstream).
+        # codex m02 r4: coerce BEFORE the finite check so a string "inf"/"nan" (direct callers; the production
+        # loader already normalizes) is caught, not just numeric non-finite.
         raw_pnl = f.get("closedPnl", None)
+        if raw_pnl is not None:
+            try:
+                raw_pnl = float(raw_pnl)
+            except (TypeError, ValueError):
+                raw_pnl = None   # unparseable -> treat as missing (derived path)
+        _raw_pnl_nonfinite = raw_pnl is not None and not np.isfinite(raw_pnl)
+        if _raw_pnl_nonfinite:
+            st["lifecycle_valid"] = False
         new_pos_preview = position + signed
-        if raw_pnl is None or (isinstance(raw_pnl, float) and raw_pnl != raw_pnl):
+        if raw_pnl is None or _raw_pnl_nonfinite:
             if (position > 0 and signed < 0) or (position < 0 and signed > 0):
                 if abs(new_pos_preview) < EPS:
                     closed_qty = position
@@ -526,9 +571,16 @@ def trace_wallet(
         if equity_enriched:
             basis = select_equity_basis(ee)
             # SIZING signal: use only a bar that has closed by ts.
-            mark = m01.get_mark(coin, ts, causal=True)
-            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
-            if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
+            _raw_mark = m01.get_mark(coin, ts, causal=True)
+            # AUDIT 2026-07-10 (codex m02 P1): a NaN/inf mark (or NaN/inf equity) must NOT survive into
+            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
+            # Require FINITE mark AND finite non-trivial equity, else the action is unsizeable (target=None).
+            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
+            mark = float(_raw_mark) if mark_ok else None
+            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark_ok else None
+            eq_finite = basis.equity is not None and np.isfinite(basis.equity)
+            eq_ok = eq_finite and abs(basis.equity) > EPS
+            if basis.mode == "NO_ANCHOR" or not eq_ok or not mark_ok:
                 target_pct = None
             else:
                 target_pct = (new_pos * mark) / basis.equity
@@ -543,6 +595,19 @@ def trace_wallet(
             sizing_mark_ts = None
             target_pct = None
 
+        # codex m02 r5: NEVER write a non-finite source_equity_post / frozen diagnostic into the action row
+        # (M01 can emit inf/NaN equity via cash reconstruction). Null non-finite equity-basis fields so no
+        # trusted row carries a non-finite equity value; the row stays lifecycle-valid, just unsizeable.
+        source_equity_out = (float(basis.equity)
+                             if (basis.equity is not None and np.isfinite(basis.equity)) else None)
+        frozen_value_out = (basis.frozen_value
+                            if (basis.frozen_value is not None and np.isfinite(basis.frozen_value)) else None)
+        frozen_mat_out = (basis.frozen_materiality_frac
+                          if (basis.frozen_materiality_frac is not None
+                              and np.isfinite(basis.frozen_materiality_frac)) else None)
+        frozen_age_out = (basis.frozen_age_s
+                          if (basis.frozen_age_s is not None and np.isfinite(basis.frozen_age_s)) else None)
+
         actions.append({
             "wallet": wallet, "coin": coin, "ts": ts,
             "fill_id": int(f.get("tid", 0) or 0),
@@ -551,13 +616,13 @@ def trace_wallet(
             "signed_size": signed, "price": price,
             "position_after": new_pos,
             "mark": mark, "mark_ts": sizing_mark_ts,
-            "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
+            "source_equity_post": source_equity_out, "equity_ts": basis.equity_ts,
             "anchor_ts": basis.anchor_ts,
             "equity_basis_mode": basis.mode,
             "equity_degraded": basis.degraded,
-            "frozen_component_value": basis.frozen_value,
-            "frozen_component_age_s": basis.frozen_age_s,
-            "frozen_materiality_frac": basis.frozen_materiality_frac,
+            "frozen_component_value": frozen_value_out,
+            "frozen_component_age_s": frozen_age_out,
+            "frozen_materiality_frac": frozen_mat_out,
             "target_exposure_pct": target_pct,
             "is_liquidation": is_liq,
             "opening_journey_id": opening_jid,
@@ -579,9 +644,14 @@ def trace_wallet(
         })
 
     # Positions still open at window end → flag (not finalized).
+    # AUDIT 2026-07-10 (codex m02 P1): finalize an OPEN journey through the WINDOW END (end_ms), not peak_ts.
+    # Using peak_ts truncated duration to 0 and dropped funding accrued between peak and window end. exit_ts
+    # stays None (still open). Falls back to the old peak_ts behavior only when end_ms is not supplied.
     for coin, st in coin_state.items():
         if st["open"] and st["open_ts"] is not None:
-            j = _finalize(coin, st, st["peak_ts"] or st["open_ts"])
+            _close_ts = end_ms if end_ms is not None else (st["peak_ts"] or st["open_ts"])
+            _close_ts = max(_close_ts, st["open_ts"])   # never negative duration
+            j = _finalize(coin, st, _close_ts)
             if j is not None:
                 j["open_at_window_end"] = True
                 j["exit_ts"] = None
@@ -675,7 +745,7 @@ def process_wallet(args: tuple) -> dict:
             n_anchors = None
             inter_drift = None
         actions, journeys = trace_wallet(
-            wallet, events, fills, funding, equity_enriched=equity_enriched
+            wallet, events, fills, funding, equity_enriched=equity_enriched, end_ms=end_ms
         )
         return {
             "wallet": wallet, "actions": actions, "journeys": journeys,
@@ -789,16 +859,30 @@ def main() -> None:
     with Pool(max(1, budget.procs), initializer=_init_worker,
               initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
               maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
-        for r in pool.imap_unordered(process_wallet, tasks):
+        # AUDIT 2026-07-10 (codex m02 P2): ORDERED imap so physical output row/shard order is deterministic
+        # run-to-run (same wallets file -> byte-stable parts). Rows are identical either way; determinism only.
+        for r in pool.imap(process_wallet, tasks):
             _consume(r)
 
     n_actions = aw.close()
     n_journeys = jw.close()
     logger.info(f"Wrote {args.actions_out}: {n_actions:,} actions")
     logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
-    if errors:
-        logger.warning(f"{len(errors)} wallet errors: {errors[:10]}")
     logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")
+    # AUDIT 2026-07-10 (codex m02 P1): a worker exception used to be logged and swallowed -> a PARTIAL wallet
+    # universe was written and the process exited 0, so downstream consumed an incomplete set as if complete.
+    # Fail CLOSED: write an explicit error manifest and exit non-zero so the pipeline halts on any wallet error.
+    if errors:
+        manifest = str(Path(args.actions_out).with_suffix(".errors.json"))
+        try:
+            Path(manifest).write_text(json.dumps(
+                {"n_errors": len(errors), "n_wallets": len(wallets),
+                 "errors": [{"wallet": w, "error": e} for w, e in errors]}, indent=2))
+        except Exception as _me:  # noqa: BLE001
+            logger.error(f"could not write error manifest {manifest}: {_me!r}")
+        logger.error(f"{len(errors)}/{len(wallets)} wallet ERRORS -> partial universe. manifest={manifest}. "
+                     f"first: {errors[:10]}")
+        raise SystemExit(1)
 
 
 def _log_one(r: dict, n: int) -> None:

@@ -1,0 +1,1328 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c9d-1e12-7fa1-bf81-958d3d36def1
+--------
+user
+# Round-3 m02 — non-finite signed_sz closed
+
+Your r2 found the last remaining bug: non-finite signed_sz flowed into the state machine (NaN new_pos ->
+REVERSE branch -> coin_journey_counter KeyError). FIXED. Read research/v15/v15_m02_journey_trace.py
+(finite guard ~L367-385) + tests/v15/test_m02_golden.py.
+
+## Applied
+- The finite guard now splits: non-finite startPosition -> neutralize sp=0 + carry_in UNKNOWN + lifecycle
+  invalid (emit row); non-finite SIGNED SIZE -> mark the coin lifecycle invalid + `continue` (DROP the
+  poisoned fill entirely, no state-machine arithmetic, no crash). A following good fill on the same coin
+  inherits the invalid lifecycle (stream_replay_valid=False). Non-finite price still emits an invalid row
+  (survivable, no crash).
+- Golden added test_p1_nonfinite_signed_size_dropped_no_crash: NaN-size fill -> no exception, no action row
+  for it, the next good fill on the coin is lifecycle_valid=False + stream_replay_valid=False.
+36 m02 (7 golden + 29 existing) + full v15 pass.
+
+## Verify
+- Is the non-finite signed_sz path now crash-free AND fail-closed (no KeyError, no NaN new_pos reaching any
+  branch)? Any other non-finite arithmetic path left (price into notional/cost_basis/fee)?
+- Confirm dropping the fill (vs emitting a row) is acceptable fail-closed: the coin lifecycle stays invalid so
+  downstream stream_replay_valid excludes every journey on it.
+- Any NEW bug or regression.
+
+## Output
+Verdict. End OVERALL: is m02 now look-ahead-safe AND fail-CLOSED with correct lifecycle/PnL accounting and
+ready to be marked TRUSTED (yes/no + what remains).
+codex
+I’ll review the changed trace logic and golden coverage in a code-review stance, then run the focused tests if the repo supports it locally.
+exec
+/bin/zsh -lc "sed -n '330,430p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 1ms:
+            "realized_pnl": st["realized_pnl"], "fees": st["fees_paid"],
+            "funding_net": funding_net, "net_realized_pnl": net_realized,
+            "journey_class": _classify_duration(duration_s, st["n_addon"], st["n_trim"]),
+            "liq_closed": st["liq_closed"],
+            "open_at_window_end": False,
+            "carry_in_status": st["carry_in_status"] or "SEEDED",
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            "state_discontinuity": bool(st.get("state_discontinuity", False)),
+        }
+
+    # Walk events in event_order (already sorted).
+    for ee in events:
+        if ee.type != "fill":
+            continue
+        f = ee.fill  # exact payload for THIS ordered fill event (no rematch)
+        if f is None:
+            continue
+
+        coin = f["coin"]
+        # Defensive parity with M1 and M7/live: the research strategy copies
+        # perps only. Spot must not affect journey/ranking metrics even if an
+        # externally supplied event stream contains it.
+        if m01.coin_is_spot(coin):
+            continue
+        st = coin_state.setdefault(coin, _new_state())
+        signed = f["signed_sz"]
+        if abs(signed) <= EPS:
+            continue
+        price = float(f["price"]) or 0.0
+        ts = ee.ts
+        is_liq = bool(f.get("is_liquidation"))
+        row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
+        actual_fee = _fill_fee_usd_actual(f)
+
+        position = st["position"]
+        cost_basis = st["cost_basis"]
+
+        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+        first_fill = not coin_seen_first_fill.get(coin, False)
+        sp = float(f.get("startPosition", 0.0) or 0.0)
+        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+        # True (fabricated pre-position). Fail CLOSED: non-finite inputs invalidate the lifecycle so downstream
+        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
+        sp_finite = bool(np.isfinite(sp))
+        signed_finite = bool(np.isfinite(signed))
+        inputs_finite = sp_finite and signed_finite and bool(np.isfinite(price))
+        if not inputs_finite:
+            st["lifecycle_valid"] = False
+            st["state_discontinuity"] = True
+            if not sp_finite:
+                sp = 0.0   # neutralize the denominator math; carry_in tagged UNKNOWN below (not SEEDED)
+            if not signed_finite:
+                # codex r2: a NaN/inf SIZE poisons new_pos (position+signed) and crashes the state machine
+                # (REVERSE branch -> coin_journey_counter KeyError). DROP this garbage fill; the coin's
+                # lifecycle is now invalid so every journey on it is stream_replay_valid=False (fail closed).
+                continue
+        state_resynced = False
+        if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+            # Missing/ambiguous fills: never continue a fabricated lifecycle.
+            # Close the interrupted journey as INVALID, then causally reseed
+            # from the current fill's authoritative pre-position.
+            if st["open"]:
+                st["lifecycle_valid"] = False
+                st["state_discontinuity"] = True
+                j = _finalize(coin, st, ts)
+                if j is not None:
+                    journeys.append(j)
+            st = _new_state()
+            coin_state[coin] = st
+            position = 0.0
+            cost_basis = 0.0
+            first_fill = True
+            state_resynced = True
+        if first_fill:
+            coin_seen_first_fill[coin] = True
+            if abs(sp) > EPS:
+                # Open an already-in-progress journey, sized causally.
+                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+                st.update(
+                    position=sp, cost_basis=price,  # best causal cost proxy = first observed px
+                    open=True, side=(1 if sp > 0 else -1),
+                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+                    max_notional=abs(sp) * price, n_carry_in=1,
+                    carry_in_status="SEEDED", fee_scope=row_scope,
+                )
+                position = sp
+                cost_basis = price
+            else:
+                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+                st["carry_in_status"] = "SEEDED" if sp_finite else "UNKNOWN"
+
+        if not bool(f.get("causal_order_ok", True)):
+            st["lifecycle_valid"] = False
+
+        # closedPnl ground truth (fallback to cost-basis derived).
+        raw_pnl = f.get("closedPnl", None)
+        new_pos_preview = position + signed
+        if raw_pnl is None or (isinstance(raw_pnl, float) and raw_pnl != raw_pnl):
+            if (position > 0 and signed < 0) or (position < 0 and signed > 0):
+                if abs(new_pos_preview) < EPS:
+
+exec
+/bin/zsh -lc 'rg -n "nonfinite|non-finite|signed_sz|startPosition|stream_replay_valid|coin_journey_counter|notional|cost_basis|fee|test_p1_nonfinite" research/v15/v15_m02_journey_trace.py tests/v15/test_m02_golden.py' in /Users/hermes/quants-lab
+ succeeded in 144ms:
+tests/v15/test_m02_golden.py:5:- P1 non-finite startPosition/size/price: fails CLOSED (lifecycle_valid=False, carry_in UNKNOWN, not a
+tests/v15/test_m02_golden.py:45:def test_p1_nonfinite_startposition_fails_closed():
+tests/v15/test_m02_golden.py:47:    f["startPosition"] = float("nan")                  # unknown pre-position
+tests/v15/test_m02_golden.py:51:    assert actions[0]["stream_replay_valid"] is False
+tests/v15/test_m02_golden.py:55:def test_p1_nonfinite_price_fails_closed():
+tests/v15/test_m02_golden.py:59:    assert actions[0]["lifecycle_valid"] is False and actions[0]["stream_replay_valid"] is False
+tests/v15/test_m02_golden.py:62:def test_p1_nonfinite_signed_size_dropped_no_crash():
+tests/v15/test_m02_golden.py:66:    bad["signed_sz"] = float("nan")
+tests/v15/test_m02_golden.py:74:    assert actions[0]["lifecycle_valid"] is False and actions[0]["stream_replay_valid"] is False
+tests/v15/test_m02_golden.py:98:def test_p1_nonfinite_mark_is_unsizeable(monkeypatch):
+research/v15/v15_m02_journey_trace.py:6:      fill event) suitable for lifecycle and fixed-notional research.
+research/v15/v15_m02_journey_trace.py:14:ENTRY/ADDON/TRIM/EXIT/REVERSE state machine and its realized-PnL / fee / funding /
+research/v15/v15_m02_journey_trace.py:28:      V15 uses the causal ``startPosition`` field on the FIRST in-window fill per
+research/v15/v15_m02_journey_trace.py:194:# Fee / funding helpers (ported from V13; actual v2-fills fees preferred)
+research/v15/v15_m02_journey_trace.py:201:def _fill_fee_usd_actual(f: dict) -> Optional[float]:
+research/v15/v15_m02_journey_trace.py:202:    """Return the signed total wallet fee reported by Hyperliquid.
+research/v15/v15_m02_journey_trace.py:205:    included in ``fee``. They are deliberately ignored here.
+research/v15/v15_m02_journey_trace.py:207:    v = f.get("fee")
+research/v15/v15_m02_journey_trace.py:217:def _fill_fee_usd(notional: float) -> float:
+research/v15/v15_m02_journey_trace.py:218:    return abs(notional) * FEE_RATE
+research/v15/v15_m02_journey_trace.py:221:def _classify_fee_scope(dir_val: str, coin: str) -> str:
+research/v15/v15_m02_journey_trace.py:300:    coin_journey_counter: dict[str, int] = {}
+research/v15/v15_m02_journey_trace.py:305:            "position": 0.0, "cost_basis": 0.0, "open": False, "side": 0,
+research/v15/v15_m02_journey_trace.py:307:            "max_notional": 0.0, "n_entry": 0, "n_addon": 0, "n_trim": 0,
+research/v15/v15_m02_journey_trace.py:309:            "realized_pnl": 0.0, "fees_paid": 0.0, "fee_scope": "standard_perp",
+research/v15/v15_m02_journey_trace.py:318:        max_notional = max(st["max_notional"], EPS)
+research/v15/v15_m02_journey_trace.py:320:        net_realized = st["realized_pnl"] - st["fees_paid"] + funding_net
+research/v15/v15_m02_journey_trace.py:329:            "max_position_notional": max_notional,
+research/v15/v15_m02_journey_trace.py:330:            "realized_pnl": st["realized_pnl"], "fees": st["fees_paid"],
+research/v15/v15_m02_journey_trace.py:355:        signed = f["signed_sz"]
+research/v15/v15_m02_journey_trace.py:361:        row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
+research/v15/v15_m02_journey_trace.py:362:        actual_fee = _fill_fee_usd_actual(f)
+research/v15/v15_m02_journey_trace.py:365:        cost_basis = st["cost_basis"]
+research/v15/v15_m02_journey_trace.py:367:        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+research/v15/v15_m02_journey_trace.py:369:        sp = float(f.get("startPosition", 0.0) or 0.0)
+research/v15/v15_m02_journey_trace.py:370:        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+research/v15/v15_m02_journey_trace.py:371:        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+research/v15/v15_m02_journey_trace.py:372:        # True (fabricated pre-position). Fail CLOSED: non-finite inputs invalidate the lifecycle so downstream
+research/v15/v15_m02_journey_trace.py:373:        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
+research/v15/v15_m02_journey_trace.py:384:                # (REVERSE branch -> coin_journey_counter KeyError). DROP this garbage fill; the coin's
+research/v15/v15_m02_journey_trace.py:385:                # lifecycle is now invalid so every journey on it is stream_replay_valid=False (fail closed).
+research/v15/v15_m02_journey_trace.py:401:            cost_basis = 0.0
+research/v15/v15_m02_journey_trace.py:408:                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+research/v15/v15_m02_journey_trace.py:410:                    position=sp, cost_basis=price,  # best causal cost proxy = first observed px
+research/v15/v15_m02_journey_trace.py:412:                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+research/v15/v15_m02_journey_trace.py:413:                    max_notional=abs(sp) * price, n_carry_in=1,
+research/v15/v15_m02_journey_trace.py:414:                    carry_in_status="SEEDED", fee_scope=row_scope,
+research/v15/v15_m02_journey_trace.py:417:                cost_basis = price
+research/v15/v15_m02_journey_trace.py:419:                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+research/v15/v15_m02_journey_trace.py:436:                closed_pnl = float((price - cost_basis) * closed_qty)
+research/v15/v15_m02_journey_trace.py:443:        pre_notional = abs(position) * price
+research/v15/v15_m02_journey_trace.py:444:        if abs(position) > EPS and pre_notional > st["max_notional"]:
+research/v15/v15_m02_journey_trace.py:445:            st["max_notional"] = pre_notional
+research/v15/v15_m02_journey_trace.py:449:        notional_after = abs(new_pos) * price
+research/v15/v15_m02_journey_trace.py:450:        fill_notional = abs(signed) * price
+research/v15/v15_m02_journey_trace.py:451:        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
+research/v15/v15_m02_journey_trace.py:460:            coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+research/v15/v15_m02_journey_trace.py:462:                journey_id=coin_journey_counter[coin], open=True,
+research/v15/v15_m02_journey_trace.py:465:                realized_pnl=0.0, max_notional=notional_after, cost_basis=price,
+research/v15/v15_m02_journey_trace.py:466:                fees_paid=fill_fee, fee_scope=row_scope, liq_closed=False,
+research/v15/v15_m02_journey_trace.py:476:            st["cost_basis"] = (cost_basis * abs(position) + price * abs(signed)) / abs(new_pos)
+research/v15/v15_m02_journey_trace.py:477:            if notional_after > st["max_notional"]:
+research/v15/v15_m02_journey_trace.py:478:                st["max_notional"] = notional_after
+research/v15/v15_m02_journey_trace.py:480:            st["fees_paid"] += fill_fee
+research/v15/v15_m02_journey_trace.py:489:            st["fees_paid"] += fill_fee
+research/v15/v15_m02_journey_trace.py:505:            st["fees_paid"] += fill_fee
+research/v15/v15_m02_journey_trace.py:517:            if actual_fee is not None and split_total > EPS:
+research/v15/v15_m02_journey_trace.py:518:                closing_fee = actual_fee * (abs(position) / split_total)
+research/v15/v15_m02_journey_trace.py:519:                opening_fee = actual_fee * (abs(new_pos) / split_total)
+research/v15/v15_m02_journey_trace.py:521:                closing_fee = abs(position) * price * FEE_RATE
+research/v15/v15_m02_journey_trace.py:522:                opening_fee = abs(new_pos) * price * FEE_RATE
+research/v15/v15_m02_journey_trace.py:523:            st["fees_paid"] += closing_fee
+research/v15/v15_m02_journey_trace.py:529:            coin_journey_counter[coin] += 1
+research/v15/v15_m02_journey_trace.py:532:                journey_id=coin_journey_counter[coin], open=True,
+research/v15/v15_m02_journey_trace.py:534:                n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
+research/v15/v15_m02_journey_trace.py:535:                fees_paid=opening_fee, fee_scope=row_scope,
+research/v15/v15_m02_journey_trace.py:599:            # the resync row because it does not carry startPosition.
+research/v15/v15_m02_journey_trace.py:600:            "stream_replay_valid": bool(
+research/v15/v15_m02_journey_trace.py:649:        action["stream_replay_valid"] = bool(
+research/v15/v15_m02_journey_trace.py:656:        journey["stream_replay_valid"] = bool(
+
+exec
+/bin/zsh -lc "sed -n '1,260p' tests/v15/test_m02_golden.py" in /Users/hermes/quants-lab
+ succeeded in 122ms:
+"""GOLDEN regression test for v15_m02_journey_trace trust-audit fixes (2026-07-10).
+
+Locks the fail-CLOSED / accounting fixes from the codex m02 audit:
+- P1 open-at-window-end: an open journey finalizes through END_MS (real duration + funding), not peak_ts (0).
+- P1 non-finite startPosition/size/price: fails CLOSED (lifecycle_valid=False, carry_in UNKNOWN, not a
+  fabricated clean flat SEEDED).
+- P1 NaN/inf mark (or equity): does NOT survive into target_exposure_pct -> unsizeable (None), mark None.
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m02_journey_trace as m02  # noqa: E402
+from v15_m02_journey_trace import LifecycleFillEvent  # noqa: E402
+from test_m02 import _fill  # noqa: E402
+
+
+def _core_events(fills):
+    return [LifecycleFillEvent(ts=int(f["time"]), event_order=i, fill=f) for i, f in enumerate(fills)]
+
+
+def test_p1_open_journey_finalizes_at_window_end():
+    # one open BTC long at ts=1000; funding +5 at t=2000; window end 3000. Journey stays open (exit_ts None)
+    # but duration + funding must run to 3000, not collapse to peak_ts (0 duration / 0 funding).
+    fills = [_fill(1000, "BTC", "B", 1, 100, 0, tid=1)]
+    funding = [{"time": 2000, "delta": {"type": "funding", "coin": "BTC", "usdc": 5.0}}]
+    _a, journeys = m02.trace_wallet("0x", _core_events(fills), fills, funding,
+                                    equity_enriched=False, end_ms=3000)
+    assert len(journeys) == 1
+    j = journeys[0]
+    assert j["open_at_window_end"] is True and j["exit_ts"] is None
+    assert j["duration_h"] > 0.0                       # (3000-1000)/3600e3, NOT 0
+    assert abs(j["funding_net"] - 5.0) < 1e-9          # funding through window end included
+
+
+def test_p1_open_journey_without_end_ms_is_backward_compatible():
+    # end_ms omitted -> old peak_ts behavior (byte-identical for existing callers).
+    fills = [_fill(1000, "BTC", "B", 1, 100, 0, tid=1)]
+    _a, journeys = m02.trace_wallet("0x", _core_events(fills), fills, [], equity_enriched=False)
+    assert journeys[0]["duration_h"] == 0.0            # peak_ts == open_ts -> 0 (unchanged)
+
+
+def test_p1_nonfinite_startposition_fails_closed():
+    f = _fill(1000, "BTC", "A", 1, 100, 0, tid=1, closed=10.0)
+    f["startPosition"] = float("nan")                  # unknown pre-position
+    actions, _j = m02.trace_wallet("0x", _core_events([f]), [f], [], equity_enriched=False)
+    assert len(actions) == 1
+    assert actions[0]["lifecycle_valid"] is False
+    assert actions[0]["stream_replay_valid"] is False
+    assert actions[0]["carry_in_status"] == "UNKNOWN"
+
+
+def test_p1_nonfinite_price_fails_closed():
+    f = _fill(1000, "BTC", "B", 1, 100, 0, tid=1)
+    f["price"] = float("inf")
+    actions, _j = m02.trace_wallet("0x", _core_events([f]), [f], [], equity_enriched=False)
+    assert actions[0]["lifecycle_valid"] is False and actions[0]["stream_replay_valid"] is False
+
+
+def test_p1_nonfinite_signed_size_dropped_no_crash():
+    # codex r2: a NaN size poisoned new_pos and crashed the REVERSE branch (KeyError). Now it is dropped
+    # (no action emitted) and does not raise; a following good fill on the same coin is lifecycle-invalid.
+    bad = _fill(1000, "BTC", "B", 1, 100, 0, tid=1)
+    bad["signed_sz"] = float("nan")
+    good = _fill(2000, "BTC", "B", 1, 100, 0, tid=2)
+    actions, journeys = m02.trace_wallet("0x", _core_events([bad, good]), [bad, good], [],
+                                         equity_enriched=False)
+    # the NaN-size fill produced no action row; only the good fill did
+    assert all(np.isfinite(a["signed_size"]) for a in actions)
+    assert len(actions) == 1 and actions[0]["ts"] == 2000
+    # the coin lifecycle is poisoned -> the good fill's journey/action is fail-closed
+    assert actions[0]["lifecycle_valid"] is False and actions[0]["stream_replay_valid"] is False
+
+
+class _EE:
+    """Minimal EventEquity stand-in: anchored, finite equity, fully markable."""
+    type = "fill"
+    event_order = 0
+    ts = 120_000
+    has_past_anchor = True
+    equity_post = 1000.0
+    frozen_component_value = 0.0
+    frozen_component_age_ms = 0
+    age_since_anchor_ms = 60_000
+    anchor_equity = 1000.0
+    anchor_ts = 60_000
+    mark_ts = 60_000
+    n_unmarkable = 0
+    markable_all = True
+    no_extradex_without_anchor = True
+
+    def __init__(self, fill):
+        self.fill = fill
+
+
+def test_p1_nonfinite_mark_is_unsizeable(monkeypatch):
+    f = _fill(120_000, "BTC", "B", 1, 100, 0, tid=1)
+    for bad in (float("nan"), float("inf")):
+        monkeypatch.setattr(m02.m01, "get_mark", lambda *a, **k: bad)
+        actions, _j = m02.trace_wallet("0x", [_EE(f)], [f], [], equity_enriched=True)
+        assert actions[0]["target_exposure_pct"] is None   # NaN/inf mark never becomes a target
+        assert actions[0]["mark"] is None
+
+
+def test_p1_finite_mark_still_sizes(monkeypatch):
+    f = _fill(120_000, "BTC", "B", 1, 100, 0, tid=1)
+    monkeypatch.setattr(m02.m01, "get_mark", lambda *a, **k: 100.0)
+    actions, _j = m02.trace_wallet("0x", [_EE(f)], [f], [], equity_enriched=True)
+    # position_after=1, mark=100, equity=1000 -> target 0.1
+    assert actions[0]["target_exposure_pct"] is not None
+    assert abs(actions[0]["target_exposure_pct"] - 0.1) < 1e-9
+
+codex
+The guard is in the expected place and the new test checks the exact r2 failure shape. I’m reading the downstream arithmetic now, especially price, fee, reverse, and validity propagation, because that is where a “dropped fill” choice can accidentally leave a clean later journey.
+exec
+/bin/zsh -lc "sed -n '1,180p' tests/v15/test_m02.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""V15 M02 unit tests — NON-LOOK-AHEAD invariants + state machine correctness.
+
+Synthetic fixtures only; no network, no Mongo, no parquet. We monkeypatch
+m01.get_mark so equity reconstruction is deterministic, then drive
+trace_wallet / compute_event_equity directly.
+
+Run:
+    /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02.py -q
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "research" / "v15"))
+
+import v15_m01_equity_reconstruct as m01  # noqa: E402
+import v15_m02_journey_trace as m02  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures / helpers
+# --------------------------------------------------------------------------- #
+
+FIXED_MARK = 100.0
+
+
+@pytest.fixture(autouse=True)
+def _patch_marks(monkeypatch):
+    """Deterministic mark: $100 for BTC, None for an unmarkable exotic coin."""
+    def fake_mark(coin, ts_ms, causal=False):
+        if coin.startswith("EXOTIC"):
+            return None
+        return FIXED_MARK
+    monkeypatch.setattr(m01, "get_mark", fake_mark)
+    monkeypatch.setattr(m02.m01, "get_mark", fake_mark)
+
+
+def _fill(ts, coin, side, size, price, start_pos, tid, closed=0.0, dir_="", liq=False):
+    return {
+        "coin": coin, "side": side, "size": float(size), "price": float(price),
+        "time": int(ts), "tid": int(tid), "dir": dir_,
+        "closedPnl": float(closed), "startPosition": float(start_pos),
+        "fee": 0.0, "builderFee": 0.0, "deployerFee": 0.0,
+        "signed_sz": float(size) if side == "B" else -float(size),
+        "is_liquidation": liq,
+    }
+
+
+class _Anchor:
+    """Minimal AnchorState stand-in: no pre-anchor positions, far-future fetch."""
+    positions: dict = {}
+    entry_px: dict = {}
+    fetched_ms = 10**15
+    dexes_seen = {"main"}
+    has_flx_anchor = False
+    has_unmarkable_dex_anchor = False
+    acct_value_by_dex = {"main": 1000.0}
+    aggregate_acct_value = 1000.0
+
+
+def _run(fills, funding=None, anchors=None):
+    funding = funding or []
+    # default anchor strictly BEFORE the first fill so events are sizeable.
+    anchors = anchors if anchors is not None else [(fills[0]["time"] - 1000, 1000.0)]
+    anchor = _Anchor()
+    ordered = m01.build_event_stream(fills, funding, [])
+    events = m01.compute_event_equity(
+        ordered, fills, anchor, "0xtest", anchors, extradex_no_anchor=False
+    )
+    actions, journeys = m02.trace_wallet("0xtest", events, fills, funding)
+    return events, actions, journeys
+
+
+def test_core_m02_does_not_reconstruct_equity(monkeypatch):
+    """The default lifecycle lane must run while M01 is absent or distrusted."""
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(3000, "BTC", "A", 1, 110, 1, tid=2, closed=10.0),
+    ]
+    for i, fill in enumerate(fills):
+        fill["fill_seq"] = i
+        fill["causal_order_ok"] = True
+    monkeypatch.setattr(m02.m01, "load_wallet_fills", lambda *_: fills)
+    monkeypatch.setattr(m02.m01, "load_wallet_funding", lambda *_: [])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("core M02 consulted M01 equity reconstruction")
+
+    monkeypatch.setattr(m02.m01, "reconstruct_wallet_event_equity", forbidden)
+    result = m02.process_wallet(("0xtest", 0, 10_000, False))
+
+    assert "error" not in result
+    assert len(result["actions"]) == 2
+    assert len(result["journeys"]) == 1
+    assert result["n_anchors"] is None
+    assert result["inter_drift"] is None
+    assert all(a["equity_basis_mode"] == "NOT_REQUESTED" for a in result["actions"])
+    assert all(a["source_equity_post"] is None for a in result["actions"])
+    assert all(a["target_exposure_pct"] is None for a in result["actions"])
+
+
+# --------------------------------------------------------------------------- #
+# NON-LOOK-AHEAD INVARIANTS
+# --------------------------------------------------------------------------- #
+
+
+def test_event_order_strictly_monotone():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(3000, "BTC", "A", 1, 110, 1, tid=2, closed=10.0),
+    ]
+    events, actions, _ = _run(fills)
+    orders = [a["event_order"] for a in actions]
+    assert orders == sorted(orders)
+    assert len(set(orders)) == len(orders)  # strict
+
+
+def test_anchor_ts_strictly_before_ts():
+    fills = [_fill(5000, "BTC", "B", 1, 100, 0, tid=1)]
+    # anchor shares the action ms -> must NOT be chosen (strict <).
+    _, actions, _ = _run(fills, anchors=[(2000, 1000.0), (5000, 1100.0)])
+    a = actions[0]
+    assert a["anchor_ts"] == 2000
+    assert a["anchor_ts"] < a["ts"]
+
+
+def test_equity_ts_and_mark_ts_le_ts():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),
+        _fill(4000, "BTC", "B", 1, 100, 1, tid=2),
+    ]
+    _, actions, _ = _run(fills)
+    for a in actions:
+        if a["equity_ts"] is not None:
+            assert a["equity_ts"] <= a["ts"]
+        if a["mark_ts"] is not None:
+            assert a["mark_ts"] <= a["ts"]
+
+
+def test_no_anchor_implies_null_target():
+    # first fill is BEFORE any anchor -> NO_ANCHOR, target null.
+    fills = [
+        _fill(1000, "BTC", "B", 1, 100, 0, tid=1),   # before anchor at 2000
+        _fill(3000, "BTC", "B", 1, 100, 1, tid=2),   # after anchor -> sizeable
+    ]
+    _, actions, _ = _run(fills, anchors=[(2000, 1000.0)])
+    a0 = next(a for a in actions if a["ts"] == 1000)
+    assert a0["equity_basis_mode"] == "NO_ANCHOR"
+    assert a0["target_exposure_pct"] is None
+    a1 = next(a for a in actions if a["ts"] == 3000)
+    assert a1["equity_basis_mode"] in ("INTRAWEEK", "PARTIAL_MTM")
+    assert a1["target_exposure_pct"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# STATE MACHINE CORRECTNESS
+# --------------------------------------------------------------------------- #
+
+
+def test_entry_addon_trim_exit_sequence():
+    fills = [
+        _fill(2000, "BTC", "B", 1, 100, 0, tid=1),                 # ENTRY long 1
+        _fill(2100, "BTC", "B", 1, 100, 1, tid=2),                 # ADDON -> 2
+        _fill(2200, "BTC", "A", 1, 110, 2, tid=3, closed=10.0),    # TRIM -> 1
+        _fill(2300, "BTC", "A", 1, 120, 1, tid=4, closed=20.0),    # EXIT -> 0
+    ]
+    _, actions, journeys = _run(fills)
+    assert [a["action_type"] for a in actions] == ["ENTRY", "ADDON", "TRIM", "EXIT"]
+    assert len(journeys) == 1
+    j = journeys[0]
+    assert j["side"] == "long"
+    assert j["n_entry_fills"] == 1 and j["n_addon_fills"] == 1
+    assert j["n_trim_fills"] == 1 and j["n_exit_fills"] == 1
+    assert abs(j["realized_pnl"] - 30.0) < 1e-6
+
+exec
+/bin/zsh -lc "rg -n \"float\\(|np\\.isfinite|isfinite|closedPnl|fee\\]|fee\\)|price\\]|signed_sz|startPosition|position_after|target_exposure_pct\" research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+21:          target_exposure_pct = position_after * mark / source_equity_post
+23:      consistent with position_after). The equity basis is chosen per-event from a
+28:      V15 uses the causal ``startPosition`` field on the FIRST in-window fill per
+34:  event_order strictly monotone per wallet ; NO_ANCHOR ⇒ target_exposure_pct null.
+84:# denominator (produces absurd target_exposure_pct, e.g. 200000x on near-zero equity). This
+129:            frozen_value=0.0, frozen_age_s=0.0, frozen_materiality_frac=float("nan"),
+135:    materiality = (abs(frozen) / abs(eq)) if (eq and abs(eq) > EPS) else float("nan")
+211:        fv = float(v)
+249:            total += float(d.get("usdc", 0) or 0)
+355:        signed = f["signed_sz"]
+358:        price = float(f["price"]) or 0.0
+367:        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+369:        sp = float(f.get("startPosition", 0.0) or 0.0)
+370:        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+371:        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+374:        sp_finite = bool(np.isfinite(sp))
+375:        signed_finite = bool(np.isfinite(signed))
+376:        inputs_finite = sp_finite and signed_finite and bool(np.isfinite(price))
+419:                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+425:        # closedPnl ground truth (fallback to cost-basis derived).
+426:        raw_pnl = f.get("closedPnl", None)
+436:                closed_pnl = float((price - cost_basis) * closed_qty)
+440:            closed_pnl = float(raw_pnl)
+551:            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
+553:            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
+554:            mark = float(_raw_mark) if mark_ok else None
+556:            eq_ok = (basis.equity is not None and np.isfinite(basis.equity) and abs(basis.equity) > EPS)
+566:                frozen_materiality_frac=float("nan"),
+578:            "position_after": new_pos,
+587:            "target_exposure_pct": target_pct,
+599:            # the resync row because it does not carry startPosition.
+
+exec
+/bin/zsh -lc "sed -n '430,690p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+                if abs(new_pos_preview) < EPS:
+                    closed_qty = position
+                elif (position > 0 and new_pos_preview > 0) or (position < 0 and new_pos_preview < 0):
+                    closed_qty = -signed
+                else:
+                    closed_qty = position
+                closed_pnl = float((price - cost_basis) * closed_qty)
+            else:
+                closed_pnl = 0.0
+        else:
+            closed_pnl = float(raw_pnl)
+
+        # PRE-fill peak capture.
+        pre_notional = abs(position) * price
+        if abs(position) > EPS and pre_notional > st["max_notional"]:
+            st["max_notional"] = pre_notional
+            st["peak_ts"] = ts
+
+        new_pos = position + signed
+        notional_after = abs(new_pos) * price
+        fill_notional = abs(signed) * price
+        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
+
+        # ---- state machine ----
+        action_type = None
+        opening_jid = None
+        closing_jid = None
+
+        if abs(position) < EPS and abs(new_pos) > EPS:
+            # ENTRY
+            coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+            st.update(
+                journey_id=coin_journey_counter[coin], open=True,
+                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+                n_entry=1, n_addon=0, n_trim=0, n_exit=0, n_reverse=0, n_carry_in=0,
+                realized_pnl=0.0, max_notional=notional_after, cost_basis=price,
+                fees_paid=fill_fee, fee_scope=row_scope, liq_closed=False,
+                carry_in_status=st["carry_in_status"] or "SEEDED",
+            )
+            action_type = "ENTRY"
+            opening_jid = st["journey_id"]
+            closing_jid = None
+
+        elif (position > 0 and signed > 0) or (position < 0 and signed < 0):
+            # ADDON
+            st["n_addon"] += 1
+            st["cost_basis"] = (cost_basis * abs(position) + price * abs(signed)) / abs(new_pos)
+            if notional_after > st["max_notional"]:
+                st["max_notional"] = notional_after
+                st["peak_ts"] = ts
+            st["fees_paid"] += fill_fee
+            action_type = "ADDON"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+
+        elif abs(new_pos) < EPS:
+            # EXACT EXIT
+            st["n_exit"] += 1
+            st["realized_pnl"] += closed_pnl
+            st["fees_paid"] += fill_fee
+            if is_liq:
+                st["liq_closed"] = True
+            action_type = "EXIT"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+            j = _finalize(coin, st, ts)
+            if j is not None:
+                journeys.append(j)
+            st.update(_new_state())
+            coin_state[coin] = st
+
+        elif (position > 0 and new_pos > 0 and signed < 0) or (position < 0 and new_pos < 0 and signed > 0):
+            # TRIM
+            st["n_trim"] += 1
+            st["realized_pnl"] += closed_pnl
+            st["fees_paid"] += fill_fee
+            action_type = "TRIM"
+            opening_jid = st["journey_id"]
+            closing_jid = st["journey_id"]
+
+        else:
+            # REVERSE (crosses zero): one action row, two journey ids.
+            st["n_reverse"] += 1
+            st["realized_pnl"] += closed_pnl
+            if is_liq:
+                st["liq_closed"] = True
+            split_total = abs(position) + abs(new_pos)
+            if actual_fee is not None and split_total > EPS:
+                closing_fee = actual_fee * (abs(position) / split_total)
+                opening_fee = actual_fee * (abs(new_pos) / split_total)
+            else:
+                closing_fee = abs(position) * price * FEE_RATE
+                opening_fee = abs(new_pos) * price * FEE_RATE
+            st["fees_paid"] += closing_fee
+            closing_jid = st["journey_id"]
+            j = _finalize(coin, st, ts)
+            if j is not None:
+                journeys.append(j)
+            # open the new (reversed) leg
+            coin_journey_counter[coin] += 1
+            st.update(_new_state())
+            st.update(
+                journey_id=coin_journey_counter[coin], open=True,
+                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+                n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
+                fees_paid=opening_fee, fee_scope=row_scope,
+                carry_in_status="SEEDED",
+            )
+            coin_state[coin] = st
+            action_type = "REVERSE"
+            opening_jid = st["journey_id"]
+
+        st["position"] = new_pos
+
+        # ---- optional equity basis + action row ----
+        # Core M02 deliberately does not read M01, anchors, or market marks.
+        if equity_enriched:
+            basis = select_equity_basis(ee)
+            # SIZING signal: use only a bar that has closed by ts.
+            _raw_mark = m01.get_mark(coin, ts, causal=True)
+            # AUDIT 2026-07-10 (codex m02 P1): a NaN/inf mark (or NaN/inf equity) must NOT survive into
+            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
+            # Require FINITE mark AND finite non-trivial equity, else the action is unsizeable (target=None).
+            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
+            mark = float(_raw_mark) if mark_ok else None
+            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark_ok else None
+            eq_ok = (basis.equity is not None and np.isfinite(basis.equity) and abs(basis.equity) > EPS)
+            if basis.mode == "NO_ANCHOR" or not eq_ok or not mark_ok:
+                target_pct = None
+            else:
+                target_pct = (new_pos * mark) / basis.equity
+        else:
+            basis = EquityBasis(
+                mode="NOT_REQUESTED", equity=None, equity_ts=None,
+                anchor_ts=None, mark_ts=None, degraded=False,
+                frozen_value=0.0, frozen_age_s=0.0,
+                frozen_materiality_frac=float("nan"),
+            )
+            mark = None
+            sizing_mark_ts = None
+            target_pct = None
+
+        actions.append({
+            "wallet": wallet, "coin": coin, "ts": ts,
+            "fill_id": int(f.get("tid", 0) or 0),
+            "event_order": ee.event_order,
+            "action_type": action_type,
+            "signed_size": signed, "price": price,
+            "position_after": new_pos,
+            "mark": mark, "mark_ts": sizing_mark_ts,
+            "source_equity_post": basis.equity, "equity_ts": basis.equity_ts,
+            "anchor_ts": basis.anchor_ts,
+            "equity_basis_mode": basis.mode,
+            "equity_degraded": basis.degraded,
+            "frozen_component_value": basis.frozen_value,
+            "frozen_component_age_s": basis.frozen_age_s,
+            "frozen_materiality_frac": basis.frozen_materiality_frac,
+            "target_exposure_pct": target_pct,
+            "is_liquidation": is_liq,
+            "opening_journey_id": opening_jid,
+            "closing_journey_id": closing_jid,
+            "journey_id": opening_jid,  # back-compat = opening side
+            "carry_in_status": st["carry_in_status"],
+            "state_resynced": state_resynced,
+            "causal_order_ok": bool(f.get("causal_order_ok", True)),
+            "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
+            # Final value is recomputed after every journey has been finalized.
+            # A future gap can retroactively invalidate earlier actions in the
+            # interrupted journey; a raw live trade stream also cannot repair
+            # the resync row because it does not carry startPosition.
+            "stream_replay_valid": bool(
+                st.get("lifecycle_valid", True)
+                and bool(f.get("causal_order_ok", True))
+                and not state_resynced
+            ),
+        })
+
+    # Positions still open at window end → flag (not finalized).
+    # AUDIT 2026-07-10 (codex m02 P1): finalize an OPEN journey through the WINDOW END (end_ms), not peak_ts.
+    # Using peak_ts truncated duration to 0 and dropped funding accrued between peak and window end. exit_ts
+    # stays None (still open). Falls back to the old peak_ts behavior only when end_ms is not supplied.
+    for coin, st in coin_state.items():
+        if st["open"] and st["open_ts"] is not None:
+            _close_ts = end_ms if end_ms is not None else (st["peak_ts"] or st["open_ts"])
+            _close_ts = max(_close_ts, st["open_ts"])   # never negative duration
+            j = _finalize(coin, st, _close_ts)
+            if j is not None:
+                j["open_at_window_end"] = True
+                j["exit_ts"] = None
+                journeys.append(j)
+
+    # Lifecycle validity is only known once the whole wallet has been walked.
+    # If a later position discontinuity interrupts a journey, propagate that
+    # failure back to every already-emitted action belonging to that journey.
+    # Without this pass, downstream code can filter lifecycle_valid=True and
+    # still ingest the beginning of a journey proven broken later.
+    invalid_journeys = {
+        (str(j["coin"]), int(j["journey_id"]))
+        for j in journeys
+        if not bool(j.get("lifecycle_valid", True)) and j.get("journey_id") is not None
+    }
+    invalid_stream_journeys = set(invalid_journeys)
+    for action in actions:
+        if action.get("state_resynced", False):
+            invalid_stream_journeys.update(
+                (str(action["coin"]), int(jid))
+                for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+                if jid is not None
+            )
+    for action in actions:
+        involved = {
+            (str(action["coin"]), int(jid))
+            for jid in (action.get("opening_journey_id"), action.get("closing_journey_id"))
+            if jid is not None
+        }
+        lifecycle_valid = bool(action.get("causal_order_ok", True)) and not bool(
+            involved & invalid_journeys
+        )
+        action["lifecycle_valid"] = lifecycle_valid
+        action["stream_replay_valid"] = bool(
+            lifecycle_valid
+            and not action.get("state_resynced", False)
+            and not bool(involved & invalid_stream_journeys)
+        )
+    for journey in journeys:
+        key = (str(journey["coin"]), int(journey["journey_id"]))
+        journey["stream_replay_valid"] = bool(
+            journey.get("lifecycle_valid", True)
+            and key not in invalid_stream_journeys
+        )
+
+    return actions, journeys
+
+
+# --------------------------------------------------------------------------- #
+# Worker
+# --------------------------------------------------------------------------- #
+
+_ANCHOR_DF = None
+
+
+def _init_worker(
+    anchor_parquet: str, worker_mem_gb: float = 3.0,
+    equity_enriched: bool = False,
+) -> None:
+    global _ANCHOR_DF
+    _ANCHOR_DF = pd.read_parquet(anchor_parquet) if equity_enriched else None
+    # codex perf-r1 #5: guard WORKERS too (per-wallet reconstruction + per-process mark-series cache
+    # live here). Backstop: abort a runaway worker loudly instead of a silent aggregate OS OOM.
+    install_memory_guard(soft_gb=worker_mem_gb, label=f"m02-worker-{os.getpid()}")
+
+
+def process_wallet(args: tuple) -> dict:
+    wallet, start_ms, end_ms, equity_enriched = args
+    try:
+        if equity_enriched:
+            anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
+            res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
+            if "error" in res:
+                return {"wallet": wallet, "error": res["error"]}
+            events = res["events"]
+
+codex
+One important distinction is emerging: NaN or inf `signed_sz` is now stopped before `new_pos`, but non-finite `price` is deliberately allowed to emit an invalid row and still flows through notional, cost basis, and fee arithmetic. I’m checking whether that remains contained by lifecycle/stream validity or leaks into trusted journey metrics.
+exec
+/bin/zsh -lc 'pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc 'git diff -- research/v15/v15_m02_journey_trace.py tests/v15/test_m02_golden.py' in /Users/hermes/quants-lab
+ succeeded in 114ms:
+diff --git a/research/v15/v15_m02_journey_trace.py b/research/v15/v15_m02_journey_trace.py
+index d783fa0..c5ba46d 100644
+--- a/research/v15/v15_m02_journey_trace.py
++++ b/research/v15/v15_m02_journey_trace.py
+@@ -42,6 +42,7 @@ CLI:
+ from __future__ import annotations
+ 
+ import argparse
++import json
+ import logging
+ import os
+ import sys
+@@ -275,6 +276,7 @@ def trace_wallet(
+     funding: list[dict],
+     *,
+     equity_enriched: bool = True,
++    end_ms: Optional[int] = None,
+ ) -> tuple[list[dict], list[dict]]:
+     """Walk the ordered FILL events for one wallet and emit (actions, journeys).
+ 
+@@ -365,6 +367,23 @@ def trace_wallet(
+         # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+         first_fill = not coin_seen_first_fill.get(coin, False)
+         sp = float(f.get("startPosition", 0.0) or 0.0)
++        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
++        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
++        # True (fabricated pre-position). Fail CLOSED: non-finite inputs invalidate the lifecycle so downstream
++        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
++        sp_finite = bool(np.isfinite(sp))
++        signed_finite = bool(np.isfinite(signed))
++        inputs_finite = sp_finite and signed_finite and bool(np.isfinite(price))
++        if not inputs_finite:
++            st["lifecycle_valid"] = False
++            st["state_discontinuity"] = True
++            if not sp_finite:
++                sp = 0.0   # neutralize the denominator math; carry_in tagged UNKNOWN below (not SEEDED)
++            if not signed_finite:
++                # codex r2: a NaN/inf SIZE poisons new_pos (position+signed) and crashes the state machine
++                # (REVERSE branch -> coin_journey_counter KeyError). DROP this garbage fill; the coin's
++                # lifecycle is now invalid so every journey on it is stream_replay_valid=False (fail closed).
++                continue
+         state_resynced = False
+         if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+             # Missing/ambiguous fills: never continue a fabricated lifecycle.
+@@ -397,7 +416,8 @@ def trace_wallet(
+                 position = sp
+                 cost_basis = price
+             else:
+-                st["carry_in_status"] = "SEEDED"  # flat carry-in = cleanly known
++                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
++                st["carry_in_status"] = "SEEDED" if sp_finite else "UNKNOWN"
+ 
+         if not bool(f.get("causal_order_ok", True)):
+             st["lifecycle_valid"] = False
+@@ -526,9 +546,15 @@ def trace_wallet(
+         if equity_enriched:
+             basis = select_equity_basis(ee)
+             # SIZING signal: use only a bar that has closed by ts.
+-            mark = m01.get_mark(coin, ts, causal=True)
+-            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark is not None else None
+-            if basis.mode == "NO_ANCHOR" or basis.equity is None or abs(basis.equity) <= EPS or mark is None:
++            _raw_mark = m01.get_mark(coin, ts, causal=True)
++            # AUDIT 2026-07-10 (codex m02 P1): a NaN/inf mark (or NaN/inf equity) must NOT survive into
++            # target_exposure_pct -- `mark is not None` alone let NaN/inf through and produced a NaN/inf target.
++            # Require FINITE mark AND finite non-trivial equity, else the action is unsizeable (target=None).
++            mark_ok = _raw_mark is not None and np.isfinite(_raw_mark)
++            mark = float(_raw_mark) if mark_ok else None
++            sizing_mark_ts = (ts // 60_000) * 60_000 - 60_000 if mark_ok else None
++            eq_ok = (basis.equity is not None and np.isfinite(basis.equity) and abs(basis.equity) > EPS)
++            if basis.mode == "NO_ANCHOR" or not eq_ok or not mark_ok:
+                 target_pct = None
+             else:
+                 target_pct = (new_pos * mark) / basis.equity
+@@ -579,9 +605,14 @@ def trace_wallet(
+         })
+ 
+     # Positions still open at window end → flag (not finalized).
++    # AUDIT 2026-07-10 (codex m02 P1): finalize an OPEN journey through the WINDOW END (end_ms), not peak_ts.
++    # Using peak_ts truncated duration to 0 and dropped funding accrued between peak and window end. exit_ts
++    # stays None (still open). Falls back to the old peak_ts behavior only when end_ms is not supplied.
+     for coin, st in coin_state.items():
+         if st["open"] and st["open_ts"] is not None:
+-            j = _finalize(coin, st, st["peak_ts"] or st["open_ts"])
++            _close_ts = end_ms if end_ms is not None else (st["peak_ts"] or st["open_ts"])
++            _close_ts = max(_close_ts, st["open_ts"])   # never negative duration
++            j = _finalize(coin, st, _close_ts)
+             if j is not None:
+                 j["open_at_window_end"] = True
+                 j["exit_ts"] = None
+@@ -675,7 +706,7 @@ def process_wallet(args: tuple) -> dict:
+             n_anchors = None
+             inter_drift = None
+         actions, journeys = trace_wallet(
+-            wallet, events, fills, funding, equity_enriched=equity_enriched
++            wallet, events, fills, funding, equity_enriched=equity_enriched, end_ms=end_ms
+         )
+         return {
+             "wallet": wallet, "actions": actions, "journeys": journeys,
+@@ -789,16 +820,30 @@ def main() -> None:
+     with Pool(max(1, budget.procs), initializer=_init_worker,
+               initargs=(args.anchor_parquet, budget.worker_soft_gb, args.equity_enrichment),
+               maxtasksperchild=MAXTASKS_PER_CHILD) as pool:
+-        for r in pool.imap_unordered(process_wallet, tasks):
++        # AUDIT 2026-07-10 (codex m02 P2): ORDERED imap so physical output row/shard order is deterministic
++        # run-to-run (same wallets file -> byte-stable parts). Rows are identical either way; determinism only.
++        for r in pool.imap(process_wallet, tasks):
+             _consume(r)
+ 
+     n_actions = aw.close()
+     n_journeys = jw.close()
+     logger.info(f"Wrote {args.actions_out}: {n_actions:,} actions")
+     logger.info(f"Wrote {args.journeys_out}: {n_journeys:,} journeys")
+-    if errors:
+-        logger.warning(f"{len(errors)} wallet errors: {errors[:10]}")
+     logger.info(f"Wall: {(time.time()-t0)/60:.2f} min")
++    # AUDIT 2026-07-10 (codex m02 P1): a worker exception used to be logged and swallowed -> a PARTIAL wallet
++    # universe was written and the process exited 0, so downstream consumed an incomplete set as if complete.
++    # Fail CLOSED: write an explicit error manifest and exit non-zero so the pipeline halts on any wallet error.
++    if errors:
++        manifest = str(Path(args.actions_out).with_suffix(".errors.json"))
++        try:
++            Path(manifest).write_text(json.dumps(
++                {"n_errors": len(errors), "n_wallets": len(wallets),
++                 "errors": [{"wallet": w, "error": e} for w, e in errors]}, indent=2))
++        except Exception as _me:  # noqa: BLE001
++            logger.error(f"could not write error manifest {manifest}: {_me!r}")
++        logger.error(f"{len(errors)}/{len(wallets)} wallet ERRORS -> partial universe. manifest={manifest}. "
++                     f"first: {errors[:10]}")
++        raise SystemExit(1)
+ 
+ 
+ def _log_one(r: dict, n: int) -> None:
+
+ exited 2 in 3003ms:
+
+==================================== ERRORS ====================================
+________________ ERROR collecting tests/v15/test_m02_golden.py _________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m02_golden.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m02_golden.py:15: in <module>
+    import v15_m02_journey_trace as m02  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m02_journey_trace.py:61: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m02.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m02.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m02.py:22: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+=========================== short test summary info ============================
+ERROR tests/v15/test_m02_golden.py
+ERROR tests/v15/test_m02.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!
+2 errors in 1.90s
+
+codex
+The default `python` in this shell is missing `pymongo`, so collection failed before exercising m02. I’m rerunning with the repo’s documented conda interpreter from the test header.
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q' in /Users/hermes/quants-lab
+ succeeded in 3733ms:
+....................................                                     [100%]
+36 passed in 2.56s
+
+codex
+The focused suite passes under the intended environment: 36 tests. I’m doing one last synthetic probe for the non-finite price path to see the exact emitted action/journey fields, since that path is survivable but still arithmetic-bearing.
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import sys, math
+from pathlib import Path
+sys.path.insert(0, str(Path('research/v15').resolve()))
+import v15_m02_journey_trace as m02
+from v15_m02_journey_trace import LifecycleFillEvent
+sys.path.insert(0, str(Path('tests/v15').resolve()))
+from test_m02 import _fill
+for val in [float('inf'), float('nan')]:
+    f = _fill(1000, 'BTC', 'B', 1, 100, 0, tid=1)
+    f['price'] = val
+    ev = [LifecycleFillEvent(ts=1000, event_order=0, fill=f)]
+    actions, journeys = m02.trace_wallet('0x', ev, [f], [], equity_enriched=False)
+    print('price', val)
+    print(actions)
+    print(journeys)
+PY" in /Users/hermes/quants-lab
+ succeeded in 2031ms:
+price inf
+[{'wallet': '0x', 'coin': 'BTC', 'ts': 1000, 'fill_id': 1, 'event_order': 0, 'action_type': 'ENTRY', 'signed_size': 1.0, 'price': inf, 'position_after': 1.0, 'mark': None, 'mark_ts': None, 'source_equity_post': None, 'equity_ts': None, 'anchor_ts': None, 'equity_basis_mode': 'NOT_REQUESTED', 'equity_degraded': False, 'frozen_component_value': 0.0, 'frozen_component_age_s': 0.0, 'frozen_materiality_frac': nan, 'target_exposure_pct': None, 'is_liquidation': False, 'opening_journey_id': 1, 'closing_journey_id': None, 'journey_id': 1, 'carry_in_status': 'SEEDED', 'state_resynced': False, 'causal_order_ok': True, 'lifecycle_valid': False, 'stream_replay_valid': False}]
+[{'wallet': '0x', 'coin': 'BTC', 'journey_id': 1, 'side': 'long', 'entry_ts': 1000, 'exit_ts': None, 'peak_ts': 1000, 'duration_h': 0.0, 'n_entry_fills': 1, 'n_addon_fills': 0, 'n_trim_fills': 0, 'n_exit_fills': 0, 'n_reverse_fills': 0, 'n_carry_in_seeds': 0, 'max_position_notional': inf, 'realized_pnl': 0.0, 'fees': 0.0, 'funding_net': 0.0, 'net_realized_pnl': 0.0, 'journey_class': 'scalp', 'liq_closed': False, 'open_at_window_end': True, 'carry_in_status': 'SEEDED', 'lifecycle_valid': False, 'state_discontinuity': True, 'stream_replay_valid': False}]
+price nan
+[{'wallet': '0x', 'coin': 'BTC', 'ts': 1000, 'fill_id': 1, 'event_order': 0, 'action_type': 'ENTRY', 'signed_size': 1.0, 'price': nan, 'position_after': 1.0, 'mark': None, 'mark_ts': None, 'source_equity_post': None, 'equity_ts': None, 'anchor_ts': None, 'equity_basis_mode': 'NOT_REQUESTED', 'equity_degraded': False, 'frozen_component_value': 0.0, 'frozen_component_age_s': 0.0, 'frozen_materiality_frac': nan, 'target_exposure_pct': None, 'is_liquidation': False, 'opening_journey_id': 1, 'closing_journey_id': None, 'journey_id': 1, 'carry_in_status': 'SEEDED', 'state_resynced': False, 'causal_order_ok': True, 'lifecycle_valid': False, 'stream_replay_valid': False}]
+[{'wallet': '0x', 'coin': 'BTC', 'journey_id': 1, 'side': 'long', 'entry_ts': 1000, 'exit_ts': None, 'peak_ts': 1000, 'duration_h': 0.0, 'n_entry_fills': 1, 'n_addon_fills': 0, 'n_trim_fills': 0, 'n_exit_fills': 0, 'n_reverse_fills': 0, 'n_carry_in_seeds': 0, 'max_position_notional': nan, 'realized_pnl': 0.0, 'fees': 0.0, 'funding_net': 0.0, 'net_realized_pnl': 0.0, 'journey_class': 'scalp', 'liq_closed': False, 'open_at_window_end': True, 'carry_in_status': 'SEEDED', 'lifecycle_valid': False, 'state_discontinuity': True, 'stream_replay_valid': False}]
+
+exec
+/bin/zsh -lc "sed -n '190,225p' research/v15/v15_m02_journey_trace.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Fee / funding helpers (ported from V13; actual v2-fills fees preferred)
+# --------------------------------------------------------------------------- #
+
+SOURCE_ASSUMED_TAKER_FEE_BPS = 4.32
+FEE_RATE = SOURCE_ASSUMED_TAKER_FEE_BPS / 10000.0
+
+
+def _fill_fee_usd_actual(f: dict) -> Optional[float]:
+    """Return the signed total wallet fee reported by Hyperliquid.
+
+    ``builderFee`` and ``deployerFee`` are component disclosures already
+    included in ``fee``. They are deliberately ignored here.
+    """
+    v = f.get("fee")
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if fv != fv else fv
+
+
+def _fill_fee_usd(notional: float) -> float:
+    return abs(notional) * FEE_RATE
+
+
+def _classify_fee_scope(dir_val: str, coin: str) -> str:
+    if isinstance(coin, str) and coin.startswith("xyz:"):
+        return "builder_perp"
+    if ":" in coin:
+        return "builder_perp"
+
+codex
+There are two finite-check gaps outside the fixed `signed_sz` path: reported `fee=inf` and `closedPnl=inf` are accepted as authoritative values and can leave a journey/action marked replay-valid with infinite accounting. That is separate from non-finite price, which is marked invalid, but it means “fail-closed accounting” is not complete yet.
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path('research/v15').resolve()))
+import v15_m02_journey_trace as m02
+from v15_m02_journey_trace import LifecycleFillEvent
+sys.path.insert(0, str(Path('tests/v15').resolve()))
+from test_m02 import _fill
+
+def run(label, fills):
+    ev = [LifecycleFillEvent(ts=int(f['time']), event_order=i, fill=f) for i, f in enumerate(fills)]
+    actions, journeys = m02.trace_wallet('0x', ev, fills, [], equity_enriched=False)
+    print('\\n' + label)
+    print('actions', actions)
+    print('journeys', journeys)
+
+f1 = _fill(1000, 'BTC', 'B', 1, 100, 0, tid=1)
+f1['fee'] = float('inf')
+f2 = _fill(2000, 'BTC', 'A', 1, 110, 1, tid=2, closed=10)
+f2['fee'] = 0.0
+run('inf fee', [f1, f2])
+
+g1 = _fill(1000, 'BTC', 'B', 1, 100, 0, tid=1)
+g2 = _fill(2000, 'BTC', 'A', 1, 110, 1, tid=2, closed=float('inf'))
+run('inf closedPnl', [g1, g2])
+PY" in /Users/hermes/quants-lab
+ exited 130 in 45900ms:
+codex
+The extra probe hung before printing, so I stopped it rather than leaving a session running. The source path is still clear enough for review: `_fill_fee_usd_actual` only rejects NaN, and `closedPnl` is cast directly when present.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '200,218p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   200	
+   201	def _fill_fee_usd_actual(f: dict) -> Optional[float]:
+   202	    """Return the signed total wallet fee reported by Hyperliquid.
+   203	
+   204	    ``builderFee`` and ``deployerFee`` are component disclosures already
+   205	    included in ``fee``. They are deliberately ignored here.
+   206	    """
+   207	    v = f.get("fee")
+   208	    if v is None:
+   209	        return None
+   210	    try:
+   211	        fv = float(v)
+   212	    except (TypeError, ValueError):
+   213	        return None
+   214	    return None if fv != fv else fv
+   215	
+   216	
+   217	def _fill_fee_usd(notional: float) -> float:
+   218	    return abs(notional) * FEE_RATE
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '350,455p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   350	        # perps only. Spot must not affect journey/ranking metrics even if an
+   351	        # externally supplied event stream contains it.
+   352	        if m01.coin_is_spot(coin):
+   353	            continue
+   354	        st = coin_state.setdefault(coin, _new_state())
+   355	        signed = f["signed_sz"]
+   356	        if abs(signed) <= EPS:
+   357	            continue
+   358	        price = float(f["price"]) or 0.0
+   359	        ts = ee.ts
+   360	        is_liq = bool(f.get("is_liquidation"))
+   361	        row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
+   362	        actual_fee = _fill_fee_usd_actual(f)
+   363	
+   364	        position = st["position"]
+   365	        cost_basis = st["cost_basis"]
+   366	
+   367	        # CAUSAL CARRY-IN: first fill for a coin reveals startPosition (pre-fill).
+   368	        first_fill = not coin_seen_first_fill.get(coin, False)
+   369	        sp = float(f.get("startPosition", 0.0) or 0.0)
+   370	        # AUDIT 2026-07-10 (codex m02 P1): a NON-FINITE startPosition/size/price must NOT fabricate a clean
+   371	        # lifecycle. A NaN startPosition made `abs(sp) > EPS` False -> seeded FLAT SEEDED with lifecycle_valid
+   372	        # True (fabricated pre-position). Fail CLOSED: non-finite inputs invalidate the lifecycle so downstream
+   373	        # (stream_replay_valid) excludes them; a non-finite carry-in is UNKNOWN, never a clean flat seed.
+   374	        sp_finite = bool(np.isfinite(sp))
+   375	        signed_finite = bool(np.isfinite(signed))
+   376	        inputs_finite = sp_finite and signed_finite and bool(np.isfinite(price))
+   377	        if not inputs_finite:
+   378	            st["lifecycle_valid"] = False
+   379	            st["state_discontinuity"] = True
+   380	            if not sp_finite:
+   381	                sp = 0.0   # neutralize the denominator math; carry_in tagged UNKNOWN below (not SEEDED)
+   382	            if not signed_finite:
+   383	                # codex r2: a NaN/inf SIZE poisons new_pos (position+signed) and crashes the state machine
+   384	                # (REVERSE branch -> coin_journey_counter KeyError). DROP this garbage fill; the coin's
+   385	                # lifecycle is now invalid so every journey on it is stream_replay_valid=False (fail closed).
+   386	                continue
+   387	        state_resynced = False
+   388	        if not first_fill and not np.isclose(position, sp, rtol=1e-9, atol=1e-9):
+   389	            # Missing/ambiguous fills: never continue a fabricated lifecycle.
+   390	            # Close the interrupted journey as INVALID, then causally reseed
+   391	            # from the current fill's authoritative pre-position.
+   392	            if st["open"]:
+   393	                st["lifecycle_valid"] = False
+   394	                st["state_discontinuity"] = True
+   395	                j = _finalize(coin, st, ts)
+   396	                if j is not None:
+   397	                    journeys.append(j)
+   398	            st = _new_state()
+   399	            coin_state[coin] = st
+   400	            position = 0.0
+   401	            cost_basis = 0.0
+   402	            first_fill = True
+   403	            state_resynced = True
+   404	        if first_fill:
+   405	            coin_seen_first_fill[coin] = True
+   406	            if abs(sp) > EPS:
+   407	                # Open an already-in-progress journey, sized causally.
+   408	                coin_journey_counter[coin] = coin_journey_counter.get(coin, 0) + 1
+   409	                st.update(
+   410	                    position=sp, cost_basis=price,  # best causal cost proxy = first observed px
+   411	                    open=True, side=(1 if sp > 0 else -1),
+   412	                    journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
+   413	                    max_notional=abs(sp) * price, n_carry_in=1,
+   414	                    carry_in_status="SEEDED", fee_scope=row_scope,
+   415	                )
+   416	                position = sp
+   417	                cost_basis = price
+   418	            else:
+   419	                # flat carry-in = cleanly known -- UNLESS startPosition was non-finite (unknown pre-position).
+   420	                st["carry_in_status"] = "SEEDED" if sp_finite else "UNKNOWN"
+   421	
+   422	        if not bool(f.get("causal_order_ok", True)):
+   423	            st["lifecycle_valid"] = False
+   424	
+   425	        # closedPnl ground truth (fallback to cost-basis derived).
+   426	        raw_pnl = f.get("closedPnl", None)
+   427	        new_pos_preview = position + signed
+   428	        if raw_pnl is None or (isinstance(raw_pnl, float) and raw_pnl != raw_pnl):
+   429	            if (position > 0 and signed < 0) or (position < 0 and signed > 0):
+   430	                if abs(new_pos_preview) < EPS:
+   431	                    closed_qty = position
+   432	                elif (position > 0 and new_pos_preview > 0) or (position < 0 and new_pos_preview < 0):
+   433	                    closed_qty = -signed
+   434	                else:
+   435	                    closed_qty = position
+   436	                closed_pnl = float((price - cost_basis) * closed_qty)
+   437	            else:
+   438	                closed_pnl = 0.0
+   439	        else:
+   440	            closed_pnl = float(raw_pnl)
+   441	
+   442	        # PRE-fill peak capture.
+   443	        pre_notional = abs(position) * price
+   444	        if abs(position) > EPS and pre_notional > st["max_notional"]:
+   445	            st["max_notional"] = pre_notional
+   446	            st["peak_ts"] = ts
+   447	
+   448	        new_pos = position + signed
+   449	        notional_after = abs(new_pos) * price
+   450	        fill_notional = abs(signed) * price
+   451	        fill_fee = actual_fee if actual_fee is not None else _fill_fee_usd(fill_notional)
+   452	
+   453	        # ---- state machine ----
+   454	        action_type = None
+   455	        opening_jid = None
+
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m02_journey_trace.py | sed -n '510,540p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+   510	        else:
+   511	            # REVERSE (crosses zero): one action row, two journey ids.
+   512	            st["n_reverse"] += 1
+   513	            st["realized_pnl"] += closed_pnl
+   514	            if is_liq:
+   515	                st["liq_closed"] = True
+   516	            split_total = abs(position) + abs(new_pos)
+   517	            if actual_fee is not None and split_total > EPS:
+   518	                closing_fee = actual_fee * (abs(position) / split_total)
+   519	                opening_fee = actual_fee * (abs(new_pos) / split_total)
+   520	            else:
+   521	                closing_fee = abs(position) * price * FEE_RATE
+   522	                opening_fee = abs(new_pos) * price * FEE_RATE
+   523	            st["fees_paid"] += closing_fee
+   524	            closing_jid = st["journey_id"]
+   525	            j = _finalize(coin, st, ts)
+   526	            if j is not None:
+   527	                journeys.append(j)
+   528	            # open the new (reversed) leg
+   529	            coin_journey_counter[coin] += 1
+   530	            st.update(_new_state())
+   531	            st.update(
+   532	                journey_id=coin_journey_counter[coin], open=True,
+   533	                side=(1 if new_pos > 0 else -1), open_ts=ts, peak_ts=ts,
+   534	                n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
+   535	                fees_paid=opening_fee, fee_scope=row_scope,
+   536	                carry_in_status="SEEDED",
+   537	            )
+   538	            coin_state[coin] = st
+   539	            action_type = "REVERSE"
+   540	            opening_jid = st["journey_id"]
+
+codex
+Verdict: **not ready to mark TRUSTED yet**.
+
+The r2 `signed_sz` bug is fixed for the reviewed path. At [v15_m02_journey_trace.py:374](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:374), non-finite `signed_sz` invalidates the coin lifecycle and `continue`s before `new_pos = position + signed`, so NaN/inf size no longer reaches ENTRY/ADDON/TRIM/EXIT/REVERSE and should not hit the old `coin_journey_counter` KeyError.
+
+Dropping the poisoned size fill is acceptable fail-closed under your stated contract: the coin `st` remains lifecycle-invalid, and the next valid fill inherits `lifecycle_valid=False` / `stream_replay_valid=False`. The new golden covers that.
+
+Remaining issue: there are still non-finite accounting ingress paths that can remain **trusted**:
+
+- [v15_m02_journey_trace.py:214](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:214): `_fill_fee_usd_actual()` rejects NaN but accepts `inf`, so `fee=inf` can flow into `fees_paid` with lifecycle still valid.
+- [v15_m02_journey_trace.py:440](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:440): `closedPnl=inf` is cast directly and can flow into `realized_pnl` / `net_realized_pnl` with lifecycle still valid.
+- Non-finite `price` is marked invalid, but still flows into `cost_basis`, `max_notional`, and fallback fee arithmetic at [v15_m02_journey_trace.py:443](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:443). That is survivable only if all downstream consumers strictly filter `stream_replay_valid`.
+
+Verification: focused m02 suite passes with the documented env:
+
+`/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q`
+
+Result: `36 passed`.
+
+OVERALL: m02 looks **look-ahead-safe** for the reviewed lifecycle mechanics, and the non-finite `signed_sz` path is now crash-free and fail-closed. But m02 is **not fully fail-CLOSED for accounting** until non-finite actual fee and `closedPnl` are rejected/invalidated. TRUSTED: **no**.
+tokens used
+31.637
+Verdict: **not ready to mark TRUSTED yet**.
+
+The r2 `signed_sz` bug is fixed for the reviewed path. At [v15_m02_journey_trace.py:374](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:374), non-finite `signed_sz` invalidates the coin lifecycle and `continue`s before `new_pos = position + signed`, so NaN/inf size no longer reaches ENTRY/ADDON/TRIM/EXIT/REVERSE and should not hit the old `coin_journey_counter` KeyError.
+
+Dropping the poisoned size fill is acceptable fail-closed under your stated contract: the coin `st` remains lifecycle-invalid, and the next valid fill inherits `lifecycle_valid=False` / `stream_replay_valid=False`. The new golden covers that.
+
+Remaining issue: there are still non-finite accounting ingress paths that can remain **trusted**:
+
+- [v15_m02_journey_trace.py:214](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:214): `_fill_fee_usd_actual()` rejects NaN but accepts `inf`, so `fee=inf` can flow into `fees_paid` with lifecycle still valid.
+- [v15_m02_journey_trace.py:440](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:440): `closedPnl=inf` is cast directly and can flow into `realized_pnl` / `net_realized_pnl` with lifecycle still valid.
+- Non-finite `price` is marked invalid, but still flows into `cost_basis`, `max_notional`, and fallback fee arithmetic at [v15_m02_journey_trace.py:443](/Users/hermes/quants-lab/research/v15/v15_m02_journey_trace.py:443). That is survivable only if all downstream consumers strictly filter `stream_replay_valid`.
+
+Verification: focused m02 suite passes with the documented env:
+
+`/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m02_golden.py tests/v15/test_m02.py -q`
+
+Result: `36 passed`.
+
+OVERALL: m02 looks **look-ahead-safe** for the reviewed lifecycle mechanics, and the non-finite `signed_sz` path is now crash-free and fail-closed. But m02 is **not fully fail-CLOSED for accounting** until non-finite actual fee and `closedPnl` are rejected/invalidated. TRUSTED: **no**.
