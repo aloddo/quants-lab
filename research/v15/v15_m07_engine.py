@@ -618,6 +618,25 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             equity_samples.append(_eq_sample(entity_id, fold_id, b, eqb, flag, state, summary["max_dd"]))
 
     rows = actions.sort_values(["ts", "event_order"]).to_dict("records") if not actions.empty else []
+    # AUDIT 2026-07-10 (codex P0#1): WINDOW PURITY. Defensively drop any SOURCE action outside [win_lo, end)
+    # so a mis-scoped input can't pollute the metrics with test-window data (the runner filters, but M8/M9
+    # call step_subaccount directly). The latency-pushed our_ts >= end guard is enforced in the loop below.
+    _win_lo = int(start_ts_ms) if start_ts_ms is not None else _bstart
+    rows = [r for r in rows if _win_lo <= int(r["ts"]) < int(end_ts_ms)]
+    # AUDIT 2026-07-10 (codex P0#2): emit window provenance on the summary so a consumer (m06b) can PROVE the
+    # row was generated for its fold's window, not a stale test run. window_end is the half-open exclusive bound.
+    summary["window_start_ms"] = int(_win_lo)
+    summary["window_end_ms"] = int(end_ts_ms)
+    summary["n_late_copy_skipped"] = 0
+    # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
+    # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
+    # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
+    # until ADL is implemented or the stress model is accepted without it (Alberto decision).
+    summary["adl_stress_requested"] = bool(params.adl_stress)
+    summary["adl_stress_applied"] = False   # not implemented; do NOT read a survived-under-ADL claim from this run
+    if params.adl_stress:
+        logger.warning("m07: adl_stress=True requested but NOT implemented (n_adl_stress=0); stress is "
+                       "UNDERSTATED. Flagged on summary (adl_stress_applied=False).")
     # risk cursor anchored at fold start (start_ts_ms) so start_state positions accrue risk even with
     # zero actions (codex code-r2 #2). Falls back to the first action time, then end_ts.
     if start_ts_ms is not None:
@@ -659,6 +678,12 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         if coin_is_spot(coin):
             continue
         our_ts = int(a["ts"]) + params.copy_latency_ms
+        # AUDIT 2026-07-10 (codex P0#1): a latency-pushed fill at our_ts >= end_ts_ms would execute on
+        # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
+        # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
+        if our_ts >= int(end_ts_ms):
+            summary["n_late_copy_skipped"] += 1
+            break
 
         _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit)
         if summary["ruin"]:
@@ -1242,7 +1267,10 @@ def _advance_between(st, md, t0_ms, t1_ms, params, events, summary, _emit=None):
             if st.cooldown_until_ms and st.cooldown_until_ms <= cursor:
                 st.cooldown_until_ms = 0
             cursor = seg_end
-            if seg_end == next_funding and seg_end <= t1_ms:
+            # AUDIT 2026-07-10 (codex P0#4): half-open window [t0,t1). Funding stamped exactly at the exclusive
+            # end (seg_end == t1_ms) belongs to the NEXT window; applying it here charged boundary/test funding
+            # into the pretest ROE. Apply only strictly INSIDE the window.
+            if seg_end == next_funding and seg_end < t1_ms:
                 _apply_funding(st, md, seg_end, summary)
                 # POST-FUNDING solvency check (codex code-r4 #1): a settlement can push below
                 # maintenance; liquidate now (the cooldown guard in _market_liquidate_scope prevents
