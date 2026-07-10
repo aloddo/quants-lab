@@ -21,10 +21,11 @@ V11-V28) is retired and being archived (never deleted). Last verified: 2026-07-1
 | Exposure | HL ~$457 (spot-only, Rule 16) + Bybit ~$465 (parked until HL eq >= $550) |
 | Wallet addrs | parent `0x11ca20aeb7cd014cf8406560ae405b12601994b4` (funds) / agent `0xdf67eda0bc0223060891d49dde9a780a4538c2e3` (signs) |
 
-Known live-stack RISKS (Phase 1 of the cleanup fixes these — do NOT rely on them until fixed):
-- `data_pipeline/hl_live_mark_collector.py` (PID 1595) runs UNSUPERVISED (no plist) → silent single point of failure.
-- [RESOLVED 2026-07-10] two-killers problem: kept the STATS-heartbeat `v12-watchdog` (strictly better than log-mtime per codex), retiring `v17-stall-watchdog`. Pending CoS unload of the mtime one + codex round-2 PASS of the heartbeat script.
-- `scripts/kill_switch.sh` targets the RETIRED HB/API stack (localhost:8001), NOT V17 — it does not stop the live engine.
+Live-stack safety (Phase 1 — RESOLVED + ACTIVATED 2026-07-10, codex 3-round consensus):
+- ✅ Mark collector now SUPERVISED: `com.quantslab.hl-mark-collector` (KeepAlive) → `scripts/hl_mark_collector_launcher.sh`. (Was an unsupervised nohup = silent SPOF.)
+- ✅ Two-killers resolved: `com.quantslab.v12-watchdog` (STATS-heartbeat content) is the SOLE sanctioned killer; the log-mtime `v17-stall-watchdog` is removed + archived (`ops/launchd/archive/`). Codex: log-mtime != loop health.
+- ✅ `scripts/kill_switch.sh` REWRITTEN to actually stop V17 (mode-validated + engine-only pattern + post-SIGKILL abort + default flatten via `tools/flatten_all_offline.py`). The old one targeted the dead HB stack.
+- INVARIANT: never rotate/replace `/tmp/ql-v12-copy-trader-launchd.log` while V17 is live (the heartbeat watchdog reads it). See `ops/launchd/README.md`.
 
 ## B. RESEARCH (offline) — the canonical funnel
 Raw S3 data (fills/funding/ledger/candles/marks under `app/data/`, SACRED, never deleted) →
