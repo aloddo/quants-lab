@@ -50,7 +50,11 @@ PRICE_VAR_NEUTRAL = 0.30        # L3 condition 2
 NET_GROSS_BORDER = 0.30         # REVIEW band upper
 WASH_EXCLUDE = 0.50
 WASH_REVIEW = 0.20
-DEX_CONC = 0.90
+DEX_CONC = 0.90  # RETIRED as a gate (Alberto 2026-05-31: "ALL DEXES IN SCOPE, no dex-based selection
+                 # exclusion"). dex_concentration is emitted as an INFORMATIONAL column only; it deliberately
+                 # does NOT gate (adding a dex REVIEW/EXCLUDE here would violate that standing directive).
+                 # Kept for back-compat/reporting. Codex m025 audit flagged it "computed but unused" -> this is
+                 # the correct-by-design state, not a fail-open.
 STALE_DAYS = 21
 MIN_ANCHORS = 8
 MIN_ACTIVE_DAYS = 30
@@ -362,8 +366,17 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
         # sum(|resid + fund_week|). Guard ~0 denominator -> nan.
         trade_fund_pnl = resid + fund_week
         denom = float(np.sum(np.abs(trade_fund_pnl)))
-        s.funding_frac = (float(np.sum(np.abs(fund_week))) / denom
-                          if denom > 1e-9 else float("nan"))
+        _fund_abs = float(np.sum(np.abs(fund_week)))
+        # AUDIT 2026-07-10 (codex m025 P1): a ~0 trade+funding denominator must NOT fail OPEN. Two cases:
+        #  (a) denom~0 AND funding present (|fund|>eps) -> funding EXACTLY offsets trading every week: this is
+        #      the funding-farm signature. funding_frac = +inf so the funding_farm hard-exclude fires (conservative).
+        #  (b) denom~0 AND ~no funding -> genuinely undefined -> NaN, routed to the nan_metric REVIEW path below.
+        if denom > 1e-9:
+            s.funding_frac = _fund_abs / denom
+        elif _fund_abs > 1e-9:
+            s.funding_frac = float("inf")   # funding-dominated, trade+funding nets to ~0 -> funding_farm EXCLUDE
+        else:
+            s.funding_frac = float("nan")   # no evidence either way -> REVIEW (fail closed, not PASS)
         # weekly return Sharpe + leverage flag
         # Raw account-value changes include deposits/withdrawals and can create
         # a fabricated Sharpe/primary ranking. Use flow-neutral trading+funding
@@ -566,6 +579,55 @@ def internal_hedge(fillsA, fillsB, lo_ms, hi_ms):
 # COMBINE
 # --------------------------------------------------------------------------- #
 
+def decide_verdict(s: "WalletScores", ent_reason, is_primary: bool, n_members: int):
+    """PURE per-wallet verdict decision, extracted from COMBINE for the trust audit so the fail-CLOSED
+    boundaries are unit-testable. Returns (verdict, added_codes). HARD EXCLUDES ALWAYS WIN (FIX 5): every
+    hard-exclude is evaluated first; only if none fire do we fall through to REVIEW reasons; PASS is last.
+    Conservative by design: an inauthentic wallet must never PASS on missing/degenerate data.
+    (This function is called by run()'s COMBINE loop; it is byte-faithful to the prior inline logic.)"""
+    is_too_big = (ent_reason == "entity_too_big_review")
+    is_l3_unknown = (ent_reason == "entity_l3_unknown_review")
+    hard_codes = []
+    # entity-level hard excludes (internal_hedge / entity_no_l3_passer); review-only entity states are NOT hard.
+    if ent_reason and not is_too_big and not is_l3_unknown:
+        hard_codes.append(ent_reason)
+    # ISSUE A: too-big/l3-unknown entities have no primary -> skip fragment so a clean member routes to REVIEW.
+    if n_members > 1 and not is_primary and not is_too_big and not is_l3_unknown:
+        hard_codes.append("entity_fragment")
+    if s.unexecutable:
+        hard_codes.append("unexecutable_dex")
+    if s.days_since_last_fill > STALE_DAYS:
+        hard_codes.append("stale")
+    if s.wash_frac >= WASH_EXCLUDE:                       # codex m025 P2: exact 0.50 -> EXCLUDE
+        hard_codes.append("wash")
+    ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
+    if (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL):
+        hard_codes.append("delta_neutral")
+    if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:  # inf trips this -> EXCLUDE
+        hard_codes.append("funding_farm")
+
+    if hard_codes:
+        return "EXCLUDE", hard_codes
+    # REVIEW reasons (only when NO hard exclude fired)
+    if ent_reason == "entity_too_big_review":
+        return "REVIEW", ["entity_too_big"]
+    if ent_reason == "entity_l3_unknown_review":
+        return "REVIEW", ["entity_l3_unknown"]
+    if s.confidence == "LOW":
+        return "REVIEW", [s.anchor_reason or "thin_history"]
+    if ng != ng or pv != pv or s.funding_frac != s.funding_frac:  # codex m025 P1: NaN funding_frac -> REVIEW
+        return "REVIEW", ["nan_metric"]
+    if s.sharpe_vs_lev_flag:
+        return "REVIEW", ["sharpe_too_smooth"]
+    if WASH_REVIEW <= s.wash_frac < WASH_EXCLUDE:         # codex m025 P2: exact 0.20 -> REVIEW (not PASS)
+        return "REVIEW", ["wash_borderline"]
+    if ng == ng and ng < NET_GROSS_NEUTRAL:
+        return "REVIEW", ["low_net_gross"]
+    if ng == ng and NET_GROSS_NEUTRAL <= ng < NET_GROSS_BORDER:
+        return "REVIEW", ["net_gross_borderline"]
+    return "PASS", []
+
+
 def run(wallets, lo_ms, hi_ms):
     log.info(f"STAGE A: {len(wallets)} wallets")
     scores = {}
@@ -640,67 +702,10 @@ def run(wallets, lo_ms, hi_ms):
         is_primary = (entity_primary.get(eid) == w) if len(members) > 1 else True
         s.is_entity_primary = is_primary
 
-        # FIX 5: HARD EXCLUDES ALWAYS WIN. Evaluate every hard-exclude condition
-        # FIRST, independent of any entity REVIEW (e.g. entity_too_big). Only if NO
-        # hard exclude fires do we fall through to REVIEW reasons. This fixes the
-        # prior bug where an entity REVIEW (entity_too_big) short-circuited the
-        # per-wallet hard excludes via `if verdict == "PASS"`.
-        hard_codes = []
-
-        # entity-level hard excludes (internal_hedge / no_l3_passer)
+        # FIX 5: HARD EXCLUDES ALWAYS WIN -> extracted to the pure decide_verdict() (unit-testable).
         ent_reason = entity_excluded.get(eid)
-        is_too_big = (ent_reason == "entity_too_big_review")
-        is_l3_unknown = (ent_reason == "entity_l3_unknown_review")
-        # review-only entity states are NOT hard excludes; only genuine entity hard
-        # reasons (internal_hedge / entity_no_l3_passer) become hard codes here.
-        if ent_reason and not is_too_big and not is_l3_unknown:
-            hard_codes.append(ent_reason)
-        # ISSUE A: entity fragment is a HARD exclude for non-primary wallets in a
-        # multi-wallet entity — but a too-big entity has NO primary set, so EVERY
-        # member would wrongly trip entity_fragment and get hard-EXCLUDED, defeating
-        # the intended REVIEW. For too-big entities, SKIP the fragment check (treat
-        # as primary for fragment purposes) so a clean member routes to REVIEW
-        # (entity_too_big); genuine per-wallet hard excludes below still fire.
-        if len(members) > 1 and not is_primary and not is_too_big and not is_l3_unknown:
-            hard_codes.append("entity_fragment")
-        # per-wallet hard excludes (all evaluated, all codes recorded)
-        if s.unexecutable:
-            hard_codes.append("unexecutable_dex")
-        if s.days_since_last_fill > STALE_DAYS:
-            hard_codes.append("stale")
-        if s.wash_frac > WASH_EXCLUDE:
-            hard_codes.append("wash")
-        ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
-        # FIX 6: delta-neutral hard exclude requires BOTH low net-gross AND low
-        # price-PnL variance.
-        if (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL):
-            hard_codes.append("delta_neutral")
-        # FIX 7(b): funding farm — |funding| dominates |total pnl|.
-        if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:
-            hard_codes.append("funding_farm")
-
-        if hard_codes:
-            verdict = "EXCLUDE"
-            rc.extend(hard_codes)
-        else:
-            # REVIEW reasons (only when NO hard exclude fired)
-            if ent_reason == "entity_too_big_review":
-                verdict = "REVIEW"; rc.append("entity_too_big")
-            elif ent_reason == "entity_l3_unknown_review":
-                verdict = "REVIEW"; rc.append("entity_l3_unknown")
-            elif s.confidence == "LOW":
-                verdict = "REVIEW"; rc.append(s.anchor_reason or "thin_history")
-            elif ng != ng or pv != pv:
-                verdict = "REVIEW"; rc.append("nan_metric")
-            elif s.sharpe_vs_lev_flag:
-                verdict = "REVIEW"; rc.append("sharpe_too_smooth")
-            elif WASH_REVIEW < s.wash_frac <= WASH_EXCLUDE:
-                verdict = "REVIEW"; rc.append("wash_borderline")
-            # FIX 6: low net-gross alone (price PnL var present) -> REVIEW, not PASS.
-            elif ng == ng and ng < NET_GROSS_NEUTRAL:
-                verdict = "REVIEW"; rc.append("low_net_gross")
-            elif ng == ng and NET_GROSS_NEUTRAL <= ng < NET_GROSS_BORDER:
-                verdict = "REVIEW"; rc.append("net_gross_borderline")
+        verdict, added_codes = decide_verdict(s, ent_reason, is_primary, len(members))
+        rc.extend(added_codes)
 
         s.verdict = verdict
         s.reason_codes = rc

@@ -1,0 +1,1644 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4c8f-ac9a-7422-87e3-bb6cbd315c61
+--------
+user
+# Round-2 m025 — fixes + pure decide_verdict() extraction
+
+Your audit found 2 real fail-opens + flagged dex-conc. All addressed; verify. Read
+research/v15/v15_m025_authenticity_gate.py (funding_frac in stage_a ~L363-375; new pure decide_verdict()
+just above run(); the COMBINE loop now calls it) + tests/v15/test_m025_golden.py.
+
+## Applied
+1. P1 funding-farm fail-open: stage_a now splits the denom~0 case -- (a) denom~0 AND |funding|>eps ->
+   funding_frac=+inf (funding-dominated, trade+funding nets to ~0 = funding-farm signature) -> the existing
+   `funding_frac>FUNDING_FARM_FRAC` hard-exclude fires; (b) denom~0 AND ~no funding -> NaN. AND the REVIEW path
+   now includes `s.funding_frac != s.funding_frac` so NaN funding_frac -> REVIEW (never PASS).
+2. P2 wash boundaries conservative: hard `wash_frac >= WASH_EXCLUDE` (exact 0.50 -> EXCLUDE); review
+   `WASH_REVIEW <= wash_frac < WASH_EXCLUDE` (exact 0.20 -> REVIEW, not PASS).
+3. dex-conc: RESOLVED as correct-by-design -- Alberto 2026-05-31 "ALL DEXES IN SCOPE, no dex-based selection
+   exclusion". DEX_CONC documented as a RETIRED gate (informational column only); adding a dex gate would
+   violate that standing directive. Confirm you agree this is design, not a bug to fix.
+4. REFACTOR: the per-wallet verdict decision was extracted verbatim from the COMBINE loop into a PURE function
+   `decide_verdict(s, ent_reason, is_primary, n_members) -> (verdict, added_codes)`, called by run(). This is
+   meant to be BYTE-FAITHFUL to the prior inline logic (same order, same HARD-EXCLUDES-WIN precedence, same
+   REVIEW cascade). Golden: tests/v15/test_m025_golden.py (12 cases). 12 golden + 373 v15 pass.
+
+## Verify
+- Is decide_verdict() BYTE-FAITHFUL to the prior inline COMBINE logic (any behavior change in ordering,
+  precedence, or which code is appended)? This is the critical check.
+- Are both fail-opens now closed (funding NaN/inf; wash boundaries)? Any remaining path where an inauthentic
+  wallet PASSES on missing/degenerate data?
+- Is the inf funding_frac guaranteed to trip funding_farm (inf==inf True, inf>0.5 True) and never the NaN path?
+- Any NEW bug from the refactor.
+
+## Output
+Verdict. End OVERALL: is m025 now fail-CLOSED, the extraction faithful, and ready to be marked TRUSTED (yes/no
++ exactly what remains if no).
+codex
+I’ll review this as an audit, so I’m going to inspect the relevant file and tests first, then run the targeted and broader test commands if the repo setup allows it.
+exec
+/bin/zsh -lc "sed -n '1,260p' tests/v15/test_m025_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m025_authenticity_gate trust-audit fixes (2026-07-10).
+
+m025 is the authenticity HARD GATE: conservative by design, an inauthentic wallet must NEVER PASS on
+missing/degenerate data. Locks the fail-CLOSED decision boundaries the codex audit hardened:
+- P1 funding-farm: NaN funding_frac (undefined evidence) -> REVIEW (not PASS); the funding-dominated case
+  (denom~0, funding present -> funding_frac=inf) -> EXCLUDE.
+- P2 wash boundaries conservative: exact 0.50 -> EXCLUDE, exact 0.20 -> REVIEW (not PASS).
+- HARD EXCLUDES ALWAYS WIN; PASS requires every gate clean.
+Tests the pure decide_verdict() extracted from the COMBINE loop.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m025_authenticity_gate as m025  # noqa: E402
+
+
+def _clean() -> "m025.WalletScores":
+    """A wallet that PASSES every gate (single-wallet entity)."""
+    s = m025.WalletScores(wallet="0xclean")
+    s.days_since_last_fill = 1.0
+    s.wash_frac = 0.0
+    s.net_gross_ratio = 0.80          # >= NET_GROSS_NEUTRAL(0.20) and >= BORDER(0.30) -> not neutral/border
+    s.price_pnl_var_frac = 0.70       # >= PRICE_VAR_NEUTRAL(0.30)
+    s.funding_frac = 0.10             # <= FUNDING_FARM_FRAC(0.5)
+    s.confidence = "HIGH"
+    s.sharpe_vs_lev_flag = False
+    s.unexecutable = False
+    return s
+
+
+def _v(s, ent_reason=None, is_primary=True, n_members=1):
+    return m025.decide_verdict(s, ent_reason, is_primary, n_members)
+
+
+def test_clean_wallet_passes():
+    assert _v(_clean()) == ("PASS", [])
+
+
+def test_funding_nan_reviews_not_passes():
+    s = _clean(); s.funding_frac = float("nan")   # undefined funding evidence
+    verdict, codes = _v(s)
+    assert verdict == "REVIEW" and "nan_metric" in codes
+
+
+def test_funding_inf_excludes():
+    s = _clean(); s.funding_frac = float("inf")    # funding-dominated (denom~0, funding present)
+    verdict, codes = _v(s)
+    assert verdict == "EXCLUDE" and "funding_farm" in codes
+
+
+def test_wash_exact_exclude_boundary():
+    s = _clean(); s.wash_frac = m025.WASH_EXCLUDE   # exactly 0.50 -> EXCLUDE (conservative)
+    verdict, codes = _v(s)
+    assert verdict == "EXCLUDE" and "wash" in codes
+
+
+def test_wash_exact_review_boundary():
+    s = _clean(); s.wash_frac = m025.WASH_REVIEW    # exactly 0.20 -> REVIEW (not PASS)
+    verdict, codes = _v(s)
+    assert verdict == "REVIEW" and "wash_borderline" in codes
+
+
+def test_wash_just_below_exclude_reviews():
+    s = _clean(); s.wash_frac = m025.WASH_EXCLUDE - 1e-6   # 0.4999... -> REVIEW, not EXCLUDE
+    verdict, codes = _v(s)
+    assert verdict == "REVIEW" and "wash_borderline" in codes
+
+
+def test_nan_l3_reviews():
+    s = _clean(); s.net_gross_ratio = float("nan")   # unknown directionality
+    verdict, codes = _v(s)
+    assert verdict == "REVIEW" and "nan_metric" in codes
+
+
+def test_delta_neutral_excludes():
+    s = _clean(); s.net_gross_ratio = 0.10; s.price_pnl_var_frac = 0.10  # both low -> flat-book farmer
+    verdict, codes = _v(s)
+    assert verdict == "EXCLUDE" and "delta_neutral" in codes
+
+
+def test_stale_excludes():
+    s = _clean(); s.days_since_last_fill = m025.STALE_DAYS + 0.5
+    verdict, codes = _v(s)
+    assert verdict == "EXCLUDE" and "stale" in codes
+
+
+def test_entity_fragment_hard_excludes_nonprimary():
+    s = _clean()
+    verdict, codes = _v(s, ent_reason=None, is_primary=False, n_members=3)
+    assert verdict == "EXCLUDE" and "entity_fragment" in codes
+
+
+def test_hard_exclude_beats_review_state():
+    # a too-big entity (REVIEW state) with a per-wallet HARD exclude -> EXCLUDE wins (FIX 5).
+    s = _clean(); s.wash_frac = 0.9
+    verdict, codes = _v(s, ent_reason="entity_too_big_review", is_primary=True, n_members=10)
+    assert verdict == "EXCLUDE" and "wash" in codes and "entity_too_big" not in codes
+
+
+def test_low_confidence_reviews():
+    s = _clean(); s.confidence = "LOW"; s.anchor_reason = "thin_history"
+    verdict, codes = _v(s)
+    assert verdict == "REVIEW" and "thin_history" in codes
+
+exec
+/bin/zsh -lc "sed -n '330,470p' research/v15/v15_m025_authenticity_gate.py && sed -n '470,650p' research/v15/v15_m025_authenticity_gate.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    for f in fills:
+        gross_by_dex[m01.coin_dex(f["coin"])] += abs(f["size"])*f["price"]
+    tot_gross = sum(gross_by_dex.values())
+    if tot_gross > 0:
+        top_dex, top_g = max(gross_by_dex.items(), key=lambda kv: kv[1])
+        s.dex_concentration = top_g/tot_gross
+        # ALL DEXES ARE IN SCOPE (Alberto, 2026-05-31). M01 reconstructs whole-account
+        # equity across every perp dex and get_portfolio_perp anchors are whole-account,
+        # so no wallet is dex-excluded from SELECTION. dex_concentration stays as an
+        # informational metric only. (Live execution capability per dex is a separate
+        # go-live concern, NOT a selection-gate filter.) unexecutable is never set ->
+        # the unexecutable_dex hard-exclude never fires.
+
+    # FIX 2: pass full (pre-window + window) fills with the window bounds and the
+    # seeded carry-in position; only the window is time-weighted.
+    s.net_gross_ratio = _net_gross_ratio(all_fills, lo_ms, hi_ms, seed_pos=seed_pos)
+    s.wash_frac = _wash_frac(fills)
+
+    # FIX 1(c): _weekly_anchor_series returns a status string first. On failure,
+    # record WHY anchors are insufficient (cache vs window vs thin) so COMBINE can
+    # emit a distinct reason code.
+    wk = _weekly_anchor_series(wallet, fills, funding, ledger, lo_ms, hi_ms)
+    if wk[0] != "ok":
+        s.anchor_reason = {"cache_missing": "anchor_cache_missing",
+                           "out_of_window": "anchors_out_of_window",
+                           "thin": "thin_history"}.get(wk[0], "thin_history")
+    else:
+        _status, anchor_ts, total_change, fund_week, resid, vals = wk
+        s.n_anchors = len(vals)
+        var_tot = float(np.var(total_change)) if len(total_change) >= 2 else 0.0
+        if var_tot > 1e-9:
+            s.price_pnl_var_frac = float(np.var(resid))/var_tot
+        # FIX 7(a) + ISSUE F: absolute funding contribution as a fraction of the
+        # TRADING+FUNDING pnl, EXCLUDING external deposits/withdrawals. resid =
+        # total_change - fund_week - ext_flow (trading/price pnl), so trading+funding
+        # pnl per week = resid + fund_week. funding_frac = sum(|fund_week|) /
+        # sum(|resid + fund_week|). Guard ~0 denominator -> nan.
+        trade_fund_pnl = resid + fund_week
+        denom = float(np.sum(np.abs(trade_fund_pnl)))
+        _fund_abs = float(np.sum(np.abs(fund_week)))
+        # AUDIT 2026-07-10 (codex m025 P1): a ~0 trade+funding denominator must NOT fail OPEN. Two cases:
+        #  (a) denom~0 AND funding present (|fund|>eps) -> funding EXACTLY offsets trading every week: this is
+        #      the funding-farm signature. funding_frac = +inf so the funding_farm hard-exclude fires (conservative).
+        #  (b) denom~0 AND ~no funding -> genuinely undefined -> NaN, routed to the nan_metric REVIEW path below.
+        if denom > 1e-9:
+            s.funding_frac = _fund_abs / denom
+        elif _fund_abs > 1e-9:
+            s.funding_frac = float("inf")   # funding-dominated, trade+funding nets to ~0 -> funding_farm EXCLUDE
+        else:
+            s.funding_frac = float("nan")   # no evidence either way -> REVIEW (fail closed, not PASS)
+        # weekly return Sharpe + leverage flag
+        # Raw account-value changes include deposits/withdrawals and can create
+        # a fabricated Sharpe/primary ranking. Use flow-neutral trading+funding
+        # PnL; all components are bounded by hi_ms in _weekly_anchor_series.
+        rets = _flow_adjusted_anchor_returns(fund_week, resid, vals)
+        if len(rets) >= MIN_ANCHORS and np.std(rets) > 1e-9:
+            s.sharpe = float(np.mean(rets)/np.std(rets)*np.sqrt(52))
+            gross_hr = _median_leverage(all_fills, vals, lo_ms=lo_ms, seed_pos=seed_pos)
+            s.median_lev = gross_hr
+            max_dd = _max_weekly_dd(vals)
+            if (s.sharpe >= SHARPE_FLAG and (gross_hr == gross_hr)
+                    and gross_hr >= LEV_FLAG and max_dd > -0.10):
+                s.sharpe_vs_lev_flag = True
+
+    # confidence
+    if s.n_anchors < MIN_ANCHORS or s.active_days < MIN_ACTIVE_DAYS:
+        s.confidence = "LOW"
+
+    # L3 standalone pass = is this wallet a real directional trader on its own?
+    ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
+    neutral = (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL)
+    s.l3_pass_standalone = (not neutral) and (ng == ng) and (pv == pv)
+    return s
+
+
+def _median_leverage(fills, vals, lo_ms=None, seed_pos=None):
+    """Median (gross open notional / equity). Rough: peak gross per week vs anchor.
+
+    FIX 2: ``seed_pos`` seeds the position carried into the window so peak gross
+    notional reflects pre-window holdings rather than starting at 0.
+
+    ISSUE 3: ``fills`` may span pre-window history (lo_ms - 365d). When ``lo_ms`` is
+    given, prime ``last_px`` from the last pre-window fill price per coin (same as
+    _net_gross_ratio) so a seeded carried coin is priced from its first segment
+    instead of contributing 0 notional until it trades again in-window.
+    """
+    if len(vals) < 2:
+        return float("nan")
+    # use mean gross position notional proxy / median equity
+    pos = defaultdict(float, dict(seed_pos) if seed_pos else {})
+    last_px = {}
+    # ISSUE 3: prime last_px from pre-window fills so seeded positions are priced.
+    if lo_ms is not None:
+        for f in sorted(fills, key=lambda x: x["time"]):
+            if f["time"] < lo_ms:
+                last_px[f["coin"]] = f["price"]
+    peak_gross = 0.0
+    for f in sorted(fills, key=lambda x: x["time"]):
+        if lo_ms is not None and f["time"] < lo_ms:
+            continue
+        pos[f["coin"]] += f["signed_sz"]
+        last_px[f["coin"]] = f["price"]
+        g = sum(abs(pos[c]*last_px.get(c, 0.0)) for c in pos)
+        peak_gross = max(peak_gross, g)
+    med_eq = float(np.median(vals))
+    return peak_gross/med_eq if med_eq > 1.0 else float("nan")
+
+
+def _max_weekly_dd(vals):
+    peak = -1e18
+    mdd = 0.0
+    for v in vals:
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = min(mdd, (v-peak)/peak)
+    return mdd
+
+
+# --------------------------------------------------------------------------- #
+# STAGE B — entity linkage
+# --------------------------------------------------------------------------- #
+
+def build_entities(wallets, lo_ms, hi_ms):
+    """Union-find over ledger transfer edges + temporal funder match.
+
+    Returns dict wallet->entity_id and dict entity_id->[wallets].
+    """
+    parent = {w: w for w in wallets}
+    wset = set(wallets)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        if a in parent and b in parent:
+            parent[find(a)] = find(b)
+
+    # direct transfer edges
+    # direct transfer edges
+    funder_events = []   # ISSUE 1: one global time-sorted list of (t, w, dir, amt)
+    for w in wallets:
+        for e in m01.load_wallet_ledger(w, lo_ms, hi_ms):
+            d = e.get("delta", {})
+            typ = d.get("type")
+            if typ in ("send", "internalTransfer", "subAccountTransfer"):
+                dest = (d.get("destination") or "").lower()
+                if dest in wset:
+                    union(w, dest)
+            # temporal funder match prep: deposits & withdrawals (global list)
+            if typ in ("deposit", "withdraw"):
+                try:
+                    amt = abs(float(d.get("usdc") or 0))
+                except (TypeError, ValueError):
+                    amt = 0.0
+                if amt > 1.0:
+                    funder_events.append(
+                        (int(e["time"]), w, "out" if typ == "withdraw" else "in", amt))
+
+    # ISSUE 1: temporal funder match over a SINGLE global time-sorted list (no per-
+    # bucket grouping). The prior round(amt,-1) bucketing missed cross-bucket pairs
+    # (e.g. 1004 -> bucket 1000 vs 1006 -> bucket 1010 never compared). Now every
+    # event is scanned forward in time while t1-t0 <= 10min; link A and B ONLY when a
+    # WITHDRAW from A (dir0=="out") is followed by a DEPOSIT to B (dir1=="in"),
+    # w0!=w1, and the actual float amounts agree within +/-0.5% (capital hand-off).
+    # The 10-min window bounds the forward inner scan; total cost O(n log n + matches).
+    AMT_TOL = 0.005
+    funder_events.sort()
+    n = len(funder_events)
+    for i in range(n):
+        t0, w0, dir0, amt0 = funder_events[i]
+        for j in range(i + 1, n):
+            t1, w1, dir1, amt1 = funder_events[j]
+            if t1 - t0 > 600_000:
+                break
+            if w0 == w1:
+                continue
+            # strict: earlier=withdraw (out) -> later=deposit (in) only
+            if not (dir0 == "out" and dir1 == "in"):
+                continue
+            ref = max(abs(amt0), abs(amt1), 1e-9)
+            if abs(amt0 - amt1) / ref <= AMT_TOL:
+                union(w0, w1)
+
+    # collect components
+    comp = defaultdict(list)
+    for w in wallets:
+        comp[find(w)].append(w)
+    ent_id = {}
+    ent_members = {}
+    for i, (_, members) in enumerate(comp.items()):
+        for w in members:
+            ent_id[w] = i
+        ent_members[i] = members
+    return ent_id, ent_members
+
+
+# --------------------------------------------------------------------------- #
+# STAGE C — within-entity mirror
+# --------------------------------------------------------------------------- #
+
+def internal_hedge(fillsA, fillsB, lo_ms, hi_ms):
+    """FIX 4: exposure-based (not flow-based) internal-hedge test.
+
+    ISSUE D(2): sample timestamps every 6 HOURS across [lo_ms, hi_ms] (denser grid
+    than the prior daily sampling). At each t, reconstruct the HELD
+    position of each wallet (m01.positions_at -> coin -> signed size). A coin is
+    "hedged" at t when A and B hold OPPOSITE signs and their magnitudes (abs size)
+    are within HEDGE_SIZE_TOL of each other. A sampled timestamp is "predominantly
+    hedged" when, among coins both wallets have exposure to, the majority are hedged.
+    The PAIR is an internal hedge when, over sampled timestamps where BOTH wallets
+    have any exposure, the fraction of predominantly-hedged timestamps is
+    >= MIRROR_HOURS_FRAC. Coins are NOT netted across each other."""
+    if hi_ms <= lo_ms:
+        return False
+    both_active = hedged_ts = 0
+    t = lo_ms
+    while t <= hi_ms:
+        posA = m01.positions_at(fillsA, t)
+        posB = m01.positions_at(fillsB, t)
+        # codex r6 fix: positions_at can return a dict with ZERO sizes (traded then
+        # flattened). Count a wallet active only if it holds REAL nonzero exposure;
+        # otherwise flat timestamps inflate both_active and dilute the hedge fraction,
+        # letting a genuinely hedged entity slip the gate.
+        activeA = any(abs(x) > 1e-12 for x in posA.values())
+        activeB = any(abs(x) > 1e-12 for x in posB.values())
+        if activeA and activeB:
+            both_active += 1
+            shared = [c for c in (set(posA) & set(posB))
+                      if abs(posA[c]) > 1e-12 and abs(posB[c]) > 1e-12]
+            if shared:
+                coin_hedged = 0
+                for c in shared:
+                    a, b = posA[c], posB[c]
+                    if (a > 0) == (b > 0):
+                        continue  # same sign -> not a hedge on this coin
+                    ref = max(abs(a), abs(b), 1e-9)
+                    if abs(abs(a) - abs(b)) / ref <= HEDGE_SIZE_TOL:
+                        coin_hedged += 1
+                if coin_hedged * 2 >= len(shared):  # predominantly hedged
+                    hedged_ts += 1
+        t += 21_600_000  # ISSUE D(2): every 6 hours
+    if both_active == 0:
+        return False
+    return hedged_ts / both_active >= MIRROR_HOURS_FRAC
+
+
+# --------------------------------------------------------------------------- #
+# COMBINE
+# --------------------------------------------------------------------------- #
+
+def decide_verdict(s: "WalletScores", ent_reason, is_primary: bool, n_members: int):
+    """PURE per-wallet verdict decision, extracted from COMBINE for the trust audit so the fail-CLOSED
+    boundaries are unit-testable. Returns (verdict, added_codes). HARD EXCLUDES ALWAYS WIN (FIX 5): every
+    hard-exclude is evaluated first; only if none fire do we fall through to REVIEW reasons; PASS is last.
+    Conservative by design: an inauthentic wallet must never PASS on missing/degenerate data.
+    (This function is called by run()'s COMBINE loop; it is byte-faithful to the prior inline logic.)"""
+    is_too_big = (ent_reason == "entity_too_big_review")
+    is_l3_unknown = (ent_reason == "entity_l3_unknown_review")
+    hard_codes = []
+    # entity-level hard excludes (internal_hedge / entity_no_l3_passer); review-only entity states are NOT hard.
+    if ent_reason and not is_too_big and not is_l3_unknown:
+        hard_codes.append(ent_reason)
+    # ISSUE A: too-big/l3-unknown entities have no primary -> skip fragment so a clean member routes to REVIEW.
+    if n_members > 1 and not is_primary and not is_too_big and not is_l3_unknown:
+        hard_codes.append("entity_fragment")
+    if s.unexecutable:
+        hard_codes.append("unexecutable_dex")
+    if s.days_since_last_fill > STALE_DAYS:
+        hard_codes.append("stale")
+    if s.wash_frac >= WASH_EXCLUDE:                       # codex m025 P2: exact 0.50 -> EXCLUDE
+        hard_codes.append("wash")
+    ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
+    if (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL):
+        hard_codes.append("delta_neutral")
+    if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:  # inf trips this -> EXCLUDE
+        hard_codes.append("funding_farm")
+
+    if hard_codes:
+        return "EXCLUDE", hard_codes
+    # REVIEW reasons (only when NO hard exclude fired)
+    if ent_reason == "entity_too_big_review":
+        return "REVIEW", ["entity_too_big"]
+    if ent_reason == "entity_l3_unknown_review":
+        return "REVIEW", ["entity_l3_unknown"]
+    if s.confidence == "LOW":
+        return "REVIEW", [s.anchor_reason or "thin_history"]
+    if ng != ng or pv != pv or s.funding_frac != s.funding_frac:  # codex m025 P1: NaN funding_frac -> REVIEW
+        return "REVIEW", ["nan_metric"]
+    if s.sharpe_vs_lev_flag:
+        return "REVIEW", ["sharpe_too_smooth"]
+    if WASH_REVIEW <= s.wash_frac < WASH_EXCLUDE:         # codex m025 P2: exact 0.20 -> REVIEW (not PASS)
+        return "REVIEW", ["wash_borderline"]
+    if ng == ng and ng < NET_GROSS_NEUTRAL:
+        return "REVIEW", ["low_net_gross"]
+    if ng == ng and NET_GROSS_NEUTRAL <= ng < NET_GROSS_BORDER:
+        return "REVIEW", ["net_gross_borderline"]
+    return "PASS", []
+
+
+def run(wallets, lo_ms, hi_ms):
+    log.info(f"STAGE A: {len(wallets)} wallets")
+    scores = {}
+    t0 = time.time()
+    for i, w in enumerate(wallets, 1):
+        scores[w] = stage_a(w, lo_ms, hi_ms)
+        if i % 500 == 0:
+            log.info(f"  A [{i}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+
+    log.info("STAGE B: entities")
+    ent_id, ent_members = build_entities(wallets, lo_ms, hi_ms)
+    for w in wallets:
+        scores[w].entity_id = ent_id[w]
+
+    log.info("STAGE B/C: entity verdicts")
+    fills_cache = {}
+
+    def get_fills(w):
+        # ISSUE D(1): load from 365d before lo_ms so m01.positions_at sees positions
+        # opened pre-window (held exposure carried into the window is visible to the
+
+exec
+/bin/zsh -lc 'rg -n "decide_verdict|funding_frac|wash_frac|DEX_CONC|COMBINE|verdict|added_codes" research/v15/v15_m025_authenticity_gate.py tests/v15/test_m025_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m025_golden.py:5:- P1 funding-farm: NaN funding_frac (undefined evidence) -> REVIEW (not PASS); the funding-dominated case
+tests/v15/test_m025_golden.py:6:  (denom~0, funding present -> funding_frac=inf) -> EXCLUDE.
+tests/v15/test_m025_golden.py:9:Tests the pure decide_verdict() extracted from the COMBINE loop.
+tests/v15/test_m025_golden.py:22:    s.wash_frac = 0.0
+tests/v15/test_m025_golden.py:25:    s.funding_frac = 0.10             # <= FUNDING_FARM_FRAC(0.5)
+tests/v15/test_m025_golden.py:33:    return m025.decide_verdict(s, ent_reason, is_primary, n_members)
+tests/v15/test_m025_golden.py:41:    s = _clean(); s.funding_frac = float("nan")   # undefined funding evidence
+tests/v15/test_m025_golden.py:42:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:43:    assert verdict == "REVIEW" and "nan_metric" in codes
+tests/v15/test_m025_golden.py:47:    s = _clean(); s.funding_frac = float("inf")    # funding-dominated (denom~0, funding present)
+tests/v15/test_m025_golden.py:48:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:49:    assert verdict == "EXCLUDE" and "funding_farm" in codes
+tests/v15/test_m025_golden.py:53:    s = _clean(); s.wash_frac = m025.WASH_EXCLUDE   # exactly 0.50 -> EXCLUDE (conservative)
+tests/v15/test_m025_golden.py:54:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:55:    assert verdict == "EXCLUDE" and "wash" in codes
+tests/v15/test_m025_golden.py:59:    s = _clean(); s.wash_frac = m025.WASH_REVIEW    # exactly 0.20 -> REVIEW (not PASS)
+tests/v15/test_m025_golden.py:60:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:61:    assert verdict == "REVIEW" and "wash_borderline" in codes
+tests/v15/test_m025_golden.py:65:    s = _clean(); s.wash_frac = m025.WASH_EXCLUDE - 1e-6   # 0.4999... -> REVIEW, not EXCLUDE
+tests/v15/test_m025_golden.py:66:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:67:    assert verdict == "REVIEW" and "wash_borderline" in codes
+tests/v15/test_m025_golden.py:72:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:73:    assert verdict == "REVIEW" and "nan_metric" in codes
+tests/v15/test_m025_golden.py:78:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:79:    assert verdict == "EXCLUDE" and "delta_neutral" in codes
+tests/v15/test_m025_golden.py:84:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:85:    assert verdict == "EXCLUDE" and "stale" in codes
+tests/v15/test_m025_golden.py:90:    verdict, codes = _v(s, ent_reason=None, is_primary=False, n_members=3)
+tests/v15/test_m025_golden.py:91:    assert verdict == "EXCLUDE" and "entity_fragment" in codes
+tests/v15/test_m025_golden.py:96:    s = _clean(); s.wash_frac = 0.9
+tests/v15/test_m025_golden.py:97:    verdict, codes = _v(s, ent_reason="entity_too_big_review", is_primary=True, n_members=10)
+tests/v15/test_m025_golden.py:98:    assert verdict == "EXCLUDE" and "wash" in codes and "entity_too_big" not in codes
+tests/v15/test_m025_golden.py:103:    verdict, codes = _v(s)
+tests/v15/test_m025_golden.py:104:    assert verdict == "REVIEW" and "thin_history" in codes
+research/v15/v15_m025_authenticity_gate.py:53:DEX_CONC = 0.90  # RETIRED as a gate (Alberto 2026-05-31: "ALL DEXES IN SCOPE, no dex-based selection
+research/v15/v15_m025_authenticity_gate.py:84:    funding_frac: float = float("nan")
+research/v15/v15_m025_authenticity_gate.py:85:    wash_frac: float = 0.0
+research/v15/v15_m025_authenticity_gate.py:96:    verdict: str = "PASS"
+research/v15/v15_m025_authenticity_gate.py:265:def _wash_frac(fills):
+research/v15/v15_m025_authenticity_gate.py:346:    s.wash_frac = _wash_frac(fills)
+research/v15/v15_m025_authenticity_gate.py:349:    # record WHY anchors are insufficient (cache vs window vs thin) so COMBINE can
+research/v15/v15_m025_authenticity_gate.py:365:        # pnl per week = resid + fund_week. funding_frac = sum(|fund_week|) /
+research/v15/v15_m025_authenticity_gate.py:372:        #      the funding-farm signature. funding_frac = +inf so the funding_farm hard-exclude fires (conservative).
+research/v15/v15_m025_authenticity_gate.py:375:            s.funding_frac = _fund_abs / denom
+research/v15/v15_m025_authenticity_gate.py:377:            s.funding_frac = float("inf")   # funding-dominated, trade+funding nets to ~0 -> funding_farm EXCLUDE
+research/v15/v15_m025_authenticity_gate.py:379:            s.funding_frac = float("nan")   # no evidence either way -> REVIEW (fail closed, not PASS)
+research/v15/v15_m025_authenticity_gate.py:579:# COMBINE
+research/v15/v15_m025_authenticity_gate.py:582:def decide_verdict(s: "WalletScores", ent_reason, is_primary: bool, n_members: int):
+research/v15/v15_m025_authenticity_gate.py:583:    """PURE per-wallet verdict decision, extracted from COMBINE for the trust audit so the fail-CLOSED
+research/v15/v15_m025_authenticity_gate.py:584:    boundaries are unit-testable. Returns (verdict, added_codes). HARD EXCLUDES ALWAYS WIN (FIX 5): every
+research/v15/v15_m025_authenticity_gate.py:587:    (This function is called by run()'s COMBINE loop; it is byte-faithful to the prior inline logic.)"""
+research/v15/v15_m025_authenticity_gate.py:601:    if s.wash_frac >= WASH_EXCLUDE:                       # codex m025 P2: exact 0.50 -> EXCLUDE
+research/v15/v15_m025_authenticity_gate.py:606:    if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:  # inf trips this -> EXCLUDE
+research/v15/v15_m025_authenticity_gate.py:618:    if ng != ng or pv != pv or s.funding_frac != s.funding_frac:  # codex m025 P1: NaN funding_frac -> REVIEW
+research/v15/v15_m025_authenticity_gate.py:622:    if WASH_REVIEW <= s.wash_frac < WASH_EXCLUDE:         # codex m025 P2: exact 0.20 -> REVIEW (not PASS)
+research/v15/v15_m025_authenticity_gate.py:645:    log.info("STAGE B/C: entity verdicts")
+research/v15/v15_m025_authenticity_gate.py:693:    log.info("COMBINE: verdicts")
+research/v15/v15_m025_authenticity_gate.py:698:        verdict = "PASS"
+research/v15/v15_m025_authenticity_gate.py:705:        # FIX 5: HARD EXCLUDES ALWAYS WIN -> extracted to the pure decide_verdict() (unit-testable).
+research/v15/v15_m025_authenticity_gate.py:707:        verdict, added_codes = decide_verdict(s, ent_reason, is_primary, len(members))
+research/v15/v15_m025_authenticity_gate.py:708:        rc.extend(added_codes)
+research/v15/v15_m025_authenticity_gate.py:710:        s.verdict = verdict
+research/v15/v15_m025_authenticity_gate.py:713:            "wallet": w, "verdict": verdict, "reason_codes": ",".join(rc),
+research/v15/v15_m025_authenticity_gate.py:718:            "funding_frac": s.funding_frac, "wash_frac": s.wash_frac,
+research/v15/v15_m025_authenticity_gate.py:750:        if r["verdict"] == "EXCLUDE":
+research/v15/v15_m025_authenticity_gate.py:752:        if r["verdict"] == "PASS":
+research/v15/v15_m025_authenticity_gate.py:759:    vc = df["verdict"].value_counts()
+
+codex
+I’ve confirmed the new funding split and the extracted decision function are present. Next I’m checking the surrounding COMBINE loop and the actual diff against the previous version so the “byte-faithful” claim is anchored in the old inline logic, not just the new tests.
+exec
+/bin/zsh -lc "sed -n '680,735p' research/v15/v15_m025_authenticity_gate.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+                entity_excluded[eid] = "entity_l3_unknown_review"  # REVIEW
+            continue
+        primary = max(passers, key=lambda w: (scores[w].sharpe
+                                              if scores[w].sharpe == scores[w].sharpe else -1e9))
+        entity_primary[eid] = primary
+        # within-entity mirror: if primary is in an internal hedge with any member -> exclude
+        for other in members:
+            if other == primary:
+                continue
+            if internal_hedge(get_fills(primary), get_fills(other), lo_ms, hi_ms):
+                entity_excluded[eid] = "internal_hedge"
+                break
+
+    log.info("COMBINE: verdicts")
+    rows = []
+    for w in wallets:
+        s = scores[w]
+        rc = list(s.reason_codes)
+        verdict = "PASS"
+        eid = s.entity_id
+        members = ent_members.get(eid, [w])
+
+        is_primary = (entity_primary.get(eid) == w) if len(members) > 1 else True
+        s.is_entity_primary = is_primary
+
+        # FIX 5: HARD EXCLUDES ALWAYS WIN -> extracted to the pure decide_verdict() (unit-testable).
+        ent_reason = entity_excluded.get(eid)
+        verdict, added_codes = decide_verdict(s, ent_reason, is_primary, len(members))
+        rc.extend(added_codes)
+
+        s.verdict = verdict
+        s.reason_codes = rc
+        rows.append({
+            "wallet": w, "verdict": verdict, "reason_codes": ",".join(rc),
+            "entity_id": eid, "is_entity_primary": is_primary,
+            "n_entity_wallets": len(members),
+            "net_gross_ratio": s.net_gross_ratio,
+            "price_pnl_var_frac": s.price_pnl_var_frac,
+            "funding_frac": s.funding_frac, "wash_frac": s.wash_frac,
+            "sharpe": s.sharpe, "median_lev": s.median_lev,
+            "sharpe_vs_lev_flag": s.sharpe_vs_lev_flag,
+            "dex_concentration": s.dex_concentration, "unexecutable": s.unexecutable,
+            "days_since_last_fill": s.days_since_last_fill,
+            "n_anchors": s.n_anchors, "active_days": s.active_days,
+            "n_fills": s.n_fills, "confidence": s.confidence,
+        })
+    return pd.DataFrame(rows)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wallets-file", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--lookback-days", type=int, default=LOOKBACK_DAYS)
+    ap.add_argument("--end", default="2026-05-23")
+    args = ap.parse_args()
+
+exec
+/bin/zsh -lc 'git diff -- research/v15/v15_m025_authenticity_gate.py tests/v15/test_m025_golden.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+diff --git a/research/v15/v15_m025_authenticity_gate.py b/research/v15/v15_m025_authenticity_gate.py
+index 6813fc5..e2bdeb1 100644
+--- a/research/v15/v15_m025_authenticity_gate.py
++++ b/research/v15/v15_m025_authenticity_gate.py
+@@ -50,7 +50,11 @@ PRICE_VAR_NEUTRAL = 0.30        # L3 condition 2
+ NET_GROSS_BORDER = 0.30         # REVIEW band upper
+ WASH_EXCLUDE = 0.50
+ WASH_REVIEW = 0.20
+-DEX_CONC = 0.90
++DEX_CONC = 0.90  # RETIRED as a gate (Alberto 2026-05-31: "ALL DEXES IN SCOPE, no dex-based selection
++                 # exclusion"). dex_concentration is emitted as an INFORMATIONAL column only; it deliberately
++                 # does NOT gate (adding a dex REVIEW/EXCLUDE here would violate that standing directive).
++                 # Kept for back-compat/reporting. Codex m025 audit flagged it "computed but unused" -> this is
++                 # the correct-by-design state, not a fail-open.
+ STALE_DAYS = 21
+ MIN_ANCHORS = 8
+ MIN_ACTIVE_DAYS = 30
+@@ -362,8 +366,17 @@ def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
+         # sum(|resid + fund_week|). Guard ~0 denominator -> nan.
+         trade_fund_pnl = resid + fund_week
+         denom = float(np.sum(np.abs(trade_fund_pnl)))
+-        s.funding_frac = (float(np.sum(np.abs(fund_week))) / denom
+-                          if denom > 1e-9 else float("nan"))
++        _fund_abs = float(np.sum(np.abs(fund_week)))
++        # AUDIT 2026-07-10 (codex m025 P1): a ~0 trade+funding denominator must NOT fail OPEN. Two cases:
++        #  (a) denom~0 AND funding present (|fund|>eps) -> funding EXACTLY offsets trading every week: this is
++        #      the funding-farm signature. funding_frac = +inf so the funding_farm hard-exclude fires (conservative).
++        #  (b) denom~0 AND ~no funding -> genuinely undefined -> NaN, routed to the nan_metric REVIEW path below.
++        if denom > 1e-9:
++            s.funding_frac = _fund_abs / denom
++        elif _fund_abs > 1e-9:
++            s.funding_frac = float("inf")   # funding-dominated, trade+funding nets to ~0 -> funding_farm EXCLUDE
++        else:
++            s.funding_frac = float("nan")   # no evidence either way -> REVIEW (fail closed, not PASS)
+         # weekly return Sharpe + leverage flag
+         # Raw account-value changes include deposits/withdrawals and can create
+         # a fabricated Sharpe/primary ranking. Use flow-neutral trading+funding
+@@ -566,6 +579,55 @@ def internal_hedge(fillsA, fillsB, lo_ms, hi_ms):
+ # COMBINE
+ # --------------------------------------------------------------------------- #
+ 
++def decide_verdict(s: "WalletScores", ent_reason, is_primary: bool, n_members: int):
++    """PURE per-wallet verdict decision, extracted from COMBINE for the trust audit so the fail-CLOSED
++    boundaries are unit-testable. Returns (verdict, added_codes). HARD EXCLUDES ALWAYS WIN (FIX 5): every
++    hard-exclude is evaluated first; only if none fire do we fall through to REVIEW reasons; PASS is last.
++    Conservative by design: an inauthentic wallet must never PASS on missing/degenerate data.
++    (This function is called by run()'s COMBINE loop; it is byte-faithful to the prior inline logic.)"""
++    is_too_big = (ent_reason == "entity_too_big_review")
++    is_l3_unknown = (ent_reason == "entity_l3_unknown_review")
++    hard_codes = []
++    # entity-level hard excludes (internal_hedge / entity_no_l3_passer); review-only entity states are NOT hard.
++    if ent_reason and not is_too_big and not is_l3_unknown:
++        hard_codes.append(ent_reason)
++    # ISSUE A: too-big/l3-unknown entities have no primary -> skip fragment so a clean member routes to REVIEW.
++    if n_members > 1 and not is_primary and not is_too_big and not is_l3_unknown:
++        hard_codes.append("entity_fragment")
++    if s.unexecutable:
++        hard_codes.append("unexecutable_dex")
++    if s.days_since_last_fill > STALE_DAYS:
++        hard_codes.append("stale")
++    if s.wash_frac >= WASH_EXCLUDE:                       # codex m025 P2: exact 0.50 -> EXCLUDE
++        hard_codes.append("wash")
++    ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
++    if (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL):
++        hard_codes.append("delta_neutral")
++    if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:  # inf trips this -> EXCLUDE
++        hard_codes.append("funding_farm")
++
++    if hard_codes:
++        return "EXCLUDE", hard_codes
++    # REVIEW reasons (only when NO hard exclude fired)
++    if ent_reason == "entity_too_big_review":
++        return "REVIEW", ["entity_too_big"]
++    if ent_reason == "entity_l3_unknown_review":
++        return "REVIEW", ["entity_l3_unknown"]
++    if s.confidence == "LOW":
++        return "REVIEW", [s.anchor_reason or "thin_history"]
++    if ng != ng or pv != pv or s.funding_frac != s.funding_frac:  # codex m025 P1: NaN funding_frac -> REVIEW
++        return "REVIEW", ["nan_metric"]
++    if s.sharpe_vs_lev_flag:
++        return "REVIEW", ["sharpe_too_smooth"]
++    if WASH_REVIEW <= s.wash_frac < WASH_EXCLUDE:         # codex m025 P2: exact 0.20 -> REVIEW (not PASS)
++        return "REVIEW", ["wash_borderline"]
++    if ng == ng and ng < NET_GROSS_NEUTRAL:
++        return "REVIEW", ["low_net_gross"]
++    if ng == ng and NET_GROSS_NEUTRAL <= ng < NET_GROSS_BORDER:
++        return "REVIEW", ["net_gross_borderline"]
++    return "PASS", []
++
++
+ def run(wallets, lo_ms, hi_ms):
+     log.info(f"STAGE A: {len(wallets)} wallets")
+     scores = {}
+@@ -640,67 +702,10 @@ def run(wallets, lo_ms, hi_ms):
+         is_primary = (entity_primary.get(eid) == w) if len(members) > 1 else True
+         s.is_entity_primary = is_primary
+ 
+-        # FIX 5: HARD EXCLUDES ALWAYS WIN. Evaluate every hard-exclude condition
+-        # FIRST, independent of any entity REVIEW (e.g. entity_too_big). Only if NO
+-        # hard exclude fires do we fall through to REVIEW reasons. This fixes the
+-        # prior bug where an entity REVIEW (entity_too_big) short-circuited the
+-        # per-wallet hard excludes via `if verdict == "PASS"`.
+-        hard_codes = []
+-
+-        # entity-level hard excludes (internal_hedge / no_l3_passer)
++        # FIX 5: HARD EXCLUDES ALWAYS WIN -> extracted to the pure decide_verdict() (unit-testable).
+         ent_reason = entity_excluded.get(eid)
+-        is_too_big = (ent_reason == "entity_too_big_review")
+-        is_l3_unknown = (ent_reason == "entity_l3_unknown_review")
+-        # review-only entity states are NOT hard excludes; only genuine entity hard
+-        # reasons (internal_hedge / entity_no_l3_passer) become hard codes here.
+-        if ent_reason and not is_too_big and not is_l3_unknown:
+-            hard_codes.append(ent_reason)
+-        # ISSUE A: entity fragment is a HARD exclude for non-primary wallets in a
+-        # multi-wallet entity — but a too-big entity has NO primary set, so EVERY
+-        # member would wrongly trip entity_fragment and get hard-EXCLUDED, defeating
+-        # the intended REVIEW. For too-big entities, SKIP the fragment check (treat
+-        # as primary for fragment purposes) so a clean member routes to REVIEW
+-        # (entity_too_big); genuine per-wallet hard excludes below still fire.
+-        if len(members) > 1 and not is_primary and not is_too_big and not is_l3_unknown:
+-            hard_codes.append("entity_fragment")
+-        # per-wallet hard excludes (all evaluated, all codes recorded)
+-        if s.unexecutable:
+-            hard_codes.append("unexecutable_dex")
+-        if s.days_since_last_fill > STALE_DAYS:
+-            hard_codes.append("stale")
+-        if s.wash_frac > WASH_EXCLUDE:
+-            hard_codes.append("wash")
+-        ng, pv = s.net_gross_ratio, s.price_pnl_var_frac
+-        # FIX 6: delta-neutral hard exclude requires BOTH low net-gross AND low
+-        # price-PnL variance.
+-        if (ng == ng and ng < NET_GROSS_NEUTRAL) and (pv == pv and pv < PRICE_VAR_NEUTRAL):
+-            hard_codes.append("delta_neutral")
+-        # FIX 7(b): funding farm — |funding| dominates |total pnl|.
+-        if s.funding_frac == s.funding_frac and s.funding_frac > FUNDING_FARM_FRAC:
+-            hard_codes.append("funding_farm")
+-
+-        if hard_codes:
+-            verdict = "EXCLUDE"
+-            rc.extend(hard_codes)
+-        else:
+-            # REVIEW reasons (only when NO hard exclude fired)
+-            if ent_reason == "entity_too_big_review":
+-                verdict = "REVIEW"; rc.append("entity_too_big")
+-            elif ent_reason == "entity_l3_unknown_review":
+-                verdict = "REVIEW"; rc.append("entity_l3_unknown")
+-            elif s.confidence == "LOW":
+-                verdict = "REVIEW"; rc.append(s.anchor_reason or "thin_history")
+-            elif ng != ng or pv != pv:
+-                verdict = "REVIEW"; rc.append("nan_metric")
+-            elif s.sharpe_vs_lev_flag:
+-                verdict = "REVIEW"; rc.append("sharpe_too_smooth")
+-            elif WASH_REVIEW < s.wash_frac <= WASH_EXCLUDE:
+-                verdict = "REVIEW"; rc.append("wash_borderline")
+-            # FIX 6: low net-gross alone (price PnL var present) -> REVIEW, not PASS.
+-            elif ng == ng and ng < NET_GROSS_NEUTRAL:
+-                verdict = "REVIEW"; rc.append("low_net_gross")
+-            elif ng == ng and NET_GROSS_NEUTRAL <= ng < NET_GROSS_BORDER:
+-                verdict = "REVIEW"; rc.append("net_gross_borderline")
++        verdict, added_codes = decide_verdict(s, ent_reason, is_primary, len(members))
++        rc.extend(added_codes)
+ 
+         s.verdict = verdict
+         s.reason_codes = rc
+
+exec
+/bin/zsh -lc 'git status --short' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+ M research/v15/v15_m025_authenticity_gate.py
+?? archive/codex_audit_m01_DEFERRED.txt
+?? archive/codex_audit_m03.txt
+?? archive/codex_audit_m05.txt
+?? archive/codex_audit_m06b.txt
+?? archive/codex_audit_m08.txt
+?? research/v15/.audit_m03.txt
+?? tests/v15/test_m025_golden.py
+
+codex
+The diff shows two intentional behavior changes from the previous inline block: `wash >= 0.50` is now hard exclude, and `nan funding_frac` now routes to `nan_metric` review. Aside from those requested hardenings, I’m checking for edge cases introduced by the extraction, especially default values and entity review interactions.
+exec
+/bin/zsh -lc "sed -n '240,285p' research/v15/v15_m025_authenticity_gate.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+            continue
+        if t > win_hi:
+            break
+        dt = t - prev_t
+        if dt > 0:
+            book_net = sum(pos[c]*last_px.get(c, 0.0) for c in pos)
+            book_gross = sum(abs(pos[c]*last_px.get(c, 0.0)) for c in pos)
+            if book_gross > 1.0:
+                num += dt * abs(book_net)
+                den += dt * book_gross
+        pos[f["coin"]] += f["signed_sz"]
+        last_px[f["coin"]] = f["price"]
+        prev_t = t
+    # ISSUE C: final segment from the last in-window fill (prev_t) to win_hi so the
+    # exposure HELD at window end is time-weighted (same book_net/book_gross logic).
+    dt = win_hi - prev_t
+    if dt > 0:
+        book_net = sum(pos[c]*last_px.get(c, 0.0) for c in pos)
+        book_gross = sum(abs(pos[c]*last_px.get(c, 0.0)) for c in pos)
+        if book_gross > 1.0:
+            num += dt * abs(book_net)
+            den += dt * book_gross
+    return (num/den) if den > 0 else float("nan")
+
+
+def _wash_frac(fills):
+    """Round-trip volume / total volume. Round-trip = same coin, opposite side
+    within T_WASH_S, price within WASH_PRICE_BPS, size within WASH_SIZE_TOL."""
+    by_coin = defaultdict(list)
+    for f in fills:
+        by_coin[f["coin"]].append(f)
+    total = sum(abs(f["size"])*f["price"] for f in fills)
+    if total <= 0:
+        return 0.0
+    wash = 0.0
+    for coin, fs in by_coin.items():
+        fs.sort(key=lambda x: x["time"])
+        used = [False]*len(fs)
+        for i, a in enumerate(fs):
+            if used[i]:
+                continue
+            # bound the forward scan: time-break handles normal wallets, the count
+            # cap bounds worst-case for HFT wallets doing thousands of fills/min.
+            for j in range(i+1, min(i+1+500, len(fs))):
+                b = fs[j]
+                if b["time"] - a["time"] > T_WASH_S*1000:
+
+exec
+/bin/zsh -lc "sed -n '1,115p' research/v15/v15_m025_authenticity_gate.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""V15 M02.5 — Authenticity HARD GATE (codex-approved spec v3).
+
+Runs BEFORE ranking. Decides which wallets are SAFE to copy: true, standalone,
+unhedged, DIRECTIONAL risk. Conservative by design (drop a real edge before copying
+a phantom at leverage).
+
+Spec: brain projects/quant/v15/m025-authenticity-gate-spec (codex 3-round APPROVED).
+Input set: the full fill-derived wallet universe. M01 reconstruction status is
+not an authenticity prerequisite.
+
+Pipeline order (codex note 1): STAGE A scalars for ALL wallets -> STAGE B entities ->
+STAGE C/D/E/F -> combine. No interleave.
+
+Reuses M01 proven loaders (fills/funding/ledger/anchors). Weekly anchors come from the
+disk cache populated by v15_prefetch_anchors.py (zero API calls when warm).
+
+CLI:
+    python v15_m025_authenticity_gate.py --wallets-file W.txt \
+        --output app/data/v15/m025_authenticity.parquet [--lookback-days 90]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, "/Users/hermes/quants-lab/research/v15")
+import v15_m01_equity_reconstruct as m01  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [m025] %(message)s",
+                    stream=sys.stdout)
+log = logging.getLogger("m025")
+
+# ---- thresholds (spec v3) ------------------------------------------------- #
+LOOKBACK_DAYS = 90
+T_WASH_S = 60
+WASH_PRICE_BPS = 5e-4
+WASH_SIZE_TOL = 0.10
+NET_GROSS_NEUTRAL = 0.20        # L3 condition 1
+PRICE_VAR_NEUTRAL = 0.30        # L3 condition 2
+NET_GROSS_BORDER = 0.30         # REVIEW band upper
+WASH_EXCLUDE = 0.50
+WASH_REVIEW = 0.20
+DEX_CONC = 0.90  # RETIRED as a gate (Alberto 2026-05-31: "ALL DEXES IN SCOPE, no dex-based selection
+                 # exclusion"). dex_concentration is emitted as an INFORMATIONAL column only; it deliberately
+                 # does NOT gate (adding a dex REVIEW/EXCLUDE here would violate that standing directive).
+                 # Kept for back-compat/reporting. Codex m025 audit flagged it "computed but unused" -> this is
+                 # the correct-by-design state, not a fail-open.
+STALE_DAYS = 21
+MIN_ANCHORS = 8
+MIN_ACTIVE_DAYS = 30
+MIRROR_NET_GROSS = 0.15
+MIRROR_HOURS_FRAC = 0.60
+HEDGE_SIZE_TOL = 0.35           # FIX 4: per-coin abs-size match for exposure hedge
+ENTITY_MAX_WALLETS = 8
+SHARPE_FLAG = 5.0
+LEV_FLAG = 5.0
+# ALL DEXES ARE IN SCOPE (Alberto, 2026-05-31). No dex-based selection exclusion. This set
+# is retained only for reference/back-compat; it is no longer consulted (see stage_a, where
+# unexecutable is never set). Whole-account equity (M01) + whole-account anchors
+# (get_portfolio_perp) make every perp dex valid for selection.
+EXECUTABLE_DEXES = frozenset()  # unused — all dexes in scope
+FUNDING_FARM_FRAC = 0.5  # FIX 7(b): |funding| as fraction of |total pnl| above this -> EXCLUDE
+
+
+@dataclass
+class WalletScores:
+    wallet: str
+    n_fills: int = 0
+    n_anchors: int = 0
+    active_days: int = 0
+    days_since_last_fill: float = 1e9
+    net_gross_ratio: float = float("nan")
+    price_pnl_var_frac: float = float("nan")
+    funding_frac: float = float("nan")
+    wash_frac: float = 0.0
+    dex_concentration: float = 0.0
+    unexecutable: bool = False
+    sharpe: float = float("nan")
+    median_lev: float = float("nan")
+    sharpe_vs_lev_flag: bool = False
+    l3_pass_standalone: bool = False     # passes L3 directional test standalone
+    confidence: str = "HIGH"
+    # filled in stage B/combine
+    entity_id: int = -1
+    is_entity_primary: bool = True
+    verdict: str = "PASS"
+    reason_codes: list = field(default_factory=list)
+    # FIX 1(c): distinguishes anchor_cache_missing vs anchors_out_of_window vs thin
+    anchor_reason: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# STAGE A — per-wallet scalars
+# --------------------------------------------------------------------------- #
+
+def _anchor_window(wallet, lo_ms, hi_ms):
+    """FIX 1: select usable weekly anchors for [lo_ms, hi_ms].
+
+    (a) Normalize anchor timestamps to ms (a value < 1e12 looks like seconds ->
+        multiply by 1000).
+    (b) Include the single anchor immediately BEFORE lo_ms so the first in-window
+        week has a valid left edge for its delta.
+    (c) Report flags so the caller can distinguish:
+          - anchor_cache_missing  : 0 raw anchors (disk cache not warmed)
+          - anchors_out_of_window : >=2 raw anchors but <2 fall in the window
+
+exec
+/bin/zsh -lc 'rg -n "unexecutable|DEX_CONC|dex_concentration|entity_excluded|entity_primary|l3_pass_standalone|confidence|anchor_reason" research/v15/v15_m025_authenticity_gate.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+53:DEX_CONC = 0.90  # RETIRED as a gate (Alberto 2026-05-31: "ALL DEXES IN SCOPE, no dex-based selection
+54:                 # exclusion"). dex_concentration is emitted as an INFORMATIONAL column only; it deliberately
+69:# unexecutable is never set). Whole-account equity (M01) + whole-account anchors
+86:    dex_concentration: float = 0.0
+87:    unexecutable: bool = False
+91:    l3_pass_standalone: bool = False     # passes L3 directional test standalone
+92:    confidence: str = "HIGH"
+95:    is_entity_primary: bool = True
+99:    anchor_reason: str = ""
+310:        s.confidence = "LOW"
+335:        s.dex_concentration = top_g/tot_gross
+338:        # so no wallet is dex-excluded from SELECTION. dex_concentration stays as an
+340:        # go-live concern, NOT a selection-gate filter.) unexecutable is never set ->
+341:        # the unexecutable_dex hard-exclude never fires.
+353:        s.anchor_reason = {"cache_missing": "anchor_cache_missing",
+394:    # confidence
+396:        s.confidence = "LOW"
+401:    s.l3_pass_standalone = (not neutral) and (ng == ng) and (pv == pv)
+597:    if s.unexecutable:
+598:        hard_codes.append("unexecutable_dex")
+616:    if s.confidence == "LOW":
+617:        return "REVIEW", [s.anchor_reason or "thin_history"]
+656:    entity_excluded = {}   # entity_id -> reason ("internal_hedge"/"no_l3_passer"/"too_big")
+657:    entity_primary = {}    # entity_id -> wallet
+660:            entity_primary[eid] = members[0]
+663:            entity_excluded[eid] = "entity_too_big_review"
+666:        passers = [w for w in members if scores[w].l3_pass_standalone]
+678:                entity_excluded[eid] = "entity_no_l3_passer"       # hard exclude
+680:                entity_excluded[eid] = "entity_l3_unknown_review"  # REVIEW
+684:        entity_primary[eid] = primary
+690:                entity_excluded[eid] = "internal_hedge"
+702:        is_primary = (entity_primary.get(eid) == w) if len(members) > 1 else True
+703:        s.is_entity_primary = is_primary
+706:        ent_reason = entity_excluded.get(eid)
+714:            "entity_id": eid, "is_entity_primary": is_primary,
+721:            "dex_concentration": s.dex_concentration, "unexecutable": s.unexecutable,
+724:            "n_fills": s.n_fills, "confidence": s.confidence,
+747:            "wash", "unexecutable_dex", "stale", "funding_farm"}
+754:            assert r["confidence"] != "LOW", f"PASS with LOW conf: {r['wallet']}"
+
+codex
+One thing I’m watching: `decide_verdict()` returns only the newly added codes, and the loop still preserves pre-existing `s.reason_codes` before extending them. That preserves the old accumulation shape; now I’m running the golden test and the v15 test slice.
+exec
+/bin/zsh -lc 'pytest -q tests/v15/test_m025_golden.py' in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc 'pytest -q tests/v15' in /Users/hermes/quants-lab
+ exited 2 in 2732ms:
+
+==================================== ERRORS ====================================
+________________ ERROR collecting tests/v15/test_m025_golden.py ________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m025_golden.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m025_golden.py:15: in <module>
+    import v15_m025_authenticity_gate as m025  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m025_authenticity_gate.py:37: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+=========================== short test summary info ============================
+ERROR tests/v15/test_m025_golden.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 1.81s
+
+ exited 2 in 3153ms:
+
+==================================== ERRORS ====================================
+________ ERROR collecting tests/v15/test_equity_independent_actions.py _________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_equity_independent_actions.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_equity_independent_actions.py:5: in <module>
+    import v15_equity_independent_actions as ei  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_equity_independent_actions.py:23: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+______________ ERROR collecting tests/v15/test_fidelity_replay.py ______________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_fidelity_replay.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_fidelity_replay.py:7: in <module>
+    from fidelity_replay import roundtrips  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/fidelity_replay.py:17: in <module>
+    import leadlag_clean_rank_sim as S
+research/v15/leadlag_clean_rank_sim.py:62: in <module>
+    from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+__________ ERROR collecting tests/v15/test_fixed_notional_signals.py ___________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_fixed_notional_signals.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_fixed_notional_signals.py:7: in <module>
+    import v15_fixed_notional_signals as sig  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_fixed_notional_signals.py:28: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m02.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m02.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m02.py:22: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+________________ ERROR collecting tests/v15/test_m025_golden.py ________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m025_golden.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m025_golden.py:15: in <module>
+    import v15_m025_authenticity_gate as m025  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m025_authenticity_gate.py:37: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m04.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m04.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m04.py:9: in <module>
+    import v15_m025_authenticity_gate as g  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m025_authenticity_gate.py:37: in <module>
+    import v15_m01_equity_reconstruct as m01  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m01_equity_reconstruct.py:93: in <module>
+    import pymongo
+E   ModuleNotFoundError: No module named 'pymongo'
+____________________ ERROR collecting tests/v15/test_m09.py ____________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_m09.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_m09.py:13: in <module>
+    import v15_m09_sim as M9  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/v15_m09_sim.py:27: in <module>
+    from _streaming_io import ShardedParquetWriter, install_memory_guard
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+________________ ERROR collecting tests/v15/test_mem_budget.py _________________
+ImportError while importing test module '/Users/hermes/quants-lab/tests/v15/test_mem_budget.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/v15/test_mem_budget.py:16: in <module>
+    from _streaming_io import plan_memory_budget, MemoryBudgetError  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+research/v15/_streaming_io.py:35: in <module>
+    import pyarrow as pa
+E   ModuleNotFoundError: No module named 'pyarrow'
+=========================== short test summary info ============================
+ERROR tests/v15/test_equity_independent_actions.py
+ERROR tests/v15/test_fidelity_replay.py
+ERROR tests/v15/test_fixed_notional_signals.py
+ERROR tests/v15/test_m02.py
+ERROR tests/v15/test_m025_golden.py
+ERROR tests/v15/test_m04.py
+ERROR tests/v15/test_m09.py
+ERROR tests/v15/test_mem_budget.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 8 errors during collection !!!!!!!!!!!!!!!!!!!!
+8 errors in 2.26s
+
+codex
+The test commands are blocked in this environment before executing assertions: `pymongo` and `pyarrow` are missing from the active Python. I’ll still complete static verification and, if there’s a local venv or alternate runner in the repo, use that.
+exec
+/bin/zsh -lc 'ls -la' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+total 352
+drwxr-xr-x   57 hermes  staff   1824 Jul 10 13:05 .
+drwxr-x---+ 118 hermes  staff   3776 Jul 10 18:05 ..
+-rw-r--r--    1 hermes  staff    299 Jun 10 15:52 .HB_STACK_DISABLED
+drwxr-xr-x    2 hermes  staff     64 Jul 10 13:05 .audit
+drwxr-xr-x    5 hermes  staff    160 Jun 13 23:55 .claude
+-rw-r--r--    1 hermes  staff    243 May  1 16:17 .claudeignore
+drwxr-xr-x    3 hermes  staff     96 May  2 15:01 .context
+drwxr-xr-x    3 hermes  staff     96 Apr 13 12:27 .docker-build
+-rw-r--r--    1 hermes  staff   1111 Mar 26 07:41 .dockerignore
+-rw-------    1 hermes  staff   1797 Jul  1 10:00 .env
+-rw-------    1 hermes  staff   1723 Jun 23 16:20 .env.bak-bybitkeyfix-20260623-152016
+-rw-r--r--    1 hermes  staff     64 May 20 13:49 .gbrainignore
+drwxr-xr-x   16 hermes  staff    512 Jul 10 17:57 .git
+drwxr-xr-x    3 hermes  staff     96 Mar 26 07:41 .github
+-rw-r--r--    1 hermes  staff   4699 Jul 10 10:42 .gitignore
+drwx------    5 hermes  staff    160 May 12 14:27 .gstack
+drwxr-xr-x    4 hermes  staff    128 Jul  6 17:03 .patches
+-rw-r--r--    1 hermes  staff    826 Mar 26 07:41 .pre-commit-config.yaml
+drwxr-xr-x    6 hermes  staff    192 Apr  9 11:07 .pytest_cache
+drwxr-xr-x    8 hermes  staff    256 Apr 18 13:13 .venv
+-rw-r--r--    1 hermes  staff  12090 Apr  2 12:36 ARCHITECTURE.md
+-rw-r--r--    1 hermes  staff   6574 Jun 10 17:29 CLAUDE.md
+-rw-r--r--    1 hermes  staff    308 Apr 22 09:49 Dockerfile.hb-demo-v2
+-rw-r--r--    1 hermes  staff  11357 Mar 26 07:41 LICENSE
+-rw-r--r--    1 hermes  staff   8292 Apr  6 15:07 NEXT_STEPS.md
+-rw-r--r--    1 hermes  staff   3921 Mar 26 07:41 README.md
+-rw-r--r--    1 hermes  staff   7026 May 31 16:45 REPO_MAP.md
+-rw-r--r--    1 hermes  staff   5525 Jul 10 12:54 SYSTEM.md
+drwxr-xr-x    6 hermes  staff    192 Jul 10 11:32 app
+drwxr-xr-x   39 hermes  staff   1248 Jul 10 17:57 archive
+-rw-r--r--    1 hermes  staff   6220 Jun  8 18:45 closedpnl_recon.py
+drwxr-xr-x   32 hermes  staff   1024 Jul 10 11:31 config
+drwxr-xr-x   15 hermes  staff    480 May 11 01:10 core
+drwxr-xr-x   30 hermes  staff    960 Jul 10 11:30 data_pipeline
+drwxr-xr-x    3 hermes  staff     96 Jul 10 11:28 docker
+drwxr-xr-x    3 hermes  staff     96 Apr 16 00:55 docker-build
+-rw-r--r--    1 hermes  staff    792 Mar 26 07:41 docker-compose-db.yml
+drwxr-xr-x   52 hermes  staff   1664 Jul 10 10:42 docs
+-rw-r--r--    1 hermes  staff    737 Mar 26 07:41 environment.yml
+-rwxr-xr-x    1 hermes  staff   8723 Mar 26 07:41 install.sh
+drwxr-xr-x    3 hermes  staff     96 May 23 23:17 logs
+drwxr-xr-x    3 hermes  staff     96 May 22 16:21 ops
+-rw-r--r--    1 hermes  staff   5561 Jun  8 18:45 parallel_compare.py
+-rw-r--r--    1 hermes  staff   1813 Mar 26 07:41 pyproject.toml
+drwxr-xr-x    8 hermes  staff    256 Mar 26 07:47 quants_lab.egg-info
+drwxr-xr-x   10 hermes  staff    320 Jul 10 11:28 research
+drwxr-xr-x   11 hermes  staff    352 Apr  9 11:38 research_notebooks
+drwxr-xr-x   50 hermes  staff   1600 Jul 10 11:37 scripts
+drwxr-xr-x    4 hermes  staff    128 Jul  5 17:11 strategies
+drwxr-xr-x    7 hermes  staff    224 Jul 10 12:44 tests
+drwxr-xr-x   19 hermes  staff    608 Jul 10 11:37 tools
+-rwxr-xr-x    1 hermes  staff   8202 Mar 26 07:41 uninstall.sh
+-rw-r--r--    1 hermes  staff   3031 May 11 10:59 voice_msg.json
+-rw-r--r--    1 hermes  staff    704 May 11 10:59 voice_msg.srt
+-rw-r--r--    1 hermes  staff    587 May 11 10:59 voice_msg.tsv
+-rw-r--r--    1 hermes  staff    506 May 11 10:59 voice_msg.txt
+-rw-r--r--    1 hermes  staff    664 May 11 10:59 voice_msg.vtt
+
+exec
+/bin/zsh -lc "rg --files -g 'pyproject.toml' -g 'requirements*.txt' -g 'uv.lock' -g 'poetry.lock' -g 'Pipfile' -g '.venv' -g 'venv'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+pyproject.toml
+
+exec
+/bin/zsh -lc "python - <<'PY'
+import sys
+for m in ['numpy','pandas','pymongo','pyarrow']:
+    try:
+        __import__(m)
+        print(m, 'OK')
+    except Exception as e:
+        print(m, type(e).__name__, e)
+PY" in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: command not found: python
+
+codex
+There is a `.venv` in the repo, and the shell’s bare `python` is not on PATH while `pytest` was. I’m switching to the project venv to avoid auditing against the wrong interpreter.
+exec
+/bin/zsh -lc '.venv/bin/pytest -q tests/v15/test_m025_golden.py' in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: no such file or directory: .venv/bin/pytest
+
+exec
+/bin/zsh -lc ".venv/bin/python - <<'PY'
+import sys
+print(sys.executable)
+for m in ['numpy','pandas','pymongo','pyarrow','pytest']:
+    try:
+        __import__(m)
+        print(m, 'OK')
+    except Exception as e:
+        print(m, type(e).__name__, e)
+PY" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+/Users/hermes/quants-lab/.venv/bin/python
+numpy ModuleNotFoundError No module named 'numpy'
+pandas ModuleNotFoundError No module named 'pandas'
+pymongo ModuleNotFoundError No module named 'pymongo'
+pyarrow ModuleNotFoundError No module named 'pyarrow'
+pytest ModuleNotFoundError No module named 'pytest'
+
+exec
+/bin/zsh -lc '.venv/bin/pytest -q tests/v15' in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: no such file or directory: .venv/bin/pytest
+
+codex
+The repo venv is empty for this slice, so it cannot run the tests either. For the golden test specifically, the only missing import hit is `pymongo` through `m01`; I’m checking whether a minimal temporary stub is enough to execute the pure decision tests without touching repo files.
+exec
+/bin/zsh -lc "sed -n '80,115p' research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+import argparse
+import glob
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import pymongo
+import requests
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("v15_m01")
+
+HL_URL = "https://api.hyperliquid.xyz/info"
+S3_FILLS_DIR = Path("/Users/hermes/quants-lab/app/data/hl_s3_fills_v2")
+S3_BY_WALLET_DIR = Path("/Users/hermes/quants-lab/app/data/hl_s3_fills_v2_by_wallet")
+FUNDING_DIR = Path("/Users/hermes/quants-lab/app/data/v13/raw_funding_cache_20k")
+LEDGER_DIR = Path("/Users/hermes/quants-lab/app/data/v13/raw_ledger_cache_20k")
+ANCHOR_PARQUET = Path("/Users/hermes/quants-lab/app/data/v13/wallet_anchor_state.parquet")
+
+exec
+/bin/zsh -lc "which pytest && pytest --version && which python3 && python3 - <<'PY'
+for m in ['numpy','pandas','pytest','dotenv','requests']:
+    try:
+        __import__(m)
+        print(m, 'OK')
+    except Exception as e:
+        print(m, type(e).__name__, e)
+PY" in /Users/hermes/quants-lab
+ succeeded in 919ms:
+pytest 9.0.3
+/usr/bin/python3
+/Users/hermes/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+numpy OK
+pandas ModuleNotFoundError No module named 'pandas'
+pytest ModuleNotFoundError No module named 'pytest'
+dotenv OK
+requests OK
+
+codex
+`m01` also imports `_streaming_io`, which imports `pyarrow`, so the pure test collection is coupled to heavier optional IO deps. I’m checking whether those imports can be temporarily stubbed just for test execution; the code under audit is still the repo code.
+exec
+/bin/zsh -lc "sed -n '1,70p' research/v15/_streaming_io.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+#!/usr/bin/env python3
+"""MANDATORY memory-safe streaming I/O for ALL fan-out / backtest / simulation scripts.
+
+BINDING RULE (Alberto 2026-05-31, after the 4th-5th OOM crash of the week; decision
+projects/quant/decisions/2026-05-31-mandatory-streaming-io; CLAUDE.md Key Rule):
+  No script that fans out over the wallet universe (or produces per-action / per-fill / per-tick
+  rows) may accumulate the FULL result set in RAM before writing. It MUST stream output to disk in
+  bounded chunks via `ShardedParquetWriter` and MUST install `install_memory_guard()` so a runaway
+  aborts LOUDLY (with the partial parts safe on disk) instead of a silent OS SIGKILL.
+
+Root cause of the recurring OOMs: `results = []; for r in pool.imap(...): results.append(r);
+df = pd.DataFrame(all_rows)`. At ~18k wallets x thousands of per-action rows that list exceeds
+16 GB and the OS SIGKILLs the process (no traceback, workers BrokenPipe, leaked semaphores).
+
+USAGE
+    from _streaming_io import ShardedParquetWriter, install_memory_guard
+    install_memory_guard(soft_gb=12, label="m02")
+    aw = ShardedParquetWriter(actions_out, flush_rows=2_000_000)
+    for r in pool.imap_unordered(process_wallet, tasks):
+        aw.add_many(r["actions"])          # buffers; auto-flushes a part to disk past flush_rows
+    n = aw.close()                          # flushes remainder + stitches parts -> single parquet
+
+Memory stays flat (bounded by flush_rows), regardless of universe size.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+logger = logging.getLogger("streaming_io")
+
+
+class ShardedParquetWriter:
+    """Buffer rows, flush a part-file every `flush_rows`, stitch parts -> ONE parquet on close().
+
+    Parent/process memory is bounded by `flush_rows` (NOT by universe size). Part files are the
+    durable artifact: if `close()`'s stitch step ever fails, the parts remain on disk and the cheap
+    stitch can be re-run with no recompute. The combined output schema is the pyarrow union of all
+    part schemas (so an all-null column in one chunk that is typed in another reconciles cleanly)."""
+
+    def __init__(self, out_path: str | Path, flush_rows: int = 1_000_000, keep_parts: bool = False):
+        self.out = Path(out_path)
+        self.parts_dir = self.out.with_suffix(self.out.suffix + ".parts")
+        self.parts_dir.mkdir(parents=True, exist_ok=True)
+        # codex perf-r1 #1: WIPE any stale parts from a prior aborted/failed run so close() can never
+        # stitch leftover rows into a fresh output (silent corruption). Each run starts clean.
+        stale = list(self.parts_dir.glob("part_*.parquet"))
+        for p in stale:
+            p.unlink()
+        if stale:
+            logger.warning(f"ShardedParquetWriter: removed {len(stale)} stale part(s) in {self.parts_dir}")
+        self.flush_rows = int(flush_rows)
+        self.keep_parts = keep_parts
+        self._buf: list[dict] = []
+        self._part_idx = 0
+        self.total_rows = 0
+
+    def add_many(self, records: list[dict] | None) -> None:
+        if not records:
+            return
+        self._buf.extend(records)
+        if len(self._buf) >= self.flush_rows:
+
+exec
+/bin/zsh -lc "rg -n \"pa\\.|pq\\.|pyarrow|ShardedParquetWriter|install_memory_guard|plan_memory_budget\" research/v15/_streaming_io.py research/v15/v15_m01_equity_reconstruct.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+research/v15/_streaming_io.py:8:  bounded chunks via `ShardedParquetWriter` and MUST install `install_memory_guard()` so a runaway
+research/v15/_streaming_io.py:16:    from _streaming_io import ShardedParquetWriter, install_memory_guard
+research/v15/_streaming_io.py:17:    install_memory_guard(soft_gb=12, label="m02")
+research/v15/_streaming_io.py:18:    aw = ShardedParquetWriter(actions_out, flush_rows=2_000_000)
+research/v15/_streaming_io.py:35:import pyarrow as pa
+research/v15/_streaming_io.py:36:import pyarrow.parquet as pq
+research/v15/_streaming_io.py:41:class ShardedParquetWriter:
+research/v15/_streaming_io.py:46:    stitch can be re-run with no recompute. The combined output schema is the pyarrow union of all
+research/v15/_streaming_io.py:59:            logger.warning(f"ShardedParquetWriter: removed {len(stale)} stale part(s) in {self.parts_dir}")
+research/v15/_streaming_io.py:100:        # instead of failing the stitch at the END of a long run. Fall back for older pyarrow.
+research/v15/_streaming_io.py:101:        schemas = [pq.read_schema(p) for p in parts]
+research/v15/_streaming_io.py:103:            unified = pa.unify_schemas(schemas, promote_options="permissive")
+research/v15/_streaming_io.py:105:            unified = pa.unify_schemas(schemas)
+research/v15/_streaming_io.py:106:        writer = pq.ParquetWriter(tmp, unified, compression="snappy")
+research/v15/_streaming_io.py:109:                t = pq.read_table(p)
+research/v15/_streaming_io.py:117:                            t = t.append_column(n, pa.nulls(t.num_rows, type=unified.field(n).type))
+research/v15/_streaming_io.py:126:        logger.info(f"ShardedParquetWriter -> {self.out} ({self.total_rows:,} rows, {len(parts)} parts stitched)")
+research/v15/_streaming_io.py:163:def install_memory_guard(soft_gb: float = 12.0, label: str = "proc", poll_s: int = 15) -> None:
+research/v15/_streaming_io.py:165:    silent OS SIGKILL. Prevention is ShardedParquetWriter; this turns any residual runaway into a
+research/v15/_streaming_io.py:179:                    f"ShardedParquetWriter / smaller flush_rows. Flushed parts are safe on disk.")
+research/v15/_streaming_io.py:203:    """Result of plan_memory_budget: a composable AGGREGATE memory plan for a fan-out run.
+research/v15/_streaming_io.py:242:def plan_memory_budget(requested_procs: int,
+research/v15/v15_m01_equity_reconstruct.py:97:from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402
+research/v15/v15_m01_equity_reconstruct.py:2479:    _budget = plan_memory_budget(requested_procs=1, per_worker_gb=2.0, main_reserve_gb=0.0,
+research/v15/v15_m01_equity_reconstruct.py:2481:    install_memory_guard(soft_gb=_budget.main_soft_gb, label="m01")
+research/v15/v15_m01_equity_reconstruct.py:2500:    # Rule 8: stream per-wallet series to disk in bounded chunks via ShardedParquetWriter; NEVER
+research/v15/v15_m01_equity_reconstruct.py:2503:    series_writer = ShardedParquetWriter(out_path, flush_rows=2_000_000)
+
+codex
+Rather than polluting imports for pytest collection, I’m going to run a small direct harness that preloads harmless stubs for `pymongo` and `_streaming_io`, imports the audited module, and exercises the same golden cases. That avoids repo edits and avoids pretending the full dependency stack is installed.
+exec
+/bin/zsh -lc 'head -1 $(which pytest) && /opt/homebrew/bin/python3.11 - <<'"'PY'
+import sys, types
+sys.path.insert(0, '/Users/hermes/quants-lab/research/v15')
+sys.modules['pymongo'] = types.ModuleType('pymongo')
+st = types.ModuleType('_streaming_io')
+st.ShardedParquetWriter = object
+st.install_memory_guard = lambda *a, **k: None
+st.plan_memory_budget = lambda *a, **k: None
+sys.modules['_streaming_io'] = st
+import v15_m025_authenticity_gate as m025
+
+def clean():
+    s = m025.WalletScores(wallet='0xclean')
+    s.days_since_last_fill = 1.0
+    s.wash_frac = 0.0
+    s.net_gross_ratio = 0.80
+    s.price_pnl_var_frac = 0.70
+    s.funding_frac = 0.10
+    s.confidence = 'HIGH'
+    s.sharpe_vs_lev_flag = False
+    s.unexecutable = False
+    return s
+
+def assert_case(name, setup, expected_verdict, expected_code=None, ent_reason=None, is_primary=True, n_members=1):
+    s = clean()
+    setup(s)
+    verdict, codes = m025.decide_verdict(s, ent_reason, is_primary, n_members)
+    assert verdict == expected_verdict, (name, verdict, codes)
+    if expected_code is not None:
+        assert expected_code in codes, (name, verdict, codes)
+    print(name, verdict, codes)
+
+assert_case('clean', lambda s: None, 'PASS')
+assert_case('funding_nan', lambda s: setattr(s, 'funding_frac', float('nan')), 'REVIEW', 'nan_metric')
+assert_case('funding_inf', lambda s: setattr(s, 'funding_frac', float('inf')), 'EXCLUDE', 'funding_farm')
+assert_case('wash_exact_exclude', lambda s: setattr(s, 'wash_frac', m025.WASH_EXCLUDE), 'EXCLUDE', 'wash')
+assert_case('wash_exact_review', lambda s: setattr(s, 'wash_frac', m025.WASH_REVIEW), 'REVIEW', 'wash_borderline')
+assert_case('wash_below_exclude', lambda s: setattr(s, 'wash_frac', m025.WASH_EXCLUDE - 1e-6), 'REVIEW', 'wash_borderline')
+assert_case('nan_l3', lambda s: setattr(s, 'net_gross_ratio', float('nan')), 'REVIEW', 'nan_metric')
+assert_case('delta_neutral', lambda s: (setattr(s, 'net_gross_ratio', 0.10), setattr(s, 'price_pnl_var_frac', 0.10)), 'EXCLUDE', 'delta_neutral')
+assert_case('stale', lambda s: setattr(s, 'days_since_last_fill', m025.STALE_DAYS + 0.5), 'EXCLUDE', 'stale')
+assert_case('entity_fragment', lambda s: None, 'EXCLUDE', 'entity_fragment', is_primary=False, n_members=3)
+assert_case('hard_beats_review', lambda s: setattr(s, 'wash_frac', 0.9), 'EXCLUDE', 'wash', ent_reason='entity_too_big_review', n_members=10)
+assert_case('low_confidence', lambda s: (setattr(s, 'confidence', 'LOW'), setattr(s, 'anchor_reason', 'thin_history')), 'REVIEW', 'thin_history')
+print('direct golden harness OK')
+PY" in /Users/hermes/quants-lab
+ succeeded in 746ms:
+clean PASS []
+funding_nan REVIEW ['nan_metric']
+funding_inf EXCLUDE ['funding_farm']
+wash_exact_exclude EXCLUDE ['wash']
+wash_exact_review REVIEW ['wash_borderline']
+wash_below_exclude REVIEW ['wash_borderline']
+nan_l3 REVIEW ['nan_metric']
+delta_neutral EXCLUDE ['delta_neutral']
+stale EXCLUDE ['stale']
+entity_fragment EXCLUDE ['entity_fragment']
+hard_beats_review EXCLUDE ['wash']
+low_confidence REVIEW ['thin_history']
+direct golden harness OK
+
+exec
+/bin/zsh -lc "sed -n '735,765p' research/v15/v15_m025_authenticity_gate.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    args = ap.parse_args()
+
+    hi_ms = int((pd.Timestamp(args.end, tz="UTC")+pd.Timedelta(days=1)).timestamp()*1000-1)
+    lo_ms = hi_ms - args.lookback_days*86_400_000
+    wallets = [w.strip().lower() for w in open(args.wallets_file)
+               if w.strip() and not w.startswith("#")]
+    log.info(f"{len(wallets)} wallets, window {args.lookback_days}d ending {args.end}")
+
+    df = run(wallets, lo_ms, hi_ms)
+
+    # codex note 5: sanity assertions
+    hard = {"entity_fragment", "entity_no_l3_passer", "internal_hedge", "delta_neutral",
+            "wash", "unexecutable_dex", "stale", "funding_farm"}
+    for _, r in df.iterrows():
+        codes = set(c for c in r["reason_codes"].split(",") if c)
+        if r["verdict"] == "EXCLUDE":
+            assert codes, f"EXCLUDE with no reason: {r['wallet']}"
+        if r["verdict"] == "PASS":
+            assert not (codes & hard), f"PASS with hard code: {r['wallet']} {codes}"
+            assert r["confidence"] != "LOW", f"PASS with LOW conf: {r['wallet']}"
+
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(args.output, index=False, compression="snappy")
+
+    vc = df["verdict"].value_counts()
+    log.info(f"VERDICTS: {dict(vc)}")
+    # reason histogram
+    from collections import Counter
+    rh = Counter()
+    for codes in df["reason_codes"]:
+        for c in codes.split(","):
+
+exec
+/bin/zsh -lc "sed -n '285,330p' research/v15/v15_m025_authenticity_gate.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+                if b["time"] - a["time"] > T_WASH_S*1000:
+                    break
+                if used[j] or (a["signed_sz"] > 0) == (b["signed_sz"] > 0):
+                    continue
+                if abs(b["price"]-a["price"])/a["price"] > WASH_PRICE_BPS:
+                    continue
+                if abs(abs(b["size"])-abs(a["size"]))/max(abs(a["size"]), 1e-9) > WASH_SIZE_TOL:
+                    continue
+                wash += (abs(a["size"])*a["price"] + abs(b["size"])*b["price"])
+                used[i] = used[j] = True
+                break
+    return min(wash/total, 1.0)
+
+
+def stage_a(wallet, lo_ms, hi_ms) -> WalletScores:
+    s = WalletScores(wallet=wallet)
+    # FIX 2 + ISSUE B: load fills from 365 days BEFORE lo_ms so positions opened
+    # up to a year before the window are seeded. The position carried into lo_ms
+    # seeds the net/gross and leverage accumulators; only the window [lo_ms, hi_ms]
+    # is time-weighted.
+    PRE_WINDOW_MS = 365 * 86_400_000
+    all_fills = m01.load_wallet_fills(wallet, lo_ms - PRE_WINDOW_MS, hi_ms)
+    fills = [f for f in all_fills if lo_ms <= f["time"] <= hi_ms]
+    s.n_fills = len(fills)
+    if not fills:
+        s.confidence = "LOW"
+        s.reason_codes.append("no_fills")
+        return s
+    # FIX 2: position carried into the window from pre-window fills (fills_ctx spans
+    # lo_ms-30d..hi_ms). seed = cumulative per-coin position held AT lo_ms, so the
+    # net/gross and leverage accumulators start from real carried exposure instead
+    # of flat 0. m01.positions_at is order-independent (cumulative signed_sz).
+    # ISSUE 2: seed STRICTLY pre-window (lo_ms - 1) so fills at t == lo_ms are NOT
+    # double-counted — the window loops below include t == lo_ms via `if t < win_lo:
+    # continue`, so seeding at lo_ms would count those fills twice.
+    seed_pos = m01.positions_at(all_fills, lo_ms - 1)
+    funding = m01.load_wallet_funding(wallet, lo_ms, hi_ms)
+    ledger = m01.load_wallet_ledger(wallet, lo_ms, hi_ms)
+    last_t = max(f["time"] for f in fills)
+    s.days_since_last_fill = (hi_ms - last_t)/86_400_000
+    days = {pd.Timestamp(f["time"], unit="ms", tz="UTC").date() for f in fills}
+    s.active_days = len(days)
+
+    # dex concentration
+    gross_by_dex = defaultdict(float)
+    for f in fills:
+
+codex
+Verdict: no findings.
+
+I agree `DEX_CONC` is design, not a bug, given the documented “all DEXes in scope” directive. It remains informational only.
+
+Checks:
+- `decide_verdict()` preserves the prior COMBINE ordering/precedence, except for the intended hardenings: wash boundary changes and `funding_frac` NaN review handling.
+- Hard excludes still win before any review state.
+- `funding_frac = inf` is not NaN, so `inf == inf` is true and `inf > FUNDING_FARM_FRAC` trips `funding_farm` EXCLUDE.
+- `funding_frac = NaN` now reaches `nan_metric` REVIEW and cannot PASS.
+- Wash boundaries are now conservative: `>= 0.50` EXCLUDE, `[0.20, 0.50)` REVIEW.
+- I do not see a new refactor bug.
+
+Test status:
+- Full `pytest` was blocked in this environment by missing `pymongo`/`pyarrow`; repo `.venv` also lacks pytest/numpy/pandas.
+- I ran a direct stubbed harness against the real module for the 12 golden decision cases; all passed.
+
+OVERALL: yes, m025 is now fail-CLOSED, the extraction is faithful modulo the intentional fixes, and ready to be marked TRUSTED.
+tokens used
+34.286
+Verdict: no findings.
+
+I agree `DEX_CONC` is design, not a bug, given the documented “all DEXes in scope” directive. It remains informational only.
+
+Checks:
+- `decide_verdict()` preserves the prior COMBINE ordering/precedence, except for the intended hardenings: wash boundary changes and `funding_frac` NaN review handling.
+- Hard excludes still win before any review state.
+- `funding_frac = inf` is not NaN, so `inf == inf` is true and `inf > FUNDING_FARM_FRAC` trips `funding_farm` EXCLUDE.
+- `funding_frac = NaN` now reaches `nan_metric` REVIEW and cannot PASS.
+- Wash boundaries are now conservative: `>= 0.50` EXCLUDE, `[0.20, 0.50)` REVIEW.
+- I do not see a new refactor bug.
+
+Test status:
+- Full `pytest` was blocked in this environment by missing `pymongo`/`pyarrow`; repo `.venv` also lacks pytest/numpy/pandas.
+- I ran a direct stubbed harness against the real module for the 12 golden decision cases; all passed.
+
+OVERALL: yes, m025 is now fail-CLOSED, the extraction is faithful modulo the intentional fixes, and ready to be marked TRUSTED.
