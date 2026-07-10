@@ -238,6 +238,20 @@ def build_cost_map(coins):
     return cmap, (share, n_cal, n_tot)
 
 
+def apply_cost_map(j, cmap):
+    """Assign per-coin RT cost from the canonical execution-model cost map, FAIL-CLOSED.
+    build_cost_map keys cmap on the exact coin universe of j (sorted(j.coin.unique())), so every coin
+    is present by construction. If a coin is ever missing (future refactor), we RAISE rather than inject
+    a coin-blind hardcoded fee -- no silent fallback that would corrupt net_ret. (Phase 3b consolidation:
+    removes the duplicated (SLIP_DEFAULT_BPS*2+8.64)/1e4 constant; the execution model is the sole source.)"""
+    rt = j["coin"].map(cmap)
+    if rt.isna().any():
+        missing = sorted(j.loc[rt.isna(), "coin"].astype(str).unique())
+        raise ValueError(f"COST=exec: {len(missing)} coin(s) missing from execution-model cost map "
+                         f"(no coin-blind fallback -- fix build_cost_map coverage): {missing[:10]}")
+    return rt
+
+
 def weekly_consistency(df, ret_col="net_ret"):
     """CONSISTENCY axis (Alberto 2026-06-28): fraction of distinct CALENDAR WEEKS in which the wallet's
     summed NET return is positive. Catches the one-lucky-week wallet that per-journey win-rate hides.
@@ -433,7 +447,7 @@ def main():
         calib10 = set(json.load(open("app/data/v15/l2_calib_10coin.json")).keys())
         if COST == "exec":
             cmap, _ = build_cost_map(sorted(j.coin.unique()))
-            j["rt_cost"] = j["coin"].map(cmap).fillna((SLIP_DEFAULT_BPS * 2 + 8.64) / 1e4)
+            j["rt_cost"] = apply_cost_map(j, cmap)
         else:
             j["rt_cost"] = RT_COST_BPS / 1e4
         j["net_ret"] = j["ret"] - j["rt_cost"]
@@ -468,7 +482,7 @@ def main():
     #    flat RT_COST_BPS so the historical path is byte-identical.
     if COST == "exec":
         cmap, (cal_share, n_cal, n_tot) = build_cost_map(sorted(j.coin.unique()))
-        j["rt_cost"] = j["coin"].map(cmap).fillna((SLIP_DEFAULT_BPS * 2 + 8.64) / 1e4)
+        j["rt_cost"] = apply_cost_map(j, cmap)
         print(f"[COST=exec] per-coin RT cost via execution_model | calibrated lookups {cal_share:.1f}% "
               f"(calib={n_cal} default={n_tot}) | tail-slip-default {SLIP_DEFAULT_BPS}bps one-way | "
               f"median RT {j['rt_cost'].median()*1e4:.1f}bps max {j['rt_cost'].max()*1e4:.1f}bps")
