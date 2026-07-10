@@ -38,9 +38,23 @@ single-source primitives.
 - Ingestion + validation gate: `s3_taker_verify.py` (taker gate, CORRECT full-history `load_fills_from_s3`)
   → `research/v16/mae_bag_measure.py` + `rescreen_bag_gate.py` (bag filter) → `forward_oos_hot.py`
   (forward-OOS, boundary-MTM, codex-signed) → `copyability_calib_share.py` (copyability rank).
-- Processing/selection engine (the raw data feeds here): `research/v15/v15_m01_equity_reconstruct` (m01) →
-  m02 journeys → m03 folds → m025 authenticity → m05 eligibility → m06a/b shortlist+ranking → m07 engine →
-  m08 survival → m09 sim → m10 gates → `v15_forward_select`. Cohort/config emit: `research/v16/select_cohort.py`.
+- Processing/selection engine (the raw data feeds here): `v15_m01_equity_reconstruct` (m01, causal
+  whole-account equity) → m02 journeys → m03 folds → m04 authenticity (`v15_m04_authenticity.py`, the per-fold
+  driver that IMPORTS `v15_m025_authenticity_gate`) → m05 eligibility → m06a shortlist → m07 engine
+  (pretest+test) → m06b ranking → m08 survival → **[decision layer]** m09 sim + m10 gates.
+- TRUST STATUS (2026-07-10): **ALL 11 modules (m01,m02,m025,m03,m05,m06a,m06b,m07,m08,m09,m10) TRUSTED** —
+  each adversarial-codex-audited to consensus, made fail-CLOSED (no NaN/missing input silently passes a gate),
+  and pinned by a golden regression test. 405 v15 tests green. Tracker: `projects/quant/cleanup/m1-m10-trust-audit`.
+- ORCHESTRATION (the canonical entrypoints — do NOT rebuild):
+  1. `scripts/run_clean_rerun.sh` → leak-free causal m01 re-run (shards) → calls recal_pipeline.sh.
+  2. `scripts/recal_pipeline.sh` (deterministic DATA+RANKING chain: m01 consolidate → m02 → m03 → m04
+     (`build_m4_perfold.sh`) → m05 → m06a → m07 pretest+test → m06b → m08). ONE shell entrypoint.
+  3. `research/v15/v15_forward_select.py::forward_backtest` = the DECISION/GRADING layer (m09 chained sim +
+     m10 gates). It is a per-RULE sweep harness (`score_fn`), NOT a fixed pipeline tail — the selection rule is
+     a research choice, so it is intentionally not baked into the shell chain. `research/v16/select_cohort.py`
+     emits the final cohort/config.
+  Overlaps to archive (superseded, keep in `archive/`): `sprint_forward_chain.sh` (separate v16 cohort slice),
+  `recal_resume_m3.sh`/`recal_resume_m6.sh` (resume shims).
 Phase-3 scope = consolidate the SHARED PRIMITIVES both stages use (coin-aware fees, one fills loader, one
 asof-mark staleness policy); NOT touch either stage's logic. ~195 dead one-off experiments already archived (Phase 3a).
 
