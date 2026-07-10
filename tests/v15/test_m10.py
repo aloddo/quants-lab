@@ -83,7 +83,7 @@ def test_g7_evaluates_ablation_g1_g3_g6():
 
 
 def _strat(**kw):
-    base = dict(chained_roe=0.7, n_positive_folds=7, max_chained_dd=0.3, g4_no_kill=True,
+    base = dict(chained_roe=0.7, n_positive_folds=7, n_folds=8, max_chained_dd=0.3, g4_no_kill=True,
                 g4_all_folds_above_floor=True, g5_pool_ok=True, chained_calmar=2.3,
                 top_entity_pnl_share=0.2)
     base.update(kw)

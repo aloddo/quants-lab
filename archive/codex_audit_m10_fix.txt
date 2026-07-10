@@ -1,0 +1,1119 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /Users/hermes/quants-lab
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f4b9d-1ed3-7543-a5e6-530de85cbb89
+--------
+user
+# Verify m10 fixes (round 2) — confirm the 5 findings are correctly closed
+
+You audited v15_m10_gates and found P0#1 (bool(np.nan)=True -> G4/G5 pass on non-bool/NaN), P0#2 (no finite/domain
+validation -> inf ROE/negative DD greenlight), P0#3 (G2 denominator not verified -> partial <8-fold passes "6 of 8"),
+P1#4 (G6 truncates non-integer pct), P1#5 (non-finite strategy -> fake strong p-value). I fixed all 5. Read
+research/v15/v15_m10_gates.py + tests/v15/test_m10_golden.py.
+
+## Fixes
+- Added `_validate_strat(strat, ablation, m)` called at the top of evaluate_gates -> returns fail-closed verdict
+  {greenlight:"no", verdict_kind:"invalid_input", validation_error:...} when: chained_roe/calmar not finite;
+  max_chained_dd/top_entity_pnl_share not in [0,1]; n_folds != expected_n_folds (=8, new manifest field);
+  n_positive_folds not int in [0,8]; g4_no_kill/g4_all_folds_above_floor/g5_pool_ok not isinstance(., (bool,np.bool_))
+  (I verified `1 in (True,False)` is True in Python, so I use isinstance-by-type, not membership); ablation metrics
+  finite + DD in [0,1].
+- G2 now also requires strat["n_folds"] == m.expected_n_folds.
+- G4/G5 now require `is True` (literal), not truthiness.
+- gate_g6_bivariate computes the gate percentile with np.percentile(clean_null, pct) at the EXACT pct (not the
+  truncated ladder key), and requires np.isfinite(strat) for a pass.
+- percentile_ladder: non-finite strategy -> p_value None, exceeds_p95 None, strategy_finite False.
+Golden test tests/v15/test_m10_golden.py (28 cases incl. parametrized non-bool/domain/denominator) + the 13
+existing m10 tests all pass; full v15 suite 334 passed.
+
+## Questions
+- Are all 5 fixes correct + complete? Any remaining path where a corrupt/partial M9 result greenlights the wrong
+  cohort (e.g. a domain I missed, an ablation field unvalidated, a numpy-bool/edge case, G6/G7 still admitting bad input)?
+- Is the fail-closed verdict shape ({gates:{}, all_pass:False, greenlight:"no", verdict_kind:"invalid_input"}) safe
+  for downstream consumers that read result["all_pass"] / result["greenlight"]?
+
+## Output
+Verdict per fix (correct?/gap?). End OVERALL: is m10 now TRUSTWORTHY as the terminal gate, or what remains.
+codex
+I’ll re-audit the gate code and golden tests directly, then run the relevant tests if the repo setup allows it. I’ll treat this as a review, so I’ll lead with any remaining findings and only then give the per-fix verdict.
+exec
+/bin/zsh -lc "sed -n '1,260p' research/v15/v15_m10_gates.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M10 -- Gates G1-G7 + quality-matched null + percentile ladder. M10-CORE = the gate-evaluation +
+significance statistics (pure functions on the M9 chained path + the matched-null distributions). The
+NULL GENERATION (driving M9 with pool_provider=matched_null over N_NULL seeds) is the integration step
+wired once M9-v2's chained sim + the re-run data are available; this module computes the verdict GIVEN
+the strategy result + null distributions.
+
+Design: brain projects/quant/v15/modules/m10 (codex DESIGN-SHIP r2) + decisions/2026-06-01-m9-m10-
+manifest-freeze. dev_verdict gates LIVE-SMALL ONLY (one-regime caveat); LP claims need the §4 forward
+holdout (p99). Reports the FULL percentile ladder p75/p90/p95/p99 (Alberto #5), not just the p95 gate.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger("m10")
+
+
+@dataclass(frozen=True)
+class M10Manifest:
+    manifest_version: str = "m10-v1"
+    g1_chained_roe: float = 0.5302         # 2^(112/182.5)-1 (2x/6mo pace over the 112d OOS)
+    g2_min_positive_folds: int = 6         # of 8
+    expected_n_folds: int = 8              # G2 denominator MUST be verified (codex P0#3)
+    g3_max_chained_dd: float = 0.50
+    g4_fold_floor: float = 0.50            # fold-end >= 50% of fold-initial + no intra-fold kill
+    g6_gate_pct: float = 95.0              # development gate percentile
+    g6_holdout_pct: float = 99.0           # confirmatory holdout (stricter)
+    g7_max_top_entity_pnl: float = 0.40
+    n_null_dev: int = 1000                 # development gate
+    n_null_holdout: int = 5000             # confirmatory holdout
+    ladder: tuple = (75.0, 90.0, 95.0, 99.0)   # Alberto #5: report the whole curve
+
+
+def _clean_null(null_dist) -> np.ndarray:
+    """codex r1#4: coerce to numeric + keep only FINITE samples (None/pd.NA/nan/inf dropped), so they
+    can't poison percentiles or be counted toward N_NULL."""
+    nd = pd.to_numeric(pd.Series(list(null_dist)), errors="coerce").to_numpy(dtype="float64")
+    return nd[np.isfinite(nd)]
+
+
+def percentile_ladder(strategy_val: float, null_dist, m: M10Manifest) -> dict:
+    """The null percentile ladder + where the strategy lands. Percentiles are kept RAW for gate logic
+    (codex r1#1: rounding could let strategy > round(p95) while <= true p95); only display copies round.
+    p-value (one-sided, fixes-r1#8) = (1 + #{null >= strategy}) / (N_valid + 1)."""
+    nd = _clean_null(null_dist)
+    n = int(nd.size)
+    raw = {f"p{int(p)}": (float(np.percentile(nd, p)) if n else None) for p in m.ladder}
+    # AUDIT 2026-07-10 (codex P1#5): a non-finite strategy value must NOT produce a strong-looking p-value.
+    # (nd >= nan) is all-False -> n_ge=0 -> p_value=1/(n+1) ~ "significant". Report invalid instead.
+    finite_strat = bool(np.isfinite(strategy_val))
+    n_ge = int((nd >= strategy_val).sum()) if finite_strat else 0
+    p_value = ((1 + n_ge) / (n + 1)) if (n and finite_strat) else None
+    return {"strategy": float(strategy_val), "n_valid_null": n, "strategy_finite": finite_strat,
+            "_raw_pct": raw,                                    # full precision -> gate logic uses this
+            **{k: (round(v, 6) if v is not None else None) for k, v in raw.items()},  # display copies
+            "p_value": (round(p_value, 8) if p_value is not None else None),
+            "exceeds_p95": (bool(strategy_val > raw["p95"]) if (finite_strat and raw.get("p95") is not None) else None)}
+
+
+def gate_g6_bivariate(strat_roe, strat_calmar, null_roe, null_calmar, m: M10Manifest,
+                      pct: Optional[float] = None, required_n: Optional[int] = None) -> dict:
+    """G6 (risk-adjusted, bivariate): strategy ROE > pPCT(null ROE) AND strategy Calmar > pPCT(null
+    Calmar). A ROE win bought with more risk than the null does NOT pass. FAILS CLOSED (codex r1#2) if
+    either null lacks `required_n` valid samples -> a p99 gate can't pass on a tiny null. Gate logic
+    uses RAW percentiles (codex r1#1)."""
+    pct = pct if pct is not None else m.g6_gate_pct
+    required_n = required_n if required_n is not None else m.n_null_dev
+    roe = percentile_ladder(strat_roe, null_roe, m)
+    cal = percentile_ladder(strat_calmar, null_calmar, m)
+    # AUDIT 2026-07-10 (codex P1#4): compute the gate percentile at the EXACT pct, not the truncated ladder
+    # key f"p{int(pct)}" (pct=95.5 would silently use p95). Also require a FINITE strategy value (P0#2 partial).
+    nd_roe = _clean_null(null_roe)
+    nd_cal = _clean_null(null_calmar)
+    enough = (nd_roe.size >= required_n) and (nd_cal.size >= required_n)
+    roe_p = float(np.percentile(nd_roe, pct)) if nd_roe.size else None
+    cal_p = float(np.percentile(nd_cal, pct)) if nd_cal.size else None
+    roe_pass = enough and roe_p is not None and bool(np.isfinite(strat_roe)) and strat_roe > roe_p
+    cal_pass = enough and cal_p is not None and bool(np.isfinite(strat_calmar)) and strat_calmar > cal_p
+    reason = "" if enough else f"insufficient_null(roe={roe['n_valid_null']},calmar={cal['n_valid_null']},need={required_n})"
+    return {"gate": "G6", "pass": bool(roe_pass and cal_pass), "at_pct": pct,
+            "required_n": required_n, "n_valid_null_roe": roe["n_valid_null"],
+            "n_valid_null_calmar": cal["n_valid_null"], "insufficient_null_reason": reason,
+            "roe_ladder": roe, "calmar_ladder": cal,
+            "roe_pass": bool(roe_pass), "calmar_pass": bool(cal_pass)}
+
+
+def gate_g7(top_entity_pnl_share: float, ablation: Optional[dict], null_roe, null_calmar,
+            m: M10Manifest, pct: float, required_n: int) -> dict:
+    """G7 concentration: PASS iff top entity <= 40% of PnL OR the CONSERVATIVE ablation (remove top
+    entity, hold its capital as cash, NO re-optimize) still clears G1+G3+G6. codex r1#3: M10 EVALUATES
+    G1/G3/G6 on the ablation metrics here (not a stale caller boolean). `ablation` keys: chained_roe,
+    max_chained_dd, chained_calmar (+ uses the same nulls/manifest/pct)."""
+    under_cap = top_entity_pnl_share <= m.g7_max_top_entity_pnl
+    abl_pass = False
+    abl_detail = None
+    if ablation is not None:
+        a_g1 = ablation["chained_roe"] >= m.g1_chained_roe
+        a_g3 = ablation["max_chained_dd"] <= m.g3_max_chained_dd
+        a_g6 = gate_g6_bivariate(ablation["chained_roe"], ablation["chained_calmar"],
+                                 null_roe, null_calmar, m, pct=pct, required_n=required_n)["pass"]
+        abl_pass = bool(a_g1 and a_g3 and a_g6)
+        abl_detail = {"g1": bool(a_g1), "g3": bool(a_g3), "g6": bool(a_g6)}
+    return {"gate": "G7", "pass": bool(under_cap or abl_pass),
+            "top_entity_pnl_share": float(top_entity_pnl_share), "under_cap": bool(under_cap),
+            "conservative_ablation_passes_g1_g3_g6": bool(abl_pass), "ablation_detail": abl_detail}
+
+
+def _validate_strat(strat: dict, ablation: Optional[dict], m: M10Manifest) -> Optional[str]:
+    """Return an error string if the strategy/ablation inputs are unsafe to gate (fail closed), else None.
+    Guards codex P0#1 (literal bools), P0#2 (finite + valid domains), P0#3 (verified fold denominator)."""
+    def _fin(x):
+        try:
+            return isinstance(x, (int, float)) and not isinstance(x, bool) and np.isfinite(x)
+        except TypeError:
+            return False
+    for k in ("chained_roe", "chained_calmar"):
+        if k not in strat or not _fin(strat[k]):
+            return f"{k} not finite ({strat.get(k)!r})"
+    if not _fin(strat.get("max_chained_dd")) or not (0.0 <= strat["max_chained_dd"] <= 1.0):
+        return f"max_chained_dd out of [0,1] ({strat.get('max_chained_dd')!r})"
+    if not _fin(strat.get("top_entity_pnl_share")) or not (0.0 <= strat["top_entity_pnl_share"] <= 1.0):
+        return f"top_entity_pnl_share out of [0,1] ({strat.get('top_entity_pnl_share')!r})"
+    if "n_folds" not in strat or strat["n_folds"] != m.expected_n_folds:
+        return f"n_folds != expected {m.expected_n_folds} ({strat.get('n_folds')!r}) — G2 denominator unverified"
+    npf = strat.get("n_positive_folds")
+    if not isinstance(npf, (int, np.integer)) or isinstance(npf, bool) or not (0 <= npf <= m.expected_n_folds):
+        return f"n_positive_folds out of [0,{m.expected_n_folds}] ({npf!r})"
+    for k in ("g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"):
+        # require an actual bool TYPE (int 1 == True in Python, so `in (True, False)` would wrongly admit 1).
+        if not isinstance(strat.get(k), (bool, np.bool_)):
+            return f"{k} must be a literal bool, got {strat.get(k)!r}"
+    if ablation is not None:
+        for k in ("chained_roe", "chained_calmar"):
+            if not _fin(ablation.get(k)):
+                return f"ablation.{k} not finite ({ablation.get(k)!r})"
+        if not _fin(ablation.get("max_chained_dd")) or not (0.0 <= ablation["max_chained_dd"] <= 1.0):
+            return f"ablation.max_chained_dd out of [0,1] ({ablation.get('max_chained_dd')!r})"
+    return None
+
+
+def evaluate_gates(strat: dict, null_roe, null_calmar, m: M10Manifest, holdout: bool = False,
+                   ablation: Optional[dict] = None) -> dict:
+    """Evaluate G1-G7 on the M9 chained result + null distributions. `strat` keys: chained_roe,
+    n_positive_folds, max_chained_dd, g4_no_kill, g4_all_folds_above_floor, g5_pool_ok, chained_calmar,
+    top_entity_pnl_share. `ablation` (conservative, top-entity-removed) keys: chained_roe,
+    max_chained_dd, chained_calmar. holdout=True -> stricter p99 + n_null=5000 + CONFIRMATORY verdict."""
+    pct = m.g6_holdout_pct if holdout else m.g6_gate_pct
+    required_n = m.n_null_holdout if holdout else m.n_null_dev
+    # AUDIT 2026-07-10 (codex P0#1,#2,#3): FAIL CLOSED on invalid inputs BEFORE gating. bool(np.nan) is True, so a
+    # missing/NaN kill/floor/pool status would silently PASS G4/G5; inf ROE would pass G1/G6; a partial <8-fold run
+    # would pass G2 "6 of 8". Require literal bools, finite metrics, valid domains, and the verified fold denominator.
+    err = _validate_strat(strat, ablation, m)
+    if err:
+        return {"gates": {}, "all_pass": False, "verdict_kind": "invalid_input",
+                "greenlight": "no", "required_n": required_n, "validation_error": err}
+    g1 = {"gate": "G1", "pass": bool(strat["chained_roe"] >= m.g1_chained_roe),
+          "value": strat["chained_roe"], "threshold": m.g1_chained_roe}
+    # G2: n_positive_folds >= min AND the denominator is verified == expected_n_folds (codex P0#3).
+    g2 = {"gate": "G2", "pass": bool(strat["n_positive_folds"] >= m.g2_min_positive_folds
+                                     and strat["n_folds"] == m.expected_n_folds),
+          "value": strat["n_positive_folds"], "n_folds": strat["n_folds"],
+          "threshold": m.g2_min_positive_folds, "expected_n_folds": m.expected_n_folds}
+    g3 = {"gate": "G3", "pass": bool(strat["max_chained_dd"] <= m.g3_max_chained_dd),
+          "value": strat["max_chained_dd"], "threshold": m.g3_max_chained_dd}
+    # G4/G5: require LITERAL True (not merely truthy) so np.nan / non-bool fail closed.
+    g4 = {"gate": "G4", "pass": bool(strat["g4_no_kill"] is True and strat["g4_all_folds_above_floor"] is True),
+          "no_kill": bool(strat["g4_no_kill"] is True), "all_folds_above_floor": bool(strat["g4_all_folds_above_floor"] is True)}
+    g5 = {"gate": "G5", "pass": bool(strat["g5_pool_ok"] is True)}
+    g6 = gate_g6_bivariate(strat["chained_roe"], strat["chained_calmar"], null_roe, null_calmar, m,
+                           pct=pct, required_n=required_n)
+    g7 = gate_g7(strat["top_entity_pnl_share"], ablation, null_roe, null_calmar, m, pct=pct,
+                 required_n=required_n)
+    gates = [g1, g2, g3, g4, g5, g6, g7]
+    all_pass = all(g["pass"] for g in gates)
+    return {
+        "gates": {g["gate"]: g for g in gates},
+        "all_pass": bool(all_pass),
+        "verdict_kind": ("confirmatory" if holdout else "development_verdict"),
+        # development_verdict greenlights LIVE-SMALL ONLY (one-regime caveat); never an LP claim.
+        "greenlight": ("live_small" if (all_pass and not holdout) else
+                       ("lp_confirmatory" if (all_pass and holdout) else "no")),
+        "required_n": required_n,
+    }
+
+exec
+/bin/zsh -lc "sed -n '1,340p' tests/v15/test_m10_golden.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""GOLDEN regression test for v15_m10_gates (trust audit 2026-07-10).
+
+Locks the terminal-gate fixes so a corrupt/partial M9 result can never greenlight the wrong cohort:
+- P0#1: NaN/non-bool kill/floor/pool status FAILS CLOSED (bool(np.nan) is True was the footgun),
+- P0#2: non-finite / out-of-domain metrics FAIL CLOSED (inf ROE, negative DD, etc.),
+- P0#3: G2 denominator verified (a partial <8-fold run cannot pass "6 of 8"),
+- P1#4: G6 uses the EXACT requested percentile (not the truncated ladder key),
+- P1#5: a non-finite strategy value yields p_value None (no fake significance),
+- happy path still greenlights live_small; gate directions (>=, <=, strict >) intact.
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m10_gates as M10
+
+M = M10.M10Manifest()
+NR = [0.1] * 1000
+NC = [0.1] * 1000
+
+
+def _good(**kw):
+    s = dict(chained_roe=0.7, n_positive_folds=7, n_folds=8, max_chained_dd=0.3, g4_no_kill=True,
+             g4_all_folds_above_floor=True, g5_pool_ok=True, chained_calmar=2.3, top_entity_pnl_share=0.2)
+    s.update(kw)
+    return s
+
+
+def test_happy_path_greenlights_live_small():
+    r = M10.evaluate_gates(_good(), NR, NC, M)
+    assert r["all_pass"] and r["greenlight"] == "live_small" and r["verdict_kind"] == "development_verdict"
+
+
+@pytest.mark.parametrize("field", ["g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"])
+@pytest.mark.parametrize("bad", [np.nan, "yes", 1, None])
+def test_p0_1_nonbool_status_fails_closed(field, bad):
+    r = M10.evaluate_gates(_good(**{field: bad}), NR, NC, M)
+    assert r["greenlight"] == "no" and r["verdict_kind"] == "invalid_input"
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("chained_roe", np.inf), ("chained_calmar", np.inf), ("chained_roe", np.nan),
+    ("max_chained_dd", -0.1), ("max_chained_dd", 1.5), ("top_entity_pnl_share", -2.0),
+    ("top_entity_pnl_share", 1.2), ("n_positive_folds", 9),
+])
+def test_p0_2_bad_domain_fails_closed(field, bad):
+    r = M10.evaluate_gates(_good(**{field: bad}), NR, NC, M)
+    assert r["greenlight"] == "no" and r["verdict_kind"] == "invalid_input"
+
+
+@pytest.mark.parametrize("nf", [6, 7, 9, 0])
+def test_p0_3_g2_denominator_verified(nf):
+    # a run that did not evaluate exactly 8 folds cannot pass, even if n_positive_folds >= 6
+    r = M10.evaluate_gates(_good(n_positive_folds=6, n_folds=nf), NR, NC, M)
+    assert r["verdict_kind"] == "invalid_input"
+
+
+def test_p1_4_g6_exact_percentile_not_truncated():
+    # null with a sharp gap between p95 and p95.5; a strategy above p95 but below p95.5 must FAIL a 95.5 gate.
+    null = list(np.linspace(0.0, 1.0, 1000))
+    p95 = float(np.percentile(null, 95.0))
+    p955 = float(np.percentile(null, 95.5))
+    mid = (p95 + p955) / 2.0  # strictly between p95 and p95.5
+    g = M10.gate_g6_bivariate(mid, mid, null, null, M, pct=95.5, required_n=1000)
+    assert g["pass"] is False  # would WRONGLY pass if it truncated 95.5 -> p95
+
+
+def test_p1_5_nonfinite_strategy_no_fake_pvalue():
+    lad = M10.percentile_ladder(np.nan, NR, M)
+    assert lad["p_value"] is None and lad["strategy_finite"] is False and lad["exceeds_p95"] is None
+
+
+def test_gate_directions_intact():
+    # G1 boundary: roe exactly == threshold passes (>=); below fails
+    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe), NR, NC, M)["gates"]["G1"]["pass"] is True
+    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe - 1e-6), NR, NC, M)["gates"]["G1"]["pass"] is False
+    # G3 boundary: dd exactly == threshold passes (<=)
+    assert M10.evaluate_gates(_good(max_chained_dd=M.g3_max_chained_dd), NR, NC, M)["gates"]["G3"]["pass"] is True
+    # G6 strict >: strategy exactly at the null p95 must NOT pass
+    g = M10.gate_g6_bivariate(float(np.percentile(NR, 95.0)), float(np.percentile(NC, 95.0)), NR, NC, M,
+                              pct=95.0, required_n=1000)
+    assert g["pass"] is False
+
+exec
+/bin/zsh -lc 'rg -n "evaluate_gates|gate_g6|percentile_ladder|expected_n_folds|v15_m10_gates" -S .' in /Users/hermes/quants-lab
+ succeeded in 404ms:
+./archive/codex_review_phase2.txt:1107:research/v15/v15_m10_gates.py
+./archive/tests/v13/test_module_10_pass_fail_gates.py:34:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:41:    decision = evaluate_gates(folds, random_null={"p95_sharpe": 0.4, "n_trials": 300})
+./archive/tests/v13/test_module_10_pass_fail_gates.py:51:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:57:    decision = evaluate_gates(folds, random_null={"p95_sharpe": 0.4, "n_trials": 300})
+./archive/tests/v13/test_module_10_pass_fail_gates.py:63:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:69:    decision = evaluate_gates(folds, random_null={"p95_sharpe": 0.4, "n_trials": 300})
+./archive/tests/v13/test_module_10_pass_fail_gates.py:76:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:82:    decision = evaluate_gates(folds, random_null={"p95_sharpe": 0.4, "n_trials": 300})
+./archive/tests/v13/test_module_10_pass_fail_gates.py:88:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:94:    decision = evaluate_gates(folds, random_null={"p95_sharpe": 0.4, "n_trials": 300})
+./archive/tests/v13/test_module_10_pass_fail_gates.py:101:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:107:    decision = evaluate_gates(folds, random_null={"p95_sharpe": 0.4, "n_trials": 300})
+./archive/tests/v13/test_module_10_pass_fail_gates.py:113:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:120:    decision = evaluate_gates(folds, random_null={"p95_sharpe": 0.9, "n_trials": 300})
+./archive/tests/v13/test_module_10_pass_fail_gates.py:127:    from v13_pass_fail_gates import evaluate_gates, compute_aggregate_metrics
+./archive/tests/v13/test_module_10_pass_fail_gates.py:148:    from v13_pass_fail_gates import evaluate_gates
+./archive/tests/v13/test_module_10_pass_fail_gates.py:154:    decision = evaluate_gates(folds, random_null=None)
+./archive/tests/v13/test_module_10_pass_fail_gates.py:160:    from v13_pass_fail_gates import evaluate_gates, compute_aggregate_metrics
+./archive/tests/v13/test_module_10_pass_fail_gates.py:163:    decision = evaluate_gates([], random_null={"p95_sharpe": 0.5, "n_trials": 300})
+./archive/research/v13/v13_entry_only_evaluate.py:28:- v13_pass_fail_gates.evaluate_gates (G1-G6)
+./archive/research/v13/v13_entry_only_evaluate.py:67:from v13_pass_fail_gates import FoldResult, evaluate_gates
+./archive/research/v13/v13_entry_only_evaluate.py:711:    decision = evaluate_gates(fold_results=fold_results, random_null=None)
+./archive/research/v13/v13_pass_fail_gates.py:147:def evaluate_gates(fold_results: list[FoldResult], random_null: Optional[dict] = None) -> GateDecision:
+./archive/research/v13/v13_pool_evaluate.py:66:from v13_pass_fail_gates import FoldResult, evaluate_gates
+./archive/research/v13/v13_pool_evaluate.py:311:    decision = evaluate_gates(fold_results=fold_results, random_null=None)
+./archive/research/v13/v13_wf_pool_eval.py:34:from v13_pass_fail_gates import FoldResult, evaluate_gates
+./archive/research/v13/v13_wf_pool_eval.py:208:    decision = evaluate_gates(fold_results=fold_results, random_null=None)
+
+codex
+The main gate path is small enough to reason through directly. I’m now checking the older m10 tests and a few edge cases interactively, especially the numpy-bool behavior and whether direct helper calls still have sharp edges outside `evaluate_gates`.
+exec
+/bin/zsh -lc "python - <<'PY'
+import numpy as np
+print('np.bool_ True is True:', np.bool_(True) is True)
+print('isinstance np.bool_', isinstance(np.bool_(True), (bool, np.bool_)))
+print('isinstance np.float64 float:', isinstance(np.float64(1.2), float))
+print('isinstance np.float32 float:', isinstance(np.float32(1.2), float))
+print('isinstance np.int64 int:', isinstance(np.int64(8), int))
+print('isinstance np.integer:', isinstance(np.int64(8), np.integer))
+PY" in /Users/hermes/quants-lab
+ exited 127 in 0ms:
+zsh:1: command not found: python
+
+exec
+/bin/zsh -lc "sed -n '1,220p' tests/v15/test_m10.py" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+"""V15 M10 gate-evaluation + significance (percentile ladder, bivariate G6, G7 ablation, verdict).
+
+Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py -q
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+import v15_m10_gates as M10  # noqa: E402
+
+# small required-N so synthetic nulls (~100 samples) satisfy the count gate (codex r1#2 is tested
+# separately via test_g6_fails_closed_on_insufficient_null).
+M = M10.M10Manifest(n_null_dev=50, n_null_holdout=50)
+
+
+def test_percentile_ladder_and_pvalue():
+    null = list(np.arange(0.0, 1.0, 0.01))    # 100 values 0..0.99
+    lad = M10.percentile_ladder(0.97, null, M)
+    assert lad["p95"] == pytest.approx(np.percentile(null, 95), abs=1e-6)
+    assert lad["exceeds_p95"] is True
+    assert lad["p_value"] == pytest.approx(4 / 101, abs=1e-6)   # null>=0.97 -> 3 -> 4/101
+    assert M10.percentile_ladder(0.5, null, M)["exceeds_p95"] is False
+
+
+def test_percentile_ladder_uses_raw_not_rounded_for_logic():
+    # codex r1#1 / r2: the gate logic uses the RAW percentile; display copies are rounded. Prove the
+    # separation non-vacuously: _raw_pct holds full precision, display p95 = round(raw,6), and
+    # exceeds_p95 is computed against RAW (a strategy just ABOVE raw exceeds; just BELOW does not).
+    null = [0.0, 0.123456789012]
+    raw95 = float(np.percentile(null, 95))
+    lad = M10.percentile_ladder(raw95, null, M)
+    assert lad["_raw_pct"]["p95"] == raw95                  # raw kept full precision
+    assert lad["p95"] == round(raw95, 6)                    # display rounded
+    assert M10.percentile_ladder(raw95 + 1e-9, null, M)["exceeds_p95"] is True
+    assert M10.percentile_ladder(raw95 - 1e-9, null, M)["exceeds_p95"] is False
+    # a value strictly between round6 and raw must follow RAW, not the rounded display.
+    if round(raw95, 6) < raw95:
+        mid = (round(raw95, 6) + raw95) / 2
+        assert M10.percentile_ladder(mid, null, M)["exceeds_p95"] is False   # <= raw -> not exceeding
+
+
+def test_clean_null_drops_none_nan_pdNA():
+    # codex r1#4: None / nan / pd.NA dropped, not counted, not poisoning percentiles.
+    nd = M10._clean_null([0.1, None, 0.2, np.nan, pd.NA, 0.3, float("inf")])
+    assert sorted(nd.tolist()) == pytest.approx([0.1, 0.2, 0.3])
+    assert M10._clean_null([None, np.nan, pd.NA]).size == 0
+
+
+def test_g6_fails_closed_on_insufficient_null():
+    # codex r1#2: too few valid null samples -> G6 fails closed (a p99 gate can't pass on a tiny null).
+    m = M10.M10Manifest(n_null_dev=1000)
+    g = M10.gate_g6_bivariate(0.99, 2.0, [0.1, 0.2, 0.3], [0.1, 0.2, 0.3], m, required_n=1000)
+    assert g["pass"] is False and g["insufficient_null_reason"].startswith("insufficient_null")
+
+
+def test_g6_bivariate_requires_both_roe_and_calmar():
+    null_roe = list(np.arange(0.0, 1.0, 0.01))
+    null_cal = list(np.arange(0.0, 2.0, 0.02))
+    g = M10.gate_g6_bivariate(0.99, 0.5, null_roe, null_cal, M)   # ROE wins, Calmar doesn't
+    assert g["roe_pass"] is True and g["calmar_pass"] is False and g["pass"] is False
+    g2 = M10.gate_g6_bivariate(0.99, 1.99, null_roe, null_cal, M)
+    assert g2["pass"] is True
+
+
+def _nulls():
+    return list(np.arange(0.0, 0.6, 0.006)), list(np.arange(0.0, 1.5, 0.015))   # 100 each
+
+
+def test_g7_evaluates_ablation_g1_g3_g6():
+    nr, nc = _nulls()
+    # under cap -> pass regardless of ablation
+    assert M10.gate_g7(0.3, None, nr, nc, M, pct=95.0, required_n=50)["pass"] is True
+    # over cap; ablation clears G1+G3+G6 -> pass
+    good_abl = {"chained_roe": 0.7, "max_chained_dd": 0.3, "chained_calmar": 2.0}
+    assert M10.gate_g7(0.6, good_abl, nr, nc, M, pct=95.0, required_n=50)["pass"] is True
+    # over cap; ablation fails G1 (low ROE) -> fail
+    bad_abl = {"chained_roe": 0.2, "max_chained_dd": 0.3, "chained_calmar": 2.0}
+    assert M10.gate_g7(0.6, bad_abl, nr, nc, M, pct=95.0, required_n=50)["pass"] is False
+
+
+def _strat(**kw):
+    base = dict(chained_roe=0.7, n_positive_folds=7, n_folds=8, max_chained_dd=0.3, g4_no_kill=True,
+                g4_all_folds_above_floor=True, g5_pool_ok=True, chained_calmar=2.3,
+                top_entity_pnl_share=0.2)
+    base.update(kw)
+    return base
+
+
+def test_evaluate_gates_all_pass_dev_greenlight_live_small():
+    nr, nc = _nulls()
+    res = M10.evaluate_gates(_strat(), nr, nc, M)
+    assert res["all_pass"] is True
+    assert res["verdict_kind"] == "development_verdict"
+    assert res["greenlight"] == "live_small"     # dev pass -> live-small ONLY (one-regime caveat)
+
+
+def test_evaluate_gates_g1_fail_blocks():
+    nr, nc = _nulls()
+    res = M10.evaluate_gates(_strat(chained_roe=0.40), nr, nc, M)
+    assert res["gates"]["G1"]["pass"] is False and res["all_pass"] is False and res["greenlight"] == "no"
+
+
+def test_holdout_uses_p99_and_confirmatory():
+    nr, nc = _nulls()
+    res = M10.evaluate_gates(_strat(), nr, nc, M, holdout=True)
+    assert res["verdict_kind"] == "confirmatory"
+    assert res["gates"]["G6"]["at_pct"] == 99.0
+    if res["all_pass"]:
+        assert res["greenlight"] == "lp_confirmatory"
+
+
+def test_g7_over_cap_blocks_without_ablation():
+    nr, nc = _nulls()
+    res = M10.evaluate_gates(_strat(top_entity_pnl_share=0.6), nr, nc, M, ablation=None)
+    assert res["gates"]["G7"]["pass"] is False and res["all_pass"] is False
+
+
+def test_holdout_requires_5000_null_dev_requires_1000():
+    # codex r2: prove the dev(1000) vs holdout(5000) required-N switch with a real count gate.
+    m = M10.M10Manifest(n_null_dev=50, n_null_holdout=5000)   # dev satisfiable by 100-sample null, holdout NOT
+    nr, nc = _nulls()                                          # 100 samples each
+    dev = M10.evaluate_gates(_strat(), nr, nc, m, holdout=False)
+    hold = M10.evaluate_gates(_strat(), nr, nc, m, holdout=True)
+    assert dev["gates"]["G6"]["pass"] is True                  # 100 >= 50 dev requirement
+    assert hold["gates"]["G6"]["pass"] is False                # 100 < 5000 holdout requirement -> fails closed
+    assert hold["gates"]["G6"]["insufficient_null_reason"].startswith("insufficient_null")
+    assert dev["required_n"] == 50 and hold["required_n"] == 5000
+
+
+def test_g3_dd_and_g2_folds_gate():
+    nr, nc = _nulls()
+    assert M10.evaluate_gates(_strat(max_chained_dd=0.6), nr, nc, M)["gates"]["G3"]["pass"] is False
+    assert M10.evaluate_gates(_strat(n_positive_folds=5), nr, nc, M)["gates"]["G2"]["pass"] is False
+
+
+def test_manifest_frozen_gates():
+    m = M10.M10Manifest()
+    assert m.g1_chained_roe == pytest.approx(0.5302) and m.g3_max_chained_dd == 0.50
+    assert m.g2_min_positive_folds == 6 and m.n_null_dev == 1000 and m.n_null_holdout == 5000
+    assert tuple(m.ladder) == (75.0, 90.0, 95.0, 99.0)
+
+exec
+/bin/zsh -lc 'git diff -- research/v15/v15_m10_gates.py tests/v15/test_m10_golden.py tests/v15/test_m10.py' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+diff --git a/research/v15/v15_m10_gates.py b/research/v15/v15_m10_gates.py
+index cc9296a..ca80d55 100644
+--- a/research/v15/v15_m10_gates.py
++++ b/research/v15/v15_m10_gates.py
+@@ -25,6 +25,7 @@ class M10Manifest:
+     manifest_version: str = "m10-v1"
+     g1_chained_roe: float = 0.5302         # 2^(112/182.5)-1 (2x/6mo pace over the 112d OOS)
+     g2_min_positive_folds: int = 6         # of 8
++    expected_n_folds: int = 8              # G2 denominator MUST be verified (codex P0#3)
+     g3_max_chained_dd: float = 0.50
+     g4_fold_floor: float = 0.50            # fold-end >= 50% of fold-initial + no intra-fold kill
+     g6_gate_pct: float = 95.0              # development gate percentile
+@@ -49,13 +50,16 @@ def percentile_ladder(strategy_val: float, null_dist, m: M10Manifest) -> dict:
+     nd = _clean_null(null_dist)
+     n = int(nd.size)
+     raw = {f"p{int(p)}": (float(np.percentile(nd, p)) if n else None) for p in m.ladder}
+-    n_ge = int((nd >= strategy_val).sum())
+-    p_value = (1 + n_ge) / (n + 1) if n else None
+-    return {"strategy": float(strategy_val), "n_valid_null": n,
++    # AUDIT 2026-07-10 (codex P1#5): a non-finite strategy value must NOT produce a strong-looking p-value.
++    # (nd >= nan) is all-False -> n_ge=0 -> p_value=1/(n+1) ~ "significant". Report invalid instead.
++    finite_strat = bool(np.isfinite(strategy_val))
++    n_ge = int((nd >= strategy_val).sum()) if finite_strat else 0
++    p_value = ((1 + n_ge) / (n + 1)) if (n and finite_strat) else None
++    return {"strategy": float(strategy_val), "n_valid_null": n, "strategy_finite": finite_strat,
+             "_raw_pct": raw,                                    # full precision -> gate logic uses this
+             **{k: (round(v, 6) if v is not None else None) for k, v in raw.items()},  # display copies
+             "p_value": (round(p_value, 8) if p_value is not None else None),
+-            "exceeds_p95": (bool(strategy_val > raw["p95"]) if raw.get("p95") is not None else None)}
++            "exceeds_p95": (bool(strategy_val > raw["p95"]) if (finite_strat and raw.get("p95") is not None) else None)}
+ 
+ 
+ def gate_g6_bivariate(strat_roe, strat_calmar, null_roe, null_calmar, m: M10Manifest,
+@@ -68,12 +72,15 @@ def gate_g6_bivariate(strat_roe, strat_calmar, null_roe, null_calmar, m: M10Mani
+     required_n = required_n if required_n is not None else m.n_null_dev
+     roe = percentile_ladder(strat_roe, null_roe, m)
+     cal = percentile_ladder(strat_calmar, null_calmar, m)
+-    pk = f"p{int(pct)}"
+-    enough = (roe["n_valid_null"] >= required_n) and (cal["n_valid_null"] >= required_n)
+-    roe_p = roe["_raw_pct"].get(pk)
+-    cal_p = cal["_raw_pct"].get(pk)
+-    roe_pass = enough and roe_p is not None and strat_roe > roe_p
+-    cal_pass = enough and cal_p is not None and strat_calmar > cal_p
++    # AUDIT 2026-07-10 (codex P1#4): compute the gate percentile at the EXACT pct, not the truncated ladder
++    # key f"p{int(pct)}" (pct=95.5 would silently use p95). Also require a FINITE strategy value (P0#2 partial).
++    nd_roe = _clean_null(null_roe)
++    nd_cal = _clean_null(null_calmar)
++    enough = (nd_roe.size >= required_n) and (nd_cal.size >= required_n)
++    roe_p = float(np.percentile(nd_roe, pct)) if nd_roe.size else None
++    cal_p = float(np.percentile(nd_cal, pct)) if nd_cal.size else None
++    roe_pass = enough and roe_p is not None and bool(np.isfinite(strat_roe)) and strat_roe > roe_p
++    cal_pass = enough and cal_p is not None and bool(np.isfinite(strat_calmar)) and strat_calmar > cal_p
+     reason = "" if enough else f"insufficient_null(roe={roe['n_valid_null']},calmar={cal['n_valid_null']},need={required_n})"
+     return {"gate": "G6", "pass": bool(roe_pass and cal_pass), "at_pct": pct,
+             "required_n": required_n, "n_valid_null_roe": roe["n_valid_null"],
+@@ -103,6 +110,39 @@ def gate_g7(top_entity_pnl_share: float, ablation: Optional[dict], null_roe, nul
+             "conservative_ablation_passes_g1_g3_g6": bool(abl_pass), "ablation_detail": abl_detail}
+ 
+ 
++def _validate_strat(strat: dict, ablation: Optional[dict], m: M10Manifest) -> Optional[str]:
++    """Return an error string if the strategy/ablation inputs are unsafe to gate (fail closed), else None.
++    Guards codex P0#1 (literal bools), P0#2 (finite + valid domains), P0#3 (verified fold denominator)."""
++    def _fin(x):
++        try:
++            return isinstance(x, (int, float)) and not isinstance(x, bool) and np.isfinite(x)
++        except TypeError:
++            return False
++    for k in ("chained_roe", "chained_calmar"):
++        if k not in strat or not _fin(strat[k]):
++            return f"{k} not finite ({strat.get(k)!r})"
++    if not _fin(strat.get("max_chained_dd")) or not (0.0 <= strat["max_chained_dd"] <= 1.0):
++        return f"max_chained_dd out of [0,1] ({strat.get('max_chained_dd')!r})"
++    if not _fin(strat.get("top_entity_pnl_share")) or not (0.0 <= strat["top_entity_pnl_share"] <= 1.0):
++        return f"top_entity_pnl_share out of [0,1] ({strat.get('top_entity_pnl_share')!r})"
++    if "n_folds" not in strat or strat["n_folds"] != m.expected_n_folds:
++        return f"n_folds != expected {m.expected_n_folds} ({strat.get('n_folds')!r}) — G2 denominator unverified"
++    npf = strat.get("n_positive_folds")
++    if not isinstance(npf, (int, np.integer)) or isinstance(npf, bool) or not (0 <= npf <= m.expected_n_folds):
++        return f"n_positive_folds out of [0,{m.expected_n_folds}] ({npf!r})"
++    for k in ("g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"):
++        # require an actual bool TYPE (int 1 == True in Python, so `in (True, False)` would wrongly admit 1).
++        if not isinstance(strat.get(k), (bool, np.bool_)):
++            return f"{k} must be a literal bool, got {strat.get(k)!r}"
++    if ablation is not None:
++        for k in ("chained_roe", "chained_calmar"):
++            if not _fin(ablation.get(k)):
++                return f"ablation.{k} not finite ({ablation.get(k)!r})"
++        if not _fin(ablation.get("max_chained_dd")) or not (0.0 <= ablation["max_chained_dd"] <= 1.0):
++            return f"ablation.max_chained_dd out of [0,1] ({ablation.get('max_chained_dd')!r})"
++    return None
++
++
+ def evaluate_gates(strat: dict, null_roe, null_calmar, m: M10Manifest, holdout: bool = False,
+                    ablation: Optional[dict] = None) -> dict:
+     """Evaluate G1-G7 on the M9 chained result + null distributions. `strat` keys: chained_roe,
+@@ -111,15 +151,26 @@ def evaluate_gates(strat: dict, null_roe, null_calmar, m: M10Manifest, holdout:
+     max_chained_dd, chained_calmar. holdout=True -> stricter p99 + n_null=5000 + CONFIRMATORY verdict."""
+     pct = m.g6_holdout_pct if holdout else m.g6_gate_pct
+     required_n = m.n_null_holdout if holdout else m.n_null_dev
++    # AUDIT 2026-07-10 (codex P0#1,#2,#3): FAIL CLOSED on invalid inputs BEFORE gating. bool(np.nan) is True, so a
++    # missing/NaN kill/floor/pool status would silently PASS G4/G5; inf ROE would pass G1/G6; a partial <8-fold run
++    # would pass G2 "6 of 8". Require literal bools, finite metrics, valid domains, and the verified fold denominator.
++    err = _validate_strat(strat, ablation, m)
++    if err:
++        return {"gates": {}, "all_pass": False, "verdict_kind": "invalid_input",
++                "greenlight": "no", "required_n": required_n, "validation_error": err}
+     g1 = {"gate": "G1", "pass": bool(strat["chained_roe"] >= m.g1_chained_roe),
+           "value": strat["chained_roe"], "threshold": m.g1_chained_roe}
+-    g2 = {"gate": "G2", "pass": bool(strat["n_positive_folds"] >= m.g2_min_positive_folds),
+-          "value": strat["n_positive_folds"], "threshold": m.g2_min_positive_folds}
++    # G2: n_positive_folds >= min AND the denominator is verified == expected_n_folds (codex P0#3).
++    g2 = {"gate": "G2", "pass": bool(strat["n_positive_folds"] >= m.g2_min_positive_folds
++                                     and strat["n_folds"] == m.expected_n_folds),
++          "value": strat["n_positive_folds"], "n_folds": strat["n_folds"],
++          "threshold": m.g2_min_positive_folds, "expected_n_folds": m.expected_n_folds}
+     g3 = {"gate": "G3", "pass": bool(strat["max_chained_dd"] <= m.g3_max_chained_dd),
+           "value": strat["max_chained_dd"], "threshold": m.g3_max_chained_dd}
+-    g4 = {"gate": "G4", "pass": bool(strat["g4_no_kill"] and strat["g4_all_folds_above_floor"]),
+-          "no_kill": bool(strat["g4_no_kill"]), "all_folds_above_floor": bool(strat["g4_all_folds_above_floor"])}
+-    g5 = {"gate": "G5", "pass": bool(strat["g5_pool_ok"])}
++    # G4/G5: require LITERAL True (not merely truthy) so np.nan / non-bool fail closed.
++    g4 = {"gate": "G4", "pass": bool(strat["g4_no_kill"] is True and strat["g4_all_folds_above_floor"] is True),
++          "no_kill": bool(strat["g4_no_kill"] is True), "all_folds_above_floor": bool(strat["g4_all_folds_above_floor"] is True)}
++    g5 = {"gate": "G5", "pass": bool(strat["g5_pool_ok"] is True)}
+     g6 = gate_g6_bivariate(strat["chained_roe"], strat["chained_calmar"], null_roe, null_calmar, m,
+                            pct=pct, required_n=required_n)
+     g7 = gate_g7(strat["top_entity_pnl_share"], ablation, null_roe, null_calmar, m, pct=pct,
+diff --git a/tests/v15/test_m10.py b/tests/v15/test_m10.py
+index 5348eac..9823bf7 100644
+--- a/tests/v15/test_m10.py
++++ b/tests/v15/test_m10.py
+@@ -83,7 +83,7 @@ def test_g7_evaluates_ablation_g1_g3_g6():
+ 
+ 
+ def _strat(**kw):
+-    base = dict(chained_roe=0.7, n_positive_folds=7, max_chained_dd=0.3, g4_no_kill=True,
++    base = dict(chained_roe=0.7, n_positive_folds=7, n_folds=8, max_chained_dd=0.3, g4_no_kill=True,
+                 g4_all_folds_above_floor=True, g5_pool_ok=True, chained_calmar=2.3,
+                 top_entity_pnl_share=0.2)
+     base.update(kw)
+
+codex
+One concrete issue is emerging: validation accepts `np.bool_(True)`, but the gate uses identity checks (`is True`), so numpy true values fail G4/G5 after passing validation. That is fail-closed, not a false greenlight, but it is an inconsistency if numpy bools are intended valid inputs.
+exec
+/bin/zsh -lc "rg -n \"\\[\\\"gates\" quote intentionally invalid" in /Users/hermes/quants-lab
+ exited 2 in 0ms:
+rg: quote: No such file or directory (os error 2)
+rg: intentionally: No such file or directory (os error 2)
+rg: invalid: No such file or directory (os error 2)
+
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import sys
+sys.path.insert(0, 'research/v15')
+import numpy as np
+import v15_m10_gates as M10
+M=M10.M10Manifest()
+NR=[0.1]*1000; NC=[0.1]*1000
+base=dict(chained_roe=0.7,n_positive_folds=7,n_folds=8,max_chained_dd=0.3,g4_no_kill=np.bool_(True),g4_all_folds_above_floor=np.bool_(True),g5_pool_ok=np.bool_(True),chained_calmar=2.3,top_entity_pnl_share=0.2)
+r=M10.evaluate_gates(base, NR, NC, M)
+print(r['verdict_kind'], r['greenlight'], r['all_pass'])
+print(r.get('validation_error'))
+print(r.get('gates',{}).get('G4'))
+print(r.get('gates',{}).get('G5'))
+print('np.bool_ True is True:', np.bool_(True) is True)
+print('np.float32 finite validates?')
+base2=dict(base, g4_no_kill=True,g4_all_folds_above_floor=True,g5_pool_ok=True,chained_roe=np.float32(0.7))
+r2=M10.evaluate_gates(base2, NR, NC, M)
+print(r2['verdict_kind'], r2.get('validation_error'))
+print('n_folds 8.0:', M10.evaluate_gates(dict(base2, chained_roe=0.7, n_folds=8.0), NR, NC, M)['verdict_kind'])
+PY" in /Users/hermes/quants-lab
+exec
+/bin/zsh -lc '/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py tests/v15/test_m10_golden.py -q' in /Users/hermes/quants-lab
+ succeeded in 982ms:
+development_verdict no False
+None
+{'gate': 'G4', 'pass': False, 'no_kill': False, 'all_folds_above_floor': False}
+{'gate': 'G5', 'pass': False}
+np.bool_ True is True: False
+np.float32 finite validates?
+invalid_input chained_roe not finite (np.float32(0.7))
+n_folds 8.0: development_verdict
+
+ succeeded in 1515ms:
+.........................................                                [100%]
+41 passed in 0.71s
+
+codex
+The focused m10 tests pass locally: `41 passed`. I’m doing one downstream-consumer scan now because the fail-closed shape uses `gates: {}`, and that is safe only if callers primarily key off `all_pass` or `greenlight` before drilling into individual gates.
+exec
+/bin/zsh -lc "rg -n \"evaluate_gates\\(|\\[\\\"gates\"\" research tests scripts tools -S" in /Users/hermes/quants-lab
+ exited 1 in 0ms:
+zsh:1: unmatched "
+
+exec
+/bin/zsh -lc 'rg -n "greenlight|all_pass|verdict_kind|validation_error" research tests scripts tools -S' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tools/preflight_rss_budget.py:4:HARD GUARD against OOM crashes. Refuses to greenlight a job whose estimated
+tests/v15/test_m10.py:93:def test_evaluate_gates_all_pass_dev_greenlight_live_small():
+tests/v15/test_m10.py:96:    assert res["all_pass"] is True
+tests/v15/test_m10.py:97:    assert res["verdict_kind"] == "development_verdict"
+tests/v15/test_m10.py:98:    assert res["greenlight"] == "live_small"     # dev pass -> live-small ONLY (one-regime caveat)
+tests/v15/test_m10.py:104:    assert res["gates"]["G1"]["pass"] is False and res["all_pass"] is False and res["greenlight"] == "no"
+tests/v15/test_m10.py:110:    assert res["verdict_kind"] == "confirmatory"
+tests/v15/test_m10.py:112:    if res["all_pass"]:
+tests/v15/test_m10.py:113:        assert res["greenlight"] == "lp_confirmatory"
+tests/v15/test_m10.py:119:    assert res["gates"]["G7"]["pass"] is False and res["all_pass"] is False
+tests/v15/test_m10_golden.py:3:Locks the terminal-gate fixes so a corrupt/partial M9 result can never greenlight the wrong cohort:
+tests/v15/test_m10_golden.py:9:- happy path still greenlights live_small; gate directions (>=, <=, strict >) intact.
+tests/v15/test_m10_golden.py:32:def test_happy_path_greenlights_live_small():
+tests/v15/test_m10_golden.py:34:    assert r["all_pass"] and r["greenlight"] == "live_small" and r["verdict_kind"] == "development_verdict"
+tests/v15/test_m10_golden.py:41:    assert r["greenlight"] == "no" and r["verdict_kind"] == "invalid_input"
+tests/v15/test_m10_golden.py:51:    assert r["greenlight"] == "no" and r["verdict_kind"] == "invalid_input"
+tests/v15/test_m10_golden.py:58:    assert r["verdict_kind"] == "invalid_input"
+research/v15/v15_m10_gates.py:159:        return {"gates": {}, "all_pass": False, "verdict_kind": "invalid_input",
+research/v15/v15_m10_gates.py:160:                "greenlight": "no", "required_n": required_n, "validation_error": err}
+research/v15/v15_m10_gates.py:179:    all_pass = all(g["pass"] for g in gates)
+research/v15/v15_m10_gates.py:182:        "all_pass": bool(all_pass),
+research/v15/v15_m10_gates.py:183:        "verdict_kind": ("confirmatory" if holdout else "development_verdict"),
+research/v15/v15_m10_gates.py:184:        # development_verdict greenlights LIVE-SMALL ONLY (one-regime caveat); never an LP claim.
+research/v15/v15_m10_gates.py:185:        "greenlight": ("live_small" if (all_pass and not holdout) else
+research/v15/v15_m10_gates.py:186:                       ("lp_confirmatory" if (all_pass and holdout) else "no")),
+
+exec
+/bin/zsh -lc 'git status --short' in /Users/hermes/quants-lab
+ succeeded in 0ms:
+ M research/v15/v15_m10_gates.py
+ M tests/v15/test_m10.py
+?? archive/codex_audit_m01_DEFERRED.txt
+?? archive/codex_audit_m03.txt
+?? research/v15/.audit_m03.txt
+?? tests/v15/test_m10_golden.py
+
+exec
+/bin/zsh -lc "rg -n 'evaluate_gates\\(' research tests scripts tools -S" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m10.py:95:    res = M10.evaluate_gates(_strat(), nr, nc, M)
+tests/v15/test_m10.py:103:    res = M10.evaluate_gates(_strat(chained_roe=0.40), nr, nc, M)
+tests/v15/test_m10.py:109:    res = M10.evaluate_gates(_strat(), nr, nc, M, holdout=True)
+tests/v15/test_m10.py:118:    res = M10.evaluate_gates(_strat(top_entity_pnl_share=0.6), nr, nc, M, ablation=None)
+tests/v15/test_m10.py:126:    dev = M10.evaluate_gates(_strat(), nr, nc, m, holdout=False)
+tests/v15/test_m10.py:127:    hold = M10.evaluate_gates(_strat(), nr, nc, m, holdout=True)
+tests/v15/test_m10.py:136:    assert M10.evaluate_gates(_strat(max_chained_dd=0.6), nr, nc, M)["gates"]["G3"]["pass"] is False
+tests/v15/test_m10.py:137:    assert M10.evaluate_gates(_strat(n_positive_folds=5), nr, nc, M)["gates"]["G2"]["pass"] is False
+tests/v15/test_m10_golden.py:33:    r = M10.evaluate_gates(_good(), NR, NC, M)
+tests/v15/test_m10_golden.py:40:    r = M10.evaluate_gates(_good(**{field: bad}), NR, NC, M)
+tests/v15/test_m10_golden.py:50:    r = M10.evaluate_gates(_good(**{field: bad}), NR, NC, M)
+tests/v15/test_m10_golden.py:57:    r = M10.evaluate_gates(_good(n_positive_folds=6, n_folds=nf), NR, NC, M)
+tests/v15/test_m10_golden.py:78:    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe), NR, NC, M)["gates"]["G1"]["pass"] is True
+tests/v15/test_m10_golden.py:79:    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe - 1e-6), NR, NC, M)["gates"]["G1"]["pass"] is False
+tests/v15/test_m10_golden.py:81:    assert M10.evaluate_gates(_good(max_chained_dd=M.g3_max_chained_dd), NR, NC, M)["gates"]["G3"]["pass"] is True
+research/v15/v15_m10_gates.py:146:def evaluate_gates(strat: dict, null_roe, null_calmar, m: M10Manifest, holdout: bool = False,
+
+exec
+/bin/zsh -lc "rg -n '\\[\"gates\"\\]|\\.get\\(\"gates\"\\)|gates\\]\\[' research tests scripts tools -S" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+tests/v15/test_m10.py:104:    assert res["gates"]["G1"]["pass"] is False and res["all_pass"] is False and res["greenlight"] == "no"
+tests/v15/test_m10.py:111:    assert res["gates"]["G6"]["at_pct"] == 99.0
+tests/v15/test_m10.py:119:    assert res["gates"]["G7"]["pass"] is False and res["all_pass"] is False
+tests/v15/test_m10.py:128:    assert dev["gates"]["G6"]["pass"] is True                  # 100 >= 50 dev requirement
+tests/v15/test_m10.py:129:    assert hold["gates"]["G6"]["pass"] is False                # 100 < 5000 holdout requirement -> fails closed
+tests/v15/test_m10.py:130:    assert hold["gates"]["G6"]["insufficient_null_reason"].startswith("insufficient_null")
+tests/v15/test_m10.py:136:    assert M10.evaluate_gates(_strat(max_chained_dd=0.6), nr, nc, M)["gates"]["G3"]["pass"] is False
+tests/v15/test_m10.py:137:    assert M10.evaluate_gates(_strat(n_positive_folds=5), nr, nc, M)["gates"]["G2"]["pass"] is False
+tests/v15/test_m10_golden.py:78:    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe), NR, NC, M)["gates"]["G1"]["pass"] is True
+tests/v15/test_m10_golden.py:79:    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe - 1e-6), NR, NC, M)["gates"]["G1"]["pass"] is False
+tests/v15/test_m10_golden.py:81:    assert M10.evaluate_gates(_good(max_chained_dd=M.g3_max_chained_dd), NR, NC, M)["gates"]["G3"]["pass"] is True
+
+exec
+/bin/zsh -lc "/Users/hermes/miniforge3/envs/quants-lab/bin/python - <<'PY'
+import sys
+sys.path.insert(0, 'research/v15')
+import numpy as np
+import v15_m10_gates as M10
+M=M10.M10Manifest(); NR=[0.1]*1000; NC=[0.1]*1000
+base=dict(chained_roe=0.7,n_positive_folds=7,n_folds=8,max_chained_dd=0.3,g4_no_kill=True,g4_all_folds_above_floor=True,g5_pool_ok=True,chained_calmar=2.3,top_entity_pnl_share=0.2)
+for field,bad in [('chained_roe', float('inf')),('chained_calmar', float('inf')),('max_chained_dd', -0.1),('top_entity_pnl_share', 1.1),('n_folds',7),('n_positive_folds',9),('g4_no_kill', np.nan),('g5_pool_ok',1)]:
+    r=M10.evaluate_gates(dict(base, **{field:bad}), NR, NC, M)
+    print(field, repr(bad), '=>', r['verdict_kind'], r['greenlight'], r['all_pass'], r.get('validation_error'))
+print('nan direct g6', M10.gate_g6_bivariate(np.nan, 2.0, NR, NC, M)['pass'])
+print('inf direct g6', M10.gate_g6_bivariate(np.inf, 2.0, NR, NC, M)['pass'])
+PY" in /Users/hermes/quants-lab
+ succeeded in 670ms:
+chained_roe inf => invalid_input no False chained_roe not finite (inf)
+chained_calmar inf => invalid_input no False chained_calmar not finite (inf)
+max_chained_dd -0.1 => invalid_input no False max_chained_dd out of [0,1] (-0.1)
+top_entity_pnl_share 1.1 => invalid_input no False top_entity_pnl_share out of [0,1] (1.1)
+n_folds 7 => invalid_input no False n_folds != expected 8 (7) — G2 denominator unverified
+n_positive_folds 9 => invalid_input no False n_positive_folds out of [0,8] (9)
+g4_no_kill nan => invalid_input no False g4_no_kill must be a literal bool, got nan
+g5_pool_ok 1 => invalid_input no False g5_pool_ok must be a literal bool, got 1
+nan direct g6 False
+inf direct g6 False
+
+codex
+I don’t see any production/downstream consumers in `research/`, `scripts/`, or `tools/`; only tests index into `result["gates"]`. That makes the invalid-input shape safe for current repo callers, though it is still a contract change for any external consumer expecting every result to contain G1-G7 details.
+exec
+/bin/zsh -lc "nl -ba research/v15/v15_m10_gates.py | sed -n '46,190p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+    46	def percentile_ladder(strategy_val: float, null_dist, m: M10Manifest) -> dict:
+    47	    """The null percentile ladder + where the strategy lands. Percentiles are kept RAW for gate logic
+    48	    (codex r1#1: rounding could let strategy > round(p95) while <= true p95); only display copies round.
+    49	    p-value (one-sided, fixes-r1#8) = (1 + #{null >= strategy}) / (N_valid + 1)."""
+    50	    nd = _clean_null(null_dist)
+    51	    n = int(nd.size)
+    52	    raw = {f"p{int(p)}": (float(np.percentile(nd, p)) if n else None) for p in m.ladder}
+    53	    # AUDIT 2026-07-10 (codex P1#5): a non-finite strategy value must NOT produce a strong-looking p-value.
+    54	    # (nd >= nan) is all-False -> n_ge=0 -> p_value=1/(n+1) ~ "significant". Report invalid instead.
+    55	    finite_strat = bool(np.isfinite(strategy_val))
+    56	    n_ge = int((nd >= strategy_val).sum()) if finite_strat else 0
+    57	    p_value = ((1 + n_ge) / (n + 1)) if (n and finite_strat) else None
+    58	    return {"strategy": float(strategy_val), "n_valid_null": n, "strategy_finite": finite_strat,
+    59	            "_raw_pct": raw,                                    # full precision -> gate logic uses this
+    60	            **{k: (round(v, 6) if v is not None else None) for k, v in raw.items()},  # display copies
+    61	            "p_value": (round(p_value, 8) if p_value is not None else None),
+    62	            "exceeds_p95": (bool(strategy_val > raw["p95"]) if (finite_strat and raw.get("p95") is not None) else None)}
+    63	
+    64	
+    65	def gate_g6_bivariate(strat_roe, strat_calmar, null_roe, null_calmar, m: M10Manifest,
+    66	                      pct: Optional[float] = None, required_n: Optional[int] = None) -> dict:
+    67	    """G6 (risk-adjusted, bivariate): strategy ROE > pPCT(null ROE) AND strategy Calmar > pPCT(null
+    68	    Calmar). A ROE win bought with more risk than the null does NOT pass. FAILS CLOSED (codex r1#2) if
+    69	    either null lacks `required_n` valid samples -> a p99 gate can't pass on a tiny null. Gate logic
+    70	    uses RAW percentiles (codex r1#1)."""
+    71	    pct = pct if pct is not None else m.g6_gate_pct
+    72	    required_n = required_n if required_n is not None else m.n_null_dev
+    73	    roe = percentile_ladder(strat_roe, null_roe, m)
+    74	    cal = percentile_ladder(strat_calmar, null_calmar, m)
+    75	    # AUDIT 2026-07-10 (codex P1#4): compute the gate percentile at the EXACT pct, not the truncated ladder
+    76	    # key f"p{int(pct)}" (pct=95.5 would silently use p95). Also require a FINITE strategy value (P0#2 partial).
+    77	    nd_roe = _clean_null(null_roe)
+    78	    nd_cal = _clean_null(null_calmar)
+    79	    enough = (nd_roe.size >= required_n) and (nd_cal.size >= required_n)
+    80	    roe_p = float(np.percentile(nd_roe, pct)) if nd_roe.size else None
+    81	    cal_p = float(np.percentile(nd_cal, pct)) if nd_cal.size else None
+    82	    roe_pass = enough and roe_p is not None and bool(np.isfinite(strat_roe)) and strat_roe > roe_p
+    83	    cal_pass = enough and cal_p is not None and bool(np.isfinite(strat_calmar)) and strat_calmar > cal_p
+    84	    reason = "" if enough else f"insufficient_null(roe={roe['n_valid_null']},calmar={cal['n_valid_null']},need={required_n})"
+    85	    return {"gate": "G6", "pass": bool(roe_pass and cal_pass), "at_pct": pct,
+    86	            "required_n": required_n, "n_valid_null_roe": roe["n_valid_null"],
+    87	            "n_valid_null_calmar": cal["n_valid_null"], "insufficient_null_reason": reason,
+    88	            "roe_ladder": roe, "calmar_ladder": cal,
+    89	            "roe_pass": bool(roe_pass), "calmar_pass": bool(cal_pass)}
+    90	
+    91	
+    92	def gate_g7(top_entity_pnl_share: float, ablation: Optional[dict], null_roe, null_calmar,
+    93	            m: M10Manifest, pct: float, required_n: int) -> dict:
+    94	    """G7 concentration: PASS iff top entity <= 40% of PnL OR the CONSERVATIVE ablation (remove top
+    95	    entity, hold its capital as cash, NO re-optimize) still clears G1+G3+G6. codex r1#3: M10 EVALUATES
+    96	    G1/G3/G6 on the ablation metrics here (not a stale caller boolean). `ablation` keys: chained_roe,
+    97	    max_chained_dd, chained_calmar (+ uses the same nulls/manifest/pct)."""
+    98	    under_cap = top_entity_pnl_share <= m.g7_max_top_entity_pnl
+    99	    abl_pass = False
+   100	    abl_detail = None
+   101	    if ablation is not None:
+   102	        a_g1 = ablation["chained_roe"] >= m.g1_chained_roe
+   103	        a_g3 = ablation["max_chained_dd"] <= m.g3_max_chained_dd
+   104	        a_g6 = gate_g6_bivariate(ablation["chained_roe"], ablation["chained_calmar"],
+   105	                                 null_roe, null_calmar, m, pct=pct, required_n=required_n)["pass"]
+   106	        abl_pass = bool(a_g1 and a_g3 and a_g6)
+   107	        abl_detail = {"g1": bool(a_g1), "g3": bool(a_g3), "g6": bool(a_g6)}
+   108	    return {"gate": "G7", "pass": bool(under_cap or abl_pass),
+   109	            "top_entity_pnl_share": float(top_entity_pnl_share), "under_cap": bool(under_cap),
+   110	            "conservative_ablation_passes_g1_g3_g6": bool(abl_pass), "ablation_detail": abl_detail}
+   111	
+   112	
+   113	def _validate_strat(strat: dict, ablation: Optional[dict], m: M10Manifest) -> Optional[str]:
+   114	    """Return an error string if the strategy/ablation inputs are unsafe to gate (fail closed), else None.
+   115	    Guards codex P0#1 (literal bools), P0#2 (finite + valid domains), P0#3 (verified fold denominator)."""
+   116	    def _fin(x):
+   117	        try:
+   118	            return isinstance(x, (int, float)) and not isinstance(x, bool) and np.isfinite(x)
+   119	        except TypeError:
+   120	            return False
+   121	    for k in ("chained_roe", "chained_calmar"):
+   122	        if k not in strat or not _fin(strat[k]):
+   123	            return f"{k} not finite ({strat.get(k)!r})"
+   124	    if not _fin(strat.get("max_chained_dd")) or not (0.0 <= strat["max_chained_dd"] <= 1.0):
+   125	        return f"max_chained_dd out of [0,1] ({strat.get('max_chained_dd')!r})"
+   126	    if not _fin(strat.get("top_entity_pnl_share")) or not (0.0 <= strat["top_entity_pnl_share"] <= 1.0):
+   127	        return f"top_entity_pnl_share out of [0,1] ({strat.get('top_entity_pnl_share')!r})"
+   128	    if "n_folds" not in strat or strat["n_folds"] != m.expected_n_folds:
+   129	        return f"n_folds != expected {m.expected_n_folds} ({strat.get('n_folds')!r}) — G2 denominator unverified"
+   130	    npf = strat.get("n_positive_folds")
+   131	    if not isinstance(npf, (int, np.integer)) or isinstance(npf, bool) or not (0 <= npf <= m.expected_n_folds):
+   132	        return f"n_positive_folds out of [0,{m.expected_n_folds}] ({npf!r})"
+   133	    for k in ("g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"):
+   134	        # require an actual bool TYPE (int 1 == True in Python, so `in (True, False)` would wrongly admit 1).
+   135	        if not isinstance(strat.get(k), (bool, np.bool_)):
+   136	            return f"{k} must be a literal bool, got {strat.get(k)!r}"
+   137	    if ablation is not None:
+   138	        for k in ("chained_roe", "chained_calmar"):
+   139	            if not _fin(ablation.get(k)):
+   140	                return f"ablation.{k} not finite ({ablation.get(k)!r})"
+   141	        if not _fin(ablation.get("max_chained_dd")) or not (0.0 <= ablation["max_chained_dd"] <= 1.0):
+   142	            return f"ablation.max_chained_dd out of [0,1] ({ablation.get('max_chained_dd')!r})"
+   143	    return None
+   144	
+   145	
+   146	def evaluate_gates(strat: dict, null_roe, null_calmar, m: M10Manifest, holdout: bool = False,
+   147	                   ablation: Optional[dict] = None) -> dict:
+   148	    """Evaluate G1-G7 on the M9 chained result + null distributions. `strat` keys: chained_roe,
+   149	    n_positive_folds, max_chained_dd, g4_no_kill, g4_all_folds_above_floor, g5_pool_ok, chained_calmar,
+   150	    top_entity_pnl_share. `ablation` (conservative, top-entity-removed) keys: chained_roe,
+   151	    max_chained_dd, chained_calmar. holdout=True -> stricter p99 + n_null=5000 + CONFIRMATORY verdict."""
+   152	    pct = m.g6_holdout_pct if holdout else m.g6_gate_pct
+   153	    required_n = m.n_null_holdout if holdout else m.n_null_dev
+   154	    # AUDIT 2026-07-10 (codex P0#1,#2,#3): FAIL CLOSED on invalid inputs BEFORE gating. bool(np.nan) is True, so a
+   155	    # missing/NaN kill/floor/pool status would silently PASS G4/G5; inf ROE would pass G1/G6; a partial <8-fold run
+   156	    # would pass G2 "6 of 8". Require literal bools, finite metrics, valid domains, and the verified fold denominator.
+   157	    err = _validate_strat(strat, ablation, m)
+   158	    if err:
+   159	        return {"gates": {}, "all_pass": False, "verdict_kind": "invalid_input",
+   160	                "greenlight": "no", "required_n": required_n, "validation_error": err}
+   161	    g1 = {"gate": "G1", "pass": bool(strat["chained_roe"] >= m.g1_chained_roe),
+   162	          "value": strat["chained_roe"], "threshold": m.g1_chained_roe}
+   163	    # G2: n_positive_folds >= min AND the denominator is verified == expected_n_folds (codex P0#3).
+   164	    g2 = {"gate": "G2", "pass": bool(strat["n_positive_folds"] >= m.g2_min_positive_folds
+   165	                                     and strat["n_folds"] == m.expected_n_folds),
+   166	          "value": strat["n_positive_folds"], "n_folds": strat["n_folds"],
+   167	          "threshold": m.g2_min_positive_folds, "expected_n_folds": m.expected_n_folds}
+   168	    g3 = {"gate": "G3", "pass": bool(strat["max_chained_dd"] <= m.g3_max_chained_dd),
+   169	          "value": strat["max_chained_dd"], "threshold": m.g3_max_chained_dd}
+   170	    # G4/G5: require LITERAL True (not merely truthy) so np.nan / non-bool fail closed.
+   171	    g4 = {"gate": "G4", "pass": bool(strat["g4_no_kill"] is True and strat["g4_all_folds_above_floor"] is True),
+   172	          "no_kill": bool(strat["g4_no_kill"] is True), "all_folds_above_floor": bool(strat["g4_all_folds_above_floor"] is True)}
+   173	    g5 = {"gate": "G5", "pass": bool(strat["g5_pool_ok"] is True)}
+   174	    g6 = gate_g6_bivariate(strat["chained_roe"], strat["chained_calmar"], null_roe, null_calmar, m,
+   175	                           pct=pct, required_n=required_n)
+   176	    g7 = gate_g7(strat["top_entity_pnl_share"], ablation, null_roe, null_calmar, m, pct=pct,
+   177	                 required_n=required_n)
+   178	    gates = [g1, g2, g3, g4, g5, g6, g7]
+   179	    all_pass = all(g["pass"] for g in gates)
+   180	    return {
+   181	        "gates": {g["gate"]: g for g in gates},
+   182	        "all_pass": bool(all_pass),
+   183	        "verdict_kind": ("confirmatory" if holdout else "development_verdict"),
+   184	        # development_verdict greenlights LIVE-SMALL ONLY (one-regime caveat); never an LP claim.
+   185	        "greenlight": ("live_small" if (all_pass and not holdout) else
+   186	                       ("lp_confirmatory" if (all_pass and holdout) else "no")),
+   187	        "required_n": required_n,
+   188	    }
+
+exec
+/bin/zsh -lc "nl -ba tests/v15/test_m10_golden.py | sed -n '1,110p'" in /Users/hermes/quants-lab
+ succeeded in 0ms:
+     1	"""GOLDEN regression test for v15_m10_gates (trust audit 2026-07-10).
+     2	
+     3	Locks the terminal-gate fixes so a corrupt/partial M9 result can never greenlight the wrong cohort:
+     4	- P0#1: NaN/non-bool kill/floor/pool status FAILS CLOSED (bool(np.nan) is True was the footgun),
+     5	- P0#2: non-finite / out-of-domain metrics FAIL CLOSED (inf ROE, negative DD, etc.),
+     6	- P0#3: G2 denominator verified (a partial <8-fold run cannot pass "6 of 8"),
+     7	- P1#4: G6 uses the EXACT requested percentile (not the truncated ladder key),
+     8	- P1#5: a non-finite strategy value yields p_value None (no fake significance),
+     9	- happy path still greenlights live_small; gate directions (>=, <=, strict >) intact.
+    10	"""
+    11	import sys
+    12	from pathlib import Path
+    13	
+    14	import numpy as np
+    15	import pytest
+    16	
+    17	sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
+    18	import v15_m10_gates as M10
+    19	
+    20	M = M10.M10Manifest()
+    21	NR = [0.1] * 1000
+    22	NC = [0.1] * 1000
+    23	
+    24	
+    25	def _good(**kw):
+    26	    s = dict(chained_roe=0.7, n_positive_folds=7, n_folds=8, max_chained_dd=0.3, g4_no_kill=True,
+    27	             g4_all_folds_above_floor=True, g5_pool_ok=True, chained_calmar=2.3, top_entity_pnl_share=0.2)
+    28	    s.update(kw)
+    29	    return s
+    30	
+    31	
+    32	def test_happy_path_greenlights_live_small():
+    33	    r = M10.evaluate_gates(_good(), NR, NC, M)
+    34	    assert r["all_pass"] and r["greenlight"] == "live_small" and r["verdict_kind"] == "development_verdict"
+    35	
+    36	
+    37	@pytest.mark.parametrize("field", ["g4_no_kill", "g4_all_folds_above_floor", "g5_pool_ok"])
+    38	@pytest.mark.parametrize("bad", [np.nan, "yes", 1, None])
+    39	def test_p0_1_nonbool_status_fails_closed(field, bad):
+    40	    r = M10.evaluate_gates(_good(**{field: bad}), NR, NC, M)
+    41	    assert r["greenlight"] == "no" and r["verdict_kind"] == "invalid_input"
+    42	
+    43	
+    44	@pytest.mark.parametrize("field,bad", [
+    45	    ("chained_roe", np.inf), ("chained_calmar", np.inf), ("chained_roe", np.nan),
+    46	    ("max_chained_dd", -0.1), ("max_chained_dd", 1.5), ("top_entity_pnl_share", -2.0),
+    47	    ("top_entity_pnl_share", 1.2), ("n_positive_folds", 9),
+    48	])
+    49	def test_p0_2_bad_domain_fails_closed(field, bad):
+    50	    r = M10.evaluate_gates(_good(**{field: bad}), NR, NC, M)
+    51	    assert r["greenlight"] == "no" and r["verdict_kind"] == "invalid_input"
+    52	
+    53	
+    54	@pytest.mark.parametrize("nf", [6, 7, 9, 0])
+    55	def test_p0_3_g2_denominator_verified(nf):
+    56	    # a run that did not evaluate exactly 8 folds cannot pass, even if n_positive_folds >= 6
+    57	    r = M10.evaluate_gates(_good(n_positive_folds=6, n_folds=nf), NR, NC, M)
+    58	    assert r["verdict_kind"] == "invalid_input"
+    59	
+    60	
+    61	def test_p1_4_g6_exact_percentile_not_truncated():
+    62	    # null with a sharp gap between p95 and p95.5; a strategy above p95 but below p95.5 must FAIL a 95.5 gate.
+    63	    null = list(np.linspace(0.0, 1.0, 1000))
+    64	    p95 = float(np.percentile(null, 95.0))
+    65	    p955 = float(np.percentile(null, 95.5))
+    66	    mid = (p95 + p955) / 2.0  # strictly between p95 and p95.5
+    67	    g = M10.gate_g6_bivariate(mid, mid, null, null, M, pct=95.5, required_n=1000)
+    68	    assert g["pass"] is False  # would WRONGLY pass if it truncated 95.5 -> p95
+    69	
+    70	
+    71	def test_p1_5_nonfinite_strategy_no_fake_pvalue():
+    72	    lad = M10.percentile_ladder(np.nan, NR, M)
+    73	    assert lad["p_value"] is None and lad["strategy_finite"] is False and lad["exceeds_p95"] is None
+    74	
+    75	
+    76	def test_gate_directions_intact():
+    77	    # G1 boundary: roe exactly == threshold passes (>=); below fails
+    78	    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe), NR, NC, M)["gates"]["G1"]["pass"] is True
+    79	    assert M10.evaluate_gates(_good(chained_roe=M.g1_chained_roe - 1e-6), NR, NC, M)["gates"]["G1"]["pass"] is False
+    80	    # G3 boundary: dd exactly == threshold passes (<=)
+    81	    assert M10.evaluate_gates(_good(max_chained_dd=M.g3_max_chained_dd), NR, NC, M)["gates"]["G3"]["pass"] is True
+    82	    # G6 strict >: strategy exactly at the null p95 must NOT pass
+    83	    g = M10.gate_g6_bivariate(float(np.percentile(NR, 95.0)), float(np.percentile(NC, 95.0)), NR, NC, M,
+    84	                              pct=95.0, required_n=1000)
+    85	    assert g["pass"] is False
+
+codex
+**Findings**
+
+P2: `np.bool_(True)` is accepted by validation but fails G4/G5.  
+[research/v15/v15_m10_gates.py](/Users/hermes/quants-lab/research/v15/v15_m10_gates.py:133) allows `(bool, np.bool_)`, but [G4/G5](/Users/hermes/quants-lab/research/v15/v15_m10_gates.py:171) use `is True`, which is false for `np.bool_(True)`. I confirmed locally: numpy-true status values produce `development_verdict`, `greenlight: "no"`, no validation error. This is fail-closed, so it cannot greenlight a corrupt cohort, but it is an input-contract inconsistency. Either reject `np.bool_` in validation or normalize/cast after validation.
+
+No remaining false-greenlight path found in the five audited areas.
+
+**Per Fix**
+
+P0#1 bool/NaN G4/G5: mostly correct for safety. Non-bool, `np.nan`, `1`, `None` fail closed via validation; G4/G5 no longer use truthiness. Gap: `np.bool_(True)` false-negative inconsistency above.
+
+P0#2 finite/domain validation: correct on the `evaluate_gates` path. Strategy ROE/Calmar finite, DD and concentration in `[0,1]`, ablation metrics finite/domain checked. Direct `gate_g6_bivariate` also fails non-finite strategy values.
+
+P0#3 G2 denominator: correct. `n_folds != expected_n_folds` returns `invalid_input`, and G2 redundantly requires the denominator. I did not find a partial `<8` path that greenlights.
+
+P1#4 G6 exact pct: correct. It now computes `np.percentile(..., pct)` directly rather than using `p{int(pct)}`.
+
+P1#5 non-finite strategy p-value: correct for NaN/inf numeric strategy values. `p_value`, `exceeds_p95` become `None`, and `strategy_finite` is false.
+
+**Fail-Closed Shape**
+
+For current repo consumers, `{gates:{}, all_pass:False, greenlight:"no", verdict_kind:"invalid_input"}` is safe. I found no production callers in `research/`, `scripts/`, or `tools`; only tests index `result["gates"]`, and those are valid-input cases. External consumers that blindly read `result["gates"]["G1"]` could break, but consumers using `all_pass` / `greenlight` are safe.
+
+Verified with:
+
+`/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py tests/v15/test_m10_golden.py -q`
+
+Result: `41 passed`.
+
+OVERALL: m10 is trustworthy against wrong greenlights from the five audited corrupt/partial M9 paths. One polish fix remains for `np.bool_` handling to avoid false negatives or contract ambiguity.
+tokens used
+37.105
+**Findings**
+
+P2: `np.bool_(True)` is accepted by validation but fails G4/G5.  
+[research/v15/v15_m10_gates.py](/Users/hermes/quants-lab/research/v15/v15_m10_gates.py:133) allows `(bool, np.bool_)`, but [G4/G5](/Users/hermes/quants-lab/research/v15/v15_m10_gates.py:171) use `is True`, which is false for `np.bool_(True)`. I confirmed locally: numpy-true status values produce `development_verdict`, `greenlight: "no"`, no validation error. This is fail-closed, so it cannot greenlight a corrupt cohort, but it is an input-contract inconsistency. Either reject `np.bool_` in validation or normalize/cast after validation.
+
+No remaining false-greenlight path found in the five audited areas.
+
+**Per Fix**
+
+P0#1 bool/NaN G4/G5: mostly correct for safety. Non-bool, `np.nan`, `1`, `None` fail closed via validation; G4/G5 no longer use truthiness. Gap: `np.bool_(True)` false-negative inconsistency above.
+
+P0#2 finite/domain validation: correct on the `evaluate_gates` path. Strategy ROE/Calmar finite, DD and concentration in `[0,1]`, ablation metrics finite/domain checked. Direct `gate_g6_bivariate` also fails non-finite strategy values.
+
+P0#3 G2 denominator: correct. `n_folds != expected_n_folds` returns `invalid_input`, and G2 redundantly requires the denominator. I did not find a partial `<8` path that greenlights.
+
+P1#4 G6 exact pct: correct. It now computes `np.percentile(..., pct)` directly rather than using `p{int(pct)}`.
+
+P1#5 non-finite strategy p-value: correct for NaN/inf numeric strategy values. `p_value`, `exceeds_p95` become `None`, and `strategy_finite` is false.
+
+**Fail-Closed Shape**
+
+For current repo consumers, `{gates:{}, all_pass:False, greenlight:"no", verdict_kind:"invalid_input"}` is safe. I found no production callers in `research/`, `scripts/`, or `tools`; only tests index `result["gates"]`, and those are valid-input cases. External consumers that blindly read `result["gates"]["G1"]` could break, but consumers using `all_pass` / `greenlight` are safe.
+
+Verified with:
+
+`/Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m10.py tests/v15/test_m10_golden.py -q`
+
+Result: `41 passed`.
+
+OVERALL: m10 is trustworthy against wrong greenlights from the five audited corrupt/partial M9 paths. One polish fix remains for `np.bool_` handling to avoid false negatives or contract ambiguity.
