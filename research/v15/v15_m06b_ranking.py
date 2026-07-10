@@ -496,10 +496,13 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
 
     # --- assemble: UNIVERSE = M6a (every shortlist row), LEFT-join M7 engine results. A M6a row with
     #     no M7 row stays in the output with roe_adj NaN -> excluded (missing_m07_row), never dropped. ---
-    df = m6a_cols.merge(summ, on=["entity_id", "fold_id"], how="left")
-    df = df.merge(elig, on=["entity_id", "fold_id"], how="left")
-    df = df.merge(cons, on=["entity_id", "fold_id"], how="left")
-    df = df.merge(exposure, on=["entity_id", "fold_id"], how="left")
+    # AUDIT 2026-07-10 (codex P0#3): validate="one_to_one" on every fold-keyed merge. A duplicate
+    # (entity_id, fold_id) row in ANY input (m6a/summ/elig/cons/exposure) would multiply the universe row and
+    # could hand one entity TWO pool slots via head(n_pool), displacing the legitimate #N. Fail closed on dups.
+    df = m6a_cols.merge(summ, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    df = df.merge(elig, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    df = df.merge(cons, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    df = df.merge(exposure, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
     df["exposure_days"] = df["exposure_days"].fillna(0.0)
     df["consistency"] = df["consistency"].fillna(0.0)
     df["n_active_subsplits"] = df["n_active_subsplits"].fillna(0).astype(int)
@@ -510,10 +513,11 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
     #     but cross-check against m04_entities as the authority. ---
     if inputs.get("m04_fold_pure") and "fold_id" in m04e.columns:
         ent_copy = m04e[["entity_id", "fold_id", "copyable"]].rename(columns={"copyable": "entity_copyable"})
-        df = df.merge(ent_copy, on=["entity_id", "fold_id"], how="left")
+        df = df.merge(ent_copy, on=["entity_id", "fold_id"], how="left", validate="one_to_one")  # codex P0#3
     else:
         ent_copy = m04e[["entity_id", "copyable"]].rename(columns={"copyable": "entity_copyable"})
-        df = df.merge(ent_copy, on="entity_id", how="left")
+        # global M4 has one row per entity; df is many folds per entity -> many_to_one (fails on dup m04e).
+        df = df.merge(ent_copy, on="entity_id", how="left", validate="many_to_one")  # codex P0#3
     df["entity_copyable"] = df["entity_copyable"].fillna(False)
 
     # --- fidelity: needs tracking_error from M7 summary. Absent column OR NaN/inf value -> UNKNOWN.
@@ -728,6 +732,11 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         )
     else:
         realized_final = False
+    # AUDIT 2026-07-10 (codex P0#2): FINAL/investable additionally REQUIRES fold-pure M4. The global
+    # m04_entities.parquet maps entity->copyable with FULL-history (post-decision) knowledge = look-ahead; a run
+    # that fell back to it must NEVER be stamped investable (it could admit an entity not copyable at test_start,
+    # or drop a historically-valid one). Fold-pure per-fold M4 (--m04-dir, provenance-checked in load_inputs) only.
+    m04_fold_pure = bool(inputs.get("m04_fold_pure"))
     investable = (
         (not uncalibrated)
         and (m.slippage_calibration_version is not None)
@@ -735,6 +744,7 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         and fidelity_final
         and consistency_final
         and realized_final
+        and m04_fold_pure
     )
     out["investable"] = bool(investable)
     out["slippage_uncalibrated"] = summ["slippage_uncalibrated"].any() if "slippage_uncalibrated" in summ else True
@@ -762,6 +772,8 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
             reasons.append(f"consistency_provisional({consistency_source})")
         if not realized_final:
             reasons.append(f"realized_metrics_missing({return_basis})")
+        if not m04_fold_pure:
+            reasons.append("m04_not_fold_pure(look_ahead_global_m04)")
         manifest["non_investable_reasons"] = reasons
     return out, manifest
 

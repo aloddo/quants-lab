@@ -33,7 +33,7 @@ def _folds(n_folds=1):
 def _make_inputs(n_entities=120, fold_id=1, *, uncalibrated=True, equity=None,
                  eligible_all=True, copyable_all=True, n_fills=100, exposure_days=10.0,
                  n_journeys=10, active_pretest_folds=3, consistency_active=3,
-                 tracking_error=None, realized=False):
+                 tracking_error=None, realized=False, fold_pure=False):
     folds = _folds(1)
     ts_asof = pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000 - 1000
     ids = list(range(n_entities))
@@ -80,6 +80,12 @@ def _make_inputs(n_entities=120, fold_id=1, *, uncalibrated=True, equity=None,
     })
     m04e = pd.DataFrame({"entity_id": ids, "copyable": copyable_all})
     m04_auth = pd.DataFrame({"wallet": wallets, "entity_id": ids})
+    if fold_pure:
+        # fold-pure per-fold M4 carries fold_id + as_of_ms == test_start (m06b provenance requirement).
+        test_start_ms = pd.Timestamp(folds.loc[0, "test_start"]).value // 1_000_000
+        for _d in (m04e, m04_auth):
+            _d["fold_id"] = fold_id
+            _d["as_of_ms"] = test_start_ms
     t0 = pd.Timestamp(folds.loc[0, "train_start"]).value // 1_000_000
     if equity is not None:
         # derive fills + journeys from the equity samples so per-block activeness (>=5 fills AND
@@ -102,6 +108,7 @@ def _make_inputs(n_entities=120, fold_id=1, *, uncalibrated=True, equity=None,
     return {
         "folds": folds, "m07_summary": summ, "m07_fills_path": fills,  # path slots hold DFs for tests
         "m06a": m06a, "m05": m05, "m04_entities": m04e, "m04_auth": m04_auth,
+        "m04_fold_pure": fold_pure,  # audit 2026-07-10 P0#2: investable requires fold-pure M4
         "m02_journeys_path": journeys, "m07_equity": equity,
     }
 
@@ -251,7 +258,7 @@ def test_final_requires_calibration_AND_real_fidelity_AND_real_consistency():
     # calibrated costs + real tracking_error + real equity-block consistency + realized round-trips
     # -> investable=True
     inp = _make_inputs(n_entities=60, uncalibrated=False, equity=eq, tracking_error=0.05,
-                       realized=True)
+                       realized=True, fold_pure=True)   # audit P0#2: investable requires fold-pure M4
     out, manifest = M.build_ranking(inp, m)
     assert manifest["consistency_source"] == "m07_equity_block_roe"
     assert manifest["fidelity_source"] == "m07_tracking_error"
