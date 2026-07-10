@@ -27,30 +27,33 @@ Live-stack safety (Phase 1 — RESOLVED + ACTIVATED 2026-07-10, codex 3-round co
 - ✅ `scripts/kill_switch.sh` REWRITTEN to actually stop V17 (mode-validated + engine-only pattern + post-SIGKILL abort + default flatten via `tools/flatten_all_offline.py`). The old one targeted the dead HB stack.
 - INVARIANT: never rotate/replace `/tmp/ql-v12-copy-trader-launchd.log` while V17 is live (the heartbeat watchdog reads it). See `ops/launchd/README.md`.
 
-## B. RESEARCH (offline) — the canonical funnel
-Raw S3 data (fills/funding/ledger/candles/marks under `app/data/`, SACRED, never deleted) →
-**one funnel**, all built on single-source primitives:
-- Primitives: `research/v15/execution_model.py` (fees/slippage/latency SSOT, always pass `coin=`),
-  `research/v15/fidelity_replay.py::roundtrips` (roundtrip pairer), `research/v15/leadlag_clean_rank_sim.py::mark_at` (asof mark index).
-- Stage 1 taker gate: `research/v15/s3_taker_verify.py` (the CORRECT full-history fills loader `load_fills_from_s3`).
-- Bag filter: `research/v16/mae_bag_measure.py` + `rescreen_bag_gate.py`.
-- Stage 2 forward-OOS: `research/v15/forward_oos_hot.py` (boundary-MTM, codex-signed 2026-07-10).
-- Stage 3 copyability: `research/v15/copyability_calib_share.py`.
-- Cohort/config emit: `research/v16/select_cohort.py` / `build_skill_cohort.py`.
-NOTE (Phase 3 fixes): a parallel `v15_m01..m10` M-module funnel still coexists; ~230 dead scripts + dead
-vN cohorts surround the ~14 keep-set modules; fee-coin-blindness, window-truncating fills loaders, and
-divergent roundtrip pairers exist in the dead/duplicate set. Use ONLY the funnel above.
+## B. RESEARCH (offline) — ONE pipeline: S3 ingestion+gate → m1-m10 processing (COMPLEMENTARY stages)
+Raw S3 data (fills/funding/ledger/candles/marks under `app/data/`, SACRED, never deleted) is ingested +
+taker-gated, then FEEDS INTO the m1-m10 processing/selection engine. These are complementary stages of ONE
+pipeline (Alberto 2026-07-10), NOT two competing funnels — do NOT demote/archive either. All built on
+single-source primitives.
+- Shared primitives (the Phase-3 consolidation target): `research/v15/execution_model.py` (fees/slippage/
+  latency SSOT, always pass `coin=`), `research/v15/fidelity_replay.py::roundtrips` (roundtrip pairer),
+  `research/v15/leadlag_clean_rank_sim.py::mark_at` (asof mark index).
+- Ingestion + validation gate: `s3_taker_verify.py` (taker gate, CORRECT full-history `load_fills_from_s3`)
+  → `research/v16/mae_bag_measure.py` + `rescreen_bag_gate.py` (bag filter) → `forward_oos_hot.py`
+  (forward-OOS, boundary-MTM, codex-signed) → `copyability_calib_share.py` (copyability rank).
+- Processing/selection engine (the raw data feeds here): `research/v15/v15_m01_equity_reconstruct` (m01) →
+  m02 journeys → m03 folds → m025 authenticity → m05 eligibility → m06a/b shortlist+ranking → m07 engine →
+  m08 survival → m09 sim → m10 gates → `v15_forward_select`. Cohort/config emit: `research/v16/select_cohort.py`.
+Phase-3 scope = consolidate the SHARED PRIMITIVES both stages use (coin-aware fees, one fills loader, one
+asof-mark staleness policy); NOT touch either stage's logic. ~195 dead one-off experiments already archived (Phase 3a).
 
 ## C. DATA PIPELINE (the one cron)
 - LaunchAgent `com.quantslab.hl-s3-fills-daily` (06:20 local) → `scripts/hl_s3_fills_daily_refresh.sh` runs
   `hl_s3_fills_daily_refresh.py` (fills + 1m candles) then `hl_s3_misc_daily_refresh.py` (funding + ledger).
   S3 archive, requester-pays, no HL REST, no trading creds. Outputs under `app/data/hl_s3_*_hot/`.
-- Live marks: `hl_live_mark_collector.py` (60s) → `app/data/hl_mark_1m_hot/` (unsupervised — see Phase 1 risk).
+- Live marks: `hl_live_mark_collector.py` (60s) → `app/data/hl_mark_1m_hot/`, supervised by `com.quantslab.hl-mark-collector` (KeepAlive).
 - Live PnL: `tools/pnl_tracker.py` (PID 591) → Telegram, supervised by `com.quantslab.pnl-tracker`.
 
 ## Ops quick-reference
 - Portfolio truth: `python tools/portfolio_snapshot.py` (HL spot-only + Bybit).
-- Kill live engine NOW: `touch /tmp/v12_pause ~/quants-lab/.HALT_COPY` (kill_switch.sh is broken, Phase 1).
+- Kill live engine NOW: `bash scripts/kill_switch.sh` (flatten+halt) or `--halt-only` / `--pause`; or manually `touch /tmp/v12_pause ~/quants-lab/.HALT_COPY`.
 - Restart: launchd KeepAlive relaunches on PID death via `v12_launcher.sh`.
 - Brain truth: `projects/quant/state`. This file mirrors the live-ops subset of it.
 
