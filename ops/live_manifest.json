@@ -1,0 +1,23 @@
+{
+  "version": "2026-07-11",
+  "note": "SANCTIONED live state. scripts/live_manifest_check.py asserts reality matches this (Phase 5 guardrail: manifest=reality + one-live-config). Update this file when the live config/engine deliberately changes; a mismatch = the gate fails loud.",
+  "engine": {
+    "script": "strategies/live/hl_copy_trader_v17.py",
+    "config": "config/copy_trader_wallets_gate1_v4.json",
+    "single_instance": true,
+    "launchd_label": "com.quantslab.v12-copy-trader"
+  },
+  "forbidden_engines": [
+    "strategies/live/hl_prop_copy.py",
+    "hummingbot",
+    "arb_hlbb",
+    "hl_mm"
+  ],
+  "data_cron": "com.quantslab.hl-s3-fills-daily",
+  "mark_collector_launchd": "com.quantslab.hl-mark-collector",
+  "execution_model_config": [
+    "app/data/v15/hl_fee_schedule.json",
+    "app/data/v15/measured_halfspread.json",
+    "app/data/v15/l2_calib_10coin.json"
+  ]
+}
