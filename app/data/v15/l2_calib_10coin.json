@@ -1,0 +1,92 @@
+{
+ "BTC": {
+  "med_spread_bps": 0.13,
+  "med_topn_depth_usd": 5895045.0,
+  "half_spread_bps": 0.065,
+  "impact_10k_bps": 0.065,
+  "impact_50k_bps": 0.065,
+  "impact_100k_bps": 0.065,
+  "n": 3000
+ },
+ "ETH": {
+  "med_spread_bps": 0.471,
+  "med_topn_depth_usd": 14594162.0,
+  "half_spread_bps": 0.235,
+  "impact_10k_bps": 0.236,
+  "impact_50k_bps": 0.236,
+  "impact_100k_bps": 0.236,
+  "n": 3000
+ },
+ "SOL": {
+  "med_spread_bps": 0.115,
+  "med_topn_depth_usd": 550624.0,
+  "half_spread_bps": 0.058,
+  "impact_10k_bps": 0.058,
+  "impact_50k_bps": 0.637,
+  "impact_100k_bps": 1.433,
+  "n": 3000
+ },
+ "BNB": {
+  "med_spread_bps": 1.062,
+  "med_topn_depth_usd": 90547.0,
+  "half_spread_bps": 0.531,
+  "impact_10k_bps": 1.749,
+  "impact_50k_bps": 4.475,
+  "impact_100k_bps": 5.923,
+  "n": 3000
+ },
+ "HYPE": {
+  "med_spread_bps": 0.174,
+  "med_topn_depth_usd": 231640.0,
+  "half_spread_bps": 0.087,
+  "impact_10k_bps": 1.219,
+  "impact_50k_bps": 2.634,
+  "impact_100k_bps": 3.615,
+  "n": 3000
+ },
+ "DOGE": {
+  "med_spread_bps": 0.946,
+  "med_topn_depth_usd": 1112126.0,
+  "half_spread_bps": 0.473,
+  "impact_10k_bps": 1.414,
+  "impact_50k_bps": 2.356,
+  "impact_100k_bps": 3.299,
+  "n": 3000
+ },
+ "ADA": {
+  "med_spread_bps": 2.376,
+  "med_topn_depth_usd": 134363.0,
+  "half_spread_bps": 1.188,
+  "impact_10k_bps": 2.399,
+  "impact_50k_bps": 4.809,
+  "impact_100k_bps": 6.999,
+  "n": 3000
+ },
+ "AVAX": {
+  "med_spread_bps": 1.165,
+  "med_topn_depth_usd": 49818.0,
+  "half_spread_bps": 0.583,
+  "impact_10k_bps": 1.525,
+  "impact_50k_bps": 4.96,
+  "impact_100k_bps": null,
+  "n": 3000
+ },
+ "LINK": {
+  "med_spread_bps": 1.331,
+  "med_topn_depth_usd": 95134.0,
+  "half_spread_bps": 0.665,
+  "impact_10k_bps": 2.239,
+  "impact_50k_bps": 4.492,
+  "impact_100k_bps": 6.214,
+  "n": 3000
+ },
+ "CRV": {
+  "med_spread_bps": 3.278,
+  "med_topn_depth_usd": 106039.0,
+  "half_spread_bps": 1.639,
+  "impact_10k_bps": 4.154,
+  "impact_50k_bps": 9.541,
+  "impact_100k_bps": 15.263,
+  "n": 3000
+ }
+}
