@@ -32,9 +32,11 @@ Raw S3 data (fills/funding/ledger/candles/marks under `app/data/`, SACRED, never
 taker-gated, then FEEDS INTO the m1-m10 processing/selection engine. These are complementary stages of ONE
 pipeline (Alberto 2026-07-10), NOT two competing funnels — do NOT demote/archive either. All built on
 single-source primitives.
-- Shared primitives (the Phase-3 consolidation target): `research/v15/execution_model.py` (fees/slippage/
-  latency SSOT, always pass `coin=`), `research/v15/fidelity_replay.py::roundtrips` (roundtrip pairer),
-  `research/v15/leadlag_clean_rank_sim.py::mark_at` (asof mark index).
+- Shared primitives (canonical map, reconciled 2026-07-11 Phase 3b):
+  - Fees/slippage/latency: `research/v15/execution_model.py` — SSOT, always pass `coin=` (coin-blind fallbacks killed, commit 6644af5). ONE.
+  - Roundtrip pairer: `research/v15/fidelity_replay.py::roundtrips` — ONE canonical impl, 7+ callers (s3_taker_verify, fidelity_oos, wallet_persistence, select_cohort, holdout_cluster_bootstrap, revalidate_api_execmodel). `forward_oos_hot::roundtrips_boundary` is a documented boundary-split VARIANT (self-contained), not a duplicate. Dead `.bak` snapshots archived.
+  - Fills loaders: NOT one function — FOUR by SOURCE (correct-by-design, not duplicates): `m01.load_wallet_fills` (S3 v2 by-wallet, FULL schema for reconstruction), `s3_taker_verify.load_fills_from_s3` (same source, 4-col projection for the gate), `forward_oos_hot.load_hot_fills` (hot dailies, forward-OOS), `v15_slippage_calib.load_v11_fills` (Mongo V11 live fills). `select_cohort.load_wallet_fills` is misnamed — it reads m02 ACTIONS, not raw fills.
+  - Asof-mark staleness: TWO regimes by CONTEXT (intentional, NOT a bug — unifying to one constant would regress m01): m01 historical reconstruction uses 15min caps (`CANDLE/ORACLE/ASSETCTX_MAX_AGE_MS`, codex marks-gate 2026-06-24, wide for sparse history); `candle_marks`/`live_marks` use 5min (live/research, 1m poll cadence). `leadlag_clean_rank_sim::mark_at` is the rank-sim asof index.
 - Ingestion + validation gate: `s3_taker_verify.py` (taker gate, CORRECT full-history `load_fills_from_s3`)
   → `research/v16/mae_bag_measure.py` + `rescreen_bag_gate.py` (bag filter) → `forward_oos_hot.py`
   (forward-OOS, boundary-MTM, codex-signed) → `copyability_calib_share.py` (copyability rank).
@@ -55,8 +57,11 @@ single-source primitives.
      emits the final cohort/config.
   Overlaps to archive (superseded, keep in `archive/`): `sprint_forward_chain.sh` (separate v16 cohort slice),
   `recal_resume_m3.sh`/`recal_resume_m6.sh` (resume shims).
-Phase-3 scope = consolidate the SHARED PRIMITIVES both stages use (coin-aware fees, one fills loader, one
-asof-mark staleness policy); NOT touch either stage's logic. ~195 dead one-off experiments already archived (Phase 3a).
+Phase-3b finding (2026-07-11): the "one fills loader / one mark policy" goal was mostly ALREADY satisfied or
+different-by-design. Fees SSOT + roundtrip pairer are ONE (done). Fills loaders are 4 distinct SOURCES (not
+duplicates). Mark caps are 2 CONTEXT regimes (m01 15min historical vs 5min live) — intentional; unifying would
+regress m01. Real 3b work was: kill coin-blind fees (done), archive dead `.bak` backups (done), and CANONIZE the
+honest primitive map here (done) — NOT a forced merge. ~195 dead one-off experiments already archived (Phase 3a).
 
 ## C. DATA PIPELINE (the one cron)
 - LaunchAgent `com.quantslab.hl-s3-fills-daily` (06:20 local) → `scripts/hl_s3_fills_daily_refresh.sh` runs
