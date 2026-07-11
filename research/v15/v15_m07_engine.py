@@ -1695,7 +1695,7 @@ def _require_action_schema(dataset) -> None:
 
 def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, out_dir: Path,
                   band: str = "base", limit_entities: Optional[int] = None, start_equity: float = 10_000.0,
-                  flush_rows: int = 1_000_000, require_cache: bool = True, window: str = "test",
+                  flush_rows: int = 250_000, require_cache: bool = True, window: str = "test",
                   slip_calib_path: Optional[str] = None, follower_trail: Optional[float] = None,
                   copy_latency_ms: int = 2_000, sizing_mode: str = "leader_equity",
                   fixed_target_exposure: float = 0.10):

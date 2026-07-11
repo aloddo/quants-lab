@@ -46,7 +46,7 @@ class ShardedParquetWriter:
     stitch can be re-run with no recompute. The combined output schema is the pyarrow union of all
     part schemas (so an all-null column in one chunk that is typed in another reconciles cleanly)."""
 
-    def __init__(self, out_path: str | Path, flush_rows: int = 1_000_000, keep_parts: bool = False):
+    def __init__(self, out_path: str | Path, flush_rows: int = 100_000, keep_parts: bool = False):
         self.out = Path(out_path)
         self.parts_dir = self.out.with_suffix(self.out.suffix + ".parts")
         self.parts_dir.mkdir(parents=True, exist_ok=True)

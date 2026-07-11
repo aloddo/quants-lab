@@ -406,7 +406,7 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                     folds: pd.DataFrame, eng, md, acts_loader, m: M9Manifest, b0: float,
                     pool_provider: str = "ranked", seed: Optional[int] = None,
                     corr: Optional[dict] = None, out_dir: Optional[str] = None,
-                    flush_rows: int = 1_000_000, mem_soft_gb: float = 12.0,
+                    flush_rows: int = 250_000, mem_soft_gb: float = 12.0,
                     allow_global_m04: bool = False) -> dict:
     """M9-v2 fixed-bankroll CHAINED portfolio sim over the 8 contiguous test folds. Per fold: select
     (M6b in_pool, drop M8 KILL), size via the sizing chain, run M7 per subaccount on that fold's TEST

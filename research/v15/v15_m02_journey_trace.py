@@ -784,7 +784,7 @@ def main() -> None:
         "--equity-enrichment", action="store_true",
         help="Opt in to M01 causal equity targets. Core actions/journeys do not require M01.",
     )
-    ap.add_argument("--flush-rows", type=int, default=2_000_000,
+    ap.add_argument("--flush-rows", type=int, default=100_000,
                     help="MANDATORY streaming: flush a parquet part + free RAM every N buffered rows.")
     ap.add_argument("--mem-soft-gb", type=float, default=12.0,
                     help="Memory-guard soft cap (GB); abort loud above this instead of silent OOM kill.")

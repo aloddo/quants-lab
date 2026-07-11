@@ -2685,7 +2685,10 @@ def main() -> None:
     # Rule 8: stream per-wallet series to disk in bounded chunks via ShardedParquetWriter; NEVER
     # concat all wallet-days into one DataFrame in RAM. We keep ONLY the lightweight per-wallet
     # audit/error records (one row per wallet, bounded) for the audit parquet + validate table.
-    series_writer = ShardedParquetWriter(out_path, flush_rows=2_000_000)
+    # Rule 8 (Alberto 2026-07-11 correction TG 11199): persist as it goes. 100k rows ~= every ~675
+    # wallets at ~148 rows/wallet -> RAM bounded to tens of MB + progress durable on disk, never
+    # buffer the full result (the OOM / lost-progress footgun we kept repeating with a 2M threshold).
+    series_writer = ShardedParquetWriter(out_path, flush_rows=100_000)
     audits: list[dict] = []
     results_lite: list[dict] = []          # only wallet/error/audit keys (NO heavy series) for table
     n_with_series = 0
