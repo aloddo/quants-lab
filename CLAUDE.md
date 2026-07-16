@@ -101,7 +101,7 @@ See `.claude/skills/quant-governance/SKILL.md` for gates and stop conditions.
 | Topic | Location |
 |-------|----------|
 | Strategy status + metrics | Brain: `projects/quant/state` |
-| Session handoffs | Brain: `handoffs/quant-engineer/YYYY-MM-DD` |
+| Continuity | Brain: your active card `card/quant-engineer/*` (card-kanban skill) |
 | Governance gates | `.claude/skills/quant-governance/SKILL.md` |
 | Research process | `.claude/skills/research-process/SKILL.md` |
 | Backtesting skill | `.claude/skills/backtesting/SKILL.md` |
