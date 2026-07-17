@@ -1693,6 +1693,38 @@ def _require_action_schema(dataset) -> None:
         )
 
 
+try:
+    import pyarrow as _pa_mod
+    _PA_VER = _pa_mod.__version__
+except Exception:  # noqa: BLE001
+    _PA_VER = "na"
+# bump the literal on any change to the shard cols/filter/partitioning; the pyarrow version is folded in
+# because pyarrow does the filtering/decoding/partition-encoding (codex P2: an upgrade must invalidate).
+_M07_SHARD_BUILD_VER = f"shard-v1|pa{_PA_VER}"
+_M07_SHARD_CACHE_DIR = Path(__file__).resolve().parents[1] / "app" / "data" / "v15" / "m07_shard_cache"
+# SOUNDNESS CONTRACT (same as m06a): m07 runs as a SEQUENTIAL recal_pipeline stage (one run_shortlist at a
+# time; m02_actions is not rewritten while it runs). Under that contract the content-hash key + atomic
+# marker-last publish make the shard cache sound. Concurrent run_shortlist into a shared cache is out of
+# contract (a per-run UUID tmp dir still prevents staging collisions; hit-time manifest validation of the
+# cached partitions is a deferred hardening).
+
+
+def _m07_shard_key(wallets, limit_entities, cols, actions_path) -> str:
+    """CONTENT-HASH key for the wallet pre-shard: the wallet SET + limit + projected cols + build version +
+    the byte-content of m02_actions (streamed in 1MB chunks -> memory-bounded). Pure, no side effects. A change
+    to any of these MISSes; an unchanged rerun (even with a new mtime) HITs."""
+    import hashlib as _hl
+    h = _hl.sha256()
+    h.update("\x00".join(wallets).encode()); h.update(f"|lim={limit_entities}|".encode())
+    h.update("\x00".join(cols).encode()); h.update(_M07_SHARD_BUILD_VER.encode())
+    af = _hl.sha256()
+    with open(actions_path, "rb") as f:
+        for ck in iter(lambda: f.read(1 << 20), b""):
+            af.update(ck)
+    h.update(af.hexdigest().encode())
+    return h.hexdigest()
+
+
 def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, out_dir: Path,
                   band: str = "base", limit_entities: Optional[int] = None, start_equity: float = 10_000.0,
                   flush_rows: int = 250_000, require_cache: bool = True, window: str = "test",
@@ -1733,22 +1765,46 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     logger.info("M7 runner: %d seats over %d wallets", len(sl), len(wallets))
 
     # PRE-SHARD actions by wallet ONCE via pyarrow write_dataset (codex code-r2 #4): streaming,
-    # memory-bounded (no per-wallet writer held open buffering rows), FRESH dir each run (no stale
-    # shard contamination). Hive-partitioned by wallet.
-    shard_dir = out_dir / "_m07_wallet_shards"
-    if shard_dir.exists():
-        shutil.rmtree(shard_dir)
-    shard_dir.mkdir(parents=True, exist_ok=True)
+    # memory-bounded (no per-wallet writer held open buffering rows). Hive-partitioned by wallet.
     dataset = ds.dataset(actions_path, format="parquet")
     _require_action_schema(dataset)
     cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size", "position_after",
             "target_exposure_pct", "is_liquidation", "carry_in_status",
             "lifecycle_valid", "stream_replay_valid"]
     replayable = ds.field("wallet").isin(wallets) & (ds.field("stream_replay_valid") == True)  # noqa: E712
-    scanner = dataset.scanner(columns=cols, filter=replayable, batch_size=200_000)
-    ds.write_dataset(scanner, shard_dir, format="parquet", partitioning=["wallet"],
-                     partitioning_flavor="hive", existing_data_behavior="overwrite_or_ignore",
-                     max_rows_per_file=2_000_000, max_rows_per_group=200_000)
+    # CONTENT-HASH CACHE (Fable+codex-gated pattern, 2026-07-17): the pre-shard is a pure function of the wallet
+    # SET + m02_actions content + the projected cols + the build logic. recal_pipeline rmtree-rebuilt it fresh
+    # every run (a full ~4.4GB scan+filter+write); cache it keyed by that content so unchanged reruns reuse the
+    # shards (biggest single reshard win).
+    shard_key = _m07_shard_key(wallets, limit_entities, cols, actions_path)
+    shard_dir = _M07_SHARD_CACHE_DIR / shard_key
+    if (shard_dir / "._complete").exists():
+        logger.info("M7 runner: reshard CACHE HIT %s (skipped the %s scan+shard)", shard_key[:12], actions_path)
+    else:
+        # build into a UNIQUE private tmp dir (tempfile.mkdtemp -> no PID-collision, codex P1), marker LAST,
+        # atomic rename -> never serve a partial/corrupt shard set.
+        import tempfile
+        _M07_SHARD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _tmp = Path(tempfile.mkdtemp(prefix=f".tmp_{shard_key}_", dir=str(_M07_SHARD_CACHE_DIR)))
+        scanner = dataset.scanner(columns=cols, filter=replayable, batch_size=200_000)
+        ds.write_dataset(scanner, _tmp, format="parquet", partitioning=["wallet"],
+                         partitioning_flavor="hive", existing_data_behavior="overwrite_or_ignore",
+                         max_rows_per_file=2_000_000, max_rows_per_group=200_000)
+        # TOCTOU guard (codex P1): only PUBLISH to the keyed cache if m02_actions is STILL what the key hashed
+        # -- a mid-build atomic replace of the actions file would otherwise store new-file shards under the old
+        # key. If it changed, use THIS run's freshly-built shards (correct for this run) but do NOT cache them.
+        if _m07_shard_key(wallets, limit_entities, cols, actions_path) != shard_key:
+            logger.warning("M7 runner: m02_actions changed during shard build -> using this run's shards, NOT caching")
+            shard_dir = _tmp   # valid for this run; left uncached (key would be wrong)
+        else:
+            (_tmp / "._complete").write_text(shard_key)
+            try:
+                os.replace(_tmp, shard_dir)   # atomic; fails if a concurrent run already won
+            except OSError:
+                shutil.rmtree(_tmp, ignore_errors=True)
+                if not (shard_dir / "._complete").exists():
+                    raise
+            logger.info("M7 runner: reshard CACHE MISS -> built %s", shard_key[:12])
     shard_ds = ds.dataset(shard_dir, format="parquet", partitioning="hive")
 
     # PRELOAD market caches for the shortlist coin set so the inner loop never hits Mongo (codex
