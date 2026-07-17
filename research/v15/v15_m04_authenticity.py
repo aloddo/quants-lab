@@ -242,9 +242,15 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
         # each day-file EXACTLY ONCE for the whole hedge-wallet set (O(days)); its per-wallet output
         # is BYTE-IDENTICAL to the per-wallet loader (hl_fills_io FIX-1 equivalence check). Same t0
         # lookback (lo_ms - 365d) as the old path so the hedge computation below is unchanged.
-        fills_by, _funding_by = _grouped_ff(
-            set(hedge_wallets), lo_ms - 365 * 86_400_000, hi_ms)
-        fills_cache.update(fills_by)  # keys lowercased by the grouped loader (HL addrs are lowercase)
+        # CHUNK the hedge preload (2026-07-17): loading all hedge wallets' fills at once is a memory PEAK that
+        # tripped the avail floor on a tight box. With the wallet-shard, reading a small chunk is cheap, so load
+        # in bounded chunks -> peak = one chunk's fills. Byte-identical (per-wallet, order-independent merge).
+        _HC = int(os.environ.get("QL_M04_HEDGE_CHUNK", "500"))
+        _hw = list(hedge_wallets)
+        for _hi0 in range(0, len(_hw), _HC):
+            fills_by, _funding_by = _grouped_ff(
+                set(_hw[_hi0:_hi0 + _HC]), lo_ms - 365 * 86_400_000, hi_ms)
+            fills_cache.update(fills_by)  # keys lowercased by the grouped loader (HL addrs are lowercase)
         log.info(f"  pre-loaded fills for {len(hedge_wallets)} multi-entity members in {(time.time()-tc)/60:.1f}min (batched 1-pass)")
 
     def get_fills(w):

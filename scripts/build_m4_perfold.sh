@@ -30,6 +30,12 @@ for r in folds.itertuples():
         ts = ts.tz_convert("UTC")
     print(f"{int(r.fold_id)}\t{ts.strftime('%Y-%m-%d')}")
 PY
+  # RESUMABLE: skip a fold whose m04 outputs are already FRESH (newer than the folds file). Lets a
+  # guard-killed run (avail<floor on a tight box) resume without redoing completed folds. M4_FORCE=1 overrides.
+  ENT="$OUTDIR/m04_entities_f${fid}.parquet"; AUTH="$OUTDIR/m04_authenticity_f${fid}.parquet"
+  if [ -z "${M4_FORCE:-}" ] && [ -f "$ENT" ] && [ -f "$AUTH" ] && [ "$ENT" -nt "$FOLDS" ] && [ "$AUTH" -nt "$FOLDS" ]; then
+    echo "[build_m4_perfold] fold ${fid}: SKIP (outputs already fresh)"; continue
+  fi
   echo "[build_m4_perfold] fold ${fid}: M4 as-of ${test_start}"
   # --headroom-gb default (6) is too conservative for a fleet-loaded box (aborts at <7.5GB free); lower it so
   # M4 fits available RAM while mem_safe_run still backstops. Override via M4_HEADROOM_GB / M4_PER_WORKER_GB.
