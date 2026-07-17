@@ -22,31 +22,9 @@ SAFE="scripts/mem_safe_run.sh --floor-gb $CEIL"
 TS=$(date +%Y%m%d_%H%M)
 log(){ echo "[recal $(date +%H:%M:%S)] $*"; }
 
-# 0) wait for the M1 daily re-run to finish
-while [ "$(ps aux | grep v15_m01_equity_reconstruct | grep -v grep | wc -l | tr -d ' ')" != "0" ]; do sleep 30; done
-log "M1 daily re-run done; consolidating corrected series + audit"
-$PY - <<'PY'
-import glob, pandas as pd, numpy as np
-ser=sorted(glob.glob('app/data/v15/m01_rerun/shard_*.parquet'))
-ser=[p for p in ser if not p.endswith('.audit.parquet')]
-df=pd.concat([pd.read_parquet(p) for p in ser], ignore_index=True)
-df.to_parquet('app/data/v15/m01_universe_corrected_series.parquet', index=False, compression='snappy')
-print('corrected series rows:', len(df), 'wallets:', df['wallet'].nunique())
-au=sorted(glob.glob('app/data/v15/m01_rerun/shard_*.audit.parquet'))
-a=pd.concat([pd.read_parquet(p) for p in au], ignore_index=True)
-a.to_parquet('app/data/v15/m01_rerun_universe.audit.parquet', index=False, compression='snappy')
-# Despite the legacy ``_pct`` suffix, these fields are fractional returns:
-# 0.001 = 0.1%, 0.10 = 10%. Keep thresholds in fractional units and label
-# rendered percentages after multiplying by 100.
-md=pd.to_numeric(a['median_inter_anchor_drift_pct'],errors='coerce').dropna()
-mx=pd.to_numeric(a['max_inter_anchor_drift_pct'],errors='coerce').dropna()
-print('CORRECTED universe MEDIAN drift (gate >10%):', '<0.1%%:%d 0.1-0.5%%:%d 0.5-1%%:%d 1-5%%:%d >5%%:%d'%(
- (md<0.001).sum(),((md>=0.001)&(md<0.005)).sum(),((md>=0.005)&(md<0.01)).sum(),((md>=0.01)&(md<0.05)).sum(),(md>=0.05).sum()))
-print('  MAX-drift gate >50%% fails: %d/%d (%.1f%%)  | quarantined %d/%d (%.1f%%)'%(
- int((mx>0.50).sum()),len(mx),100*(mx>0.50).mean(),
- int(a['quarantined'].sum()),len(a),100*a['quarantined'].mean()))
-PY
-EQUITY=$D/m01_universe_corrected_series.parquet
+# M1 is OUT OF SCOPE (Alberto 2026-07-17: "M1 must be deleted, never reference again"). The chain is
+# M2 -> M3 -> M4 -> M5(copyability), none of which use M1/equity. No M1 wait, no shard stitch, no equity artifact.
+log "M1 out of scope -> starting at M2 (copyability chain)"
 
 # back up pre-fix derived outputs (DERIVED, not raw; keep for comparison)
 mkdir -p $D/prefix_backup_$TS
@@ -75,7 +53,12 @@ $SAFE --label m03_ -- $PY research/v15/v15_m03_fold_geometry.py --actions $D/m02
 log "M4 authenticity (FOLD-PURE: per-fold as-of each fold test_start -- no cross-fold leak)"
 PY="$PY" SAFE="$SAFE" PROCS="$PROCS" scripts/build_m4_perfold.sh "$D/m03_folds.parquet" "$WALLETS" "$D" 2>&1 | tail -6
 log "M5 eligibility (corrected equity)"
-$SAFE --label m05_ -- $PY research/v15/v15_m05_eligibility.py --folds $D/m03_folds.parquet --journeys $D/m02_journeys.parquet --equity $EQUITY --m01-audit $D/m01_rerun_universe.audit.parquet --m04-dir $D --m03-activity $D/m03_wallet_activity_summary.parquet --outdir $D 2>&1 | tail -3
+# M5 in COPYABILITY mode: the M1/equity lane is OUT OF SCOPE (Alberto 2026-07-17) -> no --equity/--m01-audit,
+# no M1 dependency. Override to the equity lane only via M5_MODE=equity (requires a current M1 artifact).
+$SAFE --label m05_ -- $PY research/v15/v15_m05_eligibility.py --mode "${M5_MODE:-copyability}" --folds $D/m03_folds.parquet --journeys $D/m02_journeys.parquet --m04-dir $D --m03-activity $D/m03_wallet_activity_summary.parquet --outdir $D 2>&1 | tail -3
+# M2-M5 = the one-shot FOUNDATION (Alberto 2026-07-17). Stop here for a base build; M6+ (the backtest) runs
+# separately. Set M2M5_ONLY= to stop; unset to continue into the M6-M8 backtest chain.
+if [ -n "${M2M5_ONLY:-}" ]; then log "M2-M5 FOUNDATION DONE (M2M5_ONLY set) -> base ready; M6+ backtest runs separately"; exit 0; fi
 log "M6a shortlist"
 $SAFE --label m06a -- $PY research/v15/v15_m06a_shortlist.py --eligibility $D/m05_eligibility.parquet --pool-summary $D/m05_pool_summary.parquet --folds $D/m03_folds.parquet --m04-dir $D --actions $D/m02_actions.parquet --outdir $D 2>&1 | tail -3
 log "M7 engine PRETEST"
