@@ -31,10 +31,13 @@ for r in folds.itertuples():
     print(f"{int(r.fold_id)}\t{ts.strftime('%Y-%m-%d')}")
 PY
   echo "[build_m4_perfold] fold ${fid}: M4 as-of ${test_start}"
+  # --headroom-gb default (6) is too conservative for a fleet-loaded box (aborts at <7.5GB free); lower it so
+  # M4 fits available RAM while mem_safe_run still backstops. Override via M4_HEADROOM_GB / M4_PER_WORKER_GB.
   $SAFE --label "m04_f${fid}" -- "$PY" research/v15/v15_m04_authenticity.py \
     --wallets-file "$WALLETS" \
     --as-of "$test_start" \
     --out "$OUTDIR/m04_authenticity_f${fid}.parquet" \
     --entities-out "$OUTDIR/m04_entities_f${fid}.parquet" \
+    --headroom-gb "${M4_HEADROOM_GB:-1.5}" --per-worker-gb "${M4_PER_WORKER_GB:-2}" \
     --procs "$PROCS"
 done
