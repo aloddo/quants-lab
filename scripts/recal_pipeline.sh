@@ -41,11 +41,15 @@ if [ -n "${M2_EQUITY_ENRICH:-}" ]; then
     --actions-out $D/m02_actions.parquet --journeys-out $D/m02_journeys.parquet --procs $PROCS --skip-marks-cache \
     --equity-enrichment --headroom-gb "${M2_HEADROOM_GB:-1.5}" --per-worker-gb "${M2_PER_WORKER_GB:-3}" 2>&1 | tail -6
 else
-  # CORE journeys via the MEMORY-SAFE BATCHED runner (scripts/m2_batched_run.py): reads each day-file ONCE per
-  # wallet-batch (not once PER WALLET) -> eliminates the O(wallets x days) re-read spike that death-loop-hung
-  # the per-wallet path on a RAM-tight box. process_wallet_preloaded is byte-identical to process_wallet(core).
+  # CORE journeys via the MEMORY-SAFE BATCHED runner reading fills from the WALLET-PARTITIONED SHARD
+  # (build_fills_wallet_shard.py): each batch reads only its wallets' fills (partition pruning) instead of
+  # re-scanning the 11GB store per batch -> fast on a RAM-tight box (25 wallets 21s->7.6s; far bigger at scale).
+  # byte-identical to the day-file path (order_wallet_fills_causally). Falls back to the day-file scan if the
+  # shard is absent. process_wallet_preloaded is byte-identical to process_wallet(core).
+  FILLS_SHARD="$D/m2_fills_wallet_shards"
+  SHARD_ARG=""; [ -f "$FILLS_SHARD/._complete" ] && SHARD_ARG="--fills-shard-dir $FILLS_SHARD"
   $SAFE --label m02b -- $PY scripts/m2_batched_run.py --wallets-file "$WALLETS" --start 2025-12-01 --end 2026-05-23 \
-    --actions-out $D/m02_actions.parquet --journeys-out $D/m02_journeys.parquet \
+    --actions-out $D/m02_actions.parquet --journeys-out $D/m02_journeys.parquet $SHARD_ARG \
     --batch-size "${M2_BATCH_SIZE:-250}" --procs "$PROCS" --worker-gb "${M2_WORKER_GB:-2.5}" 2>&1 | tail -6
 fi
 log "M3 fold_geometry"

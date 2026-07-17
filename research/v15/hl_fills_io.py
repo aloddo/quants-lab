@@ -455,6 +455,76 @@ def load_grouped_fills_funding(
     return fills_by, funding_by
 
 
+_FILLS_SHARD_DSET = None
+_FILLS_SHARD_DIR = None
+
+
+def _fills_shard_dataset(shard_dir):
+    global _FILLS_SHARD_DSET, _FILLS_SHARD_DIR
+    if _FILLS_SHARD_DSET is None or _FILLS_SHARD_DIR != str(shard_dir):
+        import pyarrow.dataset as _ds
+        _FILLS_SHARD_DSET = _ds.dataset(str(shard_dir), format="parquet", partitioning="hive")
+        _FILLS_SHARD_DIR = str(shard_dir)
+    return _FILLS_SHARD_DSET
+
+
+def load_grouped_fills_funding_sharded(
+    wallets: set[str], t0: int, t1: int, shard_dir
+) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+    """SAME contract + BYTE-IDENTICAL output as load_grouped_fills_funding, but FILLS come from the wallet-
+    partitioned shard (scripts/build_fills_wallet_shard.py) via partition pruning -> reads ONLY the requested
+    wallets' fills, not the whole 11GB store. Funding is unchanged (its store is tiny). This is what makes a
+    full-universe M2 fast on a RAM-tight box (no 11GB re-read per batch). order_wallet_fills_causally makes the
+    within-wallet input order irrelevant, so shard order == day-file order after ordering (gate-verified)."""
+    import pyarrow.compute as _pc
+    wl = {str(w).lower() for w in wallets}
+    fills_by: dict[str, list[dict]] = {w: [] for w in wl}
+    dset = _fills_shard_dataset(shard_dir)
+    tbl = dset.to_table(filter=_pc.field("wallet").isin(list(wl)) & (_pc.field("time") >= t0) & (_pc.field("time") <= t1))
+    if tbl.num_rows:
+        df = tbl.to_pandas()
+        df["time"] = df["time"].astype("int64")
+        df["_w"] = df["wallet"].astype(str).str.lower()
+        for w, g in df.groupby("_w", sort=False):
+            fills_by[w].extend(_normalize_fills_df(g))
+    for w in fills_by:
+        fills_by[w] = order_wallet_fills_causally(fills_by[w])
+
+    # funding: identical to load_grouped_fills_funding (its store is small; no shard needed)
+    funding_by: dict[str, list[dict]] = {w: [] for w in wl}
+    fund_seen: dict[str, set[tuple[int, str]]] = {w: set() for w in wl}
+    for pf in sorted(glob.glob(str(HOT_FUNDING_DIR / "*.parquet"))):
+        if not _overlaps_window(pf, t0, t1):
+            continue
+        try:
+            avail = set(pq.ParquetFile(pf).schema_arrow.names)
+            missing_required = _FUNDING_REQUIRED - avail
+            if missing_required:
+                raise HotStoreReadError(
+                    f"funding {Path(pf).name}: missing required cols {sorted(missing_required)} "
+                    f"(overlaps requested window [{t0},{t1}])")
+            fd = pd.read_parquet(pf, columns=["wallet", "time", "coin", "usdc"])
+            fd["time"] = fd["time"].astype("int64")
+            fd["wlc"] = fd["wallet"].astype(str).str.lower()
+            m = fd[(fd["wlc"].isin(wl)) & (fd["time"] >= t0) & (fd["time"] <= t1)]
+        except HotStoreReadError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HotStoreReadError(f"funding {Path(pf).name}: unreadable ({e!r}); overlaps window") from e
+        if m.empty:
+            continue
+        for r in m.itertuples(index=False):
+            w = r.wlc; t = int(r.time); coin = str(r.coin); key = (t, coin)
+            if key in fund_seen[w]:
+                continue
+            fund_seen[w].add(key)
+            funding_by[w].append({"time": t, "hash": "",
+                                  "delta": {"type": "funding", "coin": coin, "usdc": str(r.usdc)}})
+    for w in funding_by:
+        funding_by[w].sort(key=lambda x: int(x["time"]))
+    return fills_by, funding_by
+
+
 def load_grouped_ledger(wallets: set[str], t0: int, t1: int) -> dict[str, list[dict]]:
     """Read each hl_s3_ledger_hot day-file ONCE and return per-wallet ledger entries for a SET of
     wallets (O(days), not O(wallets x days)). Output per wallet matches the m01.load_wallet_ledger
