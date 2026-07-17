@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from collections import Counter
@@ -37,7 +38,21 @@ import pandas as pd
 sys.path.insert(0, "/Users/hermes/quants-lab/research/v15")
 import v15_m025_authenticity_gate as g  # noqa: E402  (codex-SHIP helpers)
 import v15_m01_equity_reconstruct as m01  # noqa: E402
+import hl_fills_io as fio  # noqa: E402  (consolidated HOT fills store — same source M02 builds from)
 from _streaming_io import install_memory_guard, plan_memory_budget  # noqa: E402
+
+# Route M4 fills through the wallet-partitioned shard (per-wallet partition reads) instead of re-scanning the
+# 11GB store per chunk. That re-read is memory-MAPPED/file-backed -> consumed physical RAM (avail->2.8G, CoS
+# kill 2026-07-17) AND was slow. Byte-identical (order_wallet_fills_causally). Falls back to the day-file scan
+# if the shard is absent/incomplete or does not cover the requested window.
+_M04_FILLS_SHARD = os.environ.get(
+    "QL_M04_FILLS_SHARD", str(Path(__file__).resolve().parents[1] / "app" / "data" / "v15" / "m2_fills_wallet_shards"))
+
+
+def _grouped_ff(wallets, lo, hi):
+    if _M04_FILLS_SHARD and os.path.exists(os.path.join(_M04_FILLS_SHARD, "._complete")):
+        return fio.load_grouped_fills_funding_sharded(wallets, lo, hi, _M04_FILLS_SHARD)
+    return fio.load_grouped_fills_funding(wallets, lo, hi)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [m04] %(message)s", stream=sys.stdout)
 log = logging.getLogger("m04")
@@ -111,32 +126,98 @@ def _fills_worker(args):
     internal-hedge check). Returns (wallet, fills_list). Logic-neutral: only the I/O is parallelized;
     the hedge COMPUTATION stays in the main loop, unchanged."""
     w, lo_ms, hi_ms = args
-    return w, m01.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
+    return w, fio.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
 
 
-def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float = 12.0):
+def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float = 12.0,
+        hot_prefetch: bool = False, cached_scores: dict | None = None,
+        delta_wallets=None, return_scores: bool = False):
+    # PHASE-2b DAILY-INCREMENTAL (2026-07-16): cached_scores = prior STAGE-A WalletScores per wallet.
+    # STAGE A is the dominant cost (~14.7min/2000 wallets); B/C are cheap (~0.4min). For an incremental daily
+    # run we recompute STAGE A ONLY for wallets whose journeys/fills changed (delta_wallets) or are missing
+    # from the cache, reuse the cached scores for the rest, then re-run STAGE B (union-find) + STAGE C fully
+    # (cheap, deterministic over the scalar set) -> ROW-IDENTICAL to a full run by construction (STAGE A is
+    # pure per-wallet; B/C depend only on the scores set). return_scores=True returns (df, scores) so the
+    # daily driver can persist the STAGE-A cache.
     # NOTE: default procs=1 (sequential) so in-process callers + monkeypatched tests work; main()
     # passes the aggregate-budget-capped procs for the real parallel run. Pool workers are separate
     # processes and do NOT see a parent monkeypatch of stage_a.
-    log.info(f"STAGE A: {len(wallets)} wallets (as-of {as_of_ms}), procs={procs}")
+    #
+    # UNIFIED SINGLE-PASS SOURCE (2026-07-16, hot_prefetch): read fills+funding+ledger for the WHOLE
+    # universe ONCE per fold from the fio hot store (the single canonical source; the stale m01
+    # per-wallet parquet is retired) and REDIRECT the m01 per-wallet loaders + fio.load_wallet_fills
+    # to serve from that in-memory cache. Stage A/B/C then do pure compute with ZERO per-wallet
+    # re-reads. The redirect is in-process, so STAGE A runs SEQUENTIALLY (procs forced to 1) — the
+    # per-wallet I/O that made parallelism worthwhile is gone. No restore: each fold is a fresh
+    # process (mem_safe_run spawns python per fold), so leaving the module loaders redirected is safe.
+    # hot_prefetch memory model (codex P1 fix): the whole-universe fills prefetch (~17M dicts, >10GB)
+    # blows the process budget. Instead: prefetch ONLY the small ledger globally (build_entities needs
+    # it for ALL wallets at once) over the narrow [lo,hi] window (codex P2), and run STAGE A in bounded
+    # CHUNKS, each loading its own fills+funding once then freeing them. All redirected loaders are
+    # RESTORED in finally (codex P2). procs forced to 1 (the in-process redirect can't cross Pool workers).
+    _hp_orig = None
+    if hot_prefetch:
+        procs = 1
+        pre_lo = lo_ms - 365 * 86_400_000  # widest lookback stage_a/stage_c fills need
+        _hp_orig = (m01.load_wallet_fills, m01.load_wallet_funding, m01.load_wallet_ledger,
+                    fio.load_wallet_fills)
+        log.info(f"PREFETCH ledger (global, [lo,hi]) for {len(wallets)} wallets")
+        _ledger_full = fio.load_grouped_ledger(set(wallets), lo_ms, hi_ms)
+
+        def _cache_ledger(w, t0, t1, _c=_ledger_full):
+            return [e for e in _c.get(str(w).lower(), []) if t0 <= int(e["time"]) <= t1]
+        m01.load_wallet_ledger = _cache_ledger  # spans STAGE A (per-wallet) + STAGE B (build_entities)
+
     scores = {}
+    # INCREMENTAL: reuse cached STAGE-A scores for unchanged wallets; recompute only delta/missing wallets.
+    _delta = {str(w).lower() for w in (delta_wallets or [])}
+    if cached_scores:
+        for w in wallets:
+            if w in cached_scores and str(w).lower() not in _delta:
+                scores[w] = cached_scores[w]
+    recompute = [w for w in wallets if w not in scores]
+    log.info(f"STAGE A: {len(recompute)}/{len(wallets)} wallets need recompute "
+             f"(cached={len(scores)}, as-of {as_of_ms}), procs={procs}")
     t0 = time.time()
-    if procs > 1:
-        tasks = [(w, lo_ms, hi_ms) for w in wallets]
+    if hot_prefetch:
+        # bounded-memory chunks: hold ONE chunk's fills+funding at a time, free before the next.
+        CHUNK = int(os.environ.get("QL_M04_STAGEA_CHUNK", "5000"))
+        try:
+            for ci in range(0, len(recompute), CHUNK):
+                chunk = recompute[ci:ci + CHUNK]
+                cf, cfu = _grouped_ff(set(chunk), pre_lo, hi_ms)
+                m01.load_wallet_fills = (lambda w, a, b, _c=cf:
+                                         [f for f in _c.get(str(w).lower(), []) if a <= f["time"] <= b])
+                fio.load_wallet_fills = m01.load_wallet_fills
+                m01.load_wallet_funding = (lambda w, a, b, _c=cfu:
+                                           [x for x in _c.get(str(w).lower(), []) if a <= int(x["time"]) <= b])
+                for w in chunk:
+                    scores[w] = g.stage_a(w, lo_ms, hi_ms)
+                del cf, cfu
+                log.info(f"  A [{min(ci+CHUNK,len(wallets))}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+        finally:
+            # restore fills+funding loaders (ledger stays redirected through STAGE B)
+            m01.load_wallet_fills, m01.load_wallet_funding = _hp_orig[0], _hp_orig[1]
+            fio.load_wallet_fills = _hp_orig[3]
+    elif procs > 1:
+        tasks = [(w, lo_ms, hi_ms) for w in recompute]
         with Pool(procs, initializer=_worker_init, initargs=("m04-stageA", worker_soft_gb)) as pool:
             for i, (w, sc) in enumerate(pool.imap_unordered(_stage_a_worker, tasks, chunksize=16), 1):
                 scores[w] = sc
                 if i % 2000 == 0:
-                    log.info(f"  A [{i}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+                    log.info(f"  A [{i}/{len(recompute)}] ({(time.time()-t0)/60:.1f}min)")
     else:
-        for i, w in enumerate(wallets, 1):
+        for i, w in enumerate(recompute, 1):
             scores[w] = g.stage_a(w, lo_ms, hi_ms)
             if i % 500 == 0:
-                log.info(f"  A [{i}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+                log.info(f"  A [{i}/{len(recompute)}] ({(time.time()-t0)/60:.1f}min)")
     log.info(f"STAGE A done in {(time.time()-t0)/60:.1f}min")
 
     log.info("STAGE B: entities (union-find)")
     ent_id, ent_members = g.build_entities(wallets, lo_ms, hi_ms)
+    if hot_prefetch:  # ledger no longer needed after build_entities -> restore + free (codex P2)
+        m01.load_wallet_ledger = _hp_orig[2]
+        _ledger_full = None
     for w in wallets:
         scores[w].entity_id = ent_id[w]
 
@@ -150,17 +231,25 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
     # Pre-load those fills IN PARALLEL into the cache (logic-neutral: the hedge computation below is
     # unchanged and just reads the cache). Single-wallet entities never hedge-check, so skip them.
     hedge_wallets = sorted({w for _eid, mem in ent_members.items() if len(mem) > 1 for w in mem})
-    if hedge_wallets and procs > 1:
+    if hedge_wallets:
+        # hedge_wallets is a SMALL subset (only multi-wallet entities), so batch-load JUST their fills
+        # once (bounded) — under hot_prefetch the chunked STAGE A already freed its per-chunk fills, so
+        # this is the single source of the hedge-check fills too.
         tc = time.time()
-        with Pool(procs, initializer=_worker_init, initargs=("m04-fills", worker_soft_gb)) as pool:
-            for w, fl in pool.imap_unordered(_fills_worker,
-                                             [(w, lo_ms, hi_ms) for w in hedge_wallets], chunksize=8):
-                fills_cache[w] = fl
-        log.info(f"  pre-loaded fills for {len(hedge_wallets)} multi-entity members in {(time.time()-tc)/60:.1f}min (parallel)")
+        # PERF FIX (2026-07-16): the per-wallet fio.load_wallet_fills globs ALL 251 hot day-files
+        # (11GB) and filters to ONE wallet on EVERY call -> O(wallets x days), re-reading the whole
+        # store thousands of times (the 8hr/fold Stage C blowup). load_grouped_fills_funding reads
+        # each day-file EXACTLY ONCE for the whole hedge-wallet set (O(days)); its per-wallet output
+        # is BYTE-IDENTICAL to the per-wallet loader (hl_fills_io FIX-1 equivalence check). Same t0
+        # lookback (lo_ms - 365d) as the old path so the hedge computation below is unchanged.
+        fills_by, _funding_by = _grouped_ff(
+            set(hedge_wallets), lo_ms - 365 * 86_400_000, hi_ms)
+        fills_cache.update(fills_by)  # keys lowercased by the grouped loader (HL addrs are lowercase)
+        log.info(f"  pre-loaded fills for {len(hedge_wallets)} multi-entity members in {(time.time()-tc)/60:.1f}min (batched 1-pass)")
 
     def get_fills(w):
         if w not in fills_cache:
-            fills_cache[w] = m01.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
+            fills_cache[w] = fio.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
         return fills_cache[w]
 
     entity_primary = {}     # eid -> wallet or None
@@ -296,6 +385,8 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
             "as_of_ms": as_of_ms,  # fold-pure provenance (M6b --m04-dir requires it; codex M4 re-review)
         })
     edf = pd.DataFrame(erows)
+    if return_scores:
+        return df, edf, scores   # scores = per-wallet WalletScores (STAGE-A cache for incremental runs)
     return df, edf
 
 
@@ -331,7 +422,7 @@ def main():
     log.info(f"{len(wallets)} wallets, {args.lookback_days}d window ending as-of {args.as_of}")
 
     df, edf = run(wallets, lo_ms, hi_ms, as_of_ms, procs=budget.procs,
-                  worker_soft_gb=budget.worker_soft_gb)
+                  worker_soft_gb=budget.worker_soft_gb, hot_prefetch=True)
 
     # sanity assertions
     for _, r in df.iterrows():
