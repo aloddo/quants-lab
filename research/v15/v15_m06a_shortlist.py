@@ -39,9 +39,12 @@ Output:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
+import shutil
+import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -453,6 +456,96 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
     return sl, pool_df, waterfall
 
 
+# CONTENT-HASH CACHE (Fable + codex gated 2026-07-17). SOUNDNESS CONTRACT: m06a runs as a SEQUENTIAL stage of
+# recal_pipeline (one m06a at a time; its inputs m01->m05 are produced by earlier stages and NOT rewritten
+# while m06a runs). Under that contract the cache cannot serve stale (the key content-hashes every input +
+# resolved manifest + env flag + code + runtime). The residual codex flagged (a concurrent m06a rewriting
+# shared inputs/outdir mid-run, or ABA) is OUT OF CONTRACT -- do NOT run two m06a into the same --outdir
+# concurrently. The private generation dir + atomic marker-last cache rename still make the CACHE robust to a
+# crash; only the shared --outdir publication assumes the single-writer contract.
+_ARTIFACTS = ("m06a_shortlist.parquet", "m06a_pool_summary.parquet", "m06a_waterfall.json")
+_CACHE_DIR = Path(__file__).resolve().parents[1] / "app" / "data" / "v15" / "m06a_cache"
+# CODE version hashed ONCE AT IMPORT (codex P1): reflects the ACTUALLY-LOADED source, so editing the file
+# mid-run can't store old-logic output under a new source hash.
+_CODE_SHA = hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+# RUNTIME fingerprint (codex P2): a pandas/numpy/pyarrow/python upgrade can change parquet decoding / numeric /
+# ordering / serialization while inputs+code are unchanged -> must invalidate the cache.
+try:
+    import pyarrow as _pa
+    _pa_ver = _pa.__version__
+except Exception:  # noqa: BLE001
+    _pa_ver = "na"
+_RUNTIME_SHA = hashlib.sha256(
+    f"py{sys.version_info[:3]}|pd{pd.__version__}|np{np.__version__}|pa{_pa_ver}".encode()).hexdigest()
+
+
+def _file_sha(p: Path, h) -> None:
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+
+
+def _m06a_input_files(args) -> list:
+    """The concrete input files whose CONTENT determines m06a's output. For fold-pure mode, hash the concrete
+    m04_entities_f*.parquet list actually present (a superset is safe -> at worst a harmless miss), not the dir."""
+    files = [Path(args.eligibility), Path(args.pool_summary), Path(args.folds), Path(args.actions)]
+    if args.m04_dir:
+        files += sorted(Path(args.m04_dir).glob("m04_entities_f*.parquet"))
+    else:
+        files.append(Path(args.entities))
+    return files
+
+
+def _m06a_cache_key(args, manifest: dict) -> str:
+    """CONTENT-hash cache key (Fable plan-gate 2026-07-17): byte-hash of every input file + the RESOLVED
+    manifest + the M5_COPYABILITY_ONLY env flag (an import-time impurity that changes scoring) + the
+    entities-mode + a CODE-VERSION hash of THIS source file (covers the LOCKED constants + DEFAULT_MANIFEST, so
+    editing m06a can never serve a pre-edit output). Byte-hash, NOT size+mtime: recal_pipeline rewrites upstream
+    every run so mtimes always change even when content doesn't -> mtime gives ZERO hits; a byte false-miss is
+    safe (recompute), a false-hit is structurally impossible."""
+    h = hashlib.sha256()
+    h.update(_CODE_SHA.encode()); h.update(b"|code|")          # import-time (codex P1)
+    h.update(_RUNTIME_SHA.encode()); h.update(b"|runtime|")    # pandas/numpy/pyarrow/python (codex P2)
+    h.update(json.dumps(manifest, sort_keys=True, default=str).encode()); h.update(b"|manifest|")
+    h.update(b"copyonly=1|" if COPYABILITY_ONLY else b"copyonly=0|")
+    h.update((b"m04dir|" if args.m04_dir else b"entities|"))
+    for p in _m06a_input_files(args):
+        h.update(p.name.encode()); h.update(b":")
+        _file_sha(p, h); h.update(b"|")
+    return h.hexdigest()
+
+
+def _cache_hit_dir(key: str) -> Path | None:
+    d = _CACHE_DIR / key
+    if (d / ".complete").exists() and all((d / a).exists() for a in _ARTIFACTS):
+        return d
+    return None
+
+
+def _cache_store(key: str, srcdir: Path) -> None:
+    """Populate the cache atomically FROM THIS RUN'S PRIVATE generation dir (codex P1: never re-read the shared
+    outdir, which a concurrent run could overwrite). Write a tmp dir, copy the 3 artifacts, write the .complete
+    marker LAST, then atomic-rename into place. A crash mid-copy leaves only the tmp dir -> next run MISSES (no
+    marker), never a partial set (Fable P(d)). Race-safe (codex P2): if another run wins the rename (dst now
+    exists + complete), discard our tmp and treat as success."""
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dst = _CACHE_DIR / key
+    if _cache_hit_dir(key) is not None:
+        return
+    tmp = _CACHE_DIR / f".tmp_{key}_{_os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    for a in _ARTIFACTS:
+        shutil.copy2(srcdir / a, tmp / a)
+    (tmp / ".complete").write_text(key)
+    try:
+        _os.replace(tmp, dst)   # atomic; fails if another run already created dst (non-empty)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if _cache_hit_dir(key) is None:   # not a lost-race (dst isn't a complete winner) -> real error, re-raise
+            raise
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eligibility", required=True, help="m05_eligibility.parquet")
@@ -464,12 +557,30 @@ def main():
     ap.add_argument("--actions", required=True, help="m02_actions.parquet")
     ap.add_argument("--manifest", default=None, help="JSON run manifest (N pre-registered). Omit -> default v1 N=1000.")
     ap.add_argument("--outdir", required=True)
+    ap.add_argument("--no-cache", action="store_true", help="Force recompute; ignore + do not write the content-hash cache.")
     args = ap.parse_args()
 
     manifest = dict(DEFAULT_MANIFEST)
     if args.manifest:
         manifest.update(json.loads(Path(args.manifest).read_text()))
     logger.info(f"manifest: {manifest}")
+
+    if not args.m04_dir and not args.entities:
+        raise ValueError("provide --m04-dir for fold-pure M4 or --entities for compatibility mode")
+
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    # CONTENT-HASH CACHE (Fable-gated 2026-07-17): m06a is a pure function of its inputs+manifest+env+code, so a
+    # rerun with unchanged content reuses the cached output instead of recomputing the whole shared stage.
+    cache_key = None
+    if not args.no_cache:
+        cache_key = _m06a_cache_key(args, manifest)
+        hit = _cache_hit_dir(cache_key)
+        if hit is not None:
+            for a in _ARTIFACTS:
+                shutil.copy2(hit / a, outdir / a)
+            logger.info(f"m06a CACHE HIT {cache_key[:12]} -> reused {', '.join(_ARTIFACTS)} (skipped recompute)")
+            return
+        logger.info(f"m06a CACHE MISS {cache_key[:12]} -> computing")
 
     elig = pd.read_parquet(args.eligibility)
     pool = pd.read_parquet(args.pool_summary)
@@ -491,10 +602,27 @@ def main():
     sl, pool_df, waterfall = run(elig, pool, folds, entities, actions, manifest,
                                  entities_by_fold=entities_by_fold)
 
-    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
-    sl.to_parquet(outdir / "m06a_shortlist.parquet", index=False)
-    pool_df.to_parquet(outdir / "m06a_pool_summary.parquet", index=False)
-    (outdir / "m06a_waterfall.json").write_text(json.dumps(waterfall, indent=2, default=str))
+    # Write this run's outputs to a PRIVATE generation dir first, then publish to outdir AND cache from it
+    # (codex P1/P2): the cache reflects THIS run's immutable output, never a shared dir a concurrent run could
+    # overwrite between our write and our cache-read.
+    import tempfile
+    gen = Path(tempfile.mkdtemp(prefix=".m06a_gen_", dir=str(outdir)))
+    try:
+        sl.to_parquet(gen / "m06a_shortlist.parquet", index=False)
+        pool_df.to_parquet(gen / "m06a_pool_summary.parquet", index=False)
+        (gen / "m06a_waterfall.json").write_text(json.dumps(waterfall, indent=2, default=str))
+        for a in _ARTIFACTS:
+            shutil.copy2(gen / a, outdir / a)
+        if cache_key is not None:
+            # TOCTOU guard (codex P1): only cache if the inputs are STILL what the key hashed -- a concurrent
+            # upstream rewrite between hashing and reading would otherwise store B's output under A's key.
+            if _m06a_cache_key(args, manifest) == cache_key:
+                _cache_store(cache_key, gen)
+                logger.info(f"m06a cached {cache_key[:12]}")
+            else:
+                logger.warning("m06a: inputs changed during compute -> NOT caching this run")
+    finally:
+        shutil.rmtree(gen, ignore_errors=True)
     if manifest["mode"] == "shortlist":
         logger.info(f"shortlist: {int((sl['in_shortlist']==True).sum()):,} (entity,fold) seats; "  # noqa: E712
                     f"engine_sims={waterfall['total_engine_sims']}/{waterfall['engine_budget']} "
