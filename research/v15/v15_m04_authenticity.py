@@ -227,35 +227,19 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
     log.info("STAGE C: entity resolution + internal-hedge")
     fills_cache = {}
 
-    # PERF: the hedge check loads fills per multi-wallet-entity member — the dominant sequential I/O.
-    # Pre-load those fills IN PARALLEL into the cache (logic-neutral: the hedge computation below is
-    # unchanged and just reads the cache). Single-wallet entities never hedge-check, so skip them.
-    hedge_wallets = sorted({w for _eid, mem in ent_members.items() if len(mem) > 1 for w in mem})
-    if hedge_wallets:
-        # hedge_wallets is a SMALL subset (only multi-wallet entities), so batch-load JUST their fills
-        # once (bounded) — under hot_prefetch the chunked STAGE A already freed its per-chunk fills, so
-        # this is the single source of the hedge-check fills too.
-        tc = time.time()
-        # PERF FIX (2026-07-16): the per-wallet fio.load_wallet_fills globs ALL 251 hot day-files
-        # (11GB) and filters to ONE wallet on EVERY call -> O(wallets x days), re-reading the whole
-        # store thousands of times (the 8hr/fold Stage C blowup). load_grouped_fills_funding reads
-        # each day-file EXACTLY ONCE for the whole hedge-wallet set (O(days)); its per-wallet output
-        # is BYTE-IDENTICAL to the per-wallet loader (hl_fills_io FIX-1 equivalence check). Same t0
-        # lookback (lo_ms - 365d) as the old path so the hedge computation below is unchanged.
-        # CHUNK the hedge preload (2026-07-17): loading all hedge wallets' fills at once is a memory PEAK that
-        # tripped the avail floor on a tight box. With the wallet-shard, reading a small chunk is cheap, so load
-        # in bounded chunks -> peak = one chunk's fills. Byte-identical (per-wallet, order-independent merge).
-        _HC = int(os.environ.get("QL_M04_HEDGE_CHUNK", "500"))
-        _hw = list(hedge_wallets)
-        for _hi0 in range(0, len(_hw), _HC):
-            fills_by, _funding_by = _grouped_ff(
-                set(_hw[_hi0:_hi0 + _HC]), lo_ms - 365 * 86_400_000, hi_ms)
-            fills_cache.update(fills_by)  # keys lowercased by the grouped loader (HL addrs are lowercase)
-        log.info(f"  pre-loaded fills for {len(hedge_wallets)} multi-entity members in {(time.time()-tc)/60:.1f}min (batched 1-pass)")
-
+    # STAGE C memory bound (2026-07-18): the internal-hedge check only ever needs a given entity's OWN
+    # members' fills, and each wallet belongs to exactly ONE union-find entity -> once an entity is checked
+    # its members' fills are never read again. So we load an entity's members RIGHT BEFORE its hedge check
+    # and EVICT them right after (see the entity loop below). The old design eager-preloaded EVERY hedge
+    # wallet's fills at once and held them all simultaneously; for later folds (365d lookback -> many hedge
+    # wallets) that was a ~2GB+ resident peak that bled system-available RAM below the mem_safe_run floor at
+    # STAGE C and got the fold killed on the tight box (verified: fold 3 killed at STAGE C every attempt).
+    # Per-entity load via the wallet-shard is a cheap partition-pruned read; get_fills output is
+    # BYTE-IDENTICAL to the old per-wallet path (hl_fills_io equivalence + shard gate), so tiers are unchanged.
     def get_fills(w):
         if w not in fills_cache:
-            fills_cache[w] = fio.load_wallet_fills(w, lo_ms - 365 * 86_400_000, hi_ms)
+            _fb, _ = _grouped_ff({w}, lo_ms - 365 * 86_400_000, hi_ms)
+            fills_cache[w] = _fb.get(str(w).lower(), [])  # grouped loader keys are lowercased (HL addrs)
         return fills_cache[w]
 
     entity_primary = {}     # eid -> wallet or None
@@ -263,6 +247,7 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
     entity_codes = {}       # eid -> [codes]
     entity_evidence = {}    # eid -> link evidence
     entity_conf = {}        # eid -> high|medium
+    _hedge_entities = []    # (eid, members, primary) that reach the fills-based internal-hedge check
 
     for eid, members in ent_members.items():
         # link evidence/confidence for the dedup map (lower-bound graph, stated honestly)
@@ -305,17 +290,41 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
         primary = max(passers, key=lambda w: (scores[w].sharpe
                                               if scores[w].sharpe == scores[w].sharpe else -1e9))
         entity_primary[eid] = primary
-        # internal-hedge on-HL -> entity KILL
-        hedged = False
-        for other in members:
-            if other == primary:
-                continue
-            if g.internal_hedge(get_fills(primary), get_fills(other), lo_ms, hi_ms):
-                hedged = True
-                break
-        entity_tier[eid] = "KILL" if hedged else None
-        if hedged:
-            entity_codes[eid] = ["internal_hedge"]
+        # Defer the fills-based internal-hedge check to the BATCHED pass below. Provisional tier None;
+        # overwritten to KILL there if an internal hedge is found. (Primary selection needs no fills, so
+        # keep it here; only the hedge check is I/O-bound and gets batched.)
+        entity_tier[eid] = None
+        _hedge_entities.append((eid, members, primary))
+
+    # BATCHED internal-hedge pass (2026-07-18): load fills for a BATCH of entities in ONE partition-pruned
+    # shard scan, run each entity's hedge check on the warm cache, then EVICT the whole batch. This bounds
+    # the resident peak to one batch's fills (NOT all hedge wallets — the old eager-preload OOM) while doing
+    # ~1 scan per BATCH instead of one per wallet (the per-entity version was memory-safe but ~5-8x too slow
+    # on the 20k-partition shard). Byte-identical: identical fills (grouped loader == per-wallet loader) and
+    # identical per-entity computation; batching changes only I/O grouping, and each wallet is in exactly one
+    # entity so evicting a finished batch can never drop fills a later entity needs.
+    _EB = max(1, int(os.environ.get("QL_M04_HEDGE_ENTITY_BATCH", "300")))  # >=1: range step must be >0
+    for _bi in range(0, len(_hedge_entities), _EB):
+        _batch = _hedge_entities[_bi:_bi + _EB]
+        _bmembers = {m for _e, _mem, _p in _batch for m in _mem}
+        _need = [m for m in _bmembers if m not in fills_cache]
+        if _need:
+            _efb, _ = _grouped_ff(set(_need), lo_ms - 365 * 86_400_000, hi_ms)
+            for _m in _need:
+                fills_cache[_m] = _efb.get(str(_m).lower(), [])  # grouped keys lowercased (HL addrs)
+        for _eid, _members, _primary in _batch:
+            hedged = False
+            for other in _members:
+                if other == _primary:
+                    continue
+                if g.internal_hedge(get_fills(_primary), get_fills(other), lo_ms, hi_ms):
+                    hedged = True
+                    break
+            entity_tier[_eid] = "KILL" if hedged else None
+            if hedged:
+                entity_codes[_eid] = ["internal_hedge"]
+        for _m in _bmembers:
+            fills_cache.pop(_m, None)  # batch fully resolved -> free before the next batch
 
     log.info("COMBINE: tiers")
     rows = []
