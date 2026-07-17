@@ -58,7 +58,8 @@ log "backed up pre-fix outputs -> $D/prefix_backup_$TS"
 log "M2 journey_trace (corrected M1 seed) on $(wc -l < $WALLETS) wallets, $PROCS procs"
 $SAFE --label m02_ -- $PY research/v15/v15_m02_journey_trace.py --wallets-file "$WALLETS" --start 2025-12-01 --end 2026-05-23 \
   --actions-out $D/m02_actions.parquet --journeys-out $D/m02_journeys.parquet --procs $PROCS --skip-marks-cache \
-  --equity-enrichment 2>&1 | tail -4
+  ${M2_EQUITY_ENRICH:+--equity-enrichment} --headroom-gb "${M2_HEADROOM_GB:-1.5}" \
+  --per-worker-gb "${M2_PER_WORKER_GB:-1.5}" 2>&1 | tail -6
 log "M3 fold_geometry"
 $SAFE --label m03_ -- $PY research/v15/v15_m03_fold_geometry.py --actions $D/m02_actions.parquet --journeys $D/m02_journeys.parquet --outdir $D 2>&1 | tail -3
 log "M4 authenticity (FOLD-PURE: per-fold as-of each fold test_start -- no cross-fold leak)"
