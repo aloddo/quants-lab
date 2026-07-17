@@ -47,28 +47,40 @@ done
 # growth is gradual and sampled). No debounce: legit bounded jobs stay well under the ceiling, so ANY breach is
 # genuinely anomalous and a killed job (recoverable) beats a panicked box (15h blackout). SIGKILL can't be
 # caught/delayed, so no TERM grace on the ceiling path either.
-CEIL_MB=$(( FLOOR_GB * 1024 ))
-BREACH_NEEDED=1                 # first breach kills (no transient-spike tolerance; box-safety > a rare rerun)
+# --floor-gb is now the SYSTEM-AVAILABLE floor (2026-07-17 P0 fix): kill the job group the instant system
+# available RAM drops below it. This is the RELIABLE box-death signal -- the old job-tree RSS ceiling MISSED
+# v15_m04 because it read the 11GB store via memory-MAPPED/file-backed parquet (consumes physical RAM, drove
+# avail to 2.8G, but does NOT show as process RSS -> ceiling never breached -> box near-crash, CoS killed it).
+AVAIL_FLOOR_MB=$(( FLOOR_GB * 1024 ))
+RSS_HARDSTOP_MB=${RSS_HARDSTOP_MB:-13312}   # SECONDARY: also kill any single job tree whose RSS exceeds ~13GB
 SAMPLE_SEC=1
+_SYSCTL=/usr/sbin/sysctl                    # bare `sysctl` is NOT in the conda-env PATH -> would silently fail
 
-# Sum RSS (KB->MB) of every process in the job's process group.
+# System AVAILABLE RAM in MB via vm_stat (free+inactive+speculative+purgeable == psutil.available, verified).
+# Reliable regardless of how a job holds memory (anon RSS, mmap, file cache) -> catches the mmap-undercount.
+avail_mb() {
+  vm_stat 2>/dev/null | awk '/page size of/{ps=$8} /Pages free/{f=$3} /Pages inactive/{i=$3} /Pages speculative/{s=$3} /Pages purgeable/{p=$3} END{gsub(/\./,"",f);gsub(/\./,"",i);gsub(/\./,"",s);gsub(/\./,"",p); if(ps=="")ps=16384; print int((f+i+s+p)*ps/1048576)}'
+}
+# Sum RSS (KB->MB) of every process in the job's process group (secondary runaway catch).
 tree_rss_mb() {  # $1 = pgid
   ps -axo pgid=,rss= | awk -v g="$1" '$1==g{s+=$2} END{print int(s/1024)}'
 }
-# Kernel memory pressure: 1=normal 2=warning 4=critical. 4 immediately precedes jetsam.
-pressure_level() { sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1; }
+# Kernel memory pressure: 1=normal 2=warning 4=critical. 4 immediately precedes jetsam. FULL PATH (see above).
+pressure_level() { "$_SYSCTL" -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1; }
 
 if [ "$(pressure_level)" -ge 4 ]; then
   echo "[mem_safe_run $LABEL] REFUSING launch: kernel memory pressure already CRITICAL. Free RAM first." >&2
   exit 3
 fi
-echo "[mem_safe_run $LABEL] launching in own process group; job-tree RSS ceiling ${CEIL_MB}MB, kill on critical kernel pressure."
+_AVAIL_AT_LAUNCH=$(avail_mb)
+echo "[mem_safe_run $LABEL] launching in own process group; system-available FLOOR ${AVAIL_FLOOR_MB}MB (avail now ${_AVAIL_AT_LAUNCH}MB), RSS hard-stop ${RSS_HARDSTOP_MB}MB, kill on critical kernel pressure."
 
 # Export a marker so wrapped children can VERIFY they are under the backstop. m02 refuses to start a
 # bulk/parallel/seed run without it, so the 2026-06-04 mandate is enforced by code, not by remembering to wrap.
 export MEM_SAFE_RUN=1
 export MEM_SAFE_RUN_LABEL="$LABEL"
-export MEM_SAFE_RUN_CEIL_MB="$CEIL_MB"
+# job memory budget for in-process planners (m02 plan_memory_budget): headroom from avail-now down to the floor.
+export MEM_SAFE_RUN_CEIL_MB=$(( _AVAIL_AT_LAUNCH > AVAIL_FLOOR_MB ? _AVAIL_AT_LAUNCH - AVAIL_FLOOR_MB : 1024 ))
 
 # Launch the job as its own session/process group so the watchdog can signal the whole
 # tree. macOS has no `setsid`, so use perl's POSIX::setsid: the perl proc becomes the
@@ -93,22 +105,22 @@ _kill_group() {  # $1 = reason ; $2 = "immediate" -> SIGKILL now (no TERM grace)
   exit 9
 }
 
-breaches=0
 while kill -0 "$JOB_PID" 2>/dev/null; do
-  RSS=$(tree_rss_mb "$PGID")
+  AVAIL=$(avail_mb)
   PL=$(pressure_level)
-  # CRITICAL kernel pressure (level 4 = the level that immediately precedes jetsam) -> kill NOW, no grace.
-  # Waiting even one more 3s sample here is how the box swap-deaths (codex P1). RSS-ceiling breaches keep the
-  # 2-sample debounce to ignore transient spikes.
-  if [ "$PL" -ge 4 ]; then
-    _kill_group "kernel pressure CRITICAL (pl=$PL, rss=${RSS}MB)" immediate
+  RSS=$(tree_rss_mb "$PGID")
+  # PRIMARY (box-death signal): system available RAM below the floor -> kill NOW. Catches memory the job holds
+  # as mmap / file cache that RSS misses (the v15_m04 case). First-breach, immediate SIGKILL, no debounce.
+  if [ -n "$AVAIL" ] && [ "$AVAIL" -lt "$AVAIL_FLOOR_MB" ]; then
+    _kill_group "system available ${AVAIL}MB < floor ${AVAIL_FLOOR_MB}MB (rss=${RSS}MB pl=${PL})" immediate
   fi
-  if [ "$RSS" -gt "$CEIL_MB" ]; then
-    breaches=$(( breaches + 1 ))
-    echo "[mem_safe_run $LABEL] WARN job-tree RSS ${RSS}MB > ceiling ${CEIL_MB}MB (breach ${breaches}/${BREACH_NEEDED}; pl=${PL})" >&2
-    [ "$breaches" -ge "$BREACH_NEEDED" ] && _kill_group "job-tree RSS ${RSS}MB > ceiling ${CEIL_MB}MB" immediate
-  else
-    breaches=0
+  # kernel CRITICAL pressure (level 4 immediately precedes jetsam) -> kill NOW.
+  if [ "$PL" -ge 4 ]; then
+    _kill_group "kernel pressure CRITICAL (pl=$PL avail=${AVAIL}MB rss=${RSS}MB)" immediate
+  fi
+  # SECONDARY: a single job tree whose own RSS is enormous -> kill even if avail momentarily looks ok.
+  if [ "$RSS" -gt "$RSS_HARDSTOP_MB" ]; then
+    _kill_group "job-tree RSS ${RSS}MB > hard-stop ${RSS_HARDSTOP_MB}MB" immediate
   fi
   sleep $SAMPLE_SEC
 done
