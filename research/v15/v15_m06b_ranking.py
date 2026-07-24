@@ -35,6 +35,9 @@ logger = logging.getLogger("m06b")
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "data" / "v15"
 MS_PER_DAY = 86_400_000
+# HL round-trip taker fee (fraction of notional). mu_stress (§5 gate 3 soft) subtracts 0.5x this per position
+# as a 1.5x-cost APPROXIMATION on the size-neutral r_i. TRUE stress needs a 1.5x-fee/slip M7 re-run (flagged).
+_FEE_RT_STRESS = 0.000864
 
 # Pre-registered min CLOSED round-trips for an entity to be RANKABLE / pool-eligible (codex
 # finding): M7 emits realized_roe=0.0 / round_trip_win_rate=0.0 when n_round_trips==0, so an
@@ -191,11 +194,32 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
         mfe = pd.to_numeric(g.get("mfe"), errors="coerce")
         gb = pd.to_numeric(g.get("mfe_giveback"), errors="coerce")
         amae = mae.abs()
+        # === m6_redesign_v2 §5 additional metrics ===
+        realized_usd = pd.to_numeric(g.get("realized_pnl_after_cost"), errors="coerce")
+        tuw = (pd.to_numeric(g["time_underwater"], errors="coerce")      # gate 5 (emitted 2026-07-24)
+               if "time_underwater" in g.columns else pd.Series(dtype=float))
+        # mu_stress (gate 3 soft): 1.5x fee/slip => subtract 0.5x RT fee per position from r_i (approx;
+        # true stress needs a 1.5x-cost M7 re-run — flagged approximate).
+        mu_stress = float((g["r_i"] - 0.5 * _FEE_RT_STRESS).mean())
+        # Concentration C_position (gate 6): max single-coin |dollar PnL| / total |dollar PnL|.
+        if "coin" in g.columns and realized_usd.notna().any():
+            by_coin = realized_usd.groupby(g["coin"]).sum()
+            tot_abs = by_coin.abs().sum()
+            c_pos = float(by_coin.abs().max() / tot_abs) if tot_abs > 0 else np.nan
+            # drop-best-position (by $ PnL) leaves net-positive
+            drop_best_pos = float(realized_usd.sum() - realized_usd.max())
+        else:
+            c_pos = np.nan; drop_best_pos = np.nan
+        # Realization (gate 4b/support): frac of positions opened >=7d before window end that are closed.
+        # NOTE: the sim force-closes at fold end, so 'closed' is near-degenerate here -> realization from the
+        # sim is UNRELIABLE; the true realization gate needs on-chain leader close-turnover. FLAGGED.
+        closed = g.get("closed")
+        realization = float(pd.to_numeric(closed, errors="coerce").fillna(1).mean()) if closed is not None else np.nan
         return pd.Series({
             "pp_n": n, "pp_mean_r": mean_r, "pp_std_r": std_r, "pp_t": t, "pp_lcb_mean_r": lcb,
             "pp_med_hold_h": g["hold_h"].median(), "pp_p90_hold_h": g["hold_h"].quantile(0.9),
             "pp_frac_quick": (g["hold_h"] <= 48).mean(),
-            "pp_realized": g["realized_pnl_after_cost"].sum() if "realized_pnl_after_cost" in g else np.nan,
+            "pp_realized": realized_usd.sum() if realized_usd.notna().any() else np.nan,
             "pp_uw_add": (uw.mean() if uw.notna().any() else np.nan),
             # position-drawdown (MAE) block
             "pp_mae_med": (amae.median() if amae.notna().any() else np.nan),
@@ -204,6 +228,13 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
             # favorable-excursion (MFE) block
             "pp_mfe_med": (mfe.median() if mfe.notna().any() else np.nan),
             "pp_giveback_med": (gb.median() if gb.notna().any() else np.nan),
+            # §5 spec metrics
+            "pp_mu_stress": mu_stress,                                    # gate 3 soft
+            "pp_time_uw_p90": (tuw.quantile(0.9) if tuw.notna().any() else np.nan),  # gate 5
+            "pp_time_uw_med": (tuw.median() if tuw.notna().any() else np.nan),
+            "pp_concentration": c_pos,                                    # gate 6
+            "pp_drop_best_pos": drop_best_pos,                            # gate 6 (net-positive after drop-best)
+            "pp_realization": realization,                               # gate 4b (FLAGGED sim-degenerate)
         })
     out = df.groupby(["entity_id", "fold_id"]).apply(_agg).reset_index()
     return out

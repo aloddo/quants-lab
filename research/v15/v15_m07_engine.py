@@ -1195,6 +1195,8 @@ def _rt_open(summary: dict, coin: str, our_ts=None, side: int = 0, entry_px: flo
         "mfe": 0.0,   # per-position MAX FAVORABLE EXCURSION = best in-the-money frac vs entry VWAP (>=0).
                       # "MAE and MFE are crucial" (Alberto 2026-07-24): MFE vs realized = give-back (informs
                       # whether OUR trailing-TP could capture more than the leader's exit).
+        "n_samp": 0, "n_uw": 0,   # sample count + underwater-sample count -> time_underwater fraction
+                                  # (m6_redesign_v2 gate 5 DCA-whale: time_underwater > ceiling). Fills + hourly marks.
     }
 
 
@@ -1208,6 +1210,9 @@ def _rt_update_excursions(acc: dict, mark: float, entry_px: float, side: int) ->
         acc["mae"] = exc
     if exc > acc.get("mfe", 0.0):
         acc["mfe"] = exc
+    acc["n_samp"] = acc.get("n_samp", 0) + 1
+    if exc < 0:
+        acc["n_uw"] = acc.get("n_uw", 0) + 1
 
 
 def _rt_add(summary: dict, coin: str, realized: float = 0.0, fee: float = 0.0, funding: float = 0.0):
@@ -1280,6 +1285,10 @@ def _rt_close(summary: dict, coin: str, our_ts=None, close_reason: str = "normal
         "mfe": float(acc.get("mfe", 0.0) or 0.0),
         "mfe_giveback": (
             float(acc.get("mfe", 0.0) or 0.0) - (pnl / peak) if peak > 0 else None),
+        # time_underwater = fraction of marks (fills + hourly) where the position was underwater vs entry
+        # VWAP (m6_redesign_v2 gate 5 DCA-whale: time_underwater fraction > ceiling => reject).
+        "time_underwater": (
+            float(acc.get("n_uw", 0)) / float(acc.get("n_samp", 0)) if acc.get("n_samp", 0) else 0.0),
         "close_reason": close_reason, "closed": True,
     })
 
