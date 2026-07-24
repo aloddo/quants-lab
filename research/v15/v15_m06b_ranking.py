@@ -240,6 +240,64 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
     return out
 
 
+def _same_coin_alpha(m07_dir: Path, block_h: float = 24.0, n_boot: int = 2000, seed: int = 7) -> "pd.DataFrame | None":
+    """m6_redesign_v2 §5 GATE 8 (#E-bench): per-journey alpha_i = r_i − passive-hold-same-coin return over the
+    position's [entry,exit] window (direction-matched), removing coin beta. Returns per-(entity,fold): pp_alpha_mean
+    and pp_alpha_lcb (one-sided 95% block-bootstrap lower bound on the mean, blocks = calendar day). Gate wants
+    LCB_alpha > 0. Uses the M7 OHLC mark cache (causal). None if positions/marks unavailable."""
+    p = m07_dir / "m07_positions.parquet"
+    df = _read_parquet_maybe_parts(p) if (p.exists() or (m07_dir / "m07_positions.parquet").is_dir()) else None
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    df["r_i"] = pd.to_numeric(df["r_i"], errors="coerce")
+    df = df.dropna(subset=["r_i", "entry_ts", "exit_ts", "coin"])
+    if df.empty:
+        return None
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from v15_m07_engine import MarketData, build_ohlc_cache, coin_is_spot
+    coins = sorted({c for c in df["coin"].unique() if c and not coin_is_spot(c)})
+    build_ohlc_cache(coins)
+    md = MarketData(require_cache=True)
+    # passive-hold same-coin return over each position's window, direction-matched
+    side = np.where(pd.to_numeric(df["side"], errors="coerce") > 0, 1.0, -1.0)
+    e = pd.to_numeric(df["entry_ts"], errors="coerce").astype("Int64")
+    x = pd.to_numeric(df["exit_ts"], errors="coerce").astype("Int64")
+    passive = np.full(len(df), np.nan)
+    for i, (c, t0, t1, s) in enumerate(zip(df["coin"], e, x, side)):
+        if pd.isna(t0) or pd.isna(t1):
+            continue
+        p0 = md.mark(c, int(t0), causal=True); p1 = md.mark(c, int(t1), causal=True)
+        if p0 and p1 and p0 > 0:
+            passive[i] = s * (p1 - p0) / p0
+    df["pp_alpha_i"] = df["r_i"].to_numpy() - passive
+    df["_day"] = (e.astype("float") // MS_PER_DAY)
+    df = df.dropna(subset=["pp_alpha_i"])
+    if df.empty:
+        return None
+
+    def _agg_alpha(g):
+        a = g["pp_alpha_i"].to_numpy("float64")
+        mean_a = float(a.mean())
+        # block bootstrap LCB by calendar day (independent blocks; not iid)
+        days = g["_day"].to_numpy()
+        uniq = pd.unique(days)
+        if len(uniq) < 3:
+            lcb = mean_a - 1.645 * (a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else np.nan
+        else:
+            rng = np.random.default_rng(seed)
+            groups = [a[days == d] for d in uniq]
+            nb = len(groups)
+            means = np.empty(n_boot)
+            for b in range(n_boot):
+                idx = rng.integers(0, nb, size=nb)
+                means[b] = np.concatenate([groups[j] for j in idx]).mean()
+            lcb = float(np.percentile(means, 5))
+        return pd.Series({"pp_alpha_mean": mean_a, "pp_alpha_lcb": lcb, "pp_alpha_n": len(a)})
+    return df.groupby(["entity_id", "fold_id"]).apply(_agg_alpha).reset_index()
+
+
 def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None) -> dict:
     """Load the M7 pretest-window engine results + upstream M6a/M5/M4/M3 inputs.
 
