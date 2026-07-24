@@ -179,10 +179,31 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
         return None
     df["hold_h"] = (pd.to_numeric(df["exit_ts"], errors="coerce")
                     - pd.to_numeric(df["entry_ts"], errors="coerce")) / 3.6e6
+    df["_blk14"] = (pd.to_numeric(df["entry_ts"], errors="coerce") // (14 * MS_PER_DAY)).astype("Int64")
     def _agg(g):
         n = len(g); mean_r = g["r_i"].mean(); std_r = g["r_i"].std(ddof=1) if n > 1 else np.nan
         se = (std_r / np.sqrt(n)) if (std_r == std_r and n > 1) else np.nan
         t = (mean_r / se) if (se and se == se and se > 0) else np.nan
+        # §5 gate 2 (Codex fix): LCB_mu via 14-DAY BLOCK (circular/cluster) bootstrap, NOT the normal-IID SE
+        # (serially-correlated returns -> IID SE too small = biased loose). effective-n = # active 14d blocks
+        # (gate 1 requires >=8). Fail-closed (nan LCB) when <3 blocks so a thin wallet can't clear gate 2.
+        blk = g["_blk14"].to_numpy()
+        ublk = pd.unique(blk[~pd.isna(blk)])
+        eff_blocks = int(len(ublk))
+        r = g["r_i"].to_numpy("float64")
+        if eff_blocks >= 3:
+            _rng = np.random.default_rng(20260724)
+            groups = [r[blk == b] for b in ublk]
+            nb = len(groups)
+            bm = np.array([np.concatenate([groups[j] for j in _rng.integers(0, nb, size=nb)]).mean()
+                           for _ in range(1500)])
+            lcb_boot = float(np.percentile(bm, 5))
+        else:
+            lcb_boot = np.nan
+        # §5 gate 6 (Codex fix): POSITION concentration (largest single-position |$PnL| share), not coin.
+        rz = pd.to_numeric(g.get("realized_pnl_after_cost"), errors="coerce")
+        tot_abs_pos = rz.abs().sum()
+        pos_conc = float(rz.abs().max() / tot_abs_pos) if tot_abs_pos > 0 else np.nan
         lcb = (mean_r - 1.645 * se) if (se == se) else np.nan
         uw = pd.to_numeric(g.get("underwater_add_ratio"), errors="coerce")
         # POSITION DRAWDOWN (Alberto 2026-07-24 "It should be position drawdown", "MAE and MFE are crucial"):
@@ -229,10 +250,13 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
             "pp_mfe_med": (mfe.median() if mfe.notna().any() else np.nan),
             "pp_giveback_med": (gb.median() if gb.notna().any() else np.nan),
             # §5 spec metrics
-            "pp_mu_stress": mu_stress,                                    # gate 3 soft
+            "pp_mu_stress": mu_stress,                                    # gate 3 SOFT (not a hard gate)
+            "pp_lcb_boot": lcb_boot,                                      # gate 2: 14d block-bootstrap LCB_mu
+            "pp_eff_blocks": eff_blocks,                                  # gate 1: effective-n (active 14d blocks)
             "pp_time_uw_p90": (tuw.quantile(0.9) if tuw.notna().any() else np.nan),  # gate 5
             "pp_time_uw_med": (tuw.median() if tuw.notna().any() else np.nan),
-            "pp_concentration": c_pos,                                    # gate 6
+            "pp_concentration": c_pos,                                    # coin-level (deployment, diagnostic)
+            "pp_pos_concentration": pos_conc,                            # gate 6 POSITION-level $PnL concentration
             "pp_drop_best_pos": drop_best_pos,                            # gate 6 (net-positive after drop-best)
             "pp_realization": realization,                               # gate 4b (FLAGGED sim-degenerate)
         })
@@ -240,62 +264,75 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
     return out
 
 
-def _same_coin_alpha(m07_dir: Path, block_h: float = 24.0, n_boot: int = 2000, seed: int = 7) -> "pd.DataFrame | None":
-    """m6_redesign_v2 §5 GATE 8 (#E-bench): per-journey alpha_i = r_i − passive-hold-same-coin return over the
-    position's [entry,exit] window (direction-matched), removing coin beta. Returns per-(entity,fold): pp_alpha_mean
-    and pp_alpha_lcb (one-sided 95% block-bootstrap lower bound on the mean, blocks = calendar day). Gate wants
-    LCB_alpha > 0. Uses the M7 OHLC mark cache (causal). None if positions/marks unavailable."""
+def _same_coin_alpha(m07_dir: Path, folds: "pd.DataFrame", n_boot: int = 2000, seed: int = 7) -> "pd.DataFrame | None":
+    """m6_redesign_v2 §5 GATE 8 (#E-bench), FAITHFUL per §4/v2.2 (Codex 2026-07-24 caught my prior per-position
+    same-timing version = the EXPLICITLY-KILLED degenerate benchmark). Correct benchmark = PASSIVE buy&hold of the
+    same coin over the WHOLE pretest window [train_start, test_start), exposure-weighted to the wallet's exposure on
+    that coin. Per (entity,fold,coin): wallet_ret_c = Σrealized_after_cost / Σpeak_notional (exposure-weighted
+    realized return); passive_c = coin's window return (mark(win_end)-mark(win_start))/mark(win_start); alpha_c =
+    wallet_ret_c − passive_c. Aggregate exposure-weighted across coins -> pp_alpha_mean. LCB via bootstrap over the
+    per-coin alphas (cluster=coin, removes coin beta; not iid per-journey). Gate: pp_alpha_lcb > 0."""
     p = m07_dir / "m07_positions.parquet"
     df = _read_parquet_maybe_parts(p) if (p.exists() or (m07_dir / "m07_positions.parquet").is_dir()) else None
     if df is None or df.empty:
         return None
     df = df.copy()
-    df["r_i"] = pd.to_numeric(df["r_i"], errors="coerce")
-    df = df.dropna(subset=["r_i", "entry_ts", "exit_ts", "coin"])
+    for c in ("realized_pnl_after_cost", "peak_notional"):
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    df = df.dropna(subset=["realized_pnl_after_cost", "peak_notional", "coin", "fold_id"])
     if df.empty:
         return None
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent))
     from v15_m07_engine import MarketData, build_ohlc_cache, coin_is_spot
+    # fold pretest-window bounds [train_start, test_start) in ms
+    win = {int(r.fold_id): (int(pd.Timestamp(r.train_start).timestamp() * 1000),
+                            int(pd.Timestamp(r.test_start).timestamp() * 1000))
+           for r in folds.itertuples()}
     coins = sorted({c for c in df["coin"].unique() if c and not coin_is_spot(c)})
     build_ohlc_cache(coins)
     md = MarketData(require_cache=True)
-    # passive-hold same-coin return over each position's window, direction-matched
-    side = np.where(pd.to_numeric(df["side"], errors="coerce") > 0, 1.0, -1.0)
-    e = pd.to_numeric(df["entry_ts"], errors="coerce").astype("Int64")
-    x = pd.to_numeric(df["exit_ts"], errors="coerce").astype("Int64")
-    passive = np.full(len(df), np.nan)
-    for i, (c, t0, t1, s) in enumerate(zip(df["coin"], e, x, side)):
-        if pd.isna(t0) or pd.isna(t1):
-            continue
-        p0 = md.mark(c, int(t0), causal=True); p1 = md.mark(c, int(t1), causal=True)
-        if p0 and p1 and p0 > 0:
-            passive[i] = s * (p1 - p0) / p0
-    df["pp_alpha_i"] = df["r_i"].to_numpy() - passive
-    df["_day"] = (e.astype("float") // MS_PER_DAY)
-    df = df.dropna(subset=["pp_alpha_i"])
-    if df.empty:
+    df = df[~df["coin"].map(coin_is_spot)].copy()
+    # per (entity, fold, coin) aggregate: exposure (Σpeak) + wallet realized return + passive-hold coin return
+    grp = df.groupby(["entity_id", "fold_id", "coin"], sort=False)
+    agg = grp.agg(realized=("realized_pnl_after_cost", "sum"),
+                  exposure=("peak_notional", "sum")).reset_index()
+    agg = agg[agg["exposure"] > 0]
+    _pass_cache: dict = {}
+    def _passive(coin, fid):
+        k = (coin, fid)
+        if k in _pass_cache:
+            return _pass_cache[k]
+        t0, t1 = win.get(int(fid), (None, None))
+        v = np.nan
+        if t0 is not None:
+            p0 = md.mark(coin, t0, causal=True); p1 = md.mark(coin, t1, causal=True)
+            if p0 and p1 and p0 > 0:
+                v = (p1 - p0) / p0
+        _pass_cache[k] = v
+        return v
+    agg["wallet_ret_c"] = agg["realized"] / agg["exposure"]
+    agg["passive_c"] = [_passive(c, f) for c, f in zip(agg["coin"], agg["fold_id"])]
+    agg["alpha_c"] = agg["wallet_ret_c"] - agg["passive_c"]
+    agg = agg.dropna(subset=["alpha_c"])
+    if agg.empty:
         return None
 
     def _agg_alpha(g):
-        a = g["pp_alpha_i"].to_numpy("float64")
-        mean_a = float(a.mean())
-        # block bootstrap LCB by calendar day (independent blocks; not iid)
-        days = g["_day"].to_numpy()
-        uniq = pd.unique(days)
-        if len(uniq) < 3:
-            lcb = mean_a - 1.645 * (a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else np.nan
+        a = g["alpha_c"].to_numpy("float64"); w = g["exposure"].to_numpy("float64")
+        wsum = w.sum()
+        mean_a = float((a * w).sum() / wsum) if wsum > 0 else np.nan
+        n = len(a)
+        if n < 3:
+            lcb = np.nan   # too few coins to bootstrap -> not gate-eligible (fail-closed)
         else:
             rng = np.random.default_rng(seed)
-            groups = [a[days == d] for d in uniq]
-            nb = len(groups)
-            means = np.empty(n_boot)
-            for b in range(n_boot):
-                idx = rng.integers(0, nb, size=nb)
-                means[b] = np.concatenate([groups[j] for j in idx]).mean()
+            idx = rng.integers(0, n, size=(n_boot, n))   # resample coins (cluster bootstrap)
+            bw = w[idx]; ba = a[idx]
+            means = (ba * bw).sum(axis=1) / bw.sum(axis=1)
             lcb = float(np.percentile(means, 5))
-        return pd.Series({"pp_alpha_mean": mean_a, "pp_alpha_lcb": lcb, "pp_alpha_n": len(a)})
-    return df.groupby(["entity_id", "fold_id"]).apply(_agg_alpha).reset_index()
+        return pd.Series({"pp_alpha_mean": mean_a, "pp_alpha_lcb": lcb, "pp_alpha_ncoins": n})
+    return agg.groupby(["entity_id", "fold_id"]).apply(_agg_alpha).reset_index()
 
 
 def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None) -> dict:
