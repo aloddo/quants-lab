@@ -1489,6 +1489,23 @@ class CopyTrader:
             logger.debug(f"GROSS GATE OK {coin}: gross {new_gross_x:.2f}x <= {gross_gate_x:.2f}x "
                          f"(admit ${additional_notional:.0f})")
 
+        # OPEN-SPECIFIC gross cap (Alberto 2026-07-24 TG11744: "3x max for opens + 2x for adjustments"). Reserves
+        # dry powder: NEW opens (no existing position on this coin) are capped at gross_open_gate_x; ADD-ONs (we
+        # already hold the coin) are allowed up to the higher gross_entry_gate_x. So base exposure stops at 3x
+        # while mirrored leader adds can scale winners toward 5x. Fail-closed; no-op when the key is unset.
+        gross_open_x = float(self.global_config.get("gross_open_gate_x", float("inf")))
+        if gross_open_x != float("inf"):
+            existing_coin_notional = abs(self._exch_positions.get(coin, {}).get("positionValue", 0) or 0)
+            is_open = existing_coin_notional < 1e-6   # opening a fresh coin position, not adding to one we hold
+            if is_open:
+                _open_gross_x = (sum(abs(d.get("positionValue", 0)) for d in self._exch_positions.values())
+                                 + self._pending_gross_notional + additional_notional) / equity
+                if _open_gross_x > gross_open_x:
+                    logger.info(f"GROSS OPEN GATE BLOCKED {coin}: open would take gross to {_open_gross_x:.2f}x "
+                                f"> {gross_open_x:.2f}x (opens-only cap; adds still allowed to gross_entry_gate). "
+                                f"Dry powder reserved for add-ons.")
+                    return False
+
         coin_data = self._exch_positions.get(coin, {})
         coin_margin = coin_data.get("marginUsed", 0) + additional_margin
         coin_util = coin_margin / equity
