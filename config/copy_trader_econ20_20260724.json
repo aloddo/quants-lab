@@ -39,7 +39,7 @@
   "netx_cap_x": 2.5,
   "coin_side_cap_x": 2.0,
   "seed_min_wallets": 1,
-  "v17_authorization": "ECON+ONCHAIN 20-wallet cohort 2026-07-24, config DERIVED from leader patterns: base $100 (diversify given coin overlap), max_addon 1 (no adds; MATCHES the fixed-size sim validation; engine forbids stacking). Adds = validated v2, coin_side_cap 2x (5 leaders long HYPE->no pileup), 3x open cap + 5x backstop (dry powder). NO backfill. Mirror-full-exit. HL eq $481.70.",
+  "v17_authorization": "ECON+ONCHAIN 20-wallet cohort 2026-07-24, config DERIVED from leader patterns: base $100, max_addon 2x (=leaders' MEASURED 2.0x scale-in), coin_side_cap 2x (5 long HYPE->no pileup), 3x open cap + adds to 4.5x + 5x backstop (dry powder for adds). NO backfill. Mirror-full-exit + mirror adds. 25%/15% stops, -$25/day. HL eq $481.70. WALLET EDGE sim+onchain validated; adds are data-justified execution (downside rail-capped, not separately sim-tested); Alberto informed GO 11748 'go live tonight'.",
   "min_cohort_wallets": 1,
   "expansion": {
    "coins": [
@@ -374,14 +374,14 @@
    "min_notional_usd": 12.0,
    "max_notional_usd": 150.0
   },
-  "gross_open_gate_x": 4.5
+  "gross_open_gate_x": 3.0
  },
  "defaults": {
   "group": "v16_top_decile",
   "entry_mode": "instant",
   "twap_window_s": 0,
   "min_twap_notional": 0,
-  "max_addon_multiplier": 1,
+  "max_addon_multiplier": 2,
   "max_coin_concentration": 1.0,
   "max_coin_notional_pct": 10.0,
   "exit_type": "FIRST_CLOSE",

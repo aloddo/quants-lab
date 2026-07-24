@@ -59,7 +59,7 @@ SCRIPT="strategies/live/hl_copy_trader_v17.py"
 # Alberto capital GO TG10911/10913/10914/10916/10917 (150/order, waive codex, 5x lev, fail-fast). Ledger:
 # brain projects/quant/copy/2026-07-06-gate1-golive-validation-ledger. NOTE for CoS: plist UNCHANGED; only
 # this launcher repointed (established pattern). Supervised takeover needs halt flags removed + daemon loaded.
-ARGS="--config config/copy_trader_active8_20260724.json"   # 2026-07-24 (quant): 8 active double-validated wallets (12-fold sim OOS + real PnL/Calmar + live<=7d). Revert prior: config/copy_trader_wallets_gate1_v4.json
+ARGS="--config config/copy_trader_econ20_20260724.json"   # 2026-07-24 (quant): 8 active double-validated wallets (12-fold sim OOS + real PnL/Calmar + live<=7d). Revert prior: config/copy_trader_wallets_gate1_v4.json
 
 cd "$WORKDIR"
 

@@ -4597,8 +4597,15 @@ class V16CopyTrader(CopyTrader):
              "order_size_usd must be in [10, 200] (Alberto 2026-06-11: full account, up to 10x liquid)")
         _req(d.get("entry_mode") == "instant", "entry_mode must be 'instant' (leader open -> taker entry)")
         _req(d.get("exit_type") == "FIRST_CLOSE", "exit_type must be FIRST_CLOSE (faithful exit)")
-        _req(int(d.get("max_addon_multiplier", 99)) <= 1,
-             "max_addon_multiplier must be <=1 (copy the round-trip OPEN once; no stacking at $12)")
+        # Alberto 2026-07-24: the old "<=1, no stacking at $12" guard was a small-size min-order concern, NOT
+        # data-proven. Leaders' MEASURED scale-in is ~2.0x median, so mirroring adds up to 2x is data-justified.
+        # Keep ONLY the real protection: adds must stay above exchange min-order -> require order_size >= $50 when
+        # stacking (an add is then >= a meaningful notional, never sub-min dust). Risk bounded by gross caps + stops.
+        _addon_mult = int(d.get("max_addon_multiplier", 99))
+        _req(1 <= _addon_mult <= 2,
+             "max_addon_multiplier must be in [1,2] (1=open once; 2=mirror leaders' measured ~2x scale-in)")
+        _req(_addon_mult <= 1 or float(g.get("order_size_usd", 0)) >= 50.0,
+             "max_addon_multiplier > 1 requires order_size_usd >= $50 (adds must stay above min-order)")
         _req(d.get("trail_activate_bps") is not None and d.get("trail_bps") is not None,
              "trailing TP required on every position (hard rule #7)")
         _req(d.get("sl_bps") is not None and float(d["sl_bps"]) < 0, "protective sl_bps < 0 required")
