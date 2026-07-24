@@ -23,8 +23,8 @@ import pandas as pd
 import v15_m04_authenticity as m4
 import v15_m025_authenticity_gate as g
 import hl_fills_io as fio
-from m02_journeys_daily import (load_active_closed, DEFAULT_OUT_DIR, day_end_ms, day_start_ms,
-                                hot_available_days)
+from m02_journeys_daily import (load_active_closed, DEFAULT_OUT_DIR, DEFAULT_STATE_DIR,
+                                committed_run_id, day_end_ms, day_start_ms, hot_available_days)
 from m03_folds_daily import _m2_new_run_wallets
 
 REPO = Path(__file__).resolve().parents[1]
@@ -46,8 +46,13 @@ def _df_to_scores(df: pd.DataFrame) -> dict:
     return out
 
 
-def _universe(m2_out_dir: Path) -> list:
-    j = load_active_closed(Path(m2_out_dir), )
+def _universe(m2_out_dir: Path, m2_state_dir: Path = DEFAULT_STATE_DIR, cap: Optional[int] = None) -> list:
+    # Read ONLY committed M2 runs (codex P1 #2): never expose an uncommitted/failed run to M4.
+    # cap: a committed_run_id SNAPSHOT from the caller. Pass it so the content read and the delta cursor
+    # share ONE ceiling read at ONE instant (codex P1: a second committed_run_id() read here could see a
+    # newer committed run than the cursor -> content cap N, cursor cap N+1 -> N+1 permanently skipped).
+    _cap = committed_run_id(Path(m2_state_dir)) if cap is None else cap
+    j = load_active_closed(Path(m2_out_dir), max_run_id=_cap)
     return sorted(set(j["wallet"].astype(str).str.lower().unique()))
 
 
@@ -114,7 +119,8 @@ def _hot_inputs_fingerprint() -> str:
 
 
 def run_daily(as_of: str, out_dir: Path = DEFAULT_M4_DIR,
-              m2_out_dir: Path = DEFAULT_OUT_DIR, procs: int = 1) -> dict:
+              m2_out_dir: Path = DEFAULT_OUT_DIR, procs: int = 1,
+              m2_state_dir: Path = DEFAULT_STATE_DIR) -> dict:
     """M4 authenticity = FULL recompute over the ENTIRE wallet universe. NO incremental caching.
 
     Cadence (Alberto decision 2026-07-17, TG 11429): M4 runs WEEKLY, not daily. The anchored/stage-A
@@ -130,11 +136,16 @@ def run_daily(as_of: str, out_dir: Path = DEFAULT_M4_DIR,
     state_p = out_dir / "m4_run_state.json"
     as_of_ms = day_end_ms(as_of) + 1
     hi_ms, lo_ms = as_of_ms - 1, _anchor_lo_ms()   # ANCHORED extend-only window (full history)
-    wallets = _universe(m2_out_dir)
+    # Snapshot the committed ceiling ONCE (codex P1) so the content read (_universe) and the delta cursor
+    # (_m2_new_run_wallets) share ONE committed_run_id taken at ONE instant. Two separate reads could
+    # straddle an M2 commit -> content cap N, cursor cap N+1 -> run N+1 permanently skipped.
+    _m2_cap = committed_run_id(Path(m2_state_dir))
+    wallets = _universe(m2_out_dir, m2_state_dir, cap=_m2_cap)
     # bookkeeping: the max COMPLETE M2 run this full score reflects. Bootstrap cursor is 0 (M2 run ids are
     # 1-based; -1 makes _m2_new_run_wallets probe run_id 0, which never exists -> empty, freezing the delta
     # forever -- codex P1). 0 is the same "nothing consumed yet" sentinel the incremental path defaults to.
-    _, new_max = _m2_new_run_wallets(Path(m2_out_dir), 0)
+    # Cap the cursor to the SAME committed snapshot so new_max never records an uncommitted run.
+    _, new_max = _m2_new_run_wallets(Path(m2_out_dir), 0, max_run_id=_m2_cap)
     fp_before = _hot_inputs_fingerprint()   # coherence guard (codex P1 #3)
     source_wm = _source_watermark_day()     # SOURCE freshness of the snapshot M4 reads, captured PRE-run (codex
                                             # P1 r3: post-run would risk stamping a just-arrived, unprocessed day)
@@ -155,14 +166,15 @@ def run_daily(as_of: str, out_dir: Path = DEFAULT_M4_DIR,
             "source_watermark_day": source_wm}
 
 
-def gate(as_of: str = "20260714", m2_out_dir: Path = DEFAULT_OUT_DIR, n: int = 60) -> bool:
+def gate(as_of: str = "20260714", m2_out_dir: Path = DEFAULT_OUT_DIR, n: int = 60,
+         m2_state_dir: Path = DEFAULT_STATE_DIR) -> bool:
     """M4 is FULL-recompute-only now, so the invariant that matters is PUBLISH/RELOAD FIDELITY: a full run,
     published through the atomic parquet writer and read back, must be byte/dtype-identical to the in-memory
     result. This exercises the arrow coercions (list<->ndarray, None/NaN in WalletScores) where dtype bugs
     hide (the ones codex P3 flagged) without depending on the deleted incremental path."""
     import tempfile, shutil
     as_of_ms = day_end_ms(as_of) + 1; hi_ms, lo_ms = as_of_ms - 1, _anchor_lo_ms()   # anchored window
-    wallets = _universe(m2_out_dir)[:n]
+    wallets = _universe(m2_out_dir, m2_state_dir)[:n]
     df, edf, scores = m4.run(wallets, lo_ms, hi_ms, as_of_ms, procs=1, hot_prefetch=True, return_scores=True)
     d = Path(tempfile.mkdtemp())
     tier_p, ent_p, scores_p = d / "t.parquet", d / "e.parquet", d / "s.parquet"

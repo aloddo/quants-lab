@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""V15 M01 — Whole-account Hyperliquid PERP equity reconstructor.
+"""[ARCHIVED / M-Archived — 2026-07-12, Alberto TG 11258] DO NOT USE FOR NEW WORK.
+
+This is the historical whole-account equity RECONSTRUCTION that produced the 66.6%
+m01 quarantine (a reconstruction artifact, see brain
+projects/quant/v15/m01-quarantine-driver-breakdown-2026-07-12). Alberto retired it:
+"forget about M1 ... rename M1 as M-Archived and stop looking at it."
+
+M02 no longer depends on this module. Its fills/funding loaders were extracted to the
+standalone ``research/v15/hl_fills_io.py`` (reads the LIVE hot stores). Journeys are now
+produced by the daily-incremental ``data_pipeline/m02_journeys_daily.py``.
+
+This file is KEPT (not renamed) only because ~15 frozen legacy importers (m03-m10
+selection pipeline + m1_* validation scripts + tests) still reference it; a physical
+rename would break the frozen pipeline for zero benefit. Treat as read-only history.
+
+V15 M01 — Whole-account Hyperliquid PERP equity reconstructor.
 
 This is the V15 foundation module. It reconstructs each source wallet's
 WHOLE-ACCOUNT perp equity (summed across every markable perp dex), re-anchored

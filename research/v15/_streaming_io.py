@@ -92,7 +92,11 @@ class ShardedParquetWriter:
         parts = sorted(self.parts_dir.glob("part_*.parquet"))
         tmp = self.out.with_suffix(self.out.suffix + ".tmp")
         if not parts:
-            pd.DataFrame().to_parquet(self.out, index=False)
+            # ATOMIC empty write (codex P2 #3): temp + rename so a kill / disk error mid-write can
+            # never leave a truncated, glob-visible output that breaks every subsequent active-view
+            # read. Matches the non-empty stitch path (which already writes to .tmp then replaces).
+            pd.DataFrame().to_parquet(tmp, index=False)
+            tmp.replace(self.out)
             self._cleanup_parts(parts)
             return 0
         # codex perf-r1 #2: PERMISSIVE promotion so a column that is int64 in all-closed chunks but

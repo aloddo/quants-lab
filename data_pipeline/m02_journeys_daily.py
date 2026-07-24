@@ -157,10 +157,23 @@ def _budget_or_serial(requested_procs: int, parent_gb: float):
     ceil_gb = _job_ceiling_gb()
     free = _available_ram_gb()
     serial_need = parent_gb + _WRITER_GB + _TRACE_WORKING_GB
-    if (ceil_gb is not None and serial_need > ceil_gb) or (serial_need > free - _SERIAL_FREE_MARGIN_GB):
+    # MEM_ALLOW_LOW_FREE (Alberto 2026-07-23, explicit + informed): psutil.available EXCLUDES the macOS
+    # compressor, which frees on demand -> the free-margin clause is over-conservative on this box. When set,
+    # skip ONLY the free-margin clause; the CEILING check (mem_safe_run job-tree guarantee) still holds, and
+    # the mem_safe_run system-available floor (polls every 15s, kills the group before OOM/jetsam) remains the
+    # real backstop. Default OFF = byte-identical prior behavior. Streaming output => a guard-kill loses nothing.
+    _allow_low_free = os.environ.get("MEM_ALLOW_LOW_FREE") == "1"
+    over_ceiling = (ceil_gb is not None and serial_need > ceil_gb)
+    over_free = (serial_need > free - _SERIAL_FREE_MARGIN_GB)
+    if over_ceiling or (over_free and not _allow_low_free):
         raise MemoryBudgetError(
             f"serial infeasible: parent+writer+trace={serial_need:.1f}GB > ceiling={ceil_gb} or "
             f"free-margin={free - _SERIAL_FREE_MARGIN_GB:.1f}GB. Free RAM (pause fleet) or raise --floor-gb.")
+    if over_free and _allow_low_free:
+        logger.warning(
+            f"[mem_budget] MEM_ALLOW_LOW_FREE=1: proceeding despite psutil free-margin "
+            f"{free - _SERIAL_FREE_MARGIN_GB:.1f}GB < serial_need {serial_need:.1f}GB (fits ceiling={ceil_gb}GB; "
+            f"trusting macOS compressor on-demand release + mem_safe_run floor guard). Alberto 2026-07-23.")
     try:
         b = _budget(requested_procs, parent_gb=parent_gb)   # free-RAM fit (plan_memory_budget)
     except MemoryBudgetError:
@@ -199,6 +212,18 @@ DEFAULT_STATE_DIR = REPO / "app" / "data" / "v15" / "m02_daily_state"
 # clobber the live 1c-1f checkpoint during the cron transition (the store/out-dir is shared).
 DEFAULT_STATEFUL_STATE_DIR = REPO / "app" / "data" / "v15" / "m02_stateful_state"
 DEFAULT_OUT_DIR = REPO / "app" / "data" / "v15" / "m02_journeys_daily"
+# OPTION A canonical actions persistence (2026-07-22): the run_daily driver ALSO persists the
+# per-ACTION stream the tracer already computes, day/run-partitioned exactly like the journeys
+# closed/ store, byte-equivalent to a full-batch v15_m02 trace. Downstream (m03-m10) reads the
+# fresh canonical actions here instead of the stale legacy m02_actions.parquet. run-parts live at
+# <ACTIONS_DIR>/run_<id>.parquet (no open/closed split -- every action, open or closed journey, is
+# persisted). ONLY run_daily writes it (its correctness comes from every replay starting at an
+# all-coin-flat instant); run_daily_stateful deliberately does NOT (see gate note there).
+DEFAULT_ACTIONS_DIR = REPO / "app" / "data" / "v15" / "m02_actions_daily"
+# Hard memory bound for the out-of-core DuckDB actions reducer/tombstoner. threads alone do NOT cap
+# DuckDB RAM; a PRAGMA memory_limit does. Set well under the box so the windowed dedup can never blow
+# up before the process memory guard's 15s poll fires (codex P2 #5).
+_DUCKDB_MEM_LIMIT_GB = 4.0
 
 # Introspection hook (equivalence gate only): the per-wallet replay_start computed by the LAST
 # run_daily call. Prod cost is nil (already in RAM); no return-contract change. The gate asserts a
@@ -339,6 +364,216 @@ def _tag_journey(j: dict, run_id: int, active: bool) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# action_uid (deterministic, WINDOW-INVARIANT action identity)
+# --------------------------------------------------------------------------- #
+
+
+def action_uid(wallet: str, coin: str, ts, this_fill_ord=0) -> str:
+    """Deterministic, WINDOW-INVARIANT primary key for ONE action (one ordered fill event).
+
+    The tracer emits exactly one action row per fill it processes. All fills sharing an exact
+    (coin, ts) are present in ANY replay window covering ts (a valid last_flat <= ts), and the
+    per-fill guards (spot skip, |signed|<=EPS, non-finite drop) are deterministic, so the same-ts
+    ORDINAL ``this_fill_ord`` is identical from-genesis and from-last_flat (same argument as the
+    journey_uid Phase-1c disambiguator). Hence ``(wallet, coin, ts, this_fill_ord)`` is unique per
+    emitted action within a wallet AND stable across replay windows -> a correct active-view dedup key.
+
+    ``fill_id`` (== tid) is DELIBERATELY EXCLUDED: it is 0/missing on the S3 by-wallet partition, so it
+    cannot be the identity, and it is redundant given the same-ts ordinal (it is window-stable when
+    present, but adds nothing to uniqueness). The WINDOW-LOCAL columns (event_order, journey_id,
+    opening/closing_journey_id) are NEVER part of the key -- they restart per replay window and are
+    diagnostic-only. This uid has ZERO external consumers (the store replaces by wallet+ts RANGE); it
+    only needs to be self-consistent + window-invariant, exactly like journey_uid."""
+    return hashlib.sha256(
+        f"{str(wallet).lower()}|{coin}|{int(ts)}|{int(this_fill_ord or 0)}".encode()
+    ).hexdigest()
+
+
+def _tag_action(a: dict, run_id: int, active: bool) -> dict:
+    a = dict(a)
+    a["action_uid"] = action_uid(a["wallet"], a["coin"], a["ts"], a.get("this_fill_ord", 0))
+    a["run_id"] = int(run_id)
+    a["active"] = bool(active)
+    return a
+
+
+# --------------------------------------------------------------------------- #
+# Actions store: run-partitioned parquet + MEMORY-SAFE active-view reducer
+# --------------------------------------------------------------------------- #
+
+
+def _run_id_of_part(path: str) -> int:
+    """``.../run_000123.parquet`` -> 123."""
+    return int(Path(path).name[len("run_"):].split(".")[0])
+
+
+def committed_run_id(state_dir: Path) -> int:
+    """Highest run_id whose parts are COMMITTED (published AND checkpointed). The checkpoint is the
+    single source of truth and is written LAST (atomically, tmp+rename). A run part on disk with a
+    HIGHER run_id is an uncommitted/failed run and MUST be ignored by every reducer
+    (non-transactional-publish fail-closed, codex P1 #2). Returns 0 when no checkpoint exists.
+
+    RUN_ID CONVENTION (single documented invariant, codex P2): the two drivers store run_id
+    differently, so the checkpoint records WHICH via ``run_id_is_next``:
+      * ``run_daily``           -> stores the NEXT run_id to use  (run_id_is_next=True)  -> committed = rid-1
+      * ``run_daily_stateful``  -> stores the LAST-written run_id  (run_id_is_next=False) -> committed = rid
+    Legacy checkpoints predate the flag; they were ALL written by run_daily's next convention, so the
+    default is True (rid-1) -- correct for the live 1c-1f store."""
+    cp = load_checkpoint(state_dir)
+    if not cp:
+        return 0
+    rid = int(cp.get("run_id", 1))
+    return (rid - 1) if cp.get("run_id_is_next", True) else rid
+
+
+def _actions_parts_glob(actions_dir: Path, max_run_id: Optional[int] = None) -> list[str]:
+    """Real, READABLE, NON-EMPTY action run-parts, optionally capped to the committed run_id.
+
+    Filters out: stray .tmp/.parts staging files; parts with run_id > ``max_run_id`` (uncommitted /
+    failed runs -- codex P1 #2); and 0-row or truncated/unreadable parts (a run with zero actions
+    writes a schemaless 0-row parquet with no ``action_uid`` column that would break the windowed
+    dedup, and a kill mid-write can leave a truncated file -- codex P2 #3). Cheap: run_id from the
+    filename, num_rows from parquet metadata (no full read)."""
+    out: list[str] = []
+    for p in glob.glob(str(Path(actions_dir) / "run_*.parquet")):
+        if p.endswith(".tmp") or ".parquet.parts" in p:
+            continue
+        try:
+            rid = _run_id_of_part(p)
+        except (ValueError, IndexError):
+            continue
+        if max_run_id is not None and rid > max_run_id:
+            continue   # newer than the committed checkpoint -> uncommitted/failed run, ignore
+        try:
+            if pq.ParquetFile(p).metadata.num_rows == 0:
+                continue   # empty (or the schemaless empty-output) part -> nothing to contribute
+        except Exception:  # noqa: BLE001  truncated/unreadable (e.g. killed mid-write) -> skip safely
+            continue
+        out.append(p)
+    return sorted(out)
+
+
+def _active_actions_sql(parts: list[str], wallets: Optional[set[str]]) -> str:
+    """DuckDB SQL that reduces the run-partitioned actions store to its CURRENT active view.
+
+    Per ``action_uid`` keep the highest ``run_id``; within a run ``active=True`` (fresh) beats
+    ``active=False`` (tombstone); then keep only active rows. ``union_by_name`` tolerates a column that
+    a given run never emitted. Optional wallet filter is pushed DOWN into the scan (bounds the read)."""
+    parts_lit = "[" + ",".join("'" + p.replace("'", "''") + "'" for p in parts) + "]"
+    where = ""
+    if wallets is not None:
+        wl = ",".join("'" + str(w).lower().replace("'", "''") + "'" for w in wallets)
+        where = f"WHERE lower(wallet) IN ({wl})" if wl else "WHERE 1=0"
+    return (
+        "SELECT * EXCLUDE (rn) FROM ("
+        "  SELECT *, row_number() OVER ("
+        "    PARTITION BY action_uid ORDER BY run_id DESC, active DESC) AS rn"
+        f"  FROM read_parquet({parts_lit}, union_by_name=true) {where}"
+        ") WHERE rn = 1 AND active"
+    )
+
+
+def load_active_actions(actions_dir: Path, wallets: Optional[set[str]] = None,
+                        out_path: Optional[str] = None, max_run_id: Optional[int] = None):
+    """MEMORY-SAFE reduction of the run-partitioned actions store to the CURRENT active view.
+
+    Analogous to ``load_active_closed`` for journeys, but the actions store is ~86M+ rows so this
+    NEVER pandas-concats all parts (that is the banned all-rows materialize). It uses DuckDB, which
+    streams the parquet scan + windowed dedup OUT OF CORE with a hard ``memory_limit`` (bounded RAM
+    regardless of store size).
+
+      * ``wallets`` -- optional subset; the filter is pushed into the scan so only those wallets are
+        read/returned (bounds memory for the incremental tombstone path).
+      * ``out_path`` -- when given, the active view is streamed straight to this parquet via DuckDB
+        ``COPY`` (fully out-of-core) and the function returns ``None``. Use this for the FULL store.
+      * ``max_run_id`` -- ignore run parts newer than this committed run_id (pass
+        ``committed_run_id(state_dir)`` so an uncommitted/failed run is never read; codex P1 #2).
+
+    ``wallets=None`` AND ``out_path=None`` is REJECTED: that would ``fetch_df()`` the entire active
+    view into pandas RAM (the unbounded materialize this reducer exists to prevent, codex P2 #4). The
+    full store MUST use ``out_path`` (COPY) or a bounded ``wallets`` subset."""
+    if wallets is None and out_path is None:
+        raise ValueError(
+            "load_active_actions(wallets=None, out_path=None) would materialize the FULL ~86M-row "
+            "active view in pandas RAM (banned). Pass out_path=... to stream the full store via "
+            "DuckDB COPY, or wallets=<bounded subset> for an in-RAM slice.")
+    import duckdb  # local: only the daily driver / reducer needs it
+    parts = _actions_parts_glob(actions_dir, max_run_id=max_run_id)
+    if not parts:
+        return None if out_path else pd.DataFrame()
+    sql = _active_actions_sql(parts, wallets)
+    con = duckdb.connect()
+    try:
+        con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEM_LIMIT_GB}GB'")  # hard RAM cap (codex P2 #5)
+        con.execute("PRAGMA threads=2")  # bounded parallelism keeps peak RAM flat
+        if out_path:
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            con.execute(
+                f"COPY ({sql}) TO '{str(out_path).replace(chr(39), chr(39) * 2)}' "
+                "(FORMAT PARQUET, COMPRESSION SNAPPY)")
+            return None
+        return con.execute(sql).fetch_df()
+    finally:
+        con.close()
+
+
+def _stream_action_tombstones(actions_dir: Path, replay_start: dict[str, int], run_id: int,
+                              writer: ShardedParquetWriter, max_run_id: Optional[int] = None,
+                              batch_rows: int = 200_000) -> int:
+    """Tombstone prior-ACTIVE actions of the affected wallets by ``(wallet, ts >= replay_start[w])``,
+    mirroring the journey tombstone (which uses ``entry_ts >= replay_start``). Because every replay
+    starts at a proven all-coin-flat instant, no journey OPEN spans ``replay_start``, so for the vast
+    majority of journeys ``action.ts >= replay_start`` iff ``journey.entry_ts >= replay_start`` -- the
+    two tombstone sets coincide.
+
+    BOUNDARY (codex P2 #6, claim accuracy): the sets are NOT identical at the exact instant
+    ``ts == replay_start``. A journey with ``entry_ts < replay_start`` and ``exit_ts == replay_start``
+    is KEPT by the journey reducer (entry_ts < replay_start -> not tombstoned) yet its EXIT action at
+    ``ts == replay_start`` IS tombstoned+re-emitted here (ts >= replay_start). That is benign: the
+    re-emitted action is byte-identical canonical CONTENT (asserted exactly equal by the acceptance
+    test), and ``_compute_last_flat`` merges touching intervals so ``replay_start`` normally lands on a
+    genuine all-flat entry_ts rather than mid-position -- so this boundary is rare and content-safe,
+    never a lost or duplicated action in the active view.
+
+    MEMORY-SAFE: DuckDB (with a hard ``memory_limit``) joins the active-view against an in-memory
+    (wallet, replay_start) map and STREAMS matched rows in Arrow batches into ``writer`` (each
+    re-stamped active=False, run_id), never materializing the whole affected-wallet action history
+    (which for ~77k holders would be the banned tens-of-millions-row concat). ``max_run_id`` caps the
+    scan to committed run parts (codex P1 #2). Returns the tombstone count."""
+    import duckdb  # local
+    parts = _actions_parts_glob(actions_dir, max_run_id=max_run_id)
+    if not parts or not replay_start:
+        return 0
+    rs_df = pd.DataFrame(
+        {"wallet": [str(w).lower() for w in replay_start],
+         "_rs": [int(v) for v in replay_start.values()]})
+    active_sql = _active_actions_sql(parts, wallets=set(rs_df["wallet"]))
+    con = duckdb.connect()
+    n = 0
+    try:
+        con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEM_LIMIT_GB}GB'")  # hard RAM cap (codex P2 #5)
+        con.execute("PRAGMA threads=2")
+        con.register("rs_map", rs_df)
+        q = (f"SELECT av.* FROM ({active_sql}) av JOIN rs_map rs "
+             "ON lower(av.wallet) = rs.wallet WHERE av.ts >= rs._rs")
+        res = con.execute(q)
+        while True:
+            batch = res.fetch_df_chunk()  # bounded chunk (out-of-core); empty frame = done
+            if batch is None or batch.empty:
+                break
+            batch = batch.drop(columns=[c for c in ("run_id", "active") if c in batch.columns])
+            recs = batch.to_dict("records")
+            for rec in recs:
+                rec["run_id"] = int(run_id)
+                rec["active"] = False
+            writer.add_many(recs)
+            n += len(recs)
+    finally:
+        con.close()
+    return n
+
+
+# --------------------------------------------------------------------------- #
 # Checkpoint I/O
 # --------------------------------------------------------------------------- #
 
@@ -382,17 +617,33 @@ def _write_touched(out_dir: Path, run_id: int, wallets) -> None:
     tmp.replace(p)
 
 
-def load_active_closed(out_dir: Path, wallets: Optional[set[str]] = None) -> pd.DataFrame:
+def load_active_closed(out_dir: Path, wallets: Optional[set[str]] = None,
+                       max_run_id: Optional[int] = None) -> pd.DataFrame:
     """Reduce the run-partitioned closed store to the CURRENT active view.
 
     Per ``journey_uid`` keep the row with the highest ``run_id``; within a run,
     ``active=True`` (fresh) wins over ``active=False`` (tombstone). Then keep only
-    active rows. Optionally restrict to a wallet subset (bounds memory)."""
+    active rows. Optionally restrict to a wallet subset (bounds memory).
+
+    ``max_run_id`` -- ignore run parts newer than this committed run_id (pass
+    ``committed_run_id(state_dir)``); an uncommitted/failed run's parts are then never read, keeping
+    the journeys + actions stores consistent with the single-source-of-truth checkpoint (codex P1 #2).
+    """
     cdir = _closed_dir(out_dir)
     # EXCLUDE the touched sidecars: `run_*.parquet` also matches `run_<id>.wallets.parquet` (the stateful
     # TOUCHED sidecar), whose schema has no journey_uid/active/run_id -> concatenating it corrupts M3/M5
     # (codex P1). Only real journey partitions here.
     parts = sorted(p for p in glob.glob(str(cdir / "run_*.parquet")) if not p.endswith(".wallets.parquet"))
+    if max_run_id is not None:
+        _kept = []
+        for p in parts:
+            try:
+                _rid = _run_id_of_part(p)
+            except (ValueError, IndexError):
+                continue
+            if _rid <= max_run_id:
+                _kept.append(p)
+        parts = _kept
     if not parts:
         return pd.DataFrame()
     frames = []
@@ -427,14 +678,32 @@ def run_daily(
     lookback_days: int = 3,
     flush_rows: int = 100_000,
     mem_soft_gb: float = 12.0,
+    actions_dir: Path = DEFAULT_ACTIONS_DIR,
 ) -> dict:
     """Advance the daily-incremental journeys store to ``target_day``.
+
+    OPTION A (2026-07-22): ALSO persist the canonical per-ACTION stream the tracer already computes,
+    into ``actions_dir`` run-partitioned exactly like the journeys closed/ store. Its correctness
+    rests on the SAME invariant as the journeys store: every replay starts at a proven all-coin-flat
+    instant, so the re-traced actions are complete from a zero seed. Because no journey OPEN spans a
+    flat ``replay_start``, ``action.ts >= replay_start`` matches ``journey.entry_ts >= replay_start``
+    for the vast majority of journeys -- the action tombstones (by wallet+ts range) and journey
+    tombstones (by wallet+entry_ts range) coincide. The ONE boundary where they differ is a kept
+    journey with ``entry_ts < replay_start`` and ``exit_ts == replay_start``: its exit action at
+    ``ts == replay_start`` is tombstoned+re-emitted while the journey row is not, which is benign
+    (the re-emitted action is byte-identical canonical content -- asserted by the acceptance test).
+    See ``_stream_action_tombstones`` for the full boundary note. WINDOW-LOCAL
+    columns (event_order, journey_id, opening/closing_journey_id) restart per replay window and are
+    DIAGNOSTIC-ONLY: the active-view dedup keys on ``action_uid`` (window-invariant content), never on
+    them. The journeys store output is UNCHANGED by this (actions are an additive sidecar store).
 
     Returns a summary dict. Raises SystemExit(1) on any worker error (fail closed)."""
     state_dir = Path(state_dir)
     out_dir = Path(out_dir)
+    actions_dir = Path(actions_dir)
     _closed_dir(out_dir).mkdir(parents=True, exist_ok=True)
     (out_dir / "open_snapshot").mkdir(parents=True, exist_ok=True)
+    actions_dir.mkdir(parents=True, exist_ok=True)
 
     hot_days = hot_available_days()
     if not hot_days:
@@ -460,6 +729,30 @@ def run_daily(
     cp = load_checkpoint(state_dir)
     first_run = cp is None
     run_id = 1 if first_run else int(cp["run_id"])
+    # COMMITTED runs are those with run_id <= (checkpoint run_id - 1); the current `run_id` is
+    # uncommitted until this call writes the checkpoint LAST. Reducers cap their scan here so a
+    # prior crashed run's leftover parts (run_id == this run_id, checkpoint not advanced) are ignored
+    # -> journeys + actions stay consistent with the single-source-of-truth checkpoint (codex P1 #2).
+    committed = run_id - 1
+
+    # OPTION A migration guard (codex P1 #1): a journeys checkpoint that predates the actions feature
+    # (NOT a first_run AND no ``actions_bootstrapped`` marker) means the canonical actions store was
+    # never built. An incremental run here would persist actions ONLY for today's affected wallets,
+    # silently leaving ALL history absent while the store LOOKS valid. FAIL LOUD.
+    # The trigger is the ABSENCE OF THE CHECKPOINT MARKER, NOT an empty glob (codex P2): a legitimately
+    # committed-but-EMPTY store -- a run that produced zero qualifying actions, e.g. a filtered universe
+    # -- has the marker set and MUST NOT false-trigger. run_daily writes the marker atomically with the
+    # checkpoint the first time it commits actions (a full first_run), so marker-present <=> bootstrapped.
+    if not first_run and not cp.get("actions_bootstrapped"):
+        raise SystemExit(
+            "OPTION A actions store was NEVER bootstrapped (no 'actions_bootstrapped' checkpoint marker) "
+            f"but the journeys checkpoint is already at run_id={run_id} (watermark {cp.get('watermark_day')}). "
+            "An INCREMENTAL run would persist actions only for today's affected wallets, silently leaving "
+            "all history absent. BOOTSTRAP first via a full first_run replay from genesis (rebuilds "
+            "journeys AND actions together, and sets the marker):\n"
+            f"  rm -rf '{state_dir}' '{_closed_dir(out_dir)}' '{out_dir}/open_snapshot' '{actions_dir}'\n"
+            "then re-run run_daily under scripts/mem_safe_run.sh. (Refusing to write a partial actions "
+            "store.)")
 
     # ---- determine affected wallets + per-wallet replay_start ---------------
     replay_start: dict[str, int] = {}
@@ -551,7 +844,8 @@ def run_daily(
         logger.info("no affected wallets; advancing watermark only")
 
     # ---- tombstones for affected wallets (replace-by-range) -----------------
-    prior_active = load_active_closed(out_dir, wallets=affected) if not first_run else pd.DataFrame()
+    prior_active = (load_active_closed(out_dir, wallets=affected, max_run_id=committed)
+                    if not first_run else pd.DataFrame())
 
     # PHASE 1e (2026-07-16): pure-non-holder hist_wallets (flat at watermark, flagged ONLY by the 3-day
     # late-fill lookback / manifest diff, no stored last_flat) still replay from GENESIS after Phase 1d.
@@ -629,19 +923,40 @@ def run_daily(
     cw = ShardedParquetWriter(str(run_path), flush_rows=flush_rows)
     cw.add_many(tombstones)
 
+    # OPTION A: the actions run-part shares this run_id. Tombstone prior-active actions by
+    # (wallet, ts >= replay_start[w]) -- the exact mirror of the journey tombstone -- STREAMING the
+    # matched rows in bounded batches (never a full affected-wallet action-history concat), then the
+    # freshly emitted actions are appended as active=True in _consume below. On first_run there is no
+    # prior actions store, so this is a no-op.
+    actions_run_path = actions_dir / f"run_{run_id:06d}.parquet"
+    aw = ShardedParquetWriter(str(actions_run_path), flush_rows=flush_rows)
+    n_action_tombstones = 0
+    if not first_run and affected:
+        n_action_tombstones = _stream_action_tombstones(actions_dir, replay_start, run_id, aw,
+                                                         max_run_id=committed)
+    logger.info(f"tombstoning {n_action_tombstones:,} prior-active action rows")
+
     emitted_open: list[dict] = []
     errors: list[tuple] = []
     n_closed = 0
+    n_actions = 0
     # Per-HOLDER journey intervals emitted THIS run (kept small, Rule-8: (entry, exit_or_None,
     # n_carry_in) tuples only -- not full rows). Populated ONLY for wallets that end this run holding
     # an open position (a holder); used to compute last_all_flat_ts. Non-holders are discarded.
     journey_intervals: dict[str, list[tuple]] = {}
 
     def _consume(r: dict) -> None:
-        nonlocal n_closed
+        nonlocal n_closed, n_actions
         if "error" in r:
             errors.append((r["wallet"], r["error"]))
             return
+        # OPTION A: persist EVERY action the tracer emitted for this wallet (open AND closed journeys).
+        # All have ts >= replay_start[w] (fills are pre-filtered to the replay window), so they exactly
+        # cover the tombstoned range. Streamed to disk (Rule-8) via the sharded actions writer.
+        acts = r.get("actions") or []
+        if acts:
+            aw.add_many([_tag_action(a, run_id, True) for a in acts])
+            n_actions += len(acts)
         fresh_closed = []
         ivals: list[tuple] = []
         has_open = False
@@ -781,6 +1096,7 @@ def run_daily(
             raise
         except BaseException as e:  # noqa: BLE001  fail-closed on ANY pool crash (incl. worker os._exit)
             cw.abort()
+            aw.abort()   # OPTION A: never leave a half-written actions run-part on a fail-closed path
             manifest = str(run_path.with_suffix(".errors.json"))
             try:
                 Path(manifest).write_text(json.dumps(
@@ -793,6 +1109,7 @@ def run_daily(
 
     if errors:
         cw.abort()
+        aw.abort()   # OPTION A: discard this run's actions part too (checkpoint is NOT advanced)
         manifest = str(run_path.with_suffix(".errors.json"))
         Path(manifest).write_text(json.dumps(
             {"n_errors": len(errors), "n_affected": len(affected),
@@ -802,6 +1119,7 @@ def run_daily(
         raise SystemExit(1)
 
     cw.close()
+    n_actions_written = aw.close()   # OPTION A: stitch this run's actions part (tombstones + fresh)
 
     # ---- per-wallet last_all_flat_ts (holder-replay optimization) -----------
     # For each CURRENT holder compute the start of its LAST coverage-run over its COMPLETE journey
@@ -840,6 +1158,13 @@ def run_daily(
         "last_flat_ts": new_last_flat,
         "fills_manifest": {**(cp.get("fills_manifest", {}) if cp else {}), **cur_manifest},
         "run_id": run_id + 1,
+        # RUN_ID CONVENTION: run_daily stores the NEXT run_id -> committed_run_id() = run_id - 1 (codex P2).
+        "run_id_is_next": True,
+        # OPTION A bootstrap marker (codex P2): set the FIRST time run_daily commits actions (a full
+        # first_run) and preserved every run thereafter. Its presence is the sole signal that the
+        # canonical actions store was built; the migration guard fires on its ABSENCE, so a committed-
+        # but-EMPTY actions store (zero qualifying actions) never false-triggers. Once True, stays True.
+        "actions_bootstrapped": bool(first_run or (cp and cp.get("actions_bootstrapped"))),
         "universe_file": wallets_file,
         "updated_utc": pd.Timestamp.utcnow().isoformat(),
     }
@@ -851,12 +1176,15 @@ def run_daily(
     logger.info(
         f"run {run_id} done: target={target} affected={len(affected):,} "
         f"closed_fresh={n_closed:,} tombstones={len(tombstones):,} "
-        f"open={len(emitted_open):,} -> {run_path.name}"
+        f"open={len(emitted_open):,} actions_fresh={n_actions:,} "
+        f"action_tombstones={n_action_tombstones:,} -> {run_path.name}"
     )
     return {
         "run_id": run_id, "target": target, "affected": len(affected),
         "closed_fresh": n_closed, "tombstones": len(tombstones),
         "open": len(emitted_open), "run_path": str(run_path),
+        "actions_fresh": n_actions, "action_tombstones": n_action_tombstones,
+        "actions_written": n_actions_written, "actions_run_path": str(actions_run_path),
     }
 
 
@@ -983,7 +1311,15 @@ def run_daily_stateful(
     (checkpoint['wallet_state']). Newly-CLOSED journeys are APPENDED (settled journeys never change, no
     tombstoning); the open_snapshot is fully rewritten from current opens. Fail-closed on any wallet error.
     NOTE (v1): forward-only. Late/historical OLD-day republishing is NOT yet handled here (Phase 2b);
-    the 1c-1f run_daily remains the fallback for that until 2b lands."""
+    the 1c-1f run_daily remains the fallback for that until 2b lands.
+
+    OPTION A canonical-actions persistence is DELIBERATELY NOT enabled in this driver. It is forward-
+    only (one day at a time, resumed from carried per-holder state) and is NOT in production (its
+    m02_stateful_state/ checkpoint is absent). Incremental-actions correctness is NOT proven for this
+    path (a resumed day does not re-trace from a flat seed, so the action tombstone-by-range invariant
+    that run_daily relies on does not hold here). Canonical actions come ONLY from run_daily. If this
+    driver is ever promoted, actions persistence must be designed + gate-proven separately BEFORE
+    turning it on here."""
     state_dir = Path(state_dir); out_dir = Path(out_dir)
     _closed_dir(out_dir).mkdir(parents=True, exist_ok=True)
     (out_dir / "open_snapshot").mkdir(parents=True, exist_ok=True)
@@ -1125,6 +1461,8 @@ def run_daily_stateful(
             save_checkpoint(state_dir, {"watermark_day": watermark, "start_day": start_day,
                                         "wallet_state": wallet_state, "fills_manifest": fills_manifest,
                                         "run_id": run_id, "mode": "stateful",
+                                        # stateful stores the LAST-written run_id -> committed = run_id (codex P2)
+                                        "run_id_is_next": False,
                                         "updated_utc": pd.Timestamp.utcnow().isoformat()})
             logger.info(f"stateful (late-fill only) DONE -> watermark {watermark}, holders {len(wallet_state):,}")
             return {"run_id": run_id, "target": watermark, "closed_fresh": 0,
@@ -1226,6 +1564,8 @@ def run_daily_stateful(
         "fills_manifest": fills_manifest,
         "run_id": run_id,
         "mode": "stateful",
+        # stateful stores the LAST-written run_id -> committed_run_id() = run_id (codex P2)
+        "run_id_is_next": False,
         "updated_utc": pd.Timestamp.utcnow().isoformat(),
     }
     save_checkpoint(state_dir, new_cp)
@@ -1293,6 +1633,8 @@ def seed_stateful_checkpoint(
         "fills_manifest": {d: day_fingerprint(d) for d in hot_available_days() if d <= watermark_day},
         "run_id": int(cp.get("run_id", 1)),
         "mode": "stateful",
+        # seed writes the LAST-written run_id (matches run_daily_stateful) -> committed = run_id (codex P2)
+        "run_id_is_next": False,
         "updated_utc": pd.Timestamp.utcnow().isoformat(),
     })
     save_checkpoint(state_dir, cp)

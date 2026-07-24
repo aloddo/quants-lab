@@ -1,0 +1,48 @@
+{
+  "_note": "SHADOW-ONLY config for card copy-roster-handvetted-shadow. Wallet 6153 (0x5ce0ce) is the sole candidate that cleared the full constraint set on live HL 2026-07-14 (no bag, allTimeDD 19.7%<25%, two-sided dir-bias 0.22, active 135d). Run with --shadow (no capital). Prepped decision-independent; DO NOT go live without validation ledger + codex + Alberto GO.",
+  "global": {
+    "sizing_mode": "proportional",
+    "gross_cap": 500.0,
+    "max_margin_util": 0.8,
+    "max_daily_loss": -30.0,
+    "order_size_usd": 11.0,
+    "min_entry_notional": 10.0,
+    "target_equity_max_age_s": 120,
+    "max_leverage_cap": 5,
+    "cooldown_s": 30,
+    "exit_poll_s": 10,
+    "exit_min_trim_pct": 0.05,
+    "exit_min_trim_usd": 3.0,
+    "max_chase_bps": 15,
+    "max_spread_bps": 20,
+    "min_book_depth_usd": 3000,
+    "global_stop_pct": 0.08,
+    "pos_trailing_stop_pct": 0.12,
+    "leader_drop_upnl_pct": -0.35,
+    "leader_reinclude_upnl_pct": -0.1,
+    "mark_max_age_s": 30,
+    "trim_over_frac": 0.2,
+    "margin_reserve_max_lev": 5,
+    "gross_backstop_x": 1.5,
+    "sizing_leverage": 5.0
+  },
+  "defaults": {
+    "group": "shadow_6153",
+    "entry_mode": "instant",
+    "twap_window_s": 0,
+    "min_twap_notional": 0,
+    "max_addon_multiplier": 50,
+    "max_coin_concentration": 0.35,
+    "exit_type": "FIRST_CLOSE",
+    "sl_bps": -1200,
+    "trail_activate_bps": 60,
+    "trail_bps": 40,
+    "max_hold_s": 604800,
+    "exit_twap_min_notional": 50
+  },
+  "wallets": {
+    "0x5ce0ce4387679de0335a3e8a1c9a7abb4f150a71": {
+      "group": "shadow_6153_e6153"
+    }
+  }
+}

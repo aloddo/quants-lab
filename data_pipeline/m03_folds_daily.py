@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "research" / "v15")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pandas as pd
 import v15_m03_fold_geometry as m3
-from m02_journeys_daily import load_active_closed, DEFAULT_OUT_DIR
+from m02_journeys_daily import load_active_closed, DEFAULT_OUT_DIR, DEFAULT_STATE_DIR, committed_run_id
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_M3_DIR = REPO / "app" / "data" / "v15" / "m03_folds_daily"
@@ -47,7 +47,8 @@ def _m2_run_id(path: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def _m2_new_run_wallets(m2_out_dir: Path, last_run_id: int) -> tuple[set, int]:
+def _m2_new_run_wallets(m2_out_dir: Path, last_run_id: int,
+                        max_run_id: int | None = None) -> tuple[set, int]:
     """AUTHORITATIVE daily DELTA: the union of touched wallets across M2 runs with run_id > last_run_id,
     plus the new cursor.
 
@@ -75,6 +76,16 @@ def _m2_new_run_wallets(m2_out_dir: Path, last_run_id: int) -> tuple[set, int]:
     for p in glob.glob(str(closed / "run_*.parquet.parts")):
         rid = _m2_run_id(p)
         if rid >= 0: by_rid.setdefault(rid, {})["parts"] = p
+
+    # COMMITTED CEILING (codex P1, final item): the delta CURSOR must share the SAME committed ceiling as
+    # the content read (load_active_closed max_run_id). Drop every run whose run_id exceeds the committed
+    # run so the contiguous-prefix walk can NEVER advance last_m2_run_id past a run that published its
+    # parts/sidecar but has not yet committed its M2 checkpoint. Without this, the cursor would consume an
+    # uncommitted run N+1's wallet delta and jump to N+1 while load_active_closed is capped at N -> after
+    # N+1 later commits, M3/M5 believe it is already processed and PERMANENTLY SKIP it (stale outputs).
+    # With the cap, an uncommitted run is simply reprocessed once it commits (cap advances to include it).
+    if max_run_id is not None:
+        by_rid = {rid: srcs for rid, srcs in by_rid.items() if rid <= max_run_id}
 
     # Consume ONLY the CONTIGUOUS COMPLETE PREFIX after last_run_id. The touched SIDECAR is the run's COMMIT
     # MARKER (M2 writes it LAST, atomically). Commit-order safety (codex final review): the closed parquet
@@ -111,9 +122,12 @@ def _m2_new_run_wallets(m2_out_dir: Path, last_run_id: int) -> tuple[set, int]:
 
 
 def run_daily(out_dir: Path = DEFAULT_M3_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR,
-              delta_wallets: set | None = None) -> dict:
+              delta_wallets: set | None = None, m2_state_dir: Path = DEFAULT_STATE_DIR) -> dict:
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     m2_out_dir = Path(m2_out_dir)
+    # Read ONLY committed M2 runs (codex P1 #2): a run whose parts were published but whose checkpoint
+    # did not commit (crash between the two) must be invisible here. The checkpoint is the source of truth.
+    _m2_cap = committed_run_id(Path(m2_state_dir))
     wide_p, summ_p = out_dir / "m3_wide.parquet", out_dir / "m3_summary.parquet"
     state_p = out_dir / "m3_run_state.json"
     prior_exists = wide_p.exists() and summ_p.exists()
@@ -121,13 +135,13 @@ def run_daily(out_dir: Path = DEFAULT_M3_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR
     # AUTO-DELTA: changed wallets = wallets in M2 run files newer than the last M3 run (M2->M3 wiring).
     if delta_wallets is None and prior_exists and state_p.exists():
         last = int(json.loads(state_p.read_text()).get("last_m2_run_id", 0))
-        delta_wallets, new_max_run = _m2_new_run_wallets(m2_out_dir, last)
+        delta_wallets, new_max_run = _m2_new_run_wallets(m2_out_dir, last, max_run_id=_m2_cap)
     else:
-        _, new_max_run = _m2_new_run_wallets(m2_out_dir, 0)   # current max for bookkeeping (0 = nothing consumed yet; -1 probes run_id 0 which never exists -> freezes the delta, codex P1)
+        _, new_max_run = _m2_new_run_wallets(m2_out_dir, 0, max_run_id=_m2_cap)   # current max for bookkeeping (0 = nothing consumed yet; -1 probes run_id 0 which never exists -> freezes the delta, codex P1)
 
     incremental = prior_exists and delta_wallets is not None
     if not incremental:
-        all_j = load_active_closed(m2_out_dir)                 # FULL: first run / no prior
+        all_j = load_active_closed(m2_out_dir, max_run_id=_m2_cap)   # FULL: first run / no prior
         if all_j.empty:
             raise SystemExit("m03: no active journeys in the M2 store")
         all_j["wallet"] = all_j["wallet"].astype(str).str.lower()
@@ -138,7 +152,7 @@ def run_daily(out_dir: Path = DEFAULT_M3_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR
         if not dw:
             wide, summ = pw, ps; mode = "incremental(0 changed)"   # no new wallets -> prior stands
         else:
-            jd = load_active_closed(m2_out_dir, wallets=dw)    # load ONLY the delta wallets' journeys (fast)
+            jd = load_active_closed(m2_out_dir, wallets=dw, max_run_id=_m2_cap)   # ONLY the delta wallets (fast)
             if not jd.empty:
                 jd["wallet"] = jd["wallet"].astype(str).str.lower()
                 wide_d, summ_d = build_m3(jd)
@@ -154,9 +168,9 @@ def run_daily(out_dir: Path = DEFAULT_M3_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR
             "delta_wallets": (0 if delta_wallets is None else len(delta_wallets)), "last_m2_run_id": int(new_max_run)}
 
 
-def gate(m2_out_dir: Path = DEFAULT_OUT_DIR) -> bool:
+def gate(m2_out_dir: Path = DEFAULT_OUT_DIR, m2_state_dir: Path = DEFAULT_STATE_DIR) -> bool:
     """incremental (prior=full-minus-delta + recompute delta + merge) == full, on the REAL M2 store."""
-    all_j = load_active_closed(Path(m2_out_dir))
+    all_j = load_active_closed(Path(m2_out_dir), max_run_id=committed_run_id(Path(m2_state_dir)))
     all_j["wallet"] = all_j["wallet"].astype(str).str.lower()
     wide_full, summ_full = build_m3(all_j)
     keys = sorted(wide_full["key"].unique())

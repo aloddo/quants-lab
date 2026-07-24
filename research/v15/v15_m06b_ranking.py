@@ -64,6 +64,40 @@ class M6bManifest:
     w_capacity_health: float = 0.10
     w_fidelity: float = 0.10
     w_survivability_penalty: float = 0.15  # subtracted
+    # === V2.2 PER-POSITION SCORE (2026-07-23, Alberto: unit = round-trip journey; drop roe/calmar/win-rate)
+    # Active whenever m07_positions is present. Ranks on Alberto's WHO criteria, on the after-OUR-cost
+    # per-position return r_i (win-rate KILLED - payoff-blind; calmar KILLED - short-window noise):
+    #   +0.30 z(pp_mean_r)  consistently profitable (per-journey mean net return)
+    #   +0.25 z(pp_t)       consistency = edge/noise (t-stat; a big mean with high variance is not an edge)
+    #   -0.20 z(pp_std_r)   low risk (low std of per-journey return)
+    #   -0.15 z(max_dd)     NO unrealized loss = mark-to-market drawdown (proper MTM, not a blowup proxy)
+    #   +0.10 z(frac_quick) quick-to-close (fraction of journeys closed <=48h; not baggers)
+    #   -0.15 survivability_penalty (kept). capacity_health/fidelity remain as reported diagnostics only.
+    # FAT-EDGE re-weight (Alberto 2026-07-23: "if your preselection only has 30-50bps gross edge you're targeting
+    # the WRONG wallets"). For the cost-barrier problem, EDGE MAGNITUDE that dwarfs the ~8.6bps cost is the target,
+    # NOT thin-but-consistent edge. So: mean-return DOMINATES; the variance penalty is cut to near-zero (it was
+    # burying fat-but-noisy wallets); consistency kept small; MTM-unrealized-loss + quick-close retained (don't
+    # want baggers/multi-week holds even at fat edge).
+    w_pp_mean_r: float = 0.45      # edge magnitude — DOMINANT
+    w_pp_t: float = 0.15           # consistency (edge/noise) — reduced
+    w_pp_std: float = 0.05         # subtracted — near-zero (do NOT penalize fat-edge variance)
+    w_pp_mtm_dd: float = 0.20      # subtracted: penalize POSITION drawdown (MAE p90), not account-equity DD
+    w_pp_quick: float = 0.15
+    # V2.2 rankable gates (Alberto WHO + review): min journeys, net-edge lower bound, quick-close, MTM ceiling
+    pp_min_positions: int = 25          # material support (round-trips)
+    pp_min_lcb_mean_r: float = 0.0      # COST-FEASIBILITY: 95% one-sided lower bound on per-journey NET return > 0
+    pp_max_med_hold_h: float = 48.0     # quick to close (median)
+    pp_max_p90_hold_h: float = 168.0    # ... and not the occasional multi-week bag (p90 <= 7d)
+    pp_max_mtm_dd: float = 0.15         # no meaningful unrealized loss (MTM drawdown ceiling)
+    # walk-forward OOS confirmation (walk_forward_confirm) — POOLED multi-fold + BH-FDR (Fable+Codex 2026-07-23).
+    # Codex STANDARD is oos_min_folds=4 / oos_min_journeys_pooled=50; defaults here are the FLOOR that the
+    # currently-available 3 OOS folds (recency actions Apr06-Jul22) can support -> raise to the standard once
+    # the FULL 12-fold action bootstrap exists. NEVER tune these to hit a target wallet count.
+    oos_min_folds: int = 2              # min NON-OVERLAPPING held-out OOS folds a wallet must trade in
+    oos_min_journeys_pooled: int = 30   # min POOLED OOS journeys across those folds (SE control)
+    oos_min_frac_folds_pos: float = 0.5 # net-positive in a MAJORITY of OOS folds (regime stability)
+    oos_margin: float = 0.0             # H0 margin on pooled mean NET per-journey return (0 = break-even; raise for slippage/model-risk buffer)
+    fdr_q: float = 0.10                 # Benjamini-Hochberg false-discovery rate across all eligible wallets
     # calmar / winsor / fidelity
     dd_floor: float = 0.05            # calmar = realized_roe / max(max_dd, dd_floor)
     winsor_lo_pct: float = 1.0        # winsorize calmar + realized_roe at fold [p1, p99]
@@ -122,6 +156,59 @@ def _load_m04_by_fold(m04_dir: Path, folds: pd.DataFrame, stem: str) -> pd.DataF
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
+def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
+    """V2.2 (2026-07-23): per-(entity,fold) metrics from M7's PER-POSITION emit (m07_positions.parquet;
+    Increment-1). This is the NEW ranking basis replacing aggregate realized_roe/calmar/win-rate. Unit =
+    the round-trip journey (Alberto: "the unit of evidence is the round-trip journey"). Computes, on the
+    after-OUR-cost per-position return r_i = realized_pnl_after_cost / peak_notional:
+      n_pos, mean_r, std_r, t_stat (mean/(std/sqrt(n)) = edge/noise = consistency), lcb_mean_r (one-sided
+      95% lower bound, mean - 1.645*se = the cost-feasibility net-edge lower bound), med_hold_h + frac_quick
+      (<=48h) = quick-to-close, uw_add_ratio (DCA, reported not gated). Returns None if the emit is absent
+      (older M7 run) -> build_ranking falls back to the legacy summary scoring."""
+    p = m07_dir / "m07_positions.parquet"
+    df = _read_parquet_maybe_parts(p) if (p.exists() or (m07_dir / "m07_positions.parquet").is_dir()) else None
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    df["r_i"] = pd.to_numeric(df["r_i"], errors="coerce")
+    df = df.dropna(subset=["r_i"])
+    if df.empty:
+        return None
+    df["hold_h"] = (pd.to_numeric(df["exit_ts"], errors="coerce")
+                    - pd.to_numeric(df["entry_ts"], errors="coerce")) / 3.6e6
+    def _agg(g):
+        n = len(g); mean_r = g["r_i"].mean(); std_r = g["r_i"].std(ddof=1) if n > 1 else np.nan
+        se = (std_r / np.sqrt(n)) if (std_r == std_r and n > 1) else np.nan
+        t = (mean_r / se) if (se and se == se and se > 0) else np.nan
+        lcb = (mean_r - 1.645 * se) if (se == se) else np.nan
+        uw = pd.to_numeric(g.get("underwater_add_ratio"), errors="coerce")
+        # POSITION DRAWDOWN (Alberto 2026-07-24 "It should be position drawdown", "MAE and MFE are crucial"):
+        # mae = worst underwater frac vs entry VWAP over a position's life (<=0). This is the TRUE per-position
+        # drawdown replacing the account-equity max_dd proxy. |mae| aggregated as median (typical bag) + p90
+        # (tail bag). A bag-holder = deep, frequent MAE. mfe = best in-money frac reached; giveback = mfe - r_i
+        # (run-up surrendered at the leader's exit) -> where OUR trailing-TP can beat mirroring their exit.
+        mae = pd.to_numeric(g.get("mae"), errors="coerce")
+        mfe = pd.to_numeric(g.get("mfe"), errors="coerce")
+        gb = pd.to_numeric(g.get("mfe_giveback"), errors="coerce")
+        amae = mae.abs()
+        return pd.Series({
+            "pp_n": n, "pp_mean_r": mean_r, "pp_std_r": std_r, "pp_t": t, "pp_lcb_mean_r": lcb,
+            "pp_med_hold_h": g["hold_h"].median(), "pp_p90_hold_h": g["hold_h"].quantile(0.9),
+            "pp_frac_quick": (g["hold_h"] <= 48).mean(),
+            "pp_realized": g["realized_pnl_after_cost"].sum() if "realized_pnl_after_cost" in g else np.nan,
+            "pp_uw_add": (uw.mean() if uw.notna().any() else np.nan),
+            # position-drawdown (MAE) block
+            "pp_mae_med": (amae.median() if amae.notna().any() else np.nan),
+            "pp_mae_p90": (amae.quantile(0.9) if amae.notna().any() else np.nan),
+            "pp_frac_underwater": ((mae < 0).mean() if mae.notna().any() else np.nan),
+            # favorable-excursion (MFE) block
+            "pp_mfe_med": (mfe.median() if mfe.notna().any() else np.nan),
+            "pp_giveback_med": (gb.median() if gb.notna().any() else np.nan),
+        })
+    out = df.groupby(["entity_id", "fold_id"]).apply(_agg).reset_index()
+    return out
+
+
 def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None) -> dict:
     """Load the M7 pretest-window engine results + upstream M6a/M5/M4/M3 inputs.
 
@@ -131,6 +218,7 @@ def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None =
     folds = pd.read_parquet(data_dir / "m03_folds.parquet")
 
     m07_summary = _read_parquet_maybe_parts(m07_dir / "m07_summary.parquet")
+    m07_positions_agg = _per_position_metrics(m07_dir)   # V2.2 per-position ranking basis (None if absent)
     # m07_fills only needed for exposure_time (per (entity,fold) our_ts span). Read lazily/aggregated.
     fills_path = m07_dir / "m07_fills.parquet"
 
@@ -170,6 +258,7 @@ def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None =
         "m04_fold_pure": m04_fold_pure,
         "m02_journeys_path": m02_journeys_path,
         "m07_equity": m07_equity,
+        "m07_positions_agg": m07_positions_agg,
     }
 
 
@@ -518,6 +607,14 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
     df = df.merge(elig, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
     df = df.merge(cons, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
     df = df.merge(exposure, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
+    # V2.2: merge per-position metrics (from M7's per-position emit) if present -> switches ranking basis.
+    pp_agg = inputs.get("m07_positions_agg")
+    use_pp = pp_agg is not None and not pp_agg.empty
+    if use_pp:
+        for c in pp_agg.columns:
+            if c not in ("entity_id", "fold_id"):
+                pp_agg[c] = pd.to_numeric(pp_agg[c], errors="coerce")
+        df = df.merge(pp_agg, on=["entity_id", "fold_id"], how="left", validate="one_to_one")
     df["exposure_days"] = df["exposure_days"].fillna(0.0)
     df["consistency"] = df["consistency"].fillna(0.0)
     df["n_active_subsplits"] = df["n_active_subsplits"].fillna(0).astype(int)
@@ -586,6 +683,24 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         & np.isfinite(pd.to_numeric(df["capacity_health"], errors="coerce").to_numpy(dtype="float64"))
         & np.isfinite(pd.to_numeric(df["survivability_penalty"], errors="coerce").to_numpy(dtype="float64"))
     )
+    # V2.2 PER-POSITION GATES (Alberto WHO + strategist review): material support, COST-FEASIBILITY
+    # (95% lower bound on per-journey NET return > floor), quick-to-close, NO unrealized loss (MTM ceiling).
+    if use_pp:
+        # POSITION-DRAWDOWN basis (Alberto 2026-07-24 "It should be position drawdown"): gate + score the
+        # unrealized-loss ceiling on the per-position MAE p90 (true position drawdown), NOT max_dd_pretest
+        # (account-equity DD of our $10k copy — meaningless as a per-wallet bag signal). Fall back to
+        # max_dd_pretest only when the MAE emit is absent (older M7 run) so the module stays backward-safe.
+        _mae_p90 = pd.to_numeric(df.get("pp_mae_p90"), errors="coerce") if "pp_mae_p90" in df.columns else pd.Series(np.nan, index=df.index)
+        df["mtm_dd_basis"] = _mae_p90.where(_mae_p90.notna(), pd.to_numeric(df["max_dd_pretest"], errors="coerce"))
+        rankable = rankable & (
+            (pd.to_numeric(df["pp_n"], errors="coerce") >= m.pp_min_positions)
+            & (pd.to_numeric(df["pp_lcb_mean_r"], errors="coerce") > m.pp_min_lcb_mean_r)
+            & (pd.to_numeric(df["pp_med_hold_h"], errors="coerce") <= m.pp_max_med_hold_h)
+            & (pd.to_numeric(df["pp_p90_hold_h"], errors="coerce") <= m.pp_max_p90_hold_h)
+            & (pd.to_numeric(df["mtm_dd_basis"], errors="coerce") <= m.pp_max_mtm_dd)
+            & pd.to_numeric(df["pp_mean_r"], errors="coerce").notna()
+            & pd.to_numeric(df["pp_std_r"], errors="coerce").notna()
+        )
     df["m6b_rankable"] = rankable
     excl = []
     for _, r in df.iterrows():
@@ -622,6 +737,29 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         rk = g[g["m6b_rankable"]].copy()
         if rk.empty:
             g["m6b_score"] = np.nan
+            out_parts.append(g)
+            continue
+        if use_pp:
+            # === V2.2 PER-POSITION SCORE (Alberto: unit = round-trip journey) ===
+            # z-scored per fold over rankable entities; KILL roe/calmar/win-rate. mean+consistency dominate;
+            # subtract std (risk) + MTM drawdown (unrealized loss); reward quick-close.
+            rk["z_pp_mean_r"] = _zscore(_winsorize(pd.to_numeric(rk["pp_mean_r"], errors="coerce"),
+                                                   m.winsor_lo_pct, m.winsor_hi_pct))
+            rk["z_pp_t"] = _zscore(pd.to_numeric(rk["pp_t"], errors="coerce"))
+            rk["z_pp_std"] = _zscore(pd.to_numeric(rk["pp_std_r"], errors="coerce"))
+            rk["z_pp_mtm"] = _zscore(pd.to_numeric(rk["mtm_dd_basis"], errors="coerce"))  # position DD (MAE p90), not equity DD
+            rk["z_pp_quick"] = _zscore(pd.to_numeric(rk["pp_frac_quick"], errors="coerce"))
+            rk["m6b_score"] = (
+                m.w_pp_mean_r * rk["z_pp_mean_r"].fillna(0.0)
+                + m.w_pp_t * rk["z_pp_t"].fillna(0.0)
+                - m.w_pp_std * rk["z_pp_std"].fillna(0.0)
+                - m.w_pp_mtm_dd * rk["z_pp_mtm"].fillna(0.0)
+                + m.w_pp_quick * rk["z_pp_quick"].fillna(0.0)
+                - m.w_survivability_penalty * rk["survivability_penalty"]
+            )
+            g = g.merge(rk[["entity_id", "fold_id", "z_pp_mean_r", "z_pp_t", "z_pp_std",
+                            "z_pp_mtm", "z_pp_quick", "m6b_score"]],
+                        on=["entity_id", "fold_id"], how="left")
             out_parts.append(g)
             continue
         rk["roe_adj_w"] = _winsorize(rk["roe_adj"], m.winsor_lo_pct, m.winsor_hi_pct)
@@ -824,6 +962,10 @@ OUT_COLS = [
     "n_backstop_transfer", "account_ruin", "m4_tier", "entity_alloc_weight",
     "m5_eligible", "entity_copyable", "m6b_rankable", "rank_in_fold", "bucket", "in_pool",
     "quality_weight", "excluded_reason", "slippage_uncalibrated", "investable",
+    # V2.2 per-position basis (ranking unit = round-trip journey) + position drawdown/run-up (MAE/MFE)
+    "pp_n", "pp_mean_r", "pp_std_r", "pp_t", "pp_lcb_mean_r", "pp_med_hold_h", "pp_p90_hold_h",
+    "pp_frac_quick", "pp_uw_add", "pp_mae_med", "pp_mae_p90", "pp_frac_underwater",
+    "pp_mfe_med", "pp_giveback_med", "mtm_dd_basis",
 ]
 
 
@@ -840,6 +982,102 @@ def write_outputs(out: pd.DataFrame, manifest: dict, out_dir: Path) -> dict:
     return {"pool_rows": len(out), "pooled": n_pooled, "investable": manifest["investable"]}
 
 
+def _bh_fdr_mask(pvals: np.ndarray, q: float) -> np.ndarray:
+    """Benjamini-Hochberg step-up: boolean discoveries at FDR level q. Standard BH (independence/PRDS)."""
+    p = np.asarray(pvals, dtype="float64")
+    n = p.size
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    order = np.argsort(p)
+    thresh = q * (np.arange(1, n + 1) / n)
+    below = p[order] <= thresh
+    if not below.any():
+        return np.zeros(n, dtype=bool)
+    kmax = int(np.max(np.where(below)[0]))
+    cutoff = p[order][kmax]
+    return p <= cutoff
+
+
+def _boot_p_mean_gt(x: np.ndarray, margin: float, n_boot: int = 4000, seed: int = 12345) -> float:
+    """One-sided bootstrap p-value for H0: mean(x) <= margin (small p = evidence the NET per-journey return
+    exceeds the cost/model-risk margin). Resamples the H0-centered data (shift so mean==margin) and returns
+    P(bootstrap mean >= observed mean). Bootstrap (not a normal SE) handles the fat-tailed, small-n journey
+    returns the strategist review flagged. Journeys are treated i.i.d. here; a moving-block variant over
+    calendar-day blocks is the hardening for time-clustering (TODO with the full multi-fold pool)."""
+    x = np.asarray(x, dtype="float64")
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n < 5:
+        return 1.0
+    obs = float(x.mean())
+    if obs <= margin:
+        return 1.0
+    rng = np.random.default_rng(seed)
+    null = x - obs + margin                       # H0: mean == margin
+    idx = rng.integers(0, n, size=(n_boot, n))
+    boot_means = null[idx].mean(axis=1)
+    return float((boot_means >= obs).mean())
+
+
+def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
+    """OUT-OF-SAMPLE CONFIRMATION (2026-07-23, Fable+Codex UNANIMOUS after Alberto's push). The pretest ranking
+    is IN-SAMPLE (rho~0 forward). A single-window OOS gate is either too strict (lower-bound, ~3 wallets) or
+    ~72% false-discoveries (mean>0, ~15). The SOUND gate = POOL a wallet's OOS journeys across its NON-OVERLAPPING
+    held-out TEST folds -> BOOTSTRAP one-sided p-value that pooled mean NET return > margin -> BENJAMINI-HOCHBERG
+    FDR at q across all eligible wallets. NO forcing a target count. Requires >= oos_min_folds folds and
+    >= oos_min_journeys_pooled pooled OOS journeys per wallet (Codex: 4 folds / 50 journeys is the standard;
+    fewer available until the FULL 12-fold action bootstrap exists). Also require net-positive in a majority of
+    the wallet's OOS folds (stability). Ranking still comes from build_ranking (the module)."""
+    pool, mani = build_ranking(inputs_pretest, m)
+    pre = pool[pool["m6b_rankable"] & pool["m6b_score"].notna()].copy()
+    # per-ENTITY best pretest score (pool the pretest-rankable across folds)
+    pre_entity = pre.sort_values("m6b_score", ascending=False).drop_duplicates("entity_id")
+    cand = set(pre_entity["entity_id"].astype(int))
+    # RAW per-journey OOS returns from the held-out test window(s)
+    tpos = _read_parquet_maybe_parts(Path(m07_test_dir) / "m07_positions.parquet")
+    if tpos is None or tpos.empty:
+        raise ValueError("walk_forward_confirm: no m07_positions in the TEST dir (need per-position emit).")
+    tpos = tpos.copy()
+    tpos["r_i"] = pd.to_numeric(tpos["r_i"], errors="coerce")
+    tpos = tpos[tpos["entity_id"].astype(int).isin(cand)].dropna(subset=["r_i"])
+    rows = []
+    for eid, g in tpos.groupby("entity_id"):
+        r = g["r_i"].to_numpy("float64")
+        folds = g["fold_id"].nunique()
+        fold_means = g.groupby("fold_id")["r_i"].mean()
+        frac_pos = float((fold_means > 0).mean()) if len(fold_means) else 0.0
+        rows.append({"entity_id": int(eid), "oos_n": len(r), "oos_folds": int(folds),
+                     "oos_mean_r": float(r.mean()), "oos_frac_folds_pos": frac_pos,
+                     "p_boot": _boot_p_mean_gt(r, m.oos_margin)})
+    stats = pd.DataFrame(rows)
+    if stats.empty:
+        return stats, {"pretest_rankable_entities": len(cand), "eligible": 0, "confirmed": 0}
+    eligible = stats[(stats["oos_folds"] >= m.oos_min_folds)
+                     & (stats["oos_n"] >= m.oos_min_journeys_pooled)
+                     & (stats["oos_frac_folds_pos"] >= m.oos_min_frac_folds_pos)].copy()
+    if eligible.empty:
+        confirmed = eligible
+    else:
+        disc = _bh_fdr_mask(eligible["p_boot"].to_numpy("float64"), m.fdr_q)
+        eligible["bh_discovery"] = disc
+        confirmed = eligible[eligible["bh_discovery"]].copy()
+    _wcol = [c for c in ("primary_wallet", "m6b_score") if c in pre_entity.columns]
+    confirmed = confirmed.merge(pre_entity[["entity_id"] + _wcol], on="entity_id", how="left")
+    summ = {
+        "pretest_rankable_entities": len(cand),
+        "eligible_for_fdr": int(len(eligible)),
+        "confirmed": int(len(confirmed)),
+        "fdr_q": m.fdr_q, "oos_min_folds": m.oos_min_folds,
+        "oos_min_journeys_pooled": m.oos_min_journeys_pooled,
+        "note": ("only 3 OOS folds available (recency actions Apr06-Jul22); Codex standard is >=4 folds/>=50 "
+                 "journeys -> needs the FULL 12-fold action bootstrap. FREEZE this gate + validate on an "
+                 "untouched future window before capital."),
+    }
+    logger.info("WALK-FORWARD CONFIRM (pooled+BH-FDR q=%.2f): cand_entities=%d eligible=%d CONFIRMED=%d",
+                m.fdr_q, len(cand), summ["eligible_for_fdr"], summ["confirmed"])
+    return confirmed, summ
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
@@ -852,6 +1090,9 @@ def main():
     )
     ap.add_argument("--m04-dir", default=None,
                     help="directory with m04_authenticity_f{fold_id}.parquet and m04_entities_f{fold_id}.parquet")
+    ap.add_argument("--m07-test-dir", default=None,
+                    help="M7 TEST-window run dir (held-out OOS). If set, runs pooled walk_forward_confirm "
+                         "(BH-FDR) and writes m06b_confirmed.parquet. Needs the full-fold action bootstrap.")
     ap.add_argument("--fee-schedule-version", default=None)
     ap.add_argument("--slippage-calibration-version", default=None)
     args = ap.parse_args()
@@ -864,6 +1105,14 @@ def main():
     out, manifest = build_ranking(inputs, m)
     res = write_outputs(out, manifest, Path(args.out))
     logger.info("M6b done: %s", res)
+    # OOS CONFIRMATION (pooled multi-fold + BH-FDR). Only meaningful with the full 12-fold action bootstrap;
+    # writes the confirmed set + its summary alongside the pool so the roster rests on OOS, not in-sample rank.
+    if args.m07_test_dir:
+        confirmed, wf_summ = walk_forward_confirm(inputs, Path(args.m07_test_dir), m)
+        out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
+        confirmed.to_parquet(out_dir / "m06b_confirmed.parquet", index=False)
+        (out_dir / "m06b_walkforward_summary.json").write_text(json.dumps(wf_summ, indent=2, default=str))
+        logger.info("M6b walk-forward: %s -> m06b_confirmed.parquet", wf_summ)
 
 
 if __name__ == "__main__":

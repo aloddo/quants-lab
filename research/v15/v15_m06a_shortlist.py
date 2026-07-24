@@ -425,10 +425,17 @@ def run(elig: pd.DataFrame, pool: pd.DataFrame, folds: pd.DataFrame,
         waterfall["folds"][int(fid)] = wf
 
     if mode == "shortlist":
+        # Engine budget = n_folds * N (per-fold top-N is pre-registered at N; total is bounded by the
+        # number of folds, each emitting <= N). The literal 8 here hardcoded the original 8-fold calendar;
+        # the recency base chains 12 folds, so bound by the ACTUAL fold count (per-fold N unchanged =
+        # multiple-testing discipline intact). Byte-identical for an 8-fold run.
+        n_folds_budget = len(waterfall["folds"])
+        engine_budget = n_folds_budget * N
         waterfall["total_engine_sims"] = int(total_sims)
-        waterfall["engine_budget"] = 8 * N
-        waterfall["budget_ok"] = bool(total_sims <= 8 * N)
-        assert total_sims <= 8 * N, f"BUDGET BREACH: {total_sims} > {8*N}"
+        waterfall["engine_budget"] = int(engine_budget)
+        waterfall["n_folds"] = int(n_folds_budget)
+        waterfall["budget_ok"] = bool(total_sims <= engine_budget)
+        assert total_sims <= engine_budget, f"BUDGET BREACH: {total_sims} > {engine_budget} ({n_folds_budget} folds x N={N})"
 
     # --- pool summary ---
     g = sl.groupby("entity_id")
@@ -593,11 +600,28 @@ def main():
             raise ValueError("provide --m04-dir for fold-pure M4 or --entities for compatibility mode")
         entities = pd.read_parquet(args.entities)
         entities_by_fold = None
-    actions = pd.read_parquet(
-        args.actions, columns=["wallet", "ts", "stream_replay_valid"]
-    )
+    # MEMORY-EFFICIENT actions load (Alberto 2026-07-23 binding requirement: M6a/M6b/M7 run many times,
+    # must stream, never load the big stuff in RAM). Persistence only needs, per wallet, the set of
+    # DISTINCT 14d-BLOCK memberships, and blocks are anchored to each fold's test_start which is
+    # MIDNIGHT-aligned (verified: all fold test_start/pretest_start/train_start are 00:00:00 UTC, and
+    # BLOCK_MS = 14*MS_DAY is an integer number of days). Therefore every action timestamp within a
+    # day-aligned day maps to the SAME fold-anchored block, so reducing to DISTINCT (wallet, day) and
+    # using the day-start ms as the representative is BYTE-IDENTICAL to compute_persistence on raw ts,
+    # while collapsing ~150M rows -> ~2.6M (57x) with a memory-BOUNDED DuckDB pass (1GB cap, streams +
+    # spills). act_by feeds compute_persistence ONLY (line ~294), so no other consumer sees the reduction.
+    import duckdb as _ddb
+    _con = _ddb.connect()
+    _con.execute("PRAGMA memory_limit='1GB'; PRAGMA threads=4")
+    actions = _con.execute(
+        f"SELECT wallet, CAST(day AS BIGINT) * {MS_DAY} AS ts FROM ("
+        f"  SELECT DISTINCT wallet, ts // {MS_DAY} AS day FROM read_parquet(?) WHERE stream_replay_valid"
+        f")",
+        [str(args.actions)],
+    ).df()
+    _con.close()
     n_entities = sum(len(v) for v in entities_by_fold.values()) if entities_by_fold is not None else len(entities)
-    logger.info(f"elig={len(elig):,} pool={len(pool):,} folds={len(folds)} entities_rows={n_entities:,} actions={len(actions):,}")
+    logger.info(f"elig={len(elig):,} pool={len(pool):,} folds={len(folds)} entities_rows={n_entities:,} "
+                f"action_wallet_days={len(actions):,} (mem-efficient DuckDB day-reduction)")
 
     sl, pool_df, waterfall = run(elig, pool, folds, entities, actions, manifest,
                                  entities_by_fold=entities_by_fold)

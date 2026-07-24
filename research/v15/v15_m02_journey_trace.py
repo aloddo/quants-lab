@@ -55,10 +55,13 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-# Import M01 (same dir) — reuse loaders, cash deltas, marks, and the additive
-# per-event equity bridge. NO M01 reconstruction MATH is changed here.
+# CORE lane data source: standalone fills/funding I/O on the LIVE hot stores
+# (fills/funding loaders + causal ordering + coin helpers, extracted verbatim
+# from M01). M01 itself is imported LOCALLY only inside the optional
+# equity-enrichment branches (reconstruction/anchors/marks). NO journey MATH
+# is changed here.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import v15_m01_equity_reconstruct as m01  # noqa: E402
+import hl_fills_io as fio  # noqa: E402
 from _streaming_io import ShardedParquetWriter, install_memory_guard, plan_memory_budget  # noqa: E402  MANDATORY (decisions/2026-05-31-mandatory-streaming-io)
 
 logging.basicConfig(
@@ -75,7 +78,7 @@ SCALP_THRESHOLD_S = 30 * 60
 SWING_THRESHOLD_S = 24 * 60 * 60
 
 # Equity-basis hybrid tunables (spec). STALE_CAP = one weekly anchor cycle.
-STALE_CAP_MS = m01.STALE_CAP_MS
+STALE_CAP_MS = fio.STALE_CAP_MS
 # Force ANCHOR_FALLBACK when the frozen unmarkable component exceeds this
 # fraction of equity (material unmarkable exposure) OR is staler than STALE_CAP.
 FROZEN_MATERIALITY_CAP = 0.10
@@ -117,7 +120,7 @@ class LifecycleFillEvent:
     type: str = "fill"
 
 
-def select_equity_basis(ee: "m01.EventEquity") -> EquityBasis:
+def select_equity_basis(ee: "object") -> EquityBasis:
     """Pick the causal equity basis for one event, using ONLY data <= the event.
 
     Per-segment drift and whole-window recon-PASS are NEVER consulted (look-ahead).
@@ -280,13 +283,22 @@ def _classify_duration(duration_s: float, n_addon: int, n_trim: int) -> str:
 
 def trace_wallet(
     wallet: str,
-    events: list["m01.EventEquity"],
+    events: list["object"],
     fills: list[dict],
     funding: list[dict],
     *,
     equity_enriched: bool = True,
     end_ms: Optional[int] = None,
-) -> tuple[list[dict], list[dict]]:
+    init_state: Optional[dict] = None,
+    window_start_ms: Optional[int] = None,
+    return_state: bool = False,
+):
+    # PHASE 2 (2026-07-16): STATEFUL RESUME. When init_state is given, the per-coin books resume from the
+    # carried state instead of starting empty, and ONLY the new window's events are fed -> a wallet never
+    # re-reads history. window_start_ms is the funding watermark (the prior run's end_ms); funding for a
+    # resumed open journey is funding_net_so_far (carried) + this window's funding over (window_start_ms,
+    # close_ts]. When return_state=True the final per-coin books are returned for carry-forward. Batch
+    # (init_state=None, window_start_ms below all open_ts) is byte-identical to the prior single-pass path.
     """Walk the ordered FILL events for one wallet and emit (actions, journeys).
 
     In the default/core lane, ``events`` contains only ``LifecycleFillEvent``
@@ -308,6 +320,14 @@ def trace_wallet(
     coin_state: dict[str, dict] = {}
     coin_journey_counter: dict[str, int] = {}
     coin_seen_first_fill: dict[str, bool] = {}
+    # PHASE 2: funding watermark = start of this window. Batch/first-run has no carried state, so use a
+    # sentinel below every open_ts -> max(open_ts, _W) == open_ts -> funding interval == (open_ts, close]
+    # exactly as the old single-pass path. Resumed runs pass the prior window end.
+    _W = int(window_start_ms) if window_start_ms is not None else -(1 << 62)
+    if init_state is not None:
+        coin_state = init_state.get("coin_state", {}) or {}
+        coin_journey_counter = init_state.get("coin_journey_counter", {}) or {}
+        coin_seen_first_fill = init_state.get("coin_seen_first_fill", {}) or {}
 
     def _new_state() -> dict:
         return {
@@ -318,6 +338,24 @@ def trace_wallet(
             "realized_pnl": 0.0, "fees_paid": 0.0, "fee_scope": "standard_perp",
             "carry_in_status": None, "liq_closed": False,
             "lifecycle_valid": True, "state_discontinuity": False,
+            # ADDITIVE (2026-07-12 uid-collision fix): causal identity of the fill that OPENED this
+            # journey. Disambiguates a wallet opening the SAME side on the SAME coin twice in the SAME
+            # millisecond (open/exit/open burst) in the downstream journey_uid. Never consumed by the
+            # journey math -> equivalence gate unchanged.
+            "open_fill_seq": None, "open_fill_tid": 0,
+            # PHASE 1c (2026-07-16): WINDOW-INVARIANT opening-fill disambiguator = ordinal of the
+            # opening fill among fills sharing the exact (coin, ts). That same-ms group is fully
+            # contained in ANY replay window covering entry_ts, so the ordinal is identical whether
+            # the wallet is traced from genesis or from a last_flat point -> journey_uid is window-
+            # invariant -> holders can be read from last_flat (read window collapses to minutes).
+            "open_fill_ord": 0,
+            # PHASE 2 (2026-07-16): funding accrued for THIS open journey through the prior run's window
+            # end (the funding watermark). Lets a multi-day-open journey be traced day-by-day without
+            # re-reading earlier funding: on close, funding_net = funding_net_so_far + new-window funding
+            # over (max(open_ts, window_start), close_ts]. 0 for a journey opened in the current window;
+            # for a resumed journey it carries (open_ts, prior_window_end]. Batch (window_start below all
+            # open_ts, funding_net_so_far=0) is byte-identical to the old single-pass behaviour.
+            "funding_net_so_far": 0.0,
         }
 
     def _finalize(coin: str, st: dict, close_ts: int) -> Optional[dict]:
@@ -325,7 +363,10 @@ def trace_wallet(
             return None
         duration_s = max(0, (close_ts - st["open_ts"]) / 1000)
         max_notional = max(st["max_notional"], EPS)
-        funding_net = _funding_for_interval(funding_payloads, coin, st["open_ts"], close_ts)
+        # PHASE 2: carried funding (prior windows, through _W) + this window's funding over
+        # (max(open_ts, _W), close_ts]. Batch: funding_net_so_far=0 and _W below open_ts -> == old path.
+        funding_net = float(st.get("funding_net_so_far", 0.0)) + _funding_for_interval(
+            funding_payloads, coin, max(int(st["open_ts"]), _W), close_ts)
         net_realized = st["realized_pnl"] - st["fees_paid"] + funding_net
         return {
             "wallet": wallet, "coin": coin, "journey_id": st["journey_id"],
@@ -344,9 +385,14 @@ def trace_wallet(
             "carry_in_status": st["carry_in_status"] or "SEEDED",
             "lifecycle_valid": bool(st.get("lifecycle_valid", True)),
             "state_discontinuity": bool(st.get("state_discontinuity", False)),
+            # ADDITIVE causal opening-fill identity (uid-collision fix); not consumed by journey math.
+            "entry_fill_seq": st.get("open_fill_seq"),
+            "entry_fill_tid": int(st.get("open_fill_tid", 0) or 0),
+            "entry_fill_ord": int(st.get("open_fill_ord", 0) or 0),  # PHASE 1c window-invariant disambiguator
         }
 
     # Walk events in event_order (already sorted).
+    _same_ts_ord: dict[tuple, int] = {}   # PHASE 1c: (coin, ts) -> running fill ordinal (window-invariant)
     for ee in events:
         if ee.type != "fill":
             continue
@@ -358,7 +404,7 @@ def trace_wallet(
         # Defensive parity with M1 and M7/live: the research strategy copies
         # perps only. Spot must not affect journey/ranking metrics even if an
         # externally supplied event stream contains it.
-        if m01.coin_is_spot(coin):
+        if fio.coin_is_spot(coin):
             continue
         st = coin_state.setdefault(coin, _new_state())
         signed = f["signed_sz"]
@@ -366,6 +412,15 @@ def trace_wallet(
             continue
         price = float(f["price"]) or 0.0
         ts = ee.ts
+        this_fill_seq = int(ee.event_order)          # causal opening-fill identity (uid-collision fix)
+        this_fill_tid = int(f.get("tid", 0) or 0)
+        # PHASE 1c: window-invariant ordinal of this fill within its exact (coin, ts) group. All fills
+        # sharing (coin, ts) are present in ANY replay window covering ts (a valid last_flat <= ts), and
+        # the guards above (spot skip, |signed|<=EPS) are per-fill deterministic, so the counted set and
+        # thus this ordinal are identical from-genesis and from-last_flat. Feeds journey_uid so the uid
+        # no longer depends on the genesis-relative event_order.
+        this_fill_ord = _same_ts_ord.get((coin, ts), 0)
+        _same_ts_ord[(coin, ts)] = this_fill_ord + 1
         is_liq = bool(f.get("is_liquidation"))
         row_scope = _classify_fee_scope(str(f.get("dir", "") or ""), coin)
         actual_fee = _fill_fee_usd_actual(f)
@@ -424,6 +479,7 @@ def trace_wallet(
                     journey_id=coin_journey_counter[coin], open_ts=ts, peak_ts=ts,
                     max_notional=abs(sp) * price, n_carry_in=1,
                     carry_in_status="SEEDED", fee_scope=row_scope,
+                    open_fill_seq=this_fill_seq, open_fill_tid=this_fill_tid, open_fill_ord=this_fill_ord,
                 )
                 position = sp
                 cost_basis = price
@@ -490,6 +546,7 @@ def trace_wallet(
                 realized_pnl=0.0, max_notional=notional_after, cost_basis=price,
                 fees_paid=fill_fee, fee_scope=row_scope, liq_closed=False,
                 carry_in_status=st["carry_in_status"] or "SEEDED",
+                open_fill_seq=this_fill_seq, open_fill_tid=this_fill_tid, open_fill_ord=this_fill_ord,
             )
             action_type = "ENTRY"
             opening_jid = st["journey_id"]
@@ -559,6 +616,7 @@ def trace_wallet(
                 n_reverse=1, max_notional=abs(new_pos) * price, cost_basis=price,
                 fees_paid=opening_fee, fee_scope=row_scope,
                 carry_in_status="SEEDED",
+                open_fill_seq=this_fill_seq, open_fill_tid=this_fill_tid, open_fill_ord=this_fill_ord,
             )
             coin_state[coin] = st
             action_type = "REVERSE"
@@ -569,6 +627,7 @@ def trace_wallet(
         # ---- optional equity basis + action row ----
         # Core M02 deliberately does not read M01, anchors, or market marks.
         if equity_enriched:
+            import v15_m01_equity_reconstruct as m01  # local: enrichment lane only
             basis = select_equity_basis(ee)
             # SIZING signal: use only a bar that has closed by ts.
             _raw_mark = m01.get_mark(coin, ts, causal=True)
@@ -611,6 +670,11 @@ def trace_wallet(
         actions.append({
             "wallet": wallet, "coin": coin, "ts": ts,
             "fill_id": int(f.get("tid", 0) or 0),
+            # PHASE 1c window-invariant disambiguator: ordinal of this fill within its exact (coin, ts)
+            # group (computed at ~L422). Identical from-genesis and from-last_flat, so it is the stable
+            # action-identity tiebreak (fill_id/tid can be 0/missing on the S3 by-wallet partition). This
+            # is what makes the daily-incremental actions store's active-view dedup window-invariant.
+            "this_fill_ord": this_fill_ord,
             "event_order": ee.event_order,
             "action_type": action_type,
             "signed_size": signed, "price": price,
@@ -656,6 +720,11 @@ def trace_wallet(
                 j["open_at_window_end"] = True
                 j["exit_ts"] = None
                 journeys.append(j)
+                # PHASE 2 carry: advance funding_net_so_far to include this window's accrual through
+                # end_ms so the NEXT run (window_start = this end_ms) resumes without re-reading funding.
+                # j["funding_net"] == funding_net_so_far + (max(open_ts,_W), _close_ts]; adopting it makes
+                # the next window's max(open_ts, next_W=end_ms) == end_ms give exactly (open_ts, close].
+                st["funding_net_so_far"] = float(j["funding_net"])
 
     # Lifecycle validity is only known once the whole wallet has been walked.
     # If a later position discontinuity interrupts a journey, propagate that
@@ -697,6 +766,13 @@ def trace_wallet(
             and key not in invalid_stream_journeys
         )
 
+    if return_state:
+        final_state = {
+            "coin_state": coin_state,
+            "coin_journey_counter": coin_journey_counter,
+            "coin_seen_first_fill": coin_seen_first_fill,
+        }
+        return actions, journeys, final_state
     return actions, journeys
 
 
@@ -722,6 +798,7 @@ def process_wallet(args: tuple) -> dict:
     wallet, start_ms, end_ms, equity_enriched = args
     try:
         if equity_enriched:
+            import v15_m01_equity_reconstruct as m01  # local: enrichment lane only
             anchor = m01.load_wallet_anchor(wallet, _ANCHOR_DF)
             res = m01.reconstruct_wallet_event_equity((wallet, anchor, start_ms, end_ms))
             if "error" in res:
@@ -732,8 +809,8 @@ def process_wallet(args: tuple) -> dict:
             n_anchors = len(res["weekly_anchors"])
             inter_drift = res["inter_anchor_drift"]
         else:
-            fills = m01.load_wallet_fills(wallet, start_ms, end_ms)
-            funding = m01.load_wallet_funding(wallet, start_ms, end_ms)
+            fills = fio.load_wallet_fills(wallet, start_ms, end_ms)
+            funding = fio.load_wallet_funding(wallet, start_ms, end_ms)
             events = [
                 LifecycleFillEvent(
                     ts=int(fill["time"]),
@@ -752,6 +829,44 @@ def process_wallet(args: tuple) -> dict:
             "n_anchors": n_anchors,
             "inter_drift": inter_drift,
         }
+    except Exception as e:  # noqa: BLE001
+        return {"wallet": wallet, "error": f"exception:{e!r}"}
+
+
+def process_wallet_preloaded(args: tuple) -> dict:
+    """CORE-lane journey trace for one wallet using PRELOADED fills/funding.
+
+    Identical output to ``process_wallet((wallet, start, end, False))`` when the preloaded
+    ``fills``/``funding`` are exactly ``load_wallet_fills``/``load_wallet_funding`` over the same
+    window (guaranteed by ``hl_fills_io.load_grouped_fills_funding``). Used by the first-run / bulk
+    catch-up path, which reads each hot day-file ONCE (kills the O(wallets x days) per-wallet rescan)."""
+    # PHASE 2: optional 5th/6th/7th tuple elements (init_state, window_start_ms, return_state) enable the
+    # STATEFUL path: resume the per-coin books from carried state + feed only this window's fills. The
+    # 4-tuple form (wallet, fills, funding, end_ms) is unchanged (batch/replay path -> byte-identical).
+    wallet, fills, funding, end_ms = args[0], args[1], args[2], args[3]
+    init_state = args[4] if len(args) > 4 else None
+    window_start_ms = args[5] if len(args) > 5 else None
+    return_state = args[6] if len(args) > 6 else False
+    try:
+        events = [
+            LifecycleFillEvent(
+                ts=int(fill["time"]),
+                event_order=int(fill.get("fill_seq", i)),
+                fill=fill,
+            )
+            for i, fill in enumerate(fills)
+        ]
+        res = trace_wallet(
+            wallet, events, fills, funding, equity_enriched=False, end_ms=end_ms,
+            init_state=init_state, window_start_ms=window_start_ms, return_state=return_state,
+        )
+        if return_state:
+            actions, journeys, final_state = res
+            return {"wallet": wallet, "actions": actions, "journeys": journeys,
+                    "state": final_state, "n_anchors": None, "inter_drift": None}
+        actions, journeys = res
+        return {"wallet": wallet, "actions": actions, "journeys": journeys,
+                "n_anchors": None, "inter_drift": None}
     except Exception as e:  # noqa: BLE001
         return {"wallet": wallet, "error": f"exception:{e!r}"}
 
@@ -779,7 +894,9 @@ def main() -> None:
         "--headroom-gb", type=float, default=None,
         help="RAM reserved outside M02. Default: 2GB core; 6GB equity-enriched.",
     )
-    ap.add_argument("--anchor-parquet", default=str(m01.ANCHOR_PARQUET))
+    ap.add_argument("--anchor-parquet", default=None,
+                    help="Anchor-state parquet for the equity-enrichment lane. "
+                         "Defaults to M01's ANCHOR_PARQUET (resolved lazily only when --equity-enrichment is set).")
     ap.add_argument(
         "--equity-enrichment", action="store_true",
         help="Opt in to M01 causal equity targets. Core actions/journeys do not require M01.",
@@ -807,7 +924,11 @@ def main() -> None:
     # PRECOMPUTE marks cache ONCE (perf: avoids N workers each re-scanning Mongo for coin price
     # series, which left the pool ~74% I/O-idle). Freshness-checked (codex perf-r1 #3): rebuild if
     # the coin-set or latest candle changed since the cache was built.
+    if args.equity_enrichment and args.anchor_parquet is None:
+        import v15_m01_equity_reconstruct as m01  # local: enrichment lane only
+        args.anchor_parquet = str(m01.ANCHOR_PARQUET)
     if args.equity_enrichment and not args.skip_marks_cache:
+        import v15_m01_equity_reconstruct as m01  # local: enrichment lane only
         tmc = time.time()
         st = m01.marks_cache_status()
         force = args.rebuild_marks_cache or not st["fresh"]
@@ -829,7 +950,11 @@ def main() -> None:
     # --mem-soft-gb acts as the upper cap on the main-process guard.
     per_worker_gb = args.per_worker_gb
     if per_worker_gb is None:
-        per_worker_gb = 2.0 if args.equity_enrichment else 0.5
+        # MEASURED 2026-07-17 (/usr/bin/time + live guard): a CORE worker peaks ~1.2GB and an equity-enrichment
+        # worker ~2.6GB. The old 0.5/2.0 planning was BELOW the real peak, so every worker blew its soft cap ->
+        # guard exit137 -> Pool respawn -> infinite death-respawn HANG (parent 0% CPU). Size the plan ABOVE the
+        # measured peak so workers survive. Override with --per-worker-gb.
+        per_worker_gb = 3.0 if args.equity_enrichment else 1.5
     headroom_gb = args.headroom_gb
     if headroom_gb is None:
         headroom_gb = 6.0 if args.equity_enrichment else 2.0

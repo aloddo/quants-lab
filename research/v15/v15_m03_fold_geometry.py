@@ -385,15 +385,24 @@ def main() -> None:
     ap.add_argument("--journeys", required=True)
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--start", default=str(DEFAULT_START))
+    # N_FOLDS was hardcoded to 8, mechanically pinning the walk-forward calendar to a mid-May tail
+    # from the Dec-01 start regardless of how fresh the input data is. Expose the already-existing
+    # build_folds(n_folds=...) param so the calendar can extend to the fresh data edge (e.g. 12 folds
+    # reaches test_end ~Jul-13). Default preserves the historical 8-fold behavior.
+    ap.add_argument("--n-folds", type=int, default=N_FOLDS)
+    # is_full_test_fold = (test_end_excl <= archive_end_excl). archive_end_excl was the hardcoded
+    # DEFAULT_END_EXCL (2026-05-24), which mislabels fresh folds 9-12 as incomplete even with data
+    # through July (codex P2, 2026-07-22). Data-derive it from the actual actions edge below; --end-excl
+    # overrides. (Cosmetic today: no downstream module filters on is_full_test_fold, but the label must
+    # be honest for a hedge-fund-grade artifact.)
+    ap.add_argument("--end-excl", default=None, help="archive end (exclusive) for is_full_test_fold; default = data edge")
     args = ap.parse_args()
 
     start = pd.Timestamp(args.start).date()
-    folds = build_folds(start)
-    folds_df = folds_to_frame(folds, market_data_fn=None)  # regime backfilled later (reporting-only)
+    folds = build_folds(start, n_folds=args.n_folds)
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    folds_df.to_parquet(outdir / "m03_folds.parquet", index=False)
-    logger.info(f"folds calendar -> {outdir/'m03_folds.parquet'} (8 folds, chained OOS "
+    logger.info(f"folds calendar ({len(folds)} folds, chained OOS "
                 f"{folds[0].test_start} .. {folds[-1].test_end_excl})")
 
     # Memory-safe (CLAUDE.md Key Rule 8): read ONLY the columns the activity pass needs. The full
@@ -416,6 +425,16 @@ def main() -> None:
     actions["wallet"] = actions["wallet"].astype("category")
     journeys["wallet"] = journeys["wallet"].astype("category")
     logger.info(f"loaded {len(actions):,} actions, {len(journeys):,} journeys (wallet=category)")
+    # is_full_test_fold: data-derive the archive edge (codex P2, 2026-07-22) so fresh folds are labeled
+    # honestly, instead of the stale hardcoded DEFAULT_END_EXCL. --end-excl overrides.
+    if args.end_excl:
+        archive_end = pd.Timestamp(args.end_excl).date()
+    else:
+        archive_end = pd.Timestamp(int(actions["ts"].max()), unit="ms", tz="UTC").date()
+    folds_df = folds_to_frame(folds, market_data_fn=None, archive_end_excl=archive_end)
+    folds_df.to_parquet(outdir / "m03_folds.parquet", index=False)
+    logger.info(f"folds -> {outdir/'m03_folds.parquet'} (archive_end_excl={archive_end}, "
+                f"{int(folds_df['is_full_test_fold'].sum())}/{len(folds_df)} full test folds)")
     wide, summary = build_activity(folds, actions, journeys)
     wide.to_parquet(outdir / "m03_wallet_fold_activity.parquet", index=False)
     summary.to_parquet(outdir / "m03_wallet_activity_summary.parquet", index=False)

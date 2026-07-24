@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "research" / "v15")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pandas as pd
 import v15_m05_eligibility as m5, v15_m03_fold_geometry as m3
-from m02_journeys_daily import load_active_closed, DEFAULT_OUT_DIR
+from m02_journeys_daily import load_active_closed, DEFAULT_OUT_DIR, DEFAULT_STATE_DIR, committed_run_id
 from m03_folds_daily import _m2_new_run_wallets
 from m04_authenticity_daily import DEFAULT_M4_DIR
 
@@ -49,8 +49,11 @@ def _entity_m4_hash(m04: pd.DataFrame) -> dict:
 
 
 def run_daily(out_dir: Path = DEFAULT_M5_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR,
-              m4_dir: Path = DEFAULT_M4_DIR, delta_wallets: set | None = None) -> dict:
+              m4_dir: Path = DEFAULT_M4_DIR, delta_wallets: set | None = None,
+              m2_state_dir: Path = DEFAULT_STATE_DIR) -> dict:
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    # Read ONLY committed M2 runs (codex P1 #2): an uncommitted/failed run is invisible to M5.
+    _m2_cap = committed_run_id(Path(m2_state_dir))
     elig_p, ent_p, state_p = out_dir / "m5_eligibility.parquet", out_dir / "m5_entities.parquet", out_dir / "m5_run_state.json"
     m04 = pd.read_parquet(Path(m4_dir) / "m4_tiers.parquet")
     m04["wallet"] = m04["wallet"].astype(str).str.lower()
@@ -60,12 +63,12 @@ def run_daily(out_dir: Path = DEFAULT_M5_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR
     if delta_wallets is None and prior and state_p.exists():
         st = json.loads(state_p.read_text())
         last = int(st.get("last_m2_run_id", 0)); prev_hash = st.get("entity_m4_hash", {}) or {}
-        delta_wallets, new_max = _m2_new_run_wallets(Path(m2_out_dir), last)
+        delta_wallets, new_max = _m2_new_run_wallets(Path(m2_out_dir), last, max_run_id=_m2_cap)
     else:
-        _, new_max = _m2_new_run_wallets(Path(m2_out_dir), 0)   # 0 = nothing consumed yet; -1 probes run_id 0 which never exists -> freezes the delta forever (codex P1)
+        _, new_max = _m2_new_run_wallets(Path(m2_out_dir), 0, max_run_id=_m2_cap)   # 0 = nothing consumed yet; -1 probes run_id 0 which never exists -> freezes the delta forever (codex P1)
 
     if not prior or delta_wallets is None or not prev_hash:
-        jn = load_active_closed(Path(m2_out_dir)); jn["wallet"] = jn["wallet"].astype(str).str.lower()
+        jn = load_active_closed(Path(m2_out_dir), max_run_id=_m2_cap); jn["wallet"] = jn["wallet"].astype(str).str.lower()
         df, edf = _run_m5(m04, jn); mode = "full"
     else:
         dw = {str(w).lower() for w in delta_wallets}
@@ -85,7 +88,7 @@ def run_daily(out_dir: Path = DEFAULT_M5_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR
         else:
             m04_d = m04[m04["entity_id"].astype(str).isin(delta_ent)]
             dw_all = set(m04_d["wallet"].astype(str).str.lower())
-            jn = load_active_closed(Path(m2_out_dir), wallets=dw_all) if dw_all else _EMPTY_EQ.iloc[0:0]
+            jn = load_active_closed(Path(m2_out_dir), wallets=dw_all, max_run_id=_m2_cap) if dw_all else _EMPTY_EQ.iloc[0:0]
             if not jn.empty:
                 jn["wallet"] = jn["wallet"].astype(str).str.lower()
             df_d, edf_d = _run_m5(m04_d, jn) if len(m04_d) else (pe.iloc[0:0], pen.iloc[0:0])
@@ -100,18 +103,19 @@ def run_daily(out_dir: Path = DEFAULT_M5_DIR, m2_out_dir: Path = DEFAULT_OUT_DIR
     return {"mode": mode, "elig_rows": len(df), "entity_rows": len(edf), "last_m2_run_id": int(new_max)}
 
 
-def gate(m2_out_dir: Path = DEFAULT_OUT_DIR, n: int = 40) -> bool:
+def gate(m2_out_dir: Path = DEFAULT_OUT_DIR, n: int = 40, m2_state_dir: Path = DEFAULT_STATE_DIR) -> bool:
     import v15_m04_authenticity as m4
     from m02_journeys_daily import day_end_ms
-    wallets = sorted(set(load_active_closed(Path(m2_out_dir), wallets=None)["wallet"].astype(str).str.lower()))[:n]
+    _cap = committed_run_id(Path(m2_state_dir))
+    wallets = sorted(set(load_active_closed(Path(m2_out_dir), wallets=None, max_run_id=_cap)["wallet"].astype(str).str.lower()))[:n]
     as_of = day_end_ms("20260714") + 1
     m04, _e, _s = m4.run(wallets, as_of - 120*86_400_000, as_of - 1, as_of, procs=1, hot_prefetch=True, return_scores=True)
     m04["wallet"] = m04["wallet"].astype(str).str.lower()
-    jn = load_active_closed(Path(m2_out_dir), wallets=set(wallets)); jn["wallet"] = jn["wallet"].astype(str).str.lower()
+    jn = load_active_closed(Path(m2_out_dir), wallets=set(wallets), max_run_id=_cap); jn["wallet"] = jn["wallet"].astype(str).str.lower()
     df_f, edf_f = _run_m5(m04, jn)
     ent = sorted(m04["entity_id"].unique()); de = set(ent[: max(1, len(ent)//4)])
     m04_d = m04[m04["entity_id"].isin(de)]
-    df_d, edf_d = _run_m5(m04_d, load_active_closed(Path(m2_out_dir), wallets=set(m04_d["wallet"])))
+    df_d, edf_d = _run_m5(m04_d, load_active_closed(Path(m2_out_dir), wallets=set(m04_d["wallet"]), max_run_id=_cap))
     merged = pd.concat([df_f[~df_f["entity_id"].isin(de)], df_d], ignore_index=True)
     def sk(d): return d.sort_values(list(d.columns)).reset_index(drop=True) if len(d) else d
     ok = sk(df_f).equals(sk(merged))

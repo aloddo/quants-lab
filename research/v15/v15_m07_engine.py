@@ -485,6 +485,14 @@ class EngineParams:
     follower_trail: Optional[float] = None     # FOLLOWER trailing exit ("exit before them"): if our copy
     sizing_mode: str = "leader_equity"         # leader_equity | fixed_position
     fixed_target_exposure: float = 0.10         # signed direction gets this absolute follower exposure
+    # COPY POLICY (2026-07-23, Alberto HOW: test each wallet BOTH ways):
+    #   "full_mirror"  = copy every ENTRY/ADDON/TRIM/EXIT verbatim (default; byte-identical to prior engine).
+    #   "entry_trail"  = mirror the ENTRY only (open one fixed-size leg), IGNORE their adds/trims/exits, and
+    #                    exit each position on OUR per-position TRAILING take-profit (retrace `trail_pct` from
+    #                    the position's peak favorable mark). Trailing checked at the leader's action
+    #                    timestamps + fold-end (dense for quick-flip wallets); continuous/hourly check = TODO.
+    copy_policy: str = "full_mirror"
+    trail_pct: float = 0.15                      # entry_trail: exit on retrace >= this from peak favorable mark
     # equity draws down >= follower_trail from its running peak, FLATTEN all positions and sit out the rest
     # of the fold (independent of source). None = disabled (copy source exposure verbatim). Checked at
     # every action boundary + fold-end using REAL engine equity (fills/fees/funding/liq priced in).
@@ -563,7 +571,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             if p.mode == "isolated":
                 st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + p.isolated_margin
             del st.positions[c]
-            _rt_close(summary, c)   # CHANGE A: residual flatten ends the round-trip
+            _rt_close(summary, c, our_ts=ts, close_reason="trail_flatten")   # CHANGE A: residual flatten ends the round-trip
 
     def _trail_fire(cur_eq, ts):
         """FOLLOWER trailing-exit state machine. Updates the running peak from REAL equity at THIS
@@ -686,6 +694,32 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             summary["_te_weighted_sum"] += dt * te_prev_l1
             summary["tracking_error_active_ms"] += dt
 
+    # entry_trail (policy b): per-position peak favorable mark, for OUR trailing-TP exit.
+    trail_peak: dict = {}
+
+    def _trail_step_all(ts):
+        """Policy (b) entry_trail: update each open position's peak favorable (causal) mark and exit the
+        position on OUR trailing take-profit when the mark retraces >= trail_pct from its peak. Conservative
+        causal mark (prior completed bar). No-op unless copy_policy == 'entry_trail'."""
+        if params.copy_policy != "entry_trail":
+            return
+        for c in list(st.positions.keys()):
+            p = st.positions.get(c)
+            if p is None or p.szi == 0.0:
+                continue
+            mk = md.mark(c, ts, causal=True)
+            if mk is None or mk != mk or mk <= 0:
+                continue
+            is_long = p.szi > 0
+            pk = trail_peak.get(c)
+            pk = mk if pk is None else (max(pk, mk) if is_long else min(pk, mk))
+            trail_peak[c] = pk
+            breached = (mk <= pk * (1 - params.trail_pct)) if is_long else (mk >= pk * (1 + params.trail_pct))
+            if breached:
+                _apply_order(st, md, c, -p.szi, mk, ts, {"action_type": "FOLLOWER_TRAIL_TP", "ts": ts},
+                             params, band, fills, events, summary, force_close=True)
+                trail_peak.pop(c, None)
+
     for a in rows:
         coin = a["coin"]
         if coin_is_spot(coin):
@@ -724,19 +758,34 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             prev_ts = our_ts
             continue
 
+        # tgt_pct + exit_cond computed for BOTH policies (post-order tracking-error uses them).
         tgt_pct = _action_target_pct(a, params)
-        if tgt_pct != tgt_pct:
-            prev_ts = our_ts
-            continue
-        target_notional = tgt_pct * cur_eq
-        target_szi = target_notional / mark
-        cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
         exit_cond = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
-        if exit_cond:
-            target_szi = 0.0
-        delta_szi = target_szi - cur_szi
+        if params.copy_policy == "entry_trail":
+            # POLICY (b): first run OUR trailing-TP on every open position at this cursor; then MIRROR THE
+            # ENTRY ONLY (open one fixed-size leg when the leader opens from flat and we're flat). ADDON/
+            # TRIM/EXIT are IGNORED (our exit is the trailing stop, not theirs).
+            _trail_step_all(our_ts)
+            at = str(a.get("action_type", "")).upper()
+            cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
+            if at == "ENTRY" and abs(cur_szi) < 10 ** (-md.meta.szdec(coin)) and tgt_pct == tgt_pct:
+                side = 1.0 if _f(a.get("position_after")) >= 0 else -1.0
+                target_szi = side * abs(params.fixed_target_exposure) * cur_eq / mark
+                _apply_order(st, md, coin, target_szi - cur_szi, mark, our_ts, a, params, band, fills, events, summary)
+                trail_peak[coin] = mark
+            # else: ignore their add/trim/exit — the trailing stop above owns our exit.
+        else:
+            if tgt_pct != tgt_pct:
+                prev_ts = our_ts
+                continue
+            target_notional = tgt_pct * cur_eq
+            target_szi = target_notional / mark
+            cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
+            if exit_cond:
+                target_szi = 0.0
+            delta_szi = target_szi - cur_szi
 
-        _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary)
+            _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary)
 
         marks = _marks(st, md, our_ts, extra=coin)
         eq = st.equity(marks)
@@ -768,6 +817,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     # Runs even with zero actions so carried start_state positions are marked/funded/liquidated.
     if not summary["ruin"] and end_ts_ms > prev_ts:
         _advance_between(st, md, prev_ts, end_ts_ms, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
+        _trail_step_all(end_ts_ms)   # policy (b): final per-position trailing-TP check at fold end (no-op unless entry_trail)
         marks = _marks(st, md, end_ts_ms)
         eq = st.equity(marks)
         peak_equity = max(peak_equity, eq)
@@ -851,6 +901,13 @@ def _new_summary(entity_id, fold_id, start_equity, n_actions, params, md):
         # _finalize. Latency cost is ALREADY priced into each fill_px (CHANGE B), so the accumulated
         # realized PnL is genuinely after fees+funding+latency.
         "_rt": {}, "n_round_trips": 0, "n_round_trip_wins": 0, "realized_pnl_total": 0.0,
+        # INCREMENT 1 (v2.2 per-position emit): _positions is the internal accumulator of PER-CLOSED-
+        # ROUND-TRIP records (entry/exit/side/peak_notional/realized-after-cost/r_i + intra-journey
+        # add/trim + underwater-add). Underscore = never written to the one-row summary parquet; popped
+        # in _finalize into the return dict as "positions" (parallel to fills/events). Aggregates
+        # (n_round_trips/realized_pnl_total) are UNCHANGED -> this is a pure superset. Open-at-cutoff
+        # censoring marks, continuous-mark peak/MAE, and the sharded writer are follow-up sub-diffs.
+        "_positions": [],
     }
 
 
@@ -1098,7 +1155,7 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
                 summary["n_rejected"] += 1
                 return
 
-    _book_fill(st, md, coin, delta_szi, fill_px, mode, fee, summary)
+    _book_fill(st, md, coin, delta_szi, fill_px, mode, fee, summary, our_ts=our_ts, mark=mark)
 
     summary["n_fills"] += 1
     summary["total_fees"] += fee
@@ -1119,9 +1176,38 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
 # --------------------------------------------------------------------------- #
 # CHANGE A — realized round-trip accounting (per-coin accumulator -> M6b aggregates)
 # --------------------------------------------------------------------------- #
-def _rt_open(summary: dict, coin: str):
-    """Start (or re-arm) the round-trip accumulator for `coin` when its position opens from flat."""
-    summary["_rt"][coin] = {"realized": 0.0, "fee": 0.0, "funding": 0.0}
+def _rt_open(summary: dict, coin: str, our_ts=None, side: int = 0, entry_px: float = 0.0,
+             open_notional: float = 0.0):
+    """Start (or re-arm) the round-trip accumulator for `coin` when its position opens from flat.
+    INCREMENT 1: also seeds the per-position fields (entry_ts/side/entry_px + intra-journey add/trim +
+    peak-notional-at-fills + underwater-add numerator). NOTE: _seed_carry_in constructs the Position
+    directly and does NOT call this -> carried-in positions have no accumulator and emit NO per-position
+    record when later closed (exactly matching the legacy aggregate behavior, which also excludes them;
+    their proper censoring/cutoff handling is a later v2.2 sub-diff). The our_ts=None defaults exist only
+    as a defensive fallback; on the normal open-from-flat path our_ts is always supplied."""
+    summary["_rt"][coin] = {
+        "realized": 0.0, "fee": 0.0, "funding": 0.0,
+        "entry_ts": (int(our_ts) if our_ts is not None else None), "side": int(side),
+        "entry_px": float(entry_px), "peak_notional": float(open_notional),
+        "n_addon": 0, "n_trim": 0, "addon_notional": 0.0, "underwater_add_notional": 0.0,
+        "mae": 0.0,   # per-position MAX ADVERSE EXCURSION = worst underwater frac vs entry VWAP (<=0). True
+                      # POSITION drawdown (Alberto 2026-07-24), updated at fills + hourly funding cursors.
+        "mfe": 0.0,   # per-position MAX FAVORABLE EXCURSION = best in-the-money frac vs entry VWAP (>=0).
+                      # "MAE and MFE are crucial" (Alberto 2026-07-24): MFE vs realized = give-back (informs
+                      # whether OUR trailing-TP could capture more than the leader's exit).
+    }
+
+
+def _rt_update_excursions(acc: dict, mark: float, entry_px: float, side: int) -> None:
+    """Update a position's MAE (worst underwater) + MFE (best in-money) vs its entry VWAP, as signed
+    fractions. side=+1 long / -1 short. excursion = side*(mark-entry)/entry (>0 favorable, <0 adverse)."""
+    if acc is None or entry_px is None or entry_px <= 0 or mark is None or mark != mark or mark <= 0:
+        return
+    exc = side * (mark - entry_px) / entry_px
+    if exc < acc.get("mae", 0.0):
+        acc["mae"] = exc
+    if exc > acc.get("mfe", 0.0):
+        acc["mfe"] = exc
 
 
 def _rt_add(summary: dict, coin: str, realized: float = 0.0, fee: float = 0.0, funding: float = 0.0):
@@ -1152,9 +1238,13 @@ def _rt_realize_terminal(summary: dict, p: "Position", terminal_px: float, extra
         acc["fee"] += float(extra_loss)
 
 
-def _rt_close(summary: dict, coin: str):
+def _rt_close(summary: dict, coin: str, our_ts=None, close_reason: str = "normal"):
     """Finalize a CLOSED round-trip: realized PnL after OUR costs = realized - fees + funding (funding
-    is already signed: negative = paid). Pushes into the summary totals and clears the accumulator."""
+    is already signed: negative = paid). Pushes into the summary totals and clears the accumulator.
+    INCREMENT 1: also emits a PER-POSITION record into summary["_positions"] (aggregates unchanged).
+    close_reason: "normal" (action-driven) | "liquidation" | "backstop" | "ruin" | "trail_flatten"
+    -- so forced-loss records (the DCA-whale blowups this exists to catch) are distinguishable and
+    carry their real exit_ts (codex+fable P1: forced closes were dropping the in-scope timestamp)."""
     acc = summary["_rt"].pop(coin, None)
     if acc is None:
         return
@@ -1163,15 +1253,59 @@ def _rt_close(summary: dict, coin: str):
     if pnl > 0:
         summary["n_round_trip_wins"] += 1
     summary["realized_pnl_total"] += pnl
+    # INCREMENT 1 (v2.2): per-position record. peak_notional is the max |szi|*mark observed AT FILL
+    # EVENTS (a lower bound; continuous-mark peak/MAE via the funding/scan cursor is the next sub-diff).
+    # r_i = realized-after-cost / peak_notional (the size-neutral per-position return; NOTE v2.2 uses the
+    # G*-standardized child peak notional -> that normalization lands with the sizing sub-diff, this emits
+    # the raw follower peak). underwater_add_ratio = underwater_add_notional / addon_notional (DCA signal).
+    peak = float(acc.get("peak_notional", 0.0) or 0.0)
+    addon_notional = float(acc.get("addon_notional", 0.0) or 0.0)
+    summary["_positions"].append({
+        "entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
+        "side": int(acc.get("side", 0)), "entry_ts": acc.get("entry_ts"),
+        "exit_ts": (int(our_ts) if our_ts is not None else None),
+        "peak_notional": peak, "realized_pnl_after_cost": float(pnl),
+        "r_i": (pnl / peak if peak > 0 else None),
+        "n_addon": int(acc.get("n_addon", 0)), "n_trim": int(acc.get("n_trim", 0)),
+        "addon_notional": addon_notional,
+        "underwater_add_notional": float(acc.get("underwater_add_notional", 0.0) or 0.0),
+        "underwater_add_ratio": (
+            float(acc.get("underwater_add_notional", 0.0) or 0.0) / addon_notional
+            if addon_notional > 0 else 0.0),
+        # POSITION drawdown/run-up (Alberto 2026-07-24 "MAE and MFE are crucial"): worst underwater
+        # frac (<=0) and best in-money frac (>=0) vs entry VWAP over the position's life. mfe_giveback
+        # = how much of the peak run-up was surrendered by exit (mfe - r_i); high giveback => leader's
+        # own exit leaves money on the table => OUR trailing-TP (policy-b) may capture more.
+        "mae": float(acc.get("mae", 0.0) or 0.0),
+        "mfe": float(acc.get("mfe", 0.0) or 0.0),
+        "mfe_giveback": (
+            float(acc.get("mfe", 0.0) or 0.0) - (pnl / peak) if peak > 0 else None),
+        "close_reason": close_reason, "closed": True,
+    })
 
 
 def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fill_px: float,
-               mode: str, fee: float, summary: dict):
+               mode: str, fee: float, summary: dict, our_ts=None, mark=None):
     """Update position + the right bucket. ISOLATED opens post initial margin from main cross bucket;
     isolated realized/funding/fees route to the position's isolated bucket; closing returns isolated
-    margin + realized to main (design §1.2/§3.1; codex code-r1 #2)."""
+    margin + realized to main (design §1.2/§3.1; codex code-r1 #2).
+    INCREMENT 1: our_ts/mark thread the fill time + ref mark so the per-position accumulator records
+    entry/exit ts, peak notional (at fills), intra-journey add/trim, and underwater-add. Both default
+    to None (older callers / no-mark paths) -> the per-position fields degrade gracefully, aggregates
+    are byte-identical."""
     scope = coin_dex(coin)
+    nmark = float(mark) if (mark is not None and mark == mark) else float(fill_px)  # notional valuation
+    side_in = 1 if delta_szi > 0 else -1
     p = st.positions.get(coin)
+    # INCREMENT 1 fix (codex P1): sample peak notional at THIS fill on the PRE-fill size so the mark at a
+    # full-close / trim / flip fill is captured (the full-close branch returns before the tail update,
+    # which previously left a run-up position's peak stuck at entry notional -> r_i overstated). The
+    # between-fill continuous peak/MAE (via the funding/scan cursor) remains the next sub-diff.
+    if p is not None:
+        _acc0 = summary["_rt"].get(coin)
+        if _acc0 is not None:
+            _acc0["peak_notional"] = max(_acc0.get("peak_notional", 0.0), abs(p.szi) * nmark)
+            _rt_update_excursions(_acc0, nmark, p.entry_px, 1 if p.szi > 0 else -1)  # MAE/MFE at pre-fill mark
     realized = 0.0
     if p is None:
         new = Position(coin, delta_szi, fill_px, mode, md.meta.max_leverage(coin))
@@ -1182,7 +1316,8 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
         else:
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) - fee
         st.positions[coin] = new
-        _rt_open(summary, coin)            # CHANGE A: round-trip opens from flat
+        _rt_open(summary, coin, our_ts=our_ts, side=side_in, entry_px=fill_px,
+                 open_notional=abs(delta_szi) * nmark)   # CHANGE A / INCREMENT 1: opens from flat
         _rt_add(summary, coin, fee=fee)    # entry fee is a round-trip cost
         return
 
@@ -1200,10 +1335,20 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
         del st.positions[coin]
         _rt_add(summary, coin, realized=realized, fee=fee)   # CHANGE A: book exit realized + fee
-        _rt_close(summary, coin)                             # ...and finalize the closed round-trip
+        _rt_close(summary, coin, our_ts)                     # ...and finalize the closed round-trip
         return
 
     if (p.szi >= 0) == (new_szi >= 0) and abs(new_szi) > abs(p.szi):
+        # INCREMENT 1: an ADDON (same-side increase). Flag underwater (averaging-down) vs the entry VWAP
+        # BEFORE it is re-averaged: long adding at mark < entry (or short at mark > entry) = a DCA add.
+        _acc = summary["_rt"].get(coin)
+        if _acc is not None:
+            _acc["n_addon"] += 1
+            _add_notional = abs(delta_szi) * nmark
+            _acc["addon_notional"] += _add_notional
+            _underwater = (p.szi > 0 and nmark < p.entry_px) or (p.szi < 0 and nmark > p.entry_px)
+            if _underwater:
+                _acc["underwater_add_notional"] += _add_notional
         p.entry_px = (p.entry_px * abs(p.szi) + fill_px * abs(delta_szi)) / abs(new_szi)
         if p.mode == "isolated":
             # post the TIER-CORRECT total IM for the resulting notional; draw the delta (incl any
@@ -1239,17 +1384,26 @@ def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fi
         # CHANGE A: flip CLOSES the prior round-trip (closed portion's realized + close_fee) and OPENS a new
         # one for the residual (open_fee).
         _rt_add(summary, coin, realized=realized, fee=close_fee)
-        _rt_close(summary, coin)
-        _rt_open(summary, coin)
+        _rt_close(summary, coin, our_ts)                                    # INCREMENT 1: emit closed leg
+        _rt_open(summary, coin, our_ts=our_ts, side=(1 if new_szi > 0 else -1),
+                 entry_px=fill_px, open_notional=abs(new_szi) * nmark)      # ...open the residual leg
         _rt_add(summary, coin, fee=open_fee)   # the opposite-side RT bears its own entry fee
     else:
         # reducing (same side, smaller): realize to bucket
         _rt_add(summary, coin, realized=realized, fee=fee)   # CHANGE A: partial realized + fee
+        _acc = summary["_rt"].get(coin)        # INCREMENT 1: a TRIM (partial scale-out)
+        if _acc is not None:
+            _acc["n_trim"] += 1
         if p.mode == "isolated":
             p.isolated_margin += realized - fee
         else:
             st.cross_collateral[scope] = st.cross_collateral.get(scope, 0.0) + realized - fee
     p.szi = new_szi
+    # INCREMENT 1: update peak notional (max |szi|*mark seen at fills) on the surviving position.
+    _acc = summary["_rt"].get(coin)
+    if _acc is not None:
+        _acc["peak_notional"] = max(_acc.get("peak_notional", 0.0), abs(new_szi) * nmark)
+        _rt_update_excursions(_acc, nmark, p.entry_px, 1 if new_szi > 0 else -1)   # MAE/MFE at this fill
 
 
 def _apply_funding(st, md, h, summary):
@@ -1258,7 +1412,14 @@ def _apply_funding(st, md, h, summary):
         p = st.positions[coin]
         rate = md.funding_rate_at(coin, h)
         px = md.mark(coin, h, causal=True)
-        if px is None or px != px or rate == 0.0:
+        if px is None or px != px:
+            continue
+        # Continuous MTM cursor: update MAE/MFE on EVERY valid hourly mark, even zero-funding hours
+        # (the between-fill drawdown/run-up that the fill-only samples miss). Independent of funding.
+        _acc_f = summary["_rt"].get(coin)
+        if _acc_f is not None:
+            _rt_update_excursions(_acc_f, float(px), p.entry_px, 1 if p.szi > 0 else -1)
+        if rate == 0.0:
             continue
         fund = -(p.szi * px * rate)         # long pays positive rate
         if p.mode == "cross":
@@ -1485,7 +1646,7 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
             summary["outcome_states"].add("backstop")
             _rt_realize_terminal(summary, p, m)   # CHANGE A FIX #1: realize the wipe loss FIRST
             del st.positions[coin]
-            _rt_close(summary, coin)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+            _rt_close(summary, coin, our_ts=ts_ms, close_reason="backstop")   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
         elif iso_eq < maint:
             _liq_close(st, md, coin, m, ts_ms, summary=summary)
 
@@ -1510,7 +1671,7 @@ def _run_liquidation(st: AccountState, md: MarketData, ts_ms: int, params, event
                 _rt_realize_terminal(summary, st.positions[c],
                                      marks.get(c) or st.positions[c].entry_px)   # CHANGE A FIX #1
                 del st.positions[c]
-                _rt_close(summary, c)   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
+                _rt_close(summary, c, our_ts=ts_ms, close_reason="backstop")   # CHANGE A: backstop wipe ends the round-trip (now a LOSS)
             st.cross_collateral[scope] = 0.0
             summary["n_backstop_transfer"] += 1
             summary["outcome_states"].add("backstop")
@@ -1603,7 +1764,7 @@ def _liq_close(st, md, coin, mark, ts_ms, summary, close_szi=None, scope=None):
         if p.mode == "isolated":
             st.cross_collateral["main"] = st.cross_collateral.get("main", 0.0) + max(0.0, p.isolated_margin)
         del st.positions[coin]
-        _rt_close(summary, coin)   # CHANGE A: forced full close ends the round-trip
+        _rt_close(summary, coin, our_ts=ts_ms, close_reason="liquidation")   # CHANGE A: forced full close ends the round-trip
     else:
         p.szi = new_szi
 
@@ -1630,7 +1791,7 @@ def _ruin(st: AccountState, md: "MarketData", summary: dict, events: list, ts_ms
         if m is None or m != m or m <= 0:
             m = p.entry_px
         _rt_realize_terminal(summary, p, m)
-        _rt_close(summary, c)
+        _rt_close(summary, c, our_ts=ts_ms, close_reason="ruin")
     st.positions.clear()
     for k in list(st.cross_collateral):
         st.cross_collateral[k] = 0.0
@@ -1660,6 +1821,10 @@ def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
     # CHANGE A: finalize realized round-trip aggregates (consumed by M6b). Any round-trip still OPEN at
     # fold end (an un-closed carried position) is intentionally NOT counted -- only CLOSED round-trips.
     summary.pop("_rt", None)
+    # INCREMENT 1 (v2.2 per-position emit): lift the per-CLOSED-round-trip records out of the summary
+    # (never written to the one-row summary parquet) and return them as a parallel "positions" stream
+    # (like fills/events). Aggregates above are untouched -> pure superset.
+    positions = summary.pop("_positions", [])
     nrt = summary["n_round_trips"]
     summary["round_trip_win_rate"] = (summary["n_round_trip_wins"] / nrt) if nrt > 0 else 0.0
     summary["realized_roe"] = (summary["realized_pnl_total"] / start_equity) if start_equity > 0 else 0.0
@@ -1671,7 +1836,7 @@ def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
     ending_state = {"cross_collateral": dict(st.cross_collateral),
                     "positions": {c: vars(p) for c, p in st.positions.items()},
                     "cooldown_until_ms": st.cooldown_until_ms}
-    return {"fills": fills, "events": events, "equity": equity_samples,
+    return {"fills": fills, "events": events, "equity": equity_samples, "positions": positions,
             "ending_account_state": ending_state, "summary": summary}
 
 
@@ -1730,7 +1895,8 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
                   flush_rows: int = 250_000, require_cache: bool = True, window: str = "test",
                   slip_calib_path: Optional[str] = None, follower_trail: Optional[float] = None,
                   copy_latency_ms: int = 2_000, sizing_mode: str = "leader_equity",
-                  fixed_target_exposure: float = 0.10):
+                  fixed_target_exposure: float = 0.10,
+                  copy_policy: str = "full_mirror", trail_pct: float = 0.15):
     import shutil
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1832,10 +1998,12 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     ew = ShardedParquetWriter(out_dir / "m07_events.parquet", flush_rows=flush_rows)
     sw = ShardedParquetWriter(out_dir / "m07_summary.parquet", flush_rows=200_000)
     qw = ShardedParquetWriter(out_dir / "m07_equity.parquet", flush_rows=flush_rows)  # CHANGE 1
+    pw = ShardedParquetWriter(out_dir / "m07_positions.parquet", flush_rows=flush_rows)  # INCREMENT 1
     params = EngineParams(
         slippage_band=band, follower_trail=follower_trail,
         copy_latency_ms=copy_latency_ms, sizing_mode=sizing_mode,
         fixed_target_exposure=fixed_target_exposure,
+        copy_policy=copy_policy, trail_pct=trail_pct,
     )
 
     for w in wallets:
@@ -1852,11 +2020,13 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
             res = step_subaccount(adf, md, start_equity, params, end_ts_ms=t1ms, start_ts_ms=t0ms,
                                   entity_id=entity_id, fold_id=fold_id)
             fw.add_many(res["fills"]); ew.add_many(res["events"]); qw.add_many(res["equity"])
+            pw.add_many(res["positions"])   # INCREMENT 1: per-position records (streamed, bounded)
             sm = res["summary"]; sm["outcome_states"] = ",".join(sm["outcome_states"])
             sw.add(sm)
-    nf, ne, ns, nq = fw.close(), ew.close(), sw.close(), qw.close()
-    logger.info("M7 runner done: %d fills, %d events, %d summaries, %d equity", nf, ne, ns, nq)
-    return {"fills": nf, "events": ne, "summaries": ns, "equity": nq}
+    nf, ne, ns, nq, npos = fw.close(), ew.close(), sw.close(), qw.close(), pw.close()
+    logger.info("M7 runner done: %d fills, %d events, %d summaries, %d equity, %d positions",
+                nf, ne, ns, nq, npos)
+    return {"fills": nf, "events": ne, "summaries": ns, "equity": nq, "positions": npos}
 
 
 def main():
@@ -1884,13 +2054,17 @@ def main():
         "--fixed-target-exposure", type=float, default=0.10,
         help="Absolute follower exposure per open leader position in fixed_position mode.",
     )
+    ap.add_argument("--copy-policy", choices=("full_mirror", "entry_trail"), default="full_mirror",
+                    help="(a) full_mirror = copy every add/trim; (b) entry_trail = mirror ENTRY only, exit on OUR trailing-TP.")
+    ap.add_argument("--trail-pct", type=float, default=0.15, help="entry_trail: trailing-TP retrace-from-peak threshold.")
     args = ap.parse_args()
     run_shortlist(Path(args.actions), Path(args.shortlist), Path(args.folds), Path(args.out),
                   band=args.band, limit_entities=args.limit, start_equity=args.start_equity,
                   require_cache=args.require_cache, window=args.window, slip_calib_path=args.slip_calib,
                   follower_trail=args.follower_trail, copy_latency_ms=args.copy_latency_ms,
                   sizing_mode=args.sizing_mode,
-                  fixed_target_exposure=args.fixed_target_exposure)
+                  fixed_target_exposure=args.fixed_target_exposure,
+                  copy_policy=args.copy_policy, trail_pct=args.trail_pct)
 
 
 if __name__ == "__main__":

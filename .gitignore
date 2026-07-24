@@ -221,3 +221,6 @@ app/models/
 .env.bak*
 # Live copy-trader halt/pause flags (operational, machine-local)
 .HALT_COPY
+
+# misplaced generated cache (path-resolution artifact; regenerable)
+research/app/
