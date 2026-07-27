@@ -197,11 +197,25 @@ def _budget_or_serial(requested_procs: int, parent_gb: float):
     return b
 
 
+_MEM_HEADROOM_GB = None   # None => keep the CoS fleet target (4.0GB). Set by --mem-headroom-gb.
+
+
 def _budget(requested_procs: int, parent_gb: float, per_worker_gb: float = 1.0, headroom_gb: float = 4.0):
     """AGGREGATE memory plan: cap procs so parent+workers fit free RAM leaving >=headroom_gb for the fleet
     (CoS target 2026-07-17: >=4GB headroom), aborting BEFORE any work if even one worker can't fit (never
     'run serial and hope the per-worker guard fires' -- that IS the OOM we are preventing). main_reserve =
     the (window-aware) bounded parent chunk + streaming-writer slack."""
+    # OPT-IN override (2026-07-27). headroom_gb=4.0 is a FLEET-WIDE CoS target (2026-07-17), so the
+    # DEFAULT is untouched: other agents' RAM is not silently taken. But on a 5.9GB box a fixed 4GB
+    # reserve leaves 1.9GB, which cannot fund even ONE worker -- so m02 ran SERIAL, and the seed is
+    # pure trace CPU (measured 4.2s/wallet: fills load 1.30s, funding metadata 0.03s, rest is trace).
+    # Serial => ~11.8h. Parallelism is the ONLY lever left.
+    # Lowering it is defensible for a ONE-TIME seed because: the mem_safe_run guard now VERIFIABLY
+    # kills (f126e42 fixed a silent kill-miss), output is streaming and the checkpoint does not advance
+    # on a kill (so a guard-kill loses nothing but time), and Alberto sanctioned the same reasoning for
+    # MEM_ALLOW_LOW_FREE on 2026-07-23. Explicit per-run flag only -- never a changed default.
+    if _MEM_HEADROOM_GB is not None:
+        headroom_gb = float(_MEM_HEADROOM_GB)
     return plan_memory_budget(requested_procs=max(1, requested_procs), per_worker_gb=per_worker_gb,
                               headroom_gb=headroom_gb, main_reserve_gb=parent_gb + 1.0)
 
@@ -1652,6 +1666,18 @@ def run_daily_stateful(
             "holders": len(wallet_state)}
 
 
+def _seed_trace_one(task):
+    """Trace ONE wallet and return (wallet, carry_state|None). Module-level so Pool can pickle it.
+
+    Identical math to the previous in-line body: same trace_wallet call, same end_ms, same
+    _carry_open_state extraction. Only the process it runs in changed."""
+    w, fills, fund, t1 = task
+    events = [m02.LifecycleFillEvent(ts=int(f["time"]), event_order=int(f.get("fill_seq", i)), fill=f)
+              for i, f in enumerate(fills)]
+    res = m02.trace_wallet(w, events, fills, fund, equity_enriched=False, end_ms=t1, return_state=True)
+    return (w, _carry_open_state(res[2]))
+
+
 def seed_stateful_checkpoint(
     watermark_day: str,
     *,
@@ -1679,30 +1705,62 @@ def seed_stateful_checkpoint(
     _cp0 = load_checkpoint(state_dir) or {}
     start_day = _cp0.get("start_day") or hot_available_days()[0]   # match the store's genesis (1c-1f)
     t0, t1 = day_start_ms(start_day), day_end_ms(watermark_day)
-    logger.info(f"seed: {len(holders):,} holders, batch-trace [{start_day}..{watermark_day}] for state")
     wallet_state: dict = {}
-    wl = sorted(holders)
-    # P0 memory safety: the seed grouped-loads each chunk over the FULL [start_day..watermark] window, so a
-    # 1500-wallet chunk is the same ~34GB parent balloon that panicked the box. Bound it by the window length
-    # (single-process, but the per-chunk parent load is what OOMs). Respect a smaller explicit override.
-    chunk = min(chunk, _bounded_chunk(t1 - t0, target_parent_gb=parent_gb))
-    logger.info(f"seed: mem-bounded chunk={chunk} wallets over [{start_day}..{watermark_day}] (~{parent_gb}GB/chunk)")
+
+    # ── PER-WALLET REPLAY WINDOWS (2026-07-27) ────────────────────────────────────────────────────
+    # WAS: every holder traced from the GLOBAL genesis start_day -> 362-day window each, ~10.5h.
+    # last_flat_ts[w] is a PROVEN-FLAT instant (no position across ALL coins), so carry-in seeds to
+    # zero and a replay from there is BATCH-IDENTICAL to a start_day replay -- the same guarantee the
+    # DAILY path already relies on (PHASE 1c/1d/1e/1f). The seed simply never used it.
+    # MEASURED over these 10,077 holders: median window 45.6d, mean 127.3d vs the 362d global start
+    # => 64.8% less work. Fail SAFE: any wallet without a usable last_flat replays from genesis.
+    _lf = (_cp0.get("last_flat_ts") or {})
+    def _rs(w: str) -> int:
+        v = _lf.get(w)
+        return int(v) if isinstance(v, (int, float)) and t0 < int(v) <= t1 else t0
+    # Sort by replay_start so each chunk's read window = [min(rs over chunk)..t1] stays TIGHT -- one
+    # genesis-era holder cannot stretch a whole chunk back to the beginning of history.
+    wl = sorted(holders, key=lambda w: (_rs(w), w))
+    _oldest = min((_rs(w) for w in wl), default=t0)
+    # P0 memory safety: size the chunk for the WORST-CASE (oldest) window in the batch, so even
+    # genesis-era holders stay parent-bounded. Respect a smaller explicit override.
+    chunk = min(chunk, _bounded_chunk(t1 - _oldest, target_parent_gb=parent_gb))
+    n_chunks = (len(wl) + chunk - 1) // chunk
+    _b = _budget_or_serial(procs, parent_gb=parent_gb)
+    _SEED_MAXTASKS = 40          # recycle workers periodically (MAXTASKS is a local in run_daily, not global)
+    logger.info(f"seed: {len(holders):,} holders in {n_chunks} chunks of {chunk} over PER-WALLET windows "
+                f"[last_flat..{watermark_day}] (~{parent_gb}GB/chunk; procs {procs}->"
+                f"{_b.procs if _b else 'serial'})")
     install_memory_guard(soft_gb=mem_soft_gb, label="m02-seed")
-    for ci in range(0, len(wl), chunk):
-        cwl = wl[ci:ci + chunk]
-        gf, gfund = _load_fills_funding(set(cwl), t0, t1)
-        for w in cwl:
-            fills = fio.order_wallet_fills_causally([f for f in gf.pop(w, []) if int(f["time"]) <= t1])
-            if not fills:
-                continue
-            fund = [x for x in gfund.pop(w, []) if int(x["time"]) <= t1]
-            events = [m02.LifecycleFillEvent(ts=int(f["time"]), event_order=int(f.get("fill_seq", i)), fill=f)
-                      for i, f in enumerate(fills)]
-            res = m02.trace_wallet(w, events, fills, fund, equity_enriched=False, end_ms=t1, return_state=True)
-            keep = _carry_open_state(res[2])
-            if keep is not None:
-                wallet_state[w] = keep
-        logger.info(f"seed chunk {ci // chunk + 1}: state for {len(wallet_state):,} wallets so far")
+
+    with _worker_pool(_b, mem_soft_gb, _SEED_MAXTASKS) as pool:
+        for ci in range(0, len(wl), chunk):
+            cwl = wl[ci:ci + chunk]
+            chunk_lo = min(_rs(w) for w in cwl)          # tight per-chunk read window
+            gf, gfund = _load_fills_funding(set(cwl), chunk_lo, t1)
+
+            def _tasks(cwl=cwl, gf=gf, gfund=gfund):
+                # POP as we dispatch so the chunk's grouped dict shrinks (bounded RAM).
+                for w in cwl:
+                    rs = _rs(w)
+                    # Slice to THIS wallet's window, then re-order causally -- identical to loading
+                    # [rs, t1] directly for that wallet.
+                    fl = fio.order_wallet_fills_causally(
+                        [f for f in gf.pop(w, []) if rs <= int(f["time"]) <= t1])
+                    if not fl:
+                        continue
+                    fu = [x for x in gfund.pop(w, []) if rs <= int(x["time"]) <= t1]
+                    yield (w, fl, fu, t1)
+
+            # PARALLEL. `procs` was accepted and NEVER USED -- the loop was serial. trace_wallet is
+            # independent per wallet, and the wallet shard removed the parent balloon that had forced
+            # serial in the first place.
+            # NOTE: no chunksize kwarg -- _worker_pool yields a _SerialPool (never None) when the
+            # budget can't fund a worker, and its imap_unordered signature is (fn, iterable) only.
+            for w, keep in pool.imap_unordered(_seed_trace_one, _tasks()):
+                if keep is not None:
+                    wallet_state[w] = keep
+            logger.info(f"seed chunk {ci // chunk + 1}/{n_chunks}: state for {len(wallet_state):,} wallets so far")
     cp = load_checkpoint(state_dir) or {}
     cp.update({
         "watermark_day": watermark_day,
@@ -1763,6 +1821,11 @@ def main() -> None:
     ap.add_argument("--seed", metavar="WATERMARK", default=None,
                     help="ONE-TIME: seed the stateful wallet_state from the store at WATERMARK (YYYYMMDD), "
                          "then exit. Run once before switching the cron to --stateful.")
+    ap.add_argument("--mem-headroom-gb", type=float, default=None,
+                    help="Override the memory headroom left for the rest of the fleet when planning the "
+                         "worker pool. DEFAULT (unset) keeps the CoS fleet target of 4.0GB. Lower it ONLY "
+                         "for a one-time job you are watching: on a RAM-tight box a fixed 4GB reserve can "
+                         "make even ONE worker unaffordable, forcing a serial run.")
     ap.add_argument("--fills-shard-dir", default=str(DEFAULT_FILLS_SHARD_DIR),
                     help="Wallet-partitioned fills shard (build_fills_wallet_shard.py). When set, grouped "
                          "loads read ONLY the requested wallets via partition pruning instead of scanning the "
@@ -1770,7 +1833,11 @@ def main() -> None:
                          "for) per chunk. Pass '' to force the legacy full-store scan.")
     args = ap.parse_args()
 
-    global _FILLS_SHARD_DIR
+    global _FILLS_SHARD_DIR, _MEM_HEADROOM_GB
+    if args.mem_headroom_gb is not None:
+        _MEM_HEADROOM_GB = float(args.mem_headroom_gb)
+        logger.warning(f"mem headroom OVERRIDE {_MEM_HEADROOM_GB}GB (fleet default 4.0GB) -- explicit, "
+                       f"one-run only; mem_safe_run floor guard remains the backstop.")
     _sd = (args.fills_shard_dir or "").strip()
     if _sd:
         if not Path(_sd).exists():
