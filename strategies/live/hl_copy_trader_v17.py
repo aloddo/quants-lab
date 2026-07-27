@@ -182,6 +182,16 @@ class CopyTrader:
         # 4.0 -- the shipped default of 4.0 sat EXACTLY on the backstop, i.e. it never bound until it
         # handed you straight to the emergency flatten.
         self.leader_leverage_clamp = float(self.global_config.get("leader_leverage_clamp", 2.5))
+
+        # ── LEADER-BOOK SWEEP (see _leader_book_sweep) ──────────────────────────────────────────
+        # 60s: the retained cohort's median round trips run 162s..101,286s, so there is no latency
+        # pressure; 60s keeps the REST budget at ~5 calls/min. sweep_auto_close DEFAULT FALSE --
+        # alert-only until we can enumerate what it catches that convergence misses.
+        self.sweep_interval_s = float(self.global_config.get("sweep_interval_s", 60.0))
+        self.sweep_grace_s = float(self.global_config.get("sweep_grace_s", 90.0))
+        self.sweep_strikes = int(self.global_config.get("sweep_strikes", 2))
+        self.sweep_auto_close = bool(self.global_config.get("sweep_auto_close", False))
+        self._last_sweep_ts = 0.0
         # Alberto 2026-06-01: NO cap on gross leverage (mirror leaders' true exposure faithfully); risk is
         # capped at ALLOCATION + the global -15% stop + the exchange's own max_margin_util, not an
         # artificial gross clamp. gross_cap defaults to inf (no clamp) unless explicitly configured.
@@ -2491,6 +2501,18 @@ class CopyTrader:
         known_ids = {id(pos) for pos in still_open} | exited_ids
         new_during_exit = [p for p in self.positions if id(p) not in known_ids]
         self.positions = still_open + new_during_exit
+
+        # LEADER-BOOK SWEEP. Runs INLINE here (not as its own asyncio task) so it cannot mutate
+        # self.positions concurrently with the exit machinery above. Its own 60s timer lives inside,
+        # so the 1Hz caller does not drive REST cadence.
+        # getattr guard: the method is defined on V16CopyTrader but this call site is in the BASE
+        # class. The live engine is V17 (V17 -> V16 -> CopyTrader) so MRO resolves it, but a bare
+        # call would AttributeError for anyone instantiating the base directly. That is precisely the
+        # latent-AttributeError shape that nearly crash-looped the live engine on 2026-07-26
+        # (_v16_leg_first / copy_adds_enabled used before being initialised).
+        _sweep = getattr(self, "_leader_book_sweep", None)
+        if _sweep is not None:
+            await _sweep()
 
         # CLUSTER MODE: reconcile _cluster_open -> a coin that no longer has an open position is released
         # so a future cluster can re-trigger it. (Audit of realized exits is captured by the engine's
@@ -5037,6 +5059,111 @@ class V16CopyTrader(CopyTrader):
     # codex's `exit_min_trim_pct >= 0.80` assert was really guarding. Here we converge against the
     # SIZE-BASED leader tracker, keeping that fragile denominator out of the loop. The 0.80 full-close
     # path REMAINS the fallback whenever proportional inputs are stale.
+    async def _leader_book_sweep(self):
+        """Periodic REST reconcile of OUR book against each leader's ACTUAL book.
+
+        WHY THIS IS REQUIRED, not a safety net (Fable 2026-07-27, P1). The only existing re-base of
+        leader state, `_refresh_target_equity`, is EVENT-DRIVEN: it fires via `_leader_equity_fresh`
+        <- `_target_notional` only when something asks to size a position, i.e. when a fill arrives,
+        and even then it is throttled by a 120s cache. No fill => no re-base, forever. Worse, on the
+        convergence path the anchor returns a plausible-but-WRONG number when the tracker is wrong
+        (rather than None), so the equity fallback never fires in exactly the scenario it exists for.
+        Nothing else re-reads leader state. That is why leader positions could drift without bound and
+        strand 6 of 11 legs (55%) on 2026-07-27.
+
+        ALERT-ONLY BY DEFAULT (`sweep_auto_close: false`). The sweep's unique value is the case where
+        the TRACKER ITSELF is wrong -- which is by definition unenumerable, and therefore untestable.
+        Granting auto-close authority to a trigger we have never observed fire is the same mistake as
+        shipping the add path behind an untested gate. Run alert-only, collect what it catches, and
+        promote only once the caught cases can be named. A false auto-close costs a closed winner.
+        """
+        now = time.time()
+        if now - getattr(self, "_last_sweep_ts", 0.0) < self.sweep_interval_s:
+            return
+        self._last_sweep_ts = now
+        live = [p for p in self.positions if p.get("filled") and p.get("wallet") and p.get("coin")]
+        if not live:
+            return
+
+        # One clearinghouseState per DISTINCT wallet we actually hold something for. Main dex only:
+        # V16 sets all_builder_coins = [] and the whitelist is perp-only, so builder legs are
+        # impossible. Typically <=5 calls per sweep, i.e. 5/min at the 60s cadence.
+        fresh: dict = {}
+        for w in {p["wallet"] for p in live}:
+            try:
+                data = requests.post(f"{HL_API}/info",
+                                     json={"type": "clearinghouseState", "user": w}, timeout=5).json()
+            except Exception as e:
+                logger.warning(f"SWEEP: read failed {w[:10]}: {e} -- wallet treated as UNKNOWN")
+                continue
+            # FAIL-CLOSED. The sweep's only possible action is CLOSING, so a failed or partial read
+            # must NEVER read as "flat". Require a dict that actually carries the assetPositions key;
+            # its ABSENCE is not flatness. Same rule as _refresh_target_position ("API failed, keep
+            # the last known value rather than zeroing out") and _reconcile_positions ("never remove a
+            # position just because a query silently failed").
+            if not isinstance(data, dict) or "assetPositions" not in data:
+                logger.warning(f"SWEEP: malformed response {w[:10]} -- UNKNOWN, not flat")
+                continue
+            fresh[w] = {ap["position"]["coin"]: float(ap["position"].get("szi", 0) or 0)
+                        for ap in (data.get("assetPositions") or []) if ap.get("position")}
+
+        for pos in live:
+            w, c = pos["wallet"], pos["coin"]
+            if w not in fresh:                      # unread this cycle -> no opinion
+                pos["_sweep_flat_count"] = 0
+                continue
+            # GRACE: never judge a leg younger than sweep_grace_s. Our own entry can complete BEFORE
+            # the leader's fill is visible in REST; without this a fresh entry could be swept
+            # immediately on a leader whose state has not caught up.
+            age = now - float(pos.get("fill_time", pos.get("entry_time", now)))
+            if age < self.sweep_grace_s:
+                continue
+            # Never fight the WS exit path: it owns a position once it has begun exiting one.
+            if (pos.get("_ws_exited") or pos.get("_force_exit") or pos.get("_gave_up")
+                    or pos.get("_exit_logged")
+                    or (w, c) in getattr(self, "_exit_twap_buffer", {})
+                    or now - float(pos.get("_last_exit_attempt", 0) or 0) < 10):
+                pos["_sweep_flat_count"] = 0
+                continue
+
+            mid = self.mid_prices.get(c, 0) or 0
+            leader_sz = fresh[w].get(c, 0.0)        # absent from a VALID response == genuinely flat
+            leader_flat = (abs(leader_sz * mid) < 1.0) if mid > 0 else (abs(leader_sz) < 1e-9)
+            if not leader_flat:
+                pos["_sweep_flat_count"] = 0
+                continue
+
+            # TWO-STRIKE: require consecutive agreeing reads before believing a leader is flat. Costs
+            # one cadence period; removes the single-bad-response false positive entirely.
+            n = int(pos.get("_sweep_flat_count", 0)) + 1
+            pos["_sweep_flat_count"] = n
+            if n < self.sweep_strikes:
+                continue
+
+            our_usd = abs(pos.get("size", 0.0)) * mid
+            logger.warning(f"SWEEP ORPHAN: {c} {w[:10]} leader FLAT on {n} consecutive reads, we hold "
+                           f"${our_usd:,.0f} (age {age/60:.0f}m) -- "
+                           f"{'CLOSING' if self.sweep_auto_close else 'ALERT-ONLY, not closing'}")
+            try:
+                self.db["v17_sweep_log"].insert_one({
+                    "wallet": w, "coin": c, "our_size": pos.get("size", 0.0), "our_usd": our_usd,
+                    "leader_szi": leader_sz, "flat_count": n, "age_s": age,
+                    "auto_close": bool(self.sweep_auto_close),
+                    "tracker_szi": self._v16_leader_pos.get((w, c)),
+                    "timestamp": datetime.now(timezone.utc), "ts_epoch": now,
+                })
+            except Exception:
+                pass
+            if not self.sweep_auto_close:
+                continue
+            if await self._exit_position(pos):
+                # Clear BOTH maps, as every other exit layer does. Skipping _position_accumulated
+                # would resurrect the inflated denominator if this leg is later re-opened -- straight
+                # back into the bug this sweep exists to catch.
+                self._exit_twap_buffer.pop((w, c), None)
+                self._position_accumulated.pop((w, c), None)
+                self._post_exit_cooldown[(w, c)] = now
+
     async def _converge_positions(self):
         """Reduce/close positions sitting above their target. Downward ONLY -- upward deltas belong to
         the entry path. Gated on `copy_trims_enabled`, NOT on sizing_mode (the old check disabled the
