@@ -4835,6 +4835,12 @@ class V16CopyTrader(CopyTrader):
         # already open when we start has NO anchor, so first_entry_target() returns None and we skip
         # rather than guess (a wrong anchor would mis-size every subsequent add on that leg).
         self._v16_leg_first: dict = {}
+        # Burst coalescer state. MUST be initialised here -- on 2026-07-26 `_v16_leg_first` and
+        # `copy_adds_enabled` were used without being initialised and would have AttributeError'd the
+        # live engine on the first leader add. Keyed (wallet, coin), same as every other leg map.
+        self._converge_inflight: set = set()
+        self._converge_dirty: set = set()
+        self.converge_debounce_s = float(self.global_config.get("converge_debounce_s", 0.5))
         # MASTER SWITCH for add-mirroring. Default FALSE: the engine's historical behaviour is
         # add_tracked_not_copied, and turning this on changes live sizing. Enable explicitly in config
         # (global.copy_adds_enabled) once the behaviour is validated.
@@ -4952,24 +4958,22 @@ class V16CopyTrader(CopyTrader):
                     self._v16_add_fills += 1
                     # CONVERGE to the first-entry ratio (only when we actually hold the leg; if we never
                     # opened it there is nothing to add to and the entry path owns that decision).
+                    # BURST COALESCER (2026-07-27). _on_hl_trade is SYNCHRONOUS and is driven in a tight
+                    # loop over `trades_data`, so an entire leader burst is processed in ONE loop
+                    # iteration and NONE of the spawned tasks have run yet when the last is created.
+                    # That is why five CHIP adds arriving in the same millisecond each recomputed
+                    # against the SAME stale `_our` ($99) and escalated to a $3,630 target: it was not
+                    # a race, it was five reads of one unchanged value.
+                    # Therefore the in-flight flag MUST be set HERE, synchronously, before
+                    # create_task returns -- a flag set inside the coroutine would be useless.
+                    # Coalesce, do not single-shot: single-shot fires on an arbitrary burst member
+                    # (it would have copied the 10.8x rung and ignored the move to 36.3x).
                     if we_hold and self.copy_adds_enabled:
-                        first = self._v16_leg_first.get(key)
-                        tgt = first_entry_target(self._v16_leader_pos[key], first, self.order_size)
-                        if tgt is not None:
-                            _pos = next((p for p in self.positions
-                                         if p['coin'] == coin and p.get('wallet') == wallet and p.get('filled')), None)
-                            if _pos is not None:
-                                _mid = self.mid_prices.get(coin, 0) or px
-                                _our = _pos['size'] * _mid * (1.0 if _pos.get('side') == 'BUY' else -1.0)
-                                _d = convergence_delta(tgt, _our,
-                                                       min_order_usd=max(self.min_entry_notional, 11.0))
-                                if _d.should_trade and not _d.is_full_close and abs(tgt) > abs(_our):
-                                    logger.info(f"CONVERGE ADD {coin} {wallet[:10]}: leader {self._v16_leader_pos[key]:.4f} "
-                                                f"/ first {first:.4f} = {self._v16_leader_pos[key]/first:.2f}x -> "
-                                                f"target ${tgt:+.0f} vs ours ${_our:+.0f}, adding ${abs(_d.delta_usd):.0f}")
-                                    asyncio.create_task(self._enter_position(
-                                        coin, is_buy, wallet=wallet, skip_cooldown=True,
-                                        notional_override=abs(_d.delta_usd)))
+                        if key in self._converge_inflight:
+                            self._converge_dirty.add(key)      # leader moved again mid-flight
+                        else:
+                            self._converge_inflight.add(key)
+                            asyncio.create_task(self._converge_add_once(wallet, coin, is_buy))
                     try:
                         self.db[DB_FILLS_COLLECTION].insert_one({
                             "wallet": wallet, "coin": coin, "side": "BUY" if is_buy else "SELL",
@@ -5059,6 +5063,56 @@ class V16CopyTrader(CopyTrader):
     # codex's `exit_min_trim_pct >= 0.80` assert was really guarding. Here we converge against the
     # SIZE-BASED leader tracker, keeping that fragile denominator out of the loop. The 0.80 full-close
     # path REMAINS the fallback whenever proportional inputs are stale.
+    async def _converge_add_once(self, wallet: str, coin: str, is_buy: bool):
+        """Debounce a leader ADD burst into AT MOST ONE order, sized against SETTLED state.
+
+        The 2026-07-27 CHIP incident in one line: five adds in one millisecond produced five orders
+        targeting $1,080 / $1,619 / $1,687 / $2,710 / $3,630 on $472 of equity, because each computed
+        `target - our_current` against an `our_current` that had not moved. Debouncing lets the whole
+        burst land in `_v16_leader_pos` first, then we compute ONE delta from the final state.
+
+        `_converge_dirty` handles the slower case: adds arriving DURING our own IOC round trip (the
+        WCT fill took ~1.1s, far wider than the debounce window). Bounded re-loop so a pathological
+        leader cannot spin it."""
+        key = (wallet, coin)
+        try:
+            for _ in range(3):                       # bounded: never spin on a hyperactive leader
+                await asyncio.sleep(self.converge_debounce_s)
+                self._converge_dirty.discard(key)
+                if not self.copy_adds_enabled:
+                    return
+                pos = next((p for p in self.positions if p.get("coin") == coin
+                            and p.get("wallet") == wallet and p.get("filled")), None)
+                if pos is None:
+                    return                           # leg closed while we waited
+                mid = self.mid_prices.get(coin, 0) or 0
+                if mid <= 0:
+                    return
+                # Recompute BOTH sides from CURRENT state via the shared target function -- never
+                # reuse a value captured before the sleep. This is the whole point of the debounce.
+                tgt = self._target_notional(wallet, coin, mid)
+                if tgt is None:
+                    return
+                our = pos["size"] * mid * (1.0 if pos.get("side") == "BUY" else -1.0)
+                d = convergence_delta(tgt, our, min_order_usd=max(self.min_entry_notional, 11.0))
+                if not (d.should_trade and not d.is_full_close and abs(tgt) > abs(our)):
+                    return                           # downward/flat deltas belong to _converge_positions
+                logger.info(f"CONVERGE ADD {coin} {wallet[:10]}: leader "
+                            f"{self._v16_leader_pos.get(key, 0.0):.4f} -> target ${tgt:+.0f} "
+                            f"vs ours ${our:+.0f}, adding ${abs(d.delta_usd):.0f}")
+                # converge=True skips ONLY the knet stamp block. NOT skip_cooldown: the base 30s
+                # (wallet, coin) cooldown is a free, already-validated second layer of burst
+                # suppression, and passing skip_cooldown here (as the original code did) simply
+                # switched it off -- that flag exists for a caller that stamps `last_entry` itself
+                # before spawning, which this one does not.
+                await self._enter_position(coin, is_buy, wallet=wallet, converge=True,
+                                           notional_override=abs(d.delta_usd))
+                if key not in self._converge_dirty:
+                    return
+        finally:
+            self._converge_inflight.discard(key)
+            self._converge_dirty.discard(key)
+
     async def _leader_book_sweep(self):
         """Periodic REST reconcile of OUR book against each leader's ACTUAL book.
 
@@ -6094,7 +6148,21 @@ class V17CopyTrader(V16CopyTrader):
     # ── order path: gate + caps + seed/staleness kills, then defer to V16 (whitelist) ──
     async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None,
                               skip_cooldown: bool = False, backfill: bool = False,
-                              notional_override: float = None):
+                              notional_override: float = None, converge: bool = False):
+        # converge=True (leader ADD mirroring only): skip ONLY the knet stamp block. Rationale: knet
+        # counts how many OTHER cohort wallets currently hold this coin on this side, and exists to
+        # gate opening NEW risk on a coin we are not in. For an ADD, that question was asked and
+        # answered when the leg opened -- the coin is already in our book, on our chosen side. Re-asking
+        # it against a DIFFERENT snapshot is not a stronger gate, it is an unrelated one: a leader
+        # doubling down on a coin the other wallets happen to have just exited would be blocked from
+        # adding while our existing position stays fully on.
+        # We do NOT stamp adds instead (the obvious alternative) because that reintroduces exactly the
+        # pollution codex's P1.1 removed: _v17_knet_pending is a FIFO per (wallet, coin), so a burst of
+        # add-stamps would be consumed by a genuine OPEN arriving moments later. Following the
+        # `backfill` precedent, converge reads q=None so it never CONSUMES a pending stamp either --
+        # stamp theft runs in both directions.
+        # EVERY class-(B) risk/exposure cap stays in force: netx, coin-side, gross open/entry/backstop,
+        # margin util, per-coin notional cap, whitelist, cooldown, spread/depth/mark.
         # backfill=True (startup one-shot pass only): skip ONLY the class-(A) SIGNAL-FRESHNESS vetoes
         # (stale-tracker + knet-stamp), because a currently-held leader position has no fresh signal
         # stamp by design. EVERY class-(B) risk/exposure cap below stays fully in force: trading-enabled
@@ -6136,7 +6204,7 @@ class V17CopyTrader(V16CopyTrader):
         # and non-signal paths must not open NEW risk). For backfill: do NOT even read _v17_knet_pending
         # (q=None => stamp never consumed, so a concurrently-pending REAL signal is untouched), k stays
         # None, and both the no-stamp reject and the knet-min gate below are skipped.
-        q = self._v17_knet_pending.get((wallet, coin)) if not backfill else None
+        q = self._v17_knet_pending.get((wallet, coin)) if not (backfill or converge) else None
         k = None
         while q:
             cand = q.pop(0)
@@ -6145,11 +6213,17 @@ class V17CopyTrader(V16CopyTrader):
                 break
         if q is not None and not q:
             self._v17_knet_pending.pop((wallet, coin), None)
-        if k is None and not backfill:
+        if k is None and not (backfill or converge):
             self._v17_stale_rejects += 1
             logger.warning(f"V17 NO-STAMP REJECT: {coin} {'BUY' if is_buy else 'SELL'} wallet={wallet} "
                            f"(no fresh signal-time knet; non-signal entries do not open risk)")
             return
+        if converge:
+            # Distinct log line + gate-log class so converge adds are auditable separately and do not
+            # pollute the accepted-entry knet attribution with null-knet rows (which would silently
+            # become a bucket in the week-1 KPI).
+            logger.info(f"V17 CONVERGE ADD ADMITTED: {coin} {'BUY' if is_buy else 'SELL'} "
+                        f"{wallet[:10]} ${notional_override or 0:.0f} (knet gate bypassed by design)")
         if k is not None and k < self._v17_knet_min:
             # knet-fix (Alberto 9745/9747, validated 2026-06-19 knet_fix_backtest.py): a SHORT that REDUCES
             # our EXISTING net-long exposure on THIS coin is a de-risking trade. The knet-blocked contrarian
