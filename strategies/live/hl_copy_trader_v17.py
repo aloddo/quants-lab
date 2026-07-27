@@ -32,6 +32,13 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from pymongo import MongoClient
 
+# Faithful-copy convergence math. The SAME module the replay harness imports
+# (research/v15/replay_copy_convergence.py). runtime == replay was codex's original gate on this
+# engine; forking this math is what produced the sim-vs-live mismatches of 2026-07-25/26.
+# NOTE: the engine is launched as `python strategies/live/hl_copy_trader_v17.py`, so sys.path[0] is
+# strategies/live/ and this resolves without any path juggling.
+from copy_convergence import convergence_delta, first_entry_target, proportional_target  # noqa: F401
+
 # Repo root for repo-relative artifact paths (parquet tilt artifacts, calib JSON, etc.).
 # strategies/live/hl_copy_trader_v17.py -> parent.parent.parent == repo root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -145,7 +152,36 @@ class CopyTrader:
         # equity, instead of a fixed $/order. order_size becomes only a FLOOR/lot helper. Leader equity
         # comes from the same clearinghouseState V17 already fetches (marginSummary.accountValue summed
         # over dexes). Gross exposure across all copied positions is capped at gross_cap x our equity.
-        self.sizing_mode = self.global_config.get("sizing_mode", "proportional")  # proportional | fixed
+        # SAFE-BY-DEFAULT (Fable plan-gate 2026-07-27, P2 item #1): the default was "proportional",
+        # which is the RISKIER mode -- it skips the per-coin notional caps (L1531), discards
+        # notional_override (L1831), and aborts backfill (L5026). A config that merely OMITS the key
+        # silently got the riskier behaviour. The safe mode must be the one you get by accident.
+        self.sizing_mode = self.global_config.get("sizing_mode", "fixed")  # proportional | fixed
+
+        # ── DECOUPLED FLAGS (Fable plan-gate 2026-07-27, P5) ────────────────────────────────────
+        # `sizing_mode` alone controlled NINE behaviours: the sizing formula, the per-coin cap enable,
+        # convergence enable, backfill abort, notional_override honouring, margin-reserve leverage,
+        # the granularity floor, a boot assert, and its own unsafe default. Flipping it to get ONE of
+        # them changed all nine. That is the same "one switch, several hidden meanings" failure as
+        # `max_addon_multiplier` (a placebo knob everyone believed mirrored adds) and the convergence
+        # gate (100% inert on arrival). These flags split the meanings apart so each can be reasoned
+        # about, tested and shipped on its own.
+        #   target_mode        which TARGET function -- used by BOTH the entry path and convergence,
+        #                      so the anchor can no longer pre-empt equity sizing on the trim path.
+        #   copy_trims_enabled downward convergence (replaces the stale `sizing_mode` check).
+        #   per_coin_cap_enabled  keeps the per-coin notional caps ON under equity sizing. Their being
+        #                      coupled to sizing_mode was an accident of how L1531 was written, NOT a
+        #                      design necessity -- Alberto asked for equity sizing, not for the removal
+        #                      of the per-coin cap.
+        self.target_mode = self.global_config.get("target_mode", "anchor")   # anchor | leader_equity
+        self.copy_trims_enabled = bool(self.global_config.get("copy_trims_enabled", True))
+        self.per_coin_cap_enabled = bool(self.global_config.get("per_coin_cap_enabled", True))
+        # Bounded sanity limit on mirrored leader leverage. NOT the primary defence (the equity-
+        # denominated caps are). 2.5 chosen so worst-case gross (= MEAN leader account leverage under
+        # equal-split) lands below gross_entry_gate_x 3.0 with buffer, and well below gross_backstop_x
+        # 4.0 -- the shipped default of 4.0 sat EXACTLY on the backstop, i.e. it never bound until it
+        # handed you straight to the emergency flatten.
+        self.leader_leverage_clamp = float(self.global_config.get("leader_leverage_clamp", 2.5))
         # Alberto 2026-06-01: NO cap on gross leverage (mirror leaders' true exposure faithfully); risk is
         # capped at ALLOCATION + the global -15% stop + the exchange's own max_margin_util, not an
         # artificial gross clamp. gross_cap defaults to inf (no clamp) unless explicitly configured.
@@ -529,7 +565,11 @@ class CopyTrader:
         cannot eat the whole book and crowd out the others. Returns None when it cannot be sized safely
         (stale/missing leader equity, missing our equity, bad mark) -> caller SKIPS (never sizes off
         stale data). Per-slice -> no artificial gross cap needed; margin-util + the global stop backstop."""
-        if self.sizing_mode != "proportional" or not mark or mark <= 0:
+        # 2026-07-27: gate on target_mode, NOT sizing_mode. Previously this returned None in fixed
+        # mode, which made the whole leader-equity path -- INCLUDING _refresh_target_equity's REST
+        # re-basing of leader positions -- structurally unreachable. That unreachability is why leader
+        # state could drift without limit and produce the 55% orphan rate.
+        if self.target_mode != "leader_equity" or not mark or mark <= 0:
             return None
         leader_eq = self._leader_equity_fresh(wallet)
         if not leader_eq or leader_eq <= 0:
@@ -541,7 +581,35 @@ class CopyTrader:
         leader_szi = self._target_positions.get(wallet, {}).get(coin, 0.0)
         leader_notional = leader_szi * mark                   # signed (leader side)
         exposure_pct = leader_notional / leader_eq
+        # CLAMP the mirrored leverage. Under equal-split, total gross across N leaders equals the MEAN
+        # leader account leverage, so a per-leader clamp of c bounds worst-case gross at exactly c.
+        # Sign-preserving.
+        c = self.leader_leverage_clamp
+        if c > 0 and abs(exposure_pct) > c:
+            exposure_pct = c if exposure_pct > 0 else -c
         return exposure_pct * our_slice                       # OUR signed target notional (within slice)
+
+    def _target_notional(self, wallet: str, coin: str, mark: float) -> Optional[float]:
+        """SINGLE source of truth for OUR target SIGNED notional on (wallet, coin).
+
+        Called by BOTH the entry path and _converge_positions. Before this existed the two paths
+        computed targets differently and _converge_positions tried the anchor FIRST, falling back to
+        the equity form only when the anchor was missing. Since the anchor is present for every leg the
+        live engine opens, the equity path was never reached on the convergence path -- and, worse,
+        when the leader tracker was WRONG the anchor did not return None, it returned a plausible but
+        wrong number, so the fallback never fired in exactly the case it was needed.
+
+        One function, one dispatch, both callers. Returns None => caller SKIPS (never size off state we
+        cannot trust); it must never be coerced to 0.0, which would read as 'close everything'."""
+        if not mark or mark <= 0:
+            return None
+        if self.target_mode == "leader_equity":
+            return self._proportional_target_notional(wallet, coin, mark)
+        # anchor mode: ratio to the size the leader OPENED this leg with
+        key = (wallet, coin)
+        return first_entry_target(self._v16_leader_pos.get(key, 0.0),
+                                  getattr(self, "_v16_leg_first", {}).get(key),
+                                  self.order_size)
 
     # ── Persistent position state ─────────────────────────────────────────────
 
@@ -1521,7 +1589,13 @@ class CopyTrader:
         # 2026-06-01: mirror leaders' true exposure; risk capped by margin-util 0.95 + coin-concentration
         # + the global -15% stop, NOT an artificial per-coin notional clamp). So they apply in FIXED mode
         # only. In proportional mode the binding constraints above (total util, coin concentration) stand.
-        if self.sizing_mode != "proportional":
+        # 2026-07-27: gated on `per_coin_cap_enabled`, NOT sizing_mode. These caps were disabled in
+        # proportional mode on the theory that equity sizing made them redundant. They are not: in
+        # fixed mode `coin_cap = max(max_addon_mult x order_size, this_order)` is the TIGHTEST
+        # constraint in the entire stack (~$200/coin at order_size 100, addon 2). Coupling "size off
+        # leader equity" to "remove the per-coin cap" was an accident of how this branch was written,
+        # not a design decision -- and it is what made a leverage clamp look mandatory. Keep both.
+        if self.per_coin_cap_enabled:
             # Per-coin notional cap. The H17xE1 up-tilt intentionally sizes FAVORED entries above
             # base, so a SINGLE tilted entry must not be blocked by its own notional (else the cap
             # neuters exactly the favored entries we want). Cap at max(addon x base, this entry's
@@ -1621,8 +1695,22 @@ class CopyTrader:
     # ── Dynamic l2Book subscription ──────────────────────────────────────────
 
     def _get_needed_l2_coins(self) -> set:
-        """Coins that need l2Book data: coins we hold + coins targets hold."""
-        coins = set()
+        """Coins that need l2Book data: static pre-subscribed universe + coins we hold + coins targets hold.
+
+        2026-07-26 zero-fills fix: the book must be PRESENT AT SIGNAL TIME. The old dynamic set
+        (our held coins + leader-held coins) structurally never had it for fast leaders (median
+        hold ~2min, e.g. 0x12203316): a guard-rejected OPEN never writes _target_positions (that
+        happens at ALL-GUARDS-PASS), so a single-fill open never made the coin "needed" at all;
+        multi-fill opens got subscribed by the 30s sync only AFTER the open was already skipped;
+        and every WS reconnect (28 in the 4h incident window) wiped _book_depth + _l2_subscribed,
+        so the entry guard saw the 999 no-book sentinel and skipped -> ZERO fills in 4h.
+        Fix: V16/V17 set _l2_static_coins to the whitelist feed universe (326 coins) so l2Book is
+        subscribed at boot AND re-subscribed after every reconnect by the same sync path.
+        Measured 2026-07-26 (60s live test, all 326 coins): 68 msg/s, 79KB/s, json parse 0.3% of
+        one core, all subs acked, 0 errors -- HL throttles l2Book to ~1 push/5s/coin. Total subs
+        (~326 trades + ~326 l2Book + 2 user) stay well under HL's 1000-subscriptions/IP limit.
+        Bare base class: _l2_static_coins absent -> empty -> behavior unchanged."""
+        coins = set(getattr(self, "_l2_static_coins", ()))
         for pos in self.positions:
             if pos.get('filled'):
                 coins.add(pos['coin'])
@@ -1637,7 +1725,9 @@ class CopyTrader:
         needed = self._get_needed_l2_coins()
         # Subscribe new
         to_add = needed - self._l2_subscribed
-        for coin in to_add:
+        if len(to_add) > 10:
+            logger.info(f"L2 sync: subscribing {len(to_add)} coins (static universe boot/reconnect)")
+        for i, coin in enumerate(sorted(to_add)):
             try:
                 await ws.send(json.dumps({
                     "method": "subscribe",
@@ -1645,6 +1735,10 @@ class CopyTrader:
                 }))
                 self._l2_subscribed.add(coin)
                 logger.debug(f"L2 subscribed: {coin}")
+                # Batch large bursts (boot/reconnect re-subscribe of the static universe),
+                # same pacing as the trades subscribe loop.
+                if (i + 1) % 50 == 0:
+                    await asyncio.sleep(0.3)
             except Exception as e:
                 logger.warning(f"L2 subscribe failed for {coin}: {e}")
         # Unsubscribe stale (only if not needed and we have many subscriptions)
@@ -1801,10 +1895,15 @@ class CopyTrader:
         # V17 added a fixed $order_size per detected trade; V15 sizes the order as the DELTA needed to
         # bring our position up to (leader_exposure% x our_equity). On staleness/missing leader equity we
         # SKIP (never size off stale data). sizing_mode='fixed' falls back to V17 behavior.
-        if self.sizing_mode == "proportional":
-            tgt_notional = self._proportional_target_notional(twap_wallet, coin, mid)
+        # 2026-07-27: dispatch on target_mode via the SHARED _target_notional, so the entry path and
+        # _converge_positions size off the SAME function. notional_override still wins outright -- it
+        # carries an exact, already-computed delta (backfill, or a coalesced convergence burst) and the
+        # old code SILENTLY DISCARDED it in proportional mode, which would have thrown away the burst
+        # lock's carefully coalesced final size and recomputed against different state.
+        if self.target_mode == "leader_equity" and notional_override is None:
+            tgt_notional = self._target_notional(twap_wallet, coin, mid)
             if tgt_notional is None:
-                logger.info(f"V15 SKIP {coin} {twap_wallet[:10]}: cannot size proportionally "
+                logger.info(f"V15 SKIP {coin} {twap_wallet[:10]}: cannot size off leader equity "
                             f"(stale/missing leader equity or mark)")
                 return
             our_cur_abs = abs(existing["size"] * mid) if existing else 0.0
@@ -3021,23 +3120,31 @@ class CopyTrader:
             self.mid_prices[coin] = px
             self._mid_price_ts[coin] = time.time()
             if coin not in self._l2_subscribed:
-                logger.info(f"V17: dynamic l2Book subscribe for {coin} (first target fill)")
+                logger.info(f"V17: dynamic l2Book subscribe for {coin} (no book at signal time -- "
+                            f"should be rare post 2026-07-26 static pre-subscribe)")
                 # codex 2026-06-14 P1 fix: do NOT pre-add to _l2_subscribed here -- that defeated
                 # _sync_l2_subscriptions (needed - _l2_subscribed excluded it) so the coin NEVER got a
                 # real l2Book and traded forever on the synthetic 5bps/$10k fallback. Leaving it absent
                 # lets the 30s sync send the real subscribe within one cycle.
+                # 2026-07-26: whitelist coins are now statically pre-subscribed at boot + after every
+                # reconnect (_l2_static_coins), so this branch only fires in the few-second warm-up
+                # window right after a reconnect wipes _book_depth/mid_prices.
         chase_bps = abs(mid - px) / px * 10000
         if chase_bps > max_chase_bps:
             logger.info(f"V17 SKIP {coin}: chase {chase_bps:.0f}bps > {max_chase_bps}bps")
             return
 
-        # Entry guard: spread
+        # Entry guard: spread. NOTE: bid/ask==0 means NO BOOK (the 999 sentinel) -- we still skip
+        # (never enter without a real book; the synthetic 5bps/$10k fallback must stay unreachable
+        # for entries), but the log now says so explicitly instead of masquerading as a wide spread.
         book = self._book_depth.get(coin, {})
         bid = book.get("best_bid", 0)
         ask = book.get("best_ask", 0)
         spread_bps = (ask - bid) / mid * 10000 if mid > 0 and bid > 0 and ask > 0 else 999
         if spread_bps > max_spread_bps:
-            logger.info(f"V17 SKIP {coin}: spread {spread_bps:.0f}bps > {max_spread_bps}bps")
+            no_book = not (mid > 0 and bid > 0 and ask > 0)
+            logger.info(f"V17 SKIP {coin}: spread {spread_bps:.0f}bps > {max_spread_bps}bps"
+                        f"{' [NO-BOOK]' if no_book else ''}")
             return
 
         # Entry guard: book depth
@@ -4077,6 +4184,12 @@ class CopyTrader:
             f"liq={ep.get('liquidations', 0)}(${ep.get('liquidation_pnl', 0.0):+.2f}) "
             f"open={len(open_pos)}[{open_coins}] margin={margin_pct:.0f}% eq=${equity or 0:.2f} "
             f"sync={sync_age}s{tilt_str}"
+            # 2026-07-27: surface the two V16 classification counters. Both were incremented and NEVER
+            # read anywhere, so the volume of leader flow we TRACK BUT DO NOT COPY was invisible at
+            # runtime. adds= is the add-mirroring denominator; revsup= is the leader-closes-a-coin-we-
+            # do-not-hold class that had no forensic trail at all.
+            f" adds={getattr(self, '_v16_add_fills', 0)}"
+            f" revsup={getattr(self, '_v16_suppressed_reverse', 0)}"
         )
 
         # V17 internal TG report DISABLED -- replaced by exchange-truth pnl_tracker.py
@@ -4477,6 +4590,11 @@ class CopyTrader:
                             elif channel == "webData2":
                                 self._ingest_webdata2(data.get("data", {}))
 
+                            elif channel == "error":
+                                # 2026-07-26: surface server-side subscription/rate-limit errors loudly
+                                # (e.g. "Too many subscriptions") instead of silently dropping them.
+                                logger.warning(f"HL WS error message: {data.get('data')}")
+
                         except asyncio.TimeoutError:
                             pass
 
@@ -4486,6 +4604,7 @@ class CopyTrader:
                             self._last_check = now_check
                             await self._check_twap_windows()
                             await self._check_exits()
+                            await self._converge_positions()   # proportional downward half (no-op in fixed)
                             self._eval_tilt_counterfactual()   # codex guard: auto-disable bad tilt
                             self._log_stats()
 
@@ -4601,9 +4720,19 @@ class V16CopyTrader(CopyTrader):
         # data-proven. Leaders' MEASURED scale-in is ~2.0x median, so mirroring adds up to 2x is data-justified.
         # Keep ONLY the real protection: adds must stay above exchange min-order -> require order_size >= $50 when
         # stacking (an add is then >= a meaningful notional, never sub-min dust). Risk bounded by gross caps + stops.
+        # 2026-07-26 REVERTED to [1,2] after Fable found (and I verified in code + DB) that this knob is a
+        # PLACEBO on the live path in fixed-sizing mode: the V16 choke point `_on_hl_trade` classifies every
+        # leader same-side add as `add_tracked_not_copied` and RETURNS before the base engine's add-on merge
+        # (L1865/L1943) is reachable. There is no max_addon_mult condition on that path. Evidence:
+        # v17_target_fills holds 21,403 / 24,074 docs classed add_tracked_not_copied (89% of all leader fills
+        # ever recorded). Raising this ceiling changes NOTHING about adds; it only widens the per-coin
+        # notional cap at L1530. Faithful add-mirroring is being built via sizing_mode="proportional"
+        # (see _proportional_target_notional, L524) + downward convergence, NOT via this multiplier.
+        # DO NOT raise this again believing it mirrors scale-in. It does not.
         _addon_mult = int(d.get("max_addon_multiplier", 99))
         _req(1 <= _addon_mult <= 2,
-             "max_addon_multiplier must be in [1,2] (1=open once; 2=mirror leaders' measured ~2x scale-in)")
+             "max_addon_multiplier must be in [1,2] -- NOTE: in fixed sizing this does NOT copy leader adds "
+             "(they are tracked-not-copied at the V16 choke point); it only bounds the per-coin notional cap")
         _req(_addon_mult <= 1 or float(g.get("order_size_usd", 0)) >= 50.0,
              "max_addon_multiplier > 1 requires order_size_usd >= $50 (adds must stay above min-order)")
         _req(d.get("trail_activate_bps") is not None and d.get("trail_bps") is not None,
@@ -4662,6 +4791,12 @@ class V16CopyTrader(CopyTrader):
         if missing_feed:
             raise ValueError(f"V16: whitelist coins missing from HL perp universe: {sorted(missing_feed)}")
 
+        # 2026-07-26 zero-fills fix: static l2Book pre-subscribe universe = the whitelist feed scope.
+        # _get_needed_l2_coins unions this in, so books exist AT SIGNAL TIME (boot + after every WS
+        # reconnect) instead of arriving after the fast leader has already closed. V17 expansion
+        # re-extends this after it re-admits expansion coins to the feed lists.
+        self._l2_static_coins = set(self.all_perp_coins) | set(self.all_builder_coins)
+
         self._v16_blocked_signals = 0
         self._v16_add_fills = 0
         self._v16_suppressed_reverse = 0
@@ -4673,6 +4808,15 @@ class V16CopyTrader(CopyTrader):
         # fill on a whitelisted coin regardless of whether we copied it. Seeded from the startup REST
         # snapshot (base _init_target_positions ran in super().__init__).
         self._v16_leader_pos = {}
+        # FIRST-ENTRY ANCHOR state (Alberto 2026-07-26). Per (wallet, coin) leg: the size the leader
+        # OPENED the leg with. Adds/trims are mirrored as a ratio to it. Empty on boot by design: a leg
+        # already open when we start has NO anchor, so first_entry_target() returns None and we skip
+        # rather than guess (a wrong anchor would mis-size every subsequent add on that leg).
+        self._v16_leg_first: dict = {}
+        # MASTER SWITCH for add-mirroring. Default FALSE: the engine's historical behaviour is
+        # add_tracked_not_copied, and turning this on changes live sizing. Enable explicitly in config
+        # (global.copy_adds_enabled) once the behaviour is validated.
+        self.copy_adds_enabled = bool(self.global_config.get("copy_adds_enabled", False))
         for addr, posmap in self._target_positions.items():
             for cn, sz in posmap.items():
                 if cn in self.coin_whitelist and abs(sz) > 1e-12:
@@ -4764,8 +4908,16 @@ class V16CopyTrader(CopyTrader):
                 we_hold = any(p['coin'] == coin and p.get('wallet') == wallet and p.get('filled')
                               for p in self.positions)
 
+                # FIRST-ENTRY ANCHOR (Alberto 2026-07-26): remember the size the leader OPENED this leg
+                # with. Every later add/trim is mirrored as a RATIO to it: our_target = our_first_entry
+                # x (their_position_now / their_first_entry). Needs no leader-equity feed -- which is what
+                # makes it runnable, since target_exposure_pct is 100% NULL in our actions store.
+                if is_open:
+                    self._v16_leg_first[key] = abs(sz)
+
                 if is_add:
-                    # ADD: track, never copy -- even when the original open was guard-rejected
+                    # ADD: previously "track, never copy" -- that dropped 89% of all leader fills
+                    # (21,403/24,074 in v17_target_fills). Now: track AND converge to the first-entry ratio.
                     tid = trade.get("tid", "")
                     if tid:
                         if tid in self._seen_tids:
@@ -4776,6 +4928,26 @@ class V16CopyTrader(CopyTrader):
                     if we_hold:
                         self._position_accumulated[key] = self._position_accumulated.get(key, 0.0) + sz * px
                     self._v16_add_fills += 1
+                    # CONVERGE to the first-entry ratio (only when we actually hold the leg; if we never
+                    # opened it there is nothing to add to and the entry path owns that decision).
+                    if we_hold and self.copy_adds_enabled:
+                        first = self._v16_leg_first.get(key)
+                        tgt = first_entry_target(self._v16_leader_pos[key], first, self.order_size)
+                        if tgt is not None:
+                            _pos = next((p for p in self.positions
+                                         if p['coin'] == coin and p.get('wallet') == wallet and p.get('filled')), None)
+                            if _pos is not None:
+                                _mid = self.mid_prices.get(coin, 0) or px
+                                _our = _pos['size'] * _mid * (1.0 if _pos.get('side') == 'BUY' else -1.0)
+                                _d = convergence_delta(tgt, _our,
+                                                       min_order_usd=max(self.min_entry_notional, 11.0))
+                                if _d.should_trade and not _d.is_full_close and abs(tgt) > abs(_our):
+                                    logger.info(f"CONVERGE ADD {coin} {wallet[:10]}: leader {self._v16_leader_pos[key]:.4f} "
+                                                f"/ first {first:.4f} = {self._v16_leader_pos[key]/first:.2f}x -> "
+                                                f"target ${tgt:+.0f} vs ours ${_our:+.0f}, adding ${abs(_d.delta_usd):.0f}")
+                                    asyncio.create_task(self._enter_position(
+                                        coin, is_buy, wallet=wallet, skip_cooldown=True,
+                                        notional_override=abs(_d.delta_usd)))
                     try:
                         self.db[DB_FILLS_COLLECTION].insert_one({
                             "wallet": wallet, "coin": coin, "side": "BUY" if is_buy else "SELL",
@@ -4801,6 +4973,25 @@ class V16CopyTrader(CopyTrader):
                     self._v16_leader_pos[key] = prev + signed
                     self._target_positions.setdefault(wallet, {})[coin] = self._v16_leader_pos[key]
                     self._v16_suppressed_reverse += 1
+                    # FORENSIC TRAIL (2026-07-27): this branch fires when a leader CLOSES a coin we do
+                    # not hold -- one of the two events that DEFINE a round trip. It previously wrote
+                    # NOTHING (no DB row, no log line) and _v16_suppressed_reverse was never surfaced,
+                    # so v17_target_fills systematically lost this entire class. That hole caused a real
+                    # misdiagnosis: reconstructing leader state from the log showed 3 of 6 orphans as
+                    # "never seen by the engine" when the engine had seen them here.
+                    # findings/quant/2026-07-27-target-fills-missing-closes
+                    try:
+                        self.db[DB_FILLS_COLLECTION].insert_one({
+                            "wallet": wallet, "coin": coin, "side": "BUY" if is_buy else "SELL",
+                            "price": px, "size": sz, "notional": sz * px,
+                            "wallet_group": self.wallet_groups.get(wallet, "unknown"),
+                            "market_type": "perp", "v16_class": "reverse_suppressed_not_copied",
+                            "leader_pos_after": self._v16_leader_pos[key],
+                            "timestamp": datetime.now(timezone.utc),
+                            "ts_epoch": time.time(),
+                        })
+                    except Exception:
+                        pass
                     return
 
                 # OPEN (leader ~flat) or REVERSE-while-we-hold: update tracker, hand to the base
@@ -4834,6 +5025,84 @@ class V16CopyTrader(CopyTrader):
             pos['_maker_exit_tried'] = True       # skip the ALO leg entirely
             pos['_maker_exit_time'] = 0.0         # elapsed >= 60s instantly -> IOC path now
         return await super()._exit_position(pos, trim_size=trim_size)
+
+    # ── DOWNWARD CONVERGENCE (the missing exit half) ────────────────────────────────────────────────
+    # Fable 2026-07-26: the proportional entry path only ever sizes UP toward target
+    # (`entry_notional = abs(target) - our_current`, return if below min). When a leader TRIMS and we sit
+    # ABOVE target, NOTHING happens -- the only downward force is the 80%-cumulative full-close machinery,
+    # which yields a late, lumpy exit. This closes that gap: same delta rule, opposite direction.
+    #
+    # Deliberately does NOT touch the percent-of-_position_accumulated trim machinery. That denominator is
+    # price-time-entangled, re-seeded from mid when lost, and INFLATED by uncopied adds -- which is what
+    # codex's `exit_min_trim_pct >= 0.80` assert was really guarding. Here we converge against the
+    # SIZE-BASED leader tracker, keeping that fragile denominator out of the loop. The 0.80 full-close
+    # path REMAINS the fallback whenever proportional inputs are stale.
+    async def _converge_positions(self):
+        """Reduce/close positions sitting above their target. Downward ONLY -- upward deltas belong to
+        the entry path. Gated on `copy_trims_enabled`, NOT on sizing_mode (the old check disabled the
+        entire downward half in fixed mode, which is how leaders' de-risking was systematically
+        ignored: with sl_bps -2500 and a trailing stop that never arms, the 85% FIRST_CLOSE ratio was
+        the ONLY thing that could reduce a position)."""
+        if not self.copy_trims_enabled:
+            return
+        for pos in list(self.positions):
+            # GUARD (a): `list(self.positions)` is a SNAPSHOT. _check_exits runs immediately before us
+            # and may already have removed this position. Acting on a stale entry matters because
+            # _exch_positions is NET ACROSS WALLETS -- if a second wallet holds the same coin/side, the
+            # exit machinery can place a real reduce order against THAT wallet's leg.
+            if pos not in self.positions:
+                continue
+            if not pos.get("filled"):
+                continue
+            coin, wallet = pos.get("coin"), pos.get("wallet")
+            if not coin or not wallet:
+                continue
+            mid = self.mid_prices.get(coin, 0) or 0
+            if mid <= 0:
+                continue
+            key = (wallet, coin)
+            # ONE target function for both paths (see _target_notional). The old code tried the anchor
+            # first and fell back to equity only when the anchor was MISSING -- but the anchor exists
+            # for every leg we open, so the equity path was never reached here.
+            target = self._target_notional(wallet, coin, mid)
+            if target is None:
+                continue                  # cannot size safely -> validated exit path stays in charge
+            # GUARD (b): derive leader-flat from the AUTHORITATIVE V16 tracker with an explicit
+            # key-presence check, NOT `_target_positions.get(coin, 0.0)`. This is critical now that the
+            # leader-equity path is reachable: _refresh_target_equity re-bases positions from REST and
+            # explicitly ZEROES coins absent from the response. A partial or malformed
+            # clearinghouseState would write zeros, `leader_flat` would read them as "leader exited",
+            # and a transient REST hiccup would become a portfolio-wide liquidation. Absent key =>
+            # UNKNOWN => not flat.
+            lp = self._v16_leader_pos
+            if key not in lp:
+                continue                  # never seen this leg open -> we do not know their state
+            leader_flat = abs(lp[key] * mid) < 1.0
+            our_signed = pos["size"] * mid * (1.0 if pos.get("side") == "BUY" else -1.0)
+            d = convergence_delta(
+                target_usd=target,
+                current_usd=our_signed,
+                leader_is_flat=leader_flat,
+                min_order_usd=max(self.min_entry_notional, 11.0),
+            )
+            if not d.should_trade:
+                continue
+            # Upward deltas belong to the entry path; this method ONLY reduces.
+            if not d.is_full_close and abs(target) >= abs(our_signed):
+                continue
+            if d.is_full_close:
+                logger.info(f"CONVERGE FULL-CLOSE {coin} {wallet[:10]}: {d.reason} "
+                            f"(ours ${our_signed:+.0f} -> target ${target:+.0f})")
+                await self._exit_position(pos)
+            else:
+                trim_notional = min(abs(d.delta_usd), abs(our_signed))
+                trim_sz = trim_notional / mid
+                if trim_sz >= pos["size"] * 0.99:
+                    await self._exit_position(pos)
+                else:
+                    logger.info(f"CONVERGE TRIM {coin} {wallet[:10]}: -${trim_notional:.0f} "
+                                f"(ours ${our_signed:+.0f} -> target ${target:+.0f})")
+                    await self._exit_position(pos, trim_size=trim_sz)
 
     # ── BACKFILL PASS (OFF BY DEFAULT via global.backfill.enabled) ─────────────────────────────────
     # Once per process, after a warmup that lets marks populate, open ONE position matching each
@@ -5318,6 +5587,10 @@ class V17CopyTrader(V16CopyTrader):
         for c in new_builder:
             if c not in self.all_builder_coins:
                 self.all_builder_coins.append(c)
+        # 2026-07-26 zero-fills fix: extend the static l2Book pre-subscribe universe to the full
+        # expanded feed scope (baseline + expansion, perp + builder) so every tradeable coin has a
+        # live book at signal time. See _get_needed_l2_coins for the incident + measurement.
+        self._l2_static_coins = set(self.all_perp_coins) | set(self.all_builder_coins)
 
         # ── seed the unconditional leader tracker (_v16_leader_pos) for the new coins. The base
         # _init_target_positions already RESTed EVERY leader's clearinghouseState across ALL dexes
