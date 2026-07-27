@@ -86,8 +86,14 @@ WINSOR_PCT = 1.0           # winsorize realized-slip tails before the median (ro
 def load_v11_fills(mongo_uri: str = "mongodb://localhost:27017") -> pd.DataFrame:
     from pymongo import MongoClient
     cli = MongoClient(mongo_uri)
-    docs = list(cli.quants_lab.v11_exchange_fills.find(
-        {}, {"_id": 0, "coin": 1, "px": 1, "sz": 1, "side": 1, "time": 1}))
+    # 2026-07-27: read EVERY real-execution collection, not just v11. v11 alone covers 5,125 fills /
+    # 92 coins; v11+v16+v17 gives 9,186 fills / 112 coins and lifts coins clearing n_min_covered=20
+    # from 43 to 57. These are all OUR OWN fills at OUR OWN sizes -- exactly the population the
+    # calibration is meant to describe. Reading one of three was leaving measurement on the table.
+    docs = []
+    for _c in ("v11_exchange_fills", "v16_exchange_fills", "v17_exchange_fills"):
+        docs.extend(cli.quants_lab[_c].find(
+            {}, {"_id": 0, "coin": 1, "px": 1, "sz": 1, "side": 1, "time": 1}))
     if not docs:
         return pd.DataFrame(columns=["coin", "px", "sz", "side", "time"])
     df = pd.DataFrame(docs)
