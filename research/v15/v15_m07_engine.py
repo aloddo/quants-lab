@@ -478,7 +478,13 @@ class AccountState:
 # --------------------------------------------------------------------------- #
 @dataclass
 class EngineParams:
-    copy_latency_ms: int = 2_000
+    # MEASURED LIVE 2026-07-27 from the V17 engine log (signal -> ENTRY FILLED, n=11): median 3.21s,
+    # min 2.26s, MAX 3.76s. The previous 2_000 was asserted, never measured, and EVERY live fill
+    # exceeded it -- so every sim run to date was optimistic about how much of a leader's move we can
+    # actually capture. Kept in step with v15_m05_eligibility.P95_COPY_LATENCY_S (4.0s): if these two
+    # diverge, replay stops matching runtime and the selection gate stops predicting live behaviour.
+    # RE-MEASURE both when engine latency changes.
+    copy_latency_ms: int = 4_000
     slippage_band: str = "base"
     adl_stress: bool = False
     start_policy: str = "future_delta_only"   # future_delta_only | causal_carry_in (design D9)
@@ -1903,7 +1909,7 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
                   band: str = "base", limit_entities: Optional[int] = None, start_equity: float = 10_000.0,
                   flush_rows: int = 250_000, require_cache: bool = True, window: str = "test",
                   slip_calib_path: Optional[str] = None, follower_trail: Optional[float] = None,
-                  copy_latency_ms: int = 2_000, sizing_mode: str = "leader_equity",
+                  copy_latency_ms: int = 4_000, sizing_mode: str = "leader_equity",  # measured 2026-07-27
                   fixed_target_exposure: float = 0.10,
                   copy_policy: str = "full_mirror", trail_pct: float = 0.15):
     import shutil

@@ -44,9 +44,16 @@ MIN_JOURNEYS_PRETEST = 3
 HOLD_FLOOR_S = 60.0                 # measured from V11 copy-path latency (p95~15s -> max(2*15,60)=60)
 SWING_MAX_HOLD_S = 48 * 3600.0      # upper hold gate: V15 copies FAST directional (minutes-to-hours);
                                     # reject multi-day/week holders (median hold > 48h)
-P95_COPY_LATENCY_S = 2.0            # Alberto 2026-06-09: real copy latency is max ~2s (not 15s). The 15s
-                                    # gate was rejecting wallets whose edge lands in the 2-15s window, which
-                                    # we CAN copy at 2s. M7's sim already uses copy_latency_ms=2000.
+P95_COPY_LATENCY_S = 4.0            # MEASURED LIVE 2026-07-27 from the V17 engine log: signal -> ENTRY
+                                    # FILLED, n=11, median 3.21s / min 2.26s / MAX 3.76s. EVERY fill
+                                    # exceeded the previous 2.0 constant, so this gate was calibrated
+                                    # looser than reality. 4.0 = measured max rounded up.
+                                    # History: 15s (V11) -> 2.0 (Alberto 2026-06-09, asserted not
+                                    # measured) -> 4.0 (measured). If the live engine's latency changes,
+                                    # RE-MEASURE and update -- and note M7's sim uses copy_latency_ms,
+                                    # which must be kept in step with this or replay stops matching
+                                    # runtime. See findings/quant/2026-07-27-latency-mismatch-uncopyable-
+                                    # hft-wallet.
 SHARE_BELOW_LATENCY_CAP = 0.25
 ACCESSIBLE_FRAC_MIN = 0.80
 ROE_FULL_FLOOR_G5 = 0.50            # full-window pool gate only
