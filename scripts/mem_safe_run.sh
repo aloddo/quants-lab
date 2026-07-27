@@ -15,12 +15,20 @@
 #   scripts/mem_safe_run.sh --floor-gb 4 --label m02 -- \
 #     /path/python research/v15/v15_m02_journey_trace.py --procs 3 ...
 #
-# --floor-gb default 4GB is the JOB-TREE RSS CEILING (the max physical RSS this job's whole
-# process group may occupy), NOT a system-wide reclaimable-RAM floor. Bounding our own job's
-# RSS is the deterministic lever (macOS "free RAM" looks green right up until swap-death). The
-# job is killed the instant its tree RSS exceeds the ceiling, or IMMEDIATELY on kernel-critical
-# pressure. Sizing note: a job needs ceiling >= its real peak (m02 full-window serial ~= 3.5GB),
-# so 4GB fits m02; raise --floor-gb for heavier jobs rather than let the watchdog kill them.
+# --floor-gb is the SYSTEM-AVAILABLE FLOOR (semantics CHANGED by the 2026-07-17 P0 fix, see the
+# comment above AVAIL_FLOOR_MB below). The job group is killed the instant system available RAM
+# drops below it, or IMMEDIATELY on kernel-critical pressure; a job-tree RSS hard-stop also applies.
+#
+# SIZING (corrected 2026-07-25 -- the note previously here still described the PRE-07-17 semantics
+# and was actively misleading; it claimed "4GB fits m02", which is no longer true):
+# the in-process planner receives MEM_SAFE_RUN_CEIL_MB = (available AT LAUNCH - floor). So a job
+# whose real peak is P needs
+#     available_at_launch >= floor + P
+# m02 full-window serial peak ~= 3.5GB, so --floor-gb 4 requires ~7.5GB AVAILABLE AT LAUNCH. On a
+# busy 16GB box (gbrain-postgres VM + agent fleet) that window may not open on its own. Options:
+# wait for a quiet window (scripts/m02_bootstrap_when_ram.sh polls for one), or lower --floor-gb --
+# it is a KILL THRESHOLD, not a reservation, and the kernel-critical-pressure kill remains the real
+# box-death backstop regardless of its value.
 
 set -u
 FLOOR_GB=4
@@ -73,6 +81,17 @@ if [ "$(pressure_level)" -ge 4 ]; then
   exit 3
 fi
 _AVAIL_AT_LAUNCH=$(avail_mb)
+# BUG 1 FIX (2026-07-27): REFUSE to launch when we are ALREADY below the floor. Previously this only
+# refused on kernel-CRITICAL pressure, so with avail < floor it would launch anyway and the monitor
+# loop would kill it on its very first poll -- observed live: "launching ... (avail now 3867MB)"
+# against a 4096MB floor, followed immediately by "ABORT ... 3866MB < floor ... (rss=0MB)". Starting a
+# job we are certain to kill is pure waste, and (see BUG 2) that instant abort is exactly the window
+# where the kill is unreliable. Exit 3 = the same "refused launch" code the caller already treats as a
+# retryable RESOURCE verdict.
+if [ -n "$_AVAIL_AT_LAUNCH" ] && [ "$_AVAIL_AT_LAUNCH" -lt "$AVAIL_FLOOR_MB" ]; then
+  echo "[mem_safe_run $LABEL] REFUSING launch: system available ${_AVAIL_AT_LAUNCH}MB already < floor ${AVAIL_FLOOR_MB}MB." >&2
+  exit 3
+fi
 echo "[mem_safe_run $LABEL] launching in own process group; system-available FLOOR ${AVAIL_FLOOR_MB}MB (avail now ${_AVAIL_AT_LAUNCH}MB), RSS hard-stop ${RSS_HARDSTOP_MB}MB, kill on critical kernel pressure."
 
 # Export a marker so wrapped children can VERIFY they are under the backstop. m02 refuses to start a
@@ -90,6 +109,29 @@ perl -MPOSIX=setsid -e 'setsid; exec @ARGV or die "exec failed: $!"' -- "$@" &
 JOB_PID=$!
 PGID=$JOB_PID
 
+# BUG 2 FIX (2026-07-27) -- THE SERIOUS ONE. setsid() runs INSIDE perl, asynchronously, AFTER the
+# shell has recorded $!. If the watchdog fired before perl reached setsid(), the process was still in
+# the PARENT's process group, so `kill -KILL -$PGID` addressed a group that did not exist yet, failed
+# SILENTLY (2>/dev/null), and _kill_group then exited 9 -- leaving the job ALIVE, ORPHANED and
+# COMPLETELY UNGUARDED. Observed live 2026-07-27 09:18: guard reported "killing job group 47299",
+# exited, and 47299 kept running and grew to 905MB while system-available fell to 2588MB. That is the
+# precise shape of the 2026-07-16 kernel panic this wrapper exists to prevent, with the wrapper
+# reporting success.
+# The race window is widest exactly when the box is already tight -- i.e. when the guard is most
+# likely to fire on its first poll. Wait for the group to actually materialise before monitoring.
+_pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+_waited=0
+while [ "$(_pgid_of "$JOB_PID")" != "$JOB_PID" ]; do
+  if ! kill -0 "$JOB_PID" 2>/dev/null; then break; fi     # job already exited; nothing to guard
+  if [ "$_waited" -ge 50 ]; then                          # 5s at 0.1s -- setsid should take microseconds
+    echo "[mem_safe_run $LABEL] setsid did not take within 5s; killing PID $JOB_PID directly and aborting." >&2
+    kill -KILL "$JOB_PID" 2>/dev/null
+    exit 9
+  fi
+  sleep 0.1
+  _waited=$((_waited + 1))
+done
+
 _kill_group() {  # $1 = reason ; $2 = "immediate" -> SIGKILL now (no TERM grace)
   echo "[mem_safe_run $LABEL] ABORT: $1 -> killing job group $PGID to protect the box." >&2
   if [ "${2:-}" = "immediate" ]; then
@@ -100,6 +142,18 @@ _kill_group() {  # $1 = reason ; $2 = "immediate" -> SIGKILL now (no TERM grace)
     kill -TERM -"$PGID" 2>/dev/null
     sleep 8
     kill -KILL -"$PGID" 2>/dev/null
+  fi
+  # VERIFY the kill actually landed. A group kill can miss (race above, or the job re-parented), and a
+  # silent miss is worse than no guard at all because it reports success. Fall back to the PID, then
+  # confirm. NEVER exit claiming we protected the box while the job is still running.
+  sleep 0.5
+  if kill -0 "$JOB_PID" 2>/dev/null; then
+    echo "[mem_safe_run $LABEL] group kill MISSED (pgid=$(_pgid_of "$JOB_PID")); SIGKILLing PID $JOB_PID directly." >&2
+    kill -KILL "$JOB_PID" 2>/dev/null
+    sleep 0.5
+    if kill -0 "$JOB_PID" 2>/dev/null; then
+      echo "[mem_safe_run $LABEL] FATAL: PID $JOB_PID SURVIVED SIGKILL -- job is UNGUARDED. Kill it by hand: kill -9 $JOB_PID" >&2
+    fi
   fi
   wait "$JOB_PID" 2>/dev/null
   exit 9
