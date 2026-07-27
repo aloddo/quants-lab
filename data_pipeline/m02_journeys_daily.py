@@ -85,6 +85,12 @@ _GB_PER_WALLET_DAY = 7.0e-5        # grouped fills+funding RAM per wallet per wi
 _PARENT_INFLIGHT_MULT = 1.5        # parent chunk dict + in-flight pickled worker slices held concurrently
 _DEFAULT_PARENT_GB = 1.5           # target PARENT RSS per grouped-load chunk (kept low so parent+writer+trace
                                    # fits UNDER the mem_safe_run 4GB job-tree ceiling on the serial path)
+                                   # OVERRIDABLE via --parent-gb (2026-07-25). Lowering it shrinks the chunk,
+                                   # so serial_need = parent+writer+trace drops and the job becomes launchable
+                                   # on a busy box. COST: day-files are re-read ONCE PER CHUNK, so halving this
+                                   # roughly DOUBLES grouped-load passes. That penalty lands on the ONE-TIME
+                                   # genesis replay only -- a daily incremental has a ~1-day window, hits the
+                                   # chunk `hi` clamp, and is unaffected. Keep the DEFAULT for daily runs.
 _WRITER_GB = 1.0                   # ShardedParquetWriter buffers + main-process overhead
 
 
@@ -207,6 +213,67 @@ logging.basicConfig(
 logger = logging.getLogger("m02_daily")
 
 REPO = Path(__file__).resolve().parents[1]
+
+# ── WALLET-SHARDED FILLS (2026-07-27, Alberto: "fix it from first principle") ──────────────────────
+# THE COST BUG: every loader call here used fio.load_grouped_fills_funding, which globs EVERY hot
+# day-file and filters to the requested wallets. Cost is therefore O(WHOLE STORE) per call, not
+# O(wallets asked for) -- so a 78-wallet chunk re-read the full ~11GB fills history, took ~5 minutes,
+# and needed ~4GB RAM. With 130 chunks that is ~11 HOURS to seed, and the daily job paid the same tax
+# every run.
+#
+# fio.load_grouped_fills_funding_sharded reads ONLY the requested wallets via partition pruning over
+# app/data/v15/m2_fills_wallet_shards (20,378 wallet partitions). Its docstring states SAME CONTRACT +
+# BYTE-IDENTICAL output, gate-verified -- order_wallet_fills_causally makes within-wallet input order
+# irrelevant. v15_m04_authenticity and scripts/m2_batched_run.py already use it; this module never did.
+# Both halves existed and were simply never connected.
+#
+# Routed through ONE indirection so all 5 call sites switch together and the fallback stays exact.
+DEFAULT_FILLS_SHARD_DIR = REPO / "app" / "data" / "v15" / "m2_fills_wallet_shards"
+_FILLS_SHARD_DIR = None          # set from --fills-shard-dir; None => legacy full-store scan
+
+
+def shard_coverage_ms(shard_dir) -> tuple[int, int]:
+    """(min_time, max_time) actually present in the wallet shard. Cheap: reads only the `time` column."""
+    import pyarrow.dataset as _ds
+    import pyarrow.compute as _pc
+    d = _ds.dataset(str(shard_dir), partitioning="hive")
+    tbl = d.to_table(columns=["time"])
+    if tbl.num_rows == 0:
+        return (0, 0)
+    col = tbl.column("time")
+    return (int(_pc.min(col).as_py()), int(_pc.max(col).as_py()))
+
+
+def assert_shard_covers(shard_dir, t0: int, t1: int) -> None:
+    """FAIL CLOSED if the shard does not cover [t0, t1].
+
+    THIS GUARD IS THE POINT. `load_grouped_fills_funding_sharded` returns whatever the shard holds --
+    a shard that is stale or starts late yields FEWER fills with NO error, which silently produces
+    WRONG journeys (missing opens => phantom carry-in; missing closes => phantom open positions).
+    That is strictly worse than being slow. Verified 2026-07-27: the shard on disk covered
+    2025-12-01..2026-06-26 while the seed asked for 2025-07-27..2026-07-24 -- short at BOTH ends by
+    ~4 months and ~1 month. Wiring the fast path without this check would have corrupted the store."""
+    lo, hi = shard_coverage_ms(shard_dir)
+    if lo == 0 and hi == 0:
+        raise SystemExit(f"fills shard {shard_dir} is EMPTY; refusing to use it.")
+    if lo > t0 or hi < t1:
+        import datetime as _dt
+        f = lambda ms: _dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+        raise SystemExit(
+            f"fills shard does NOT cover the requested window -- refusing (would silently drop fills).\n"
+            f"  requested: {f(t0)} .. {f(t1)}\n"
+            f"  shard has: {f(lo)} .. {f(hi)}\n"
+            f"Rebuild/extend it: scripts/build_fills_wallet_shard.py --start {f(t0)} --end {f(t1)}\n"
+            f"or pass --fills-shard-dir '' to fall back to the (much slower) full-store scan.")
+
+
+def _load_fills_funding(wallets: set, t0: int, t1: int):
+    """Grouped fills+funding for `wallets` over [t0, t1]. Uses the wallet shard when configured."""
+    if _FILLS_SHARD_DIR:
+        return fio.load_grouped_fills_funding_sharded(set(wallets), t0, t1, _FILLS_SHARD_DIR)
+    return fio.load_grouped_fills_funding(set(wallets), t0, t1)
+
+
 DEFAULT_STATE_DIR = REPO / "app" / "data" / "v15" / "m02_daily_state"
 # Phase 2 stateful checkpoint lives in a SEPARATE dir so the one-time seed + the stateful driver never
 # clobber the live 1c-1f checkpoint during the cron transition (the store/out-dir is shared).
@@ -679,6 +746,7 @@ def run_daily(
     flush_rows: int = 100_000,
     mem_soft_gb: float = 12.0,
     actions_dir: Path = DEFAULT_ACTIONS_DIR,
+    parent_gb: float = _DEFAULT_PARENT_GB,
 ) -> dict:
     """Advance the daily-incremental journeys store to ``target_day``.
 
@@ -997,7 +1065,7 @@ def run_daily(
                 # are re-read per chunk but the OS page-cache keeps them warm, so reads stay cheap.
                 # P0 memory safety: bound CHUNK by the FULL window (kills the ~34GB parent balloon) and cap
                 # procs by an aggregate budget (abort-before-start if the box can't fit it).
-                CHUNK = _bounded_chunk(target_end - start_ms)
+                CHUNK = _bounded_chunk(target_end - start_ms, target_parent_gb=parent_gb)
                 _b = _budget_or_serial(procs, parent_gb=_parent_gb_for(min(CHUNK, len(affected)), target_end - start_ms))
                 wl_sorted = sorted(affected)
                 n_chunks = (len(wl_sorted) + CHUNK - 1) // CHUNK
@@ -1008,7 +1076,7 @@ def run_daily(
                     for ci in range(0, len(wl_sorted), CHUNK):
                         chunk = wl_sorted[ci:ci + CHUNK]
                         logger.info(f"BULK chunk {ci // CHUNK + 1}/{n_chunks}: grouped-load {len(chunk)} wallets")
-                        gf, gfund = fio.load_grouped_fills_funding(set(chunk), start_ms, target_end)
+                        gf, gfund = _load_fills_funding(set(chunk), start_ms, target_end)
 
                         def _chunk_tasks(chunk=chunk, gf=gf, gfund=gfund):
                             # POP as we dispatch so the chunk's grouped dict shrinks (bounded RAM).
@@ -1062,7 +1130,7 @@ def run_daily(
                 # P0 memory safety: size CHUNK for the WORST-CASE (oldest replay_start) window in the batch so
                 # even old-flat holders that stretch back toward genesis stay parent-bounded; cap procs.
                 _oldest = min(replay_start.values()) if replay_start else target_end
-                CHUNK = _bounded_chunk(target_end - _oldest)
+                CHUNK = _bounded_chunk(target_end - _oldest, target_parent_gb=parent_gb)
                 _b = _budget_or_serial(procs, parent_gb=_parent_gb_for(min(CHUNK, len(affected)), target_end - _oldest))
                 wl_sorted = sorted(affected, key=lambda w: (replay_start[w], w))
                 n_chunks = (len(wl_sorted) + CHUNK - 1) // CHUNK
@@ -1075,7 +1143,7 @@ def run_daily(
                         chunk_lo = min(replay_start[w] for w in chunk)   # tight per-chunk read window
                         logger.info(f"INCR chunk {ci // CHUNK + 1}/{n_chunks}: grouped-load {len(chunk)} "
                                     f"wallets over [{chunk_lo}..{target_end}]")
-                        gf, gfund = fio.load_grouped_fills_funding(set(chunk), chunk_lo, target_end)
+                        gf, gfund = _load_fills_funding(set(chunk), chunk_lo, target_end)
 
                         def _chunk_tasks(chunk=chunk, gf=gf, gfund=gfund):
                             # POP as we dispatch so the chunk's grouped dict shrinks (bounded RAM).
@@ -1305,6 +1373,7 @@ def run_daily_stateful(
     universe: Optional[set] = None,
     flush_rows: int = 100_000,
     mem_soft_gb: float = 12.0,
+    parent_gb: float = _DEFAULT_PARENT_GB,
 ) -> dict:
     """Advance the journeys store to target_day by feeding ONLY each new day's fills through the tracer
     resumed from carried per-holder state (zero history re-read). Requires a seeded checkpoint
@@ -1419,10 +1488,10 @@ def run_daily_stateful(
         wl = sorted(late_wallets)
         # P0 memory safety (codex P1): the 2b replay grouped-loads over the FULL [start_day..target] window,
         # so a 1500-wallet chunk is the same ~34GB balloon. Bound by window length.
-        _replay_chunk = _bounded_chunk(tgt_end - day_start_ms(start_day))
+        _replay_chunk = _bounded_chunk(tgt_end - day_start_ms(start_day), target_parent_gb=parent_gb)
         for ci in range(0, len(wl), _replay_chunk):
             cwl = wl[ci:ci + _replay_chunk]
-            gf2, gf2u = fio.load_grouped_fills_funding(set(cwl), day_start_ms(start_day), tgt_end)
+            gf2, gf2u = _load_fills_funding(set(cwl), day_start_ms(start_day), tgt_end)
             for w in cwl:
                 fills = fio.order_wallet_fills_causally([f for f in gf2.pop(w, []) if int(f["time"]) <= tgt_end])
                 if not fills:
@@ -1508,11 +1577,11 @@ def run_daily_stateful(
         # P0 memory safety (codex P1): CHUNK the forward grouped-load by the active set so the parent holds only
         # one chunk's fills over the short forward window, never the whole active universe at once. Per-wallet
         # independent (each uses its own carried init + own fills) -> chunking is output-invariant.
-        _fwd_chunk = _bounded_chunk(hi - d0)
+        _fwd_chunk = _bounded_chunk(hi - d0, target_parent_gb=parent_gb)
         active_sorted = sorted(active)
         for _fi in range(0, len(active_sorted), _fwd_chunk):
           _cwset = active_sorted[_fi:_fi + _fwd_chunk]
-          gf, gfund = fio.load_grouped_fills_funding(set(_cwset), d0, hi) if _cwset else ({}, {})
+          gf, gfund = _load_fills_funding(set(_cwset), d0, hi) if _cwset else ({}, {})
           for w in _cwset:
             init = wallet_state.get(w)
             wf = fio.order_wallet_fills_causally([f for f in gf.pop(w, []) if d0 <= int(f["time"]) <= d1])
@@ -1584,6 +1653,7 @@ def seed_stateful_checkpoint(
     procs: int = 6,
     mem_soft_gb: float = 12.0,
     chunk: int = 1500,
+    parent_gb: float = _DEFAULT_PARENT_GB,
 ) -> dict:
     """ONE-TIME bootstrap: build checkpoint['wallet_state'] (the per-holder carried tracer state) that
     run_daily_stateful resumes from, WITHOUT changing the existing closed store (already built row-identical
@@ -1607,12 +1677,12 @@ def seed_stateful_checkpoint(
     # P0 memory safety: the seed grouped-loads each chunk over the FULL [start_day..watermark] window, so a
     # 1500-wallet chunk is the same ~34GB parent balloon that panicked the box. Bound it by the window length
     # (single-process, but the per-chunk parent load is what OOMs). Respect a smaller explicit override.
-    chunk = min(chunk, _bounded_chunk(t1 - t0))
-    logger.info(f"seed: mem-bounded chunk={chunk} wallets over [{start_day}..{watermark_day}] (~{_DEFAULT_PARENT_GB}GB/chunk)")
+    chunk = min(chunk, _bounded_chunk(t1 - t0, target_parent_gb=parent_gb))
+    logger.info(f"seed: mem-bounded chunk={chunk} wallets over [{start_day}..{watermark_day}] (~{parent_gb}GB/chunk)")
     install_memory_guard(soft_gb=mem_soft_gb, label="m02-seed")
     for ci in range(0, len(wl), chunk):
         cwl = wl[ci:ci + chunk]
-        gf, gfund = fio.load_grouped_fills_funding(set(cwl), t0, t1)
+        gf, gfund = _load_fills_funding(set(cwl), t0, t1)
         for w in cwl:
             fills = fio.order_wallet_fills_causally([f for f in gf.pop(w, []) if int(f["time"]) <= t1])
             if not fills:
@@ -1673,13 +1743,38 @@ def main() -> None:
                     help="Rule-8 streaming: flush a parquet part every N buffered rows.")
     ap.add_argument("--mem-soft-gb", type=float, default=12.0,
                     help="Memory-guard soft cap (GB); abort loud above this.")
+    ap.add_argument("--parent-gb", type=float, default=_DEFAULT_PARENT_GB,
+                    help="Target PARENT RSS per grouped-load chunk (GB). Lower => smaller chunks => the run "
+                         "becomes launchable on a busy box (serial_need = parent+writer+trace shrinks), at the "
+                         "cost of proportionally MORE grouped-load passes (day-files are re-read once per "
+                         "chunk). Intended for the ONE-TIME genesis replay; leave at the default for daily "
+                         "incremental runs (short window => chunk hits its upper clamp => unaffected).")
     ap.add_argument("--stateful", action="store_true",
                     help="Run the Phase-2 STATEFUL incremental driver (run_daily_stateful): carry per-holder "
                          "state, feed only new-day fills (~seconds/day). Requires a seeded --state-dir.")
     ap.add_argument("--seed", metavar="WATERMARK", default=None,
                     help="ONE-TIME: seed the stateful wallet_state from the store at WATERMARK (YYYYMMDD), "
                          "then exit. Run once before switching the cron to --stateful.")
+    ap.add_argument("--fills-shard-dir", default=str(DEFAULT_FILLS_SHARD_DIR),
+                    help="Wallet-partitioned fills shard (build_fills_wallet_shard.py). When set, grouped "
+                         "loads read ONLY the requested wallets via partition pruning instead of scanning the "
+                         "whole ~11GB day-file store -- the difference between O(store) and O(wallets asked "
+                         "for) per chunk. Pass '' to force the legacy full-store scan.")
     args = ap.parse_args()
+
+    global _FILLS_SHARD_DIR
+    _sd = (args.fills_shard_dir or "").strip()
+    if _sd:
+        if not Path(_sd).exists():
+            sys.stderr.write(f"--fills-shard-dir {_sd!r} does not exist. Build it with "
+                             f"scripts/build_fills_wallet_shard.py, or pass --fills-shard-dir '' for the "
+                             f"(much slower) full-store scan.\n")
+            sys.exit(2)
+        _FILLS_SHARD_DIR = _sd
+        logger.info(f"fills source: WALLET SHARD {_sd} (partition-pruned; O(wallets) not O(store))")
+    else:
+        logger.warning("fills source: FULL-STORE SCAN (legacy). Every grouped load re-reads the whole "
+                       "day-file store -- expect ~minutes and GBs per chunk.")
 
     # ENFORCE the 2026-06-04 mem_safe_run mandate BY CODE (not by remembering to wrap): every real m02 run
     # (bulk run_daily / stateful / seed) MUST be launched under scripts/mem_safe_run.sh, which sets
@@ -1702,10 +1797,11 @@ def main() -> None:
 
     t0 = time.time()
     if args.seed:
-        seed_stateful_checkpoint(args.seed, state_dir=state_dir, out_dir=Path(args.out_dir), procs=args.procs)
+        seed_stateful_checkpoint(args.seed, state_dir=state_dir, out_dir=Path(args.out_dir), procs=args.procs,
+                                 parent_gb=args.parent_gb)
     elif args.stateful:
         run_daily_stateful(target_day=args.target_day, state_dir=state_dir, out_dir=Path(args.out_dir),
-                           flush_rows=args.flush_rows, mem_soft_gb=args.mem_soft_gb)
+                           flush_rows=args.flush_rows, mem_soft_gb=args.mem_soft_gb, parent_gb=args.parent_gb)
     else:
         run_daily(
             target_day=args.target_day,
@@ -1717,6 +1813,7 @@ def main() -> None:
             lookback_days=args.lookback_days,
             flush_rows=args.flush_rows,
             mem_soft_gb=args.mem_soft_gb,
+            parent_gb=args.parent_gb,
         )
     logger.info(f"wall: {(time.time()-t0)/60:.2f} min")
 
