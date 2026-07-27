@@ -1798,7 +1798,11 @@ def main() -> None:
     ap.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR),
                     help="Checkpoint dir (checkpoint.json).")
     ap.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR),
-                    help="Output store dir (closed/, open_snapshot/).")
+                    help="Output store dir (closed/, open_snapshot/). NOTE: this does NOT redirect the "
+                         "ACTIONS store -- use --actions-dir for that (see the guard below).")
+    ap.add_argument("--actions-dir", default=str(DEFAULT_ACTIONS_DIR),
+                    help="Actions store dir. SEPARATE from --out-dir. Redirecting --out-dir alone leaves "
+                         "actions writing to the SHARED universe store.")
     ap.add_argument("--procs", type=int, default=4, help="Worker processes.")
     ap.add_argument("--allow-unwrapped", action="store_true",
                     help="Bypass the mem_safe_run backstop requirement (ONLY for tiny test/gate slices).")
@@ -1832,6 +1836,22 @@ def main() -> None:
                          "whole ~11GB day-file store -- the difference between O(store) and O(wallets asked "
                          "for) per chunk. Pass '' to force the legacy full-store scan.")
     args = ap.parse_args()
+
+    # ISOLATION FOOTGUN GUARD (2026-07-27 -- after this exact mistake destroyed a universe store).
+    # `--out-dir` redirects closed/ + open_snapshot/ ONLY. The ACTIONS store is a SEPARATE path with its
+    # own module-level default and, until now, NO CLI FLAG AT ALL. So a run isolated with
+    # `--out-dir /tmp/mine` still wrote actions into the SHARED universe store and silently overwrote
+    # run_000001.parquet with a 5-wallet subset. Verifying that ONE path was redirected and concluding
+    # ALL were is exactly the partial-verification failure that cost the data.
+    # Refuse the half-isolated combination outright: if out-dir is non-default, actions-dir must be too.
+    if str(Path(args.out_dir)) != str(DEFAULT_OUT_DIR) and str(Path(args.actions_dir)) == str(DEFAULT_ACTIONS_DIR):
+        sys.stderr.write(
+            "REFUSING half-isolated run: --out-dir is redirected but --actions-dir is still the SHARED "
+            f"default ({DEFAULT_ACTIONS_DIR}). "
+            "This combination OVERWRITES the shared universe actions store with whatever subset you are "
+            "running. Pass --actions-dir explicitly (a sibling of --out-dir is the usual intent), or "
+            "drop --out-dir to run against the shared stores deliberately.\n")
+        sys.exit(2)
 
     global _FILLS_SHARD_DIR, _MEM_HEADROOM_GB
     if args.mem_headroom_gb is not None:
@@ -1876,12 +1896,14 @@ def main() -> None:
                                  parent_gb=args.parent_gb)
     elif args.stateful:
         run_daily_stateful(target_day=args.target_day, state_dir=state_dir, out_dir=Path(args.out_dir),
+                           actions_dir=Path(args.actions_dir),
                            flush_rows=args.flush_rows, mem_soft_gb=args.mem_soft_gb, parent_gb=args.parent_gb)
     else:
         run_daily(
             target_day=args.target_day,
             state_dir=state_dir,
             out_dir=Path(args.out_dir),
+            actions_dir=Path(args.actions_dir),
             wallets_file=args.wallets_file,
             start_day=args.start_day,
             procs=args.procs,
