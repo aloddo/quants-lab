@@ -256,7 +256,15 @@ def assert_shard_covers(shard_dir, t0: int, t1: int) -> None:
     lo, hi = shard_coverage_ms(shard_dir)
     if lo == 0 and hi == 0:
         raise SystemExit(f"fills shard {shard_dir} is EMPTY; refusing to use it.")
-    if lo > t0 or hi < t1:
+    # Compare at DAY granularity, not raw ms. The shard's min/max are ACTUAL FILL timestamps, so on the
+    # boundary days they sit strictly inside the day: the first fill of 2025-07-27 is after midnight, so
+    # a raw `lo > t0` is true for a shard that covers the day perfectly. Requiring data at the exact
+    # millisecond of a day boundary is asking for a fill that may not exist.
+    # (Caught 2026-07-27: the guard false-positived on a freshly built, fully-covering shard.)
+    _DAY = 86_400_000
+    lo_day, hi_day = (lo // _DAY) * _DAY, (hi // _DAY) * _DAY
+    t0_day, t1_day = (t0 // _DAY) * _DAY, (t1 // _DAY) * _DAY
+    if lo_day > t0_day or hi_day < t1_day:
         import datetime as _dt
         f = lambda ms: _dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
         raise SystemExit(
