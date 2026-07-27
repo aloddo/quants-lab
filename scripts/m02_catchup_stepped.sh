@@ -35,7 +35,17 @@ RETRY_MAX=${M02_RETRY_MAX:-8}
 # INDEPENDENT kernel-pressure trigger (pl>=4, which fires immediately before jetsam) is untouched. A
 # 2GB floor with verified kills is stronger protection than the 4GB floor was at 09:00 today, when
 # the kills were silently failing. Do NOT lower this further without re-verifying the guard.
-# NOTE --parent-gb is a NO-OP here: at a 1-day window _bounded_chunk hits its `hi` clamp regardless.
+# --parent-gb IS REQUIRED HERE. (Corrected 2026-07-27 after it cost a 30-minute run.) It feeds TWO
+# places and it is easy to check only the first:
+#   1. the grouped-load CHUNK  -- hi-clamped at a 1-day window, so genuinely no effect. Checking this
+#      alone leads to the WRONG conclusion that the flag does nothing.
+#   2. `serial_need = parent_gb + _WRITER_GB(1.0) + _TRACE_WORKING_GB(1.0)` -- NO clamp. This is the
+#      budget gate that raises MemoryBudgetError("serial infeasible: parent+writer+trace=...").
+#        --parent-gb 1.5  -> serial_need 3.50GB   FAILS against ~2.9GB free
+#        --parent-gb 0.25 -> serial_need 2.25GB   fits
+# The observed failure came 30 min in, AFTER tombstoning 4.1M closed + 58M action rows, so a run can
+# look healthy for a long time before hitting it. Keep this low for backlog steps.
+PARENT_GB=${M02_PARENT_GB:-0.25}
 FLOOR_GB=${M02_FLOOR_GB:-2}
 
 for DAY in $DAYS; do
@@ -44,7 +54,7 @@ for DAY in $DAYS; do
   while :; do
     _try=$((_try + 1))
     "$REPO/scripts/mem_safe_run.sh" --floor-gb "$FLOOR_GB" --label "m02-step-$DAY" -- \
-      "$PY" data_pipeline/m02_journeys_daily.py --procs 2 --target-day "$DAY"
+      "$PY" data_pipeline/m02_journeys_daily.py --procs 2 --parent-gb "$PARENT_GB" --target-day "$DAY"
     _rc=$?
     [ "$_rc" -eq 0 ] && { echo "--- $DAY OK (attempt $_try) ---"; break; }
     if [ "$_rc" -ne 3 ] && [ "$_rc" -ne 9 ]; then
