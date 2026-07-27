@@ -25,6 +25,43 @@ echo "--- step 2/2: M2 daily-incremental journeys (only-new) ---"
 # MANDATORY mem_safe_run backstop (decision 2026-06-04; the direct launch here OOM-panicked the box 2026-07-16,
 # postmortem projects/quant/postmortems/2026-07-17-m02-oom-kernel-panic). --floor-gb 4 = 4GB job-tree RSS
 # CEILING (the group is killed above it); it also kills immediately on kernel-critical pressure.
-"$REPO/scripts/mem_safe_run.sh" --floor-gb 4 --label m02-daily -- \
-  "$PY" data_pipeline/m02_journeys_daily.py --procs 4
-echo "=== [$(date +%Y%m%dT%H%M%S)] M2 daily pipeline done OK ==="
+#
+# RETRY-ON-RESOURCE (2026-07-27). This step had started 7 times and completed ZERO times: every run
+# lost the coin-flip on free RAM at fire time and gave up until the next day, leaving m02_actions /
+# m02_journeys FIVE DAYS stale and blocking all replay validation. The five aborts were
+# 4038 / 3842 / 3969 / 2936 / 3924 MB against the 4096MB floor -- four of them within 6% of clearing.
+# The floor is NOT the problem and is not being lowered: it exists because the direct launch
+# OOM-panicked the box. The problem was that a transient resource shortage was treated as a terminal
+# failure. Poll for a window instead.
+#
+# Retryable == a RESOURCE verdict from mem_safe_run only:
+#   3 = refused launch (kernel pressure already critical)
+#   9 = aborted mid-run (guard killed the job group)
+# Any OTHER nonzero is the JOB's own exit code -- a real failure. Fail closed immediately, unchanged:
+# m02_journeys_daily is fail-closed internally (checkpoint not advanced on partial failure), and
+# retrying a genuine error would just burn hours re-hitting it.
+RETRY_DEADLINE_S=${M02_RETRY_DEADLINE_S:-14400}     # 4h; fires 06:45 -> gives up ~10:45
+RETRY_SLEEP_S=${M02_RETRY_SLEEP_S:-1200}            # 20min between attempts
+_started=$(date +%s)
+_attempt=0
+while :; do
+  _attempt=$((_attempt + 1))
+  set +e
+  "$REPO/scripts/mem_safe_run.sh" --floor-gb 4 --label m02-daily -- \
+    "$PY" data_pipeline/m02_journeys_daily.py --procs 4
+  _rc=$?
+  set -e
+  [ "$_rc" -eq 0 ] && break
+  if [ "$_rc" -ne 3 ] && [ "$_rc" -ne 9 ]; then
+    echo "M2 daily: journeys step FAILED rc=$_rc (job error, not a resource abort) -- not retrying." >&2
+    exit "$_rc"
+  fi
+  _elapsed=$(( $(date +%s) - _started ))
+  if [ "$_elapsed" -ge "$RETRY_DEADLINE_S" ]; then
+    echo "M2 daily: giving up after ${_attempt} attempts / $((_elapsed / 60))min waiting for a RAM window (last rc=$_rc)." >&2
+    exit "$_rc"
+  fi
+  echo "M2 daily: attempt ${_attempt} hit a resource abort (rc=$_rc) after $((_elapsed / 60))min; retrying in $((RETRY_SLEEP_S / 60))min."
+  sleep "$RETRY_SLEEP_S"
+done
+echo "=== [$(date +%Y%m%dT%H%M%S)] M2 daily pipeline done OK (journeys took ${_attempt} attempt(s)) ==="
