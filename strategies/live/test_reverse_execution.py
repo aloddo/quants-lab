@@ -34,6 +34,9 @@ class StubEngine:
         self.reverse_min_notional = 10.0
         self.mid_prices = {"CHIP": mid}
         self._v16_leader_pos = {("0xA", "CHIP"): leader_pos}
+        # signal-time knet FIFO: (knet, ts, is_buy). The reverse CONSUMES the real stamp rather
+        # than recomputing one (codex r5 P1 #1), so the stub must provide it.
+        self._v17_knet_pending = {("0xA", "CHIP"): [(3, __import__("time").time(), leader_pos > 0)]}
         self._reverse_opens = []
         # call log, so ORDERING is assertable -- ordering is what every prior version got wrong
         self.calls = []
@@ -140,7 +143,10 @@ reaped = run(eng, pos)
 # not distinguish them. Reaping and deleting persistence here dropped tracking of real exchange
 # exposure. Keep it tracked and hand it to force-exit; abandoning the far side is the cheap half.
 assert reaped is False, "must NOT reap a leg while the exchange still shows size on the coin"
-assert pos.get("_force_exit") is True, "must latch force-exit on an unproven flat"
+# r5 P1 #2: do NOT latch force-exit -- that path trades the AGGREGATE net and could close another
+# wallet's leg, and drops the row after 30 failures. The residual is unattributable by construction.
+assert pos.get("_force_exit") is not True, "must NOT force-exit an unattributable residual"
+assert "_pending_reverse" not in pos, "the reverse intent is dropped"
 assert eng._reverse_opens == [], "NEVER open the far side while the exchange shows size on the coin"
 assert eng.removed == [], "must not delete persistence for a leg that may still be live"
 ok += 4
@@ -206,10 +212,39 @@ ok += 2
 #     requests carry the SAME signal-time authorization (codex r4 P1 #1: without it, attempts 2-5
 #     and every recovered request hit NO-STAMP REJECT and the queue could never deliver a leg).
 eng = StubEngine(leader_pos=-7.0)
-eng._v17_knet = lambda coin, is_buy, wallet, px: 3
 pos = mkpos()
 run(eng, pos)
 assert eng._reverse_opens[0]["knet"] == 3, eng._reverse_opens
+assert eng._reverse_opens[0]["knet_ts"] is not None, "TTL needs the stamp's own timestamp"
+# the stamp must be CONSUMED, not left behind for a later same-direction OPEN to pick up
+assert not eng._v17_knet_pending.get(("0xA", "CHIP")), eng._v17_knet_pending
+ok += 3
+
+# 6d. NO signal-time stamp -> stay flat rather than open on unproven authorization.
+eng = StubEngine(leader_pos=-7.0)
+eng._v17_knet_pending = {}
+pos = mkpos()
+reaped = run(eng, pos)
+assert reaped is True and eng._reverse_opens == [], eng._reverse_opens
+ok += 2
+
+# 6e. A STALE stamp (older than the FIFO's 60s expiry) must not authorize a recovered request.
+import time as _t  # noqa: E402
+eng = StubEngine(leader_pos=-7.0)
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time() - 120, "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert eng.entered == [], "a stale signal-time knet must never authorize an entry"
+assert eng._reverse_opens == [], eng._reverse_opens
+ok += 2
+
+# 6f. PRE-ORDER FLAT PROOF: the coin reopening between the flatten and the order must block it.
+eng = StubEngine(leader_pos=-7.0)
+eng._exch_after_exit = 2.0        # strict reader now says NOT flat at order time
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert eng.entered == [], "must not open the far side once the coin is no longer flat"
 ok += 1
 
 # ══ ROUND-3 REGRESSIONS (codex r3 P1 #1-#4) ═════════════════════════════════════════════════════
@@ -241,7 +276,8 @@ ok += 4
 #     simply rejected by a gate, since _enter_position returns no success status -- lost the reverse.
 eng = StubEngine()
 eng._entry_fills = False                     # entry silently does not take
-eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 0}]
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 0,
+                       "knet": 3, "knet_ts": __import__("time").time()}]
 asyncio.run(eng._drain_reverse_opens())
 assert len(eng.entered) == 1, eng.entered
 assert len(eng._reverse_opens) == 1, "an unconfirmed entry must stay queued"
@@ -250,7 +286,8 @@ ok += 3
 
 # 8b. Once the leg IS open on the requested side, the request is retired.
 eng = StubEngine()
-eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 0}]
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 0,
+                       "knet": 3, "knet_ts": __import__("time").time()}]
 asyncio.run(eng._drain_reverse_opens())      # _entry_fills=True -> leg appears
 assert len(eng._reverse_opens) == 1 and eng._reverse_opens[0]["attempts"] == 1
 asyncio.run(eng._drain_reverse_opens())      # next cycle observes it and retires the request
@@ -261,7 +298,8 @@ ok += 3
 # 8c. Bounded: gives up after 5 attempts rather than re-entering forever.
 eng = StubEngine()
 eng._entry_fills = False
-eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 5}]
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 5,
+                       "knet": 3, "knet_ts": __import__("time").time()}]
 asyncio.run(eng._drain_reverse_opens())
 assert eng._reverse_opens == [], "must give up after the attempt bound"
 assert eng.entered == [], "the give-up cycle must not fire another entry"
@@ -270,7 +308,8 @@ ok += 2
 # 8d. If a leg reappears on the OLD side before the far-side entry, abandon rather than stack.
 eng = StubEngine()
 eng.positions.append({"coin": "CHIP", "wallet": "0xA", "filled": True, "side": "BUY", "size": 1.0})
-eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 0}]
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1, "attempts": 0,
+                       "knet": 3, "knet_ts": __import__("time").time()}]
 asyncio.run(eng._drain_reverse_opens())
 assert eng._reverse_opens == [], eng._reverse_opens
 assert eng.entered == [], "never open a SHORT on top of a LONG that came back"

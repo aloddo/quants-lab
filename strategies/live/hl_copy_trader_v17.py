@@ -5344,9 +5344,17 @@ class V16CopyTrader(CopyTrader):
             # by this point, so this collection is the only record of the obligation.
             if not self.shadow_mode and not getattr(self, "_reverse_opens_loaded", False):
                 try:
-                    self._reverse_opens = [
-                        {k: v for k, v in d.items() if k != "_id"}
-                        for d in self.db[DB_PENDING_REVERSE].find()]
+                    recovered = [{k: v for k, v in d.items() if k != "_id"}
+                                 for d in self.db[DB_PENDING_REVERSE].find()]
+                    # A generationless record acts as a wildcard in compare-and-delete and could
+                    # retire a NEWER obligation (codex r5 P2). Refuse to act on one.
+                    self._reverse_opens = [r for r in recovered if r.get("gen") is not None]
+                    for bad in [r for r in recovered if r.get("gen") is None]:
+                        logger.error(f"REVERSE: dropping generationless pending record "
+                                     f"{bad.get('coin')} {str(bad.get('wallet'))[:10]}")
+                        self.db[DB_PENDING_REVERSE].delete_one(
+                            {"wallet": bad.get("wallet"), "coin": bad.get("coin"),
+                             "gen": {"$exists": False}})
                     # Latch only AFTER a SUCCESSFUL read (codex r4 P2): setting it first meant a
                     # single transient Mongo error disabled recovery for the whole process life.
                     self._reverse_opens_loaded = True
@@ -5395,6 +5403,36 @@ class V16CopyTrader(CopyTrader):
                     keep.append(req)
                 continue
 
+            # KNET TTL (codex r5 P1 #1): the FIFO enforces a 60s expiry on a stamp; an override must
+            # not escape it, or a restart-recovered request could open on arbitrarily old evidence.
+            kts = req.get("knet_ts")
+            if kts is None or (time.time() - kts) > 60.0:
+                logger.info(f"REVERSE {c} {w[:10]}: signal-time knet is stale "
+                            f"({'missing' if kts is None else f'{time.time() - kts:.0f}s'}) -- "
+                            f"dropping the far-side request, staying flat")
+                if not self._clear_pending_reverse(w, c, req.get("gen")):
+                    keep.append(req)
+                continue
+
+            # PROVE FLAT AGAIN, here, immediately before submitting (codex r5 P1 #3). The strict
+            # read in the flatten happened before the lock was released and the list rebuilt; a
+            # background entry for another wallet, or a late external fill, can reopen the coin in
+            # that window -- and _enter_position treats another wallet's leg on the coin as
+            # permission to open a NEW position rather than a reason to refuse.
+            try:
+                exch_now = self._exchange_position_size_strict(c)
+            except Exception as exc:
+                logger.warning(f"REVERSE {c} {w[:10]}: pre-order flat check failed ({exc}) -- "
+                               f"retrying next cycle")
+                keep.append(req)
+                continue
+            if abs(exch_now) > 1e-10:
+                logger.warning(f"REVERSE {c} {w[:10]}: coin is no longer flat ({exch_now:+.6f}) at "
+                               f"order time -- far side NOT opened")
+                if not self._clear_pending_reverse(w, c, req.get("gen")):
+                    keep.append(req)
+                continue
+
             try:
                 # knet carried on the request, so retries and restart-recovered requests are
                 # authorized by the SAME signal-time value the first attempt used.
@@ -5407,7 +5445,8 @@ class V16CopyTrader(CopyTrader):
             if not self.shadow_mode:
                 try:
                     self.db[DB_PENDING_REVERSE].update_one(
-                        {"wallet": w, "coin": c}, {"$set": {"attempts": req["attempts"]}})
+                        {"wallet": w, "coin": c, "gen": req.get("gen")},
+                        {"$set": {"attempts": req["attempts"]}})
                 except Exception:
                     pass
             keep.append(req)
@@ -5524,12 +5563,16 @@ class V16CopyTrader(CopyTrader):
             # exposure. Keep the position tracked and hand it to the force-exit machinery instead;
             # abandoning the far side is the cheap half of this failure, losing the leg is not.
             logger.error(f"REVERSE {coin} {wallet[:10]}: exit reported success but exchange still "
-                         f"shows {exch_sz:+.6f} on this coin -- NOT opening the far side, "
-                         f"latching _force_exit and KEEPING the position tracked")
-            _tg(f"REVERSE {coin}: exchange not flat after exit ({exch_sz:+.6f}), force-exit latched")
+                         f"shows {exch_sz:+.6f} on this coin -- far side NOT opened, reverse "
+                         f"intent dropped, position KEPT tracked (residual is unattributable)")
+            _tg(f"REVERSE {coin}: exchange not flat after exit ({exch_sz:+.6f}), far side skipped")
+            # Do NOT latch _force_exit here (codex r5 P1 #2): that path trades against the
+            # AGGREGATE exchange net, so it could close ANOTHER wallet's leg on this coin, and it
+            # drops the row entirely after 30 failures. The residual is unattributable by
+            # construction. Keep the leg tracked exactly as it is, drop the reverse intent, and
+            # alert -- the sweep and reconciliation own an unattributable residual, not this path.
             pos.pop('_pending_reverse', None)
             pos.pop('_reverse_attempts', None)
-            pos['_force_exit'] = True
             try:
                 self._persist_position(pos)
             except Exception:
@@ -5554,14 +5597,29 @@ class V16CopyTrader(CopyTrader):
             logger.info(f"REVERSE {coin} {wallet[:10]}: leader now {cur:+.4f} "
                         f"(${abs(cur) * mid:,.0f}) -- under the floor after flatten, staying flat")
             return True
-        # Capture the SIGNAL-TIME knet now, onto the obligation, so every retry and any restart
-        # recovery carries the same authorization the first attempt had.
-        try:
-            knet_at_signal = self._v17_knet(coin, cur > 0, wallet, mid)
-        except Exception:
-            knet_at_signal = None
-        req = {"wallet": wallet, "coin": coin, "is_buy": cur > 0, "gen": intent.get("gen"),
-               "knet": knet_at_signal, "attempts": 0, "created_ts": time.time()}
+        # CONSUME the actual signal-time stamp minted by V17._on_hl_trade for this flip (codex r5
+        # P1 #1). Recomputing a fresh knet here was wrong twice over: the value was measured at
+        # flatten time rather than signal time, and the original FIFO entry was left behind where a
+        # later same-direction OPEN could consume it as stale authorization.
+        knet_at_signal, knet_ts = None, None
+        want_buy = cur > 0
+        fifo = self._v17_knet_pending.get((wallet, coin)) if hasattr(self, "_v17_knet_pending") else None
+        if fifo:
+            for i, cand in enumerate(list(fifo)):
+                if len(cand) > 2 and cand[2] != want_buy:
+                    continue
+                knet_at_signal, knet_ts = cand[0], cand[1]
+                fifo.pop(i)
+                break
+            if not fifo:
+                self._v17_knet_pending.pop((wallet, coin), None)
+        if knet_at_signal is None:
+            logger.warning(f"REVERSE {coin} {wallet[:10]}: no signal-time knet stamp for the far "
+                           f"side -- staying flat rather than opening on unproven authorization")
+            return True
+        req = {"wallet": wallet, "coin": coin, "is_buy": want_buy, "gen": intent.get("gen"),
+               "knet": knet_at_signal, "knet_ts": knet_ts,
+               "attempts": 0, "created_ts": time.time()}
         # PERSIST FIRST, then queue in memory. The position row is already gone at this point, so
         # this collection is the ONLY record that we owe an opposite-side leg; a crash between here
         # and the drain would otherwise lose the reverse silently.
