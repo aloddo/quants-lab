@@ -4845,6 +4845,17 @@ class V16CopyTrader(CopyTrader):
         # add_tracked_not_copied, and turning this on changes live sizing. Enable explicitly in config
         # (global.copy_adds_enabled) once the behaviour is validated.
         self.copy_adds_enabled = bool(self.global_config.get("copy_adds_enabled", False))
+        # ── REVERSE VERB (Alberto TG 11978, 2026-07-28: "If they reverse we reverse what's so hard
+        # about faithfully copying?"). Before this, a leader flip THROUGH ZERO was classified
+        # identically to a plain trim and handed to the base handler, which ran it through the ENTRY
+        # path and fed the inflated reverse_notional/_position_accumulated denominator. Nothing
+        # anywhere flattened-then-opened-the-opposite. See test_reverse_classification.py.
+        # Default TRUE: a HALF-copied reverse is strictly worse than either extreme -- it leaves us
+        # long into a leader who is now short. `_reverse_inflight` mirrors `_converge_inflight`.
+        self.copy_reverse_enabled = bool(self.global_config.get("copy_reverse_enabled", True))
+        self.reverse_min_notional = float(self.global_config.get("reverse_min_notional", 10.0))
+        self._reverse_inflight: set = set()
+        self._v16_reverse_fills = 0
         for addr, posmap in self._target_positions.items():
             for cn, sz in posmap.items():
                 if cn in self.coin_whitelist and abs(sz) > 1e-12:
@@ -5020,8 +5031,65 @@ class V16CopyTrader(CopyTrader):
                         pass
                     return
 
-                # OPEN (leader ~flat) or REVERSE-while-we-hold: update tracker, hand to the base
-                # engine (entry guards / exit-TWAP machinery). Base may also update its own
+                # ── TRUE REVERSE while we hold: leader flipped THROUGH ZERO (long -> short or
+                # short -> long) on a leg we are actually copying. Alberto TG 11978: "If they
+                # reverse we reverse."
+                #
+                # This MUST be intercepted before the base handler. The base handler treats a flip
+                # as (a) an ENTRY signal -- it runs the leader's EXIT fill through
+                # _handle_instant_entry/_handle_twap_entry -- and (b) exit fuel, accumulating it into
+                # _exit_twap_buffer['reverse_notional'] whose 0.85 trigger divides by
+                # _position_accumulated, a denominator inflated by every leader add while our leg
+                # stays flat (findings/quant/2026-07-27-mirror-exit-denominator-orphans). Neither
+                # path flattens-then-opens-the-opposite, so a flip left us long into a short leader.
+                #
+                # Distinguishing a REVERSE from a TRIM/CLOSE is a pure sign test on the tracker:
+                # the leader's resulting position must cross zero AND land on a leg big enough to be
+                # worth copying. A flip that lands on dust is a CLOSE, and belongs to the exit
+                # machinery, not here.
+                after = prev + signed
+                crossed_zero = (prev > 0) != (after > 0) and abs(after) > 1e-12
+                is_true_reverse = ((not is_open) and (not is_add) and we_hold and crossed_zero
+                                   and abs(after) * px >= self.reverse_min_notional)
+                if is_true_reverse:
+                    tid = trade.get("tid", "")
+                    if tid:
+                        if tid in self._seen_tids:
+                            return
+                        self._seen_tids[tid] = time.time()
+                    self._v16_leader_pos[key] = after
+                    self._target_positions.setdefault(wallet, {})[coin] = after
+                    # The leader has effectively OPENED a new leg. Re-anchor, or every subsequent
+                    # add on the new leg is mirrored as a ratio to the OLD (opposite-side) leg.
+                    self._v16_leg_first[key] = abs(after)
+                    self._v16_reverse_fills += 1
+                    logger.warning(
+                        f"REVERSE {coin} {wallet[:10]}: leader {prev:+.4f} -> {after:+.4f} "
+                        f"(${abs(after) * px:,.0f}) -- flatten then open "
+                        f"{'LONG' if after > 0 else 'SHORT'}")
+                    try:
+                        self.db[DB_FILLS_COLLECTION].insert_one({
+                            "wallet": wallet, "coin": coin, "side": "BUY" if is_buy else "SELL",
+                            "price": px, "size": sz, "notional": sz * px,
+                            "wallet_group": self.wallet_groups.get(wallet, "unknown"),
+                            "market_type": "perp", "v16_class": "reverse_copied",
+                            "leader_pos_before": prev, "leader_pos_after": after,
+                            "timestamp": datetime.now(timezone.utc),
+                            "ts_epoch": time.time(),
+                        })
+                    except Exception:
+                        pass
+                    if self.copy_reverse_enabled:
+                        # Same synchronous in-flight discipline as the add coalescer: _on_hl_trade is
+                        # SYNCHRONOUS and drains a whole burst in one loop iteration, so a flag set
+                        # inside the coroutine would be useless -- every burst member would spawn.
+                        if key not in self._reverse_inflight:
+                            self._reverse_inflight.add(key)
+                            asyncio.create_task(self._reverse_once(wallet, coin, after > 0))
+                    return          # NEVER fall through to the base handler on a flip
+
+                # OPEN (leader ~flat) or REDUCE-while-we-hold (trim / close): update tracker, hand to
+                # the base engine (entry guards / exit-TWAP machinery). Base may also update its own
                 # _target_positions on a copied open; ours is authoritative for classification.
                 # Dedup: CHECK (without consuming) -- the base handler inserts the tid itself.
                 tid = trade.get("tid", "")
@@ -5112,6 +5180,69 @@ class V16CopyTrader(CopyTrader):
         finally:
             self._converge_inflight.discard(key)
             self._converge_dirty.discard(key)
+
+    async def _reverse_once(self, wallet: str, coin: str, new_is_long: bool):
+        """FLATTEN our leg, then OPEN the opposite one. The 4th verb (Alberto TG 11978).
+
+        Ordering is not arbitrary -- flatten FIRST, always:
+          - Opening first would briefly hold BOTH legs, doubling gross exposure on a $472 account and
+            potentially tripping `gross_backstop_x` (which would then reject the very order that was
+            supposed to reduce risk, leaving us on the WRONG side with the hedge rejected).
+          - HL is a unified cross-margin wallet, so a simultaneous long+short on one coin is not a
+            netted no-op mid-flight; it is two margin consumers.
+
+        FAIL-CLOSED: if the flatten does not confirm, we do NOT open the opposite leg. Being flat
+        after a leader reverse is a missed trade; being long into a short leader with a failed exit
+        is the orphan class that caused the 07-27 halt. Missed trade is strictly the better failure.
+        """
+        key = (wallet, coin)
+        try:
+            pos = next((p for p in self.positions if p.get("coin") == coin
+                        and p.get("wallet") == wallet and p.get("filled")), None)
+            if pos is None:
+                # Leg closed between classification and this task (the base exit machinery may have
+                # already taken it). Nothing to flatten; the leader's new leg will be picked up by
+                # the normal open path if they add to it.
+                logger.info(f"REVERSE {coin} {wallet[:10]}: leg already gone, nothing to flatten")
+                return
+            if pos.get("_in_twap") or pos.get("_force_exit") or pos.get("_gave_up"):
+                logger.warning(f"REVERSE {coin} {wallet[:10]}: leg busy "
+                               f"(_in_twap={pos.get('_in_twap')} _force_exit={pos.get('_force_exit')}) "
+                               f"-- letting the existing exit path finish, NOT opening the opposite")
+                return
+
+            ok = await self._exit_position(pos)
+            if not ok:
+                logger.error(f"REVERSE {coin} {wallet[:10]}: FLATTEN FAILED -- refusing to open the "
+                             f"opposite leg (fail-closed). We stay on the old side; the sweep and "
+                             f"the exit machinery own recovery.")
+                _tg(f"REVERSE {coin}: flatten FAILED, opposite leg NOT opened (fail-closed)")
+                return
+
+            # Confirm we are actually flat on this (wallet, coin) before adding risk on the far side.
+            still = next((p for p in self.positions if p.get("coin") == coin
+                          and p.get("wallet") == wallet and p.get("filled")), None)
+            if still is not None:
+                logger.error(f"REVERSE {coin} {wallet[:10]}: exit reported success but the leg is "
+                             f"STILL in self.positions -- NOT opening the opposite leg")
+                _tg(f"REVERSE {coin}: leg still present after exit, opposite NOT opened")
+                return
+
+            if not self.copy_reverse_enabled:
+                return
+            logger.info(f"REVERSE {coin} {wallet[:10]}: flat confirmed, opening "
+                        f"{'LONG' if new_is_long else 'SHORT'}")
+            # Fresh open on the far side. converge=True skips ONLY the knet stamp block -- a reverse
+            # is its own signal and will never carry a knet stamp (that stamp is minted on the
+            # leader's OPEN, and this fill is classified as their exit). We do NOT pass
+            # skip_cooldown: the base (wallet, coin) cooldown stays armed as a second layer against a
+            # leader oscillating across zero. No notional_override -- this is a NEW leg and must be
+            # sized by the normal entry path, not by a delta.
+            await self._enter_position(coin, new_is_long, wallet=wallet, converge=True)
+        except Exception as e:
+            logger.error(f"REVERSE {coin} {wallet[:10]}: unhandled error {e}", exc_info=True)
+        finally:
+            self._reverse_inflight.discard(key)
 
     async def _leader_book_sweep(self):
         """Periodic REST reconcile of OUR book against each leader's ACTUAL book.
