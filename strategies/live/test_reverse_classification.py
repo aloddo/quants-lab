@@ -13,43 +13,32 @@ routed to _reverse_once as of 2026-07-28 (Alberto TG 11978); the boundaries are 
 verb cannot regress silently.
 """
 
-MIN_NOTIONAL = 1.0
+import os
+import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from copy_convergence import classify_leader_fill, DEFAULT_REVERSE_MIN_USD  # noqa: E402
 
-REVERSE_MIN_NOTIONAL = 10.0
+REVERSE_MIN_NOTIONAL = DEFAULT_REVERSE_MIN_USD
 
 
 def classify(prev, sz, is_buy, px, we_hold):
-    """Returns (verb, leader_pos_after, routed_to).
+    """Thin adapter over the PRODUCTION classifier, mapping verb -> (verb, after, route).
 
-    Mirrors the live chain exactly:
-        prev_notional = abs(prev) * px
-        is_open = prev_notional < 1.0
-        is_add  = (not is_open) and ((prev > 0) == is_buy)
-        add               -> tracked, converge task, forensic DB row          (return)
-        reduce-not-held   -> tracked, forensic DB row, NEVER routed to base   (return)
-        TRUE REVERSE      -> tracked, re-anchored, _reverse_once task         (return)
-        everything else   -> tracked, routed to super()._on_hl_trade
+    The route is the routing CONTRACT each verb carries in V16CopyTrader._on_hl_trade. It is asserted
+    here because the routing is what the P1s were actually about: a flip reaching the base handler
+    gets re-entered on the leader's own exit fill.
     """
-    signed = sz if is_buy else -sz
-    prev_notional = abs(prev) * px
-    is_open = prev_notional < MIN_NOTIONAL
-    is_add = (not is_open) and ((prev > 0) == is_buy)
-    after = prev + signed
-
-    if is_add:
-        return "ADD", after, "converge_add_once" if we_hold else "tracked_only"
-    if (not is_open) and (not we_hold):
-        # covers leader TRIM and leader CLOSE on a coin we do not hold
-        return "REDUCE_NOT_HELD", after, "tracked_only+forensic_row"
-    # TRUE REVERSE: crossed zero, on a leg we hold, landing on something worth copying.
-    crossed_zero = (prev > 0) != (after > 0) and abs(after) > 1e-12
-    if ((not is_open) and (not is_add) and we_hold and crossed_zero
-            and abs(after) * px >= REVERSE_MIN_NOTIONAL):
-        return "REVERSE", after, "reverse_once"
-    if is_open:
-        return "OPEN", after, "base_handler"
-    return "REDUCE_WE_HOLD", after, "base_handler"
+    verb, after = classify_leader_fill(prev, sz, is_buy, px, we_hold,
+                                       reverse_min_usd=REVERSE_MIN_NOTIONAL)
+    route = {
+        "ADD": "converge_add_once" if we_hold else "tracked_only",
+        "REVERSE": "reverse_once",
+        "REDUCE_NOT_HELD": "tracked_only+forensic_row",
+        "OPEN": "base_handler",
+        "REDUCE_WE_HOLD": "base_handler",
+    }[verb]
+    return verb, after, route
 
 
 PX = 100.0
@@ -153,6 +142,29 @@ assert (v, after, route) == ("REDUCE_WE_HOLD", 0.0, "base_handler"), (v, after, 
 v, after, route = classify(prev=10.0, sz=9.99, is_buy=False, px=PX, we_hold=True)
 assert v == "REDUCE_WE_HOLD", (v, after)
 
+# ── 5h. REGRESSION, codex 2026-07-28 P1 #4 -- DUST-ORIGIN FLIP. ─────────────────────────────────
+#     The leader sits on $0.50 of residual long (below the $1 leg-dust floor, so `is_open` is TRUE)
+#     and sells into a material short while WE still hold the copied long. The first implementation
+#     gated reverse detection on `not is_open`, so this routed to the base handler as an OPEN and the
+#     reverse was silently missed -- leaving us long into a short leader, the exact orphan shape the
+#     verb exists to prevent. The old test had this SHAPE (case 1b) but only with we_hold=False, so
+#     it stayed green over the hole. That is why the classifier is now imported, not re-implemented.
+v, after, route = classify(prev=0.005, sz=10.0, is_buy=False, px=PX, we_hold=True)
+assert abs(after - (-9.995)) < 1e-9, after
+assert v == "REVERSE", f"dust-origin flip must reverse, got {v}"
+assert route == "reverse_once", route
+
+# 5i. Same dust origin, but we do NOT hold -> nothing to flatten, so it is an OPEN for the base
+#     handler, exactly as before. The fix must not widen the reverse path to legs we never copied.
+v, after, route = classify(prev=0.005, sz=10.0, is_buy=False, px=PX, we_hold=False)
+assert (v, route) == ("OPEN", "base_handler"), (v, route)
+
+# 5j. prev == 0 exactly, we hold: a fresh leader OPEN must NEVER read as a reverse. The naive
+#     `(prev > 0) != (after > 0)` sign test treats 0 as negative and would have called this a
+#     REVERSE, flattening a leg on a leader who simply opened.
+v, after, route = classify(prev=0.0, sz=10.0, is_buy=True, px=PX, we_hold=True)
+assert v == "OPEN", f"prev==0 must never classify as REVERSE, got {v}"
+
 # ── 6. Exhaustive sign-consistency sweep: the tracker must ALWAYS equal prev+signed, in every verb.
 #     A tracker that drifts from the leader's true position is the root cause of the orphan class.
 for prev in (-10.0, -0.005, 0.0, 0.005, 10.0):
@@ -163,5 +175,5 @@ for prev in (-10.0, -0.005, 0.0, 0.005, 10.0):
                 expect = prev + (sz if is_buy else -sz)
                 assert abs(after - expect) < 1e-12, (prev, sz, is_buy, after, expect)
 
-print("reverse-classification self-test PASSED (7 groups, 32 assertions + 80-case sign sweep)")
+print("reverse-classification self-test PASSED (8 groups, 39 assertions + 80-case sign sweep)")
 print("  REVERSE verb IMPLEMENTED: flip -> flatten, confirm flat, open opposite (fail-closed)")

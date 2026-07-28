@@ -203,6 +203,59 @@ def granularity_rungs(our_slice: float, typical_exposure_pct: float,
     return typical_notional / min_order_usd
 
 
+# ----------------------------------------------------------------------------- fill classification
+# Leader-fill dust floor, in USD of the leader's PRIOR leg. Below this the leg reads as flat, so the
+# next fill is an OPEN rather than an add/reduce. Matches the live engine's historical $1 constant.
+DEFAULT_LEG_DUST_USD = 1.0
+# A flip must land on at least this much NEW leg to be worth copying. Below it, a flip through zero is
+# just a CLOSE that overshot, and belongs to the exit machinery.
+DEFAULT_REVERSE_MIN_USD = 10.0
+
+
+def classify_leader_fill(prev: float, sz: float, is_buy: bool, px: float, we_hold: bool,
+                         reverse_min_usd: float = DEFAULT_REVERSE_MIN_USD,
+                         leg_dust_usd: float = DEFAULT_LEG_DUST_USD) -> tuple:
+    """Classify ONE leader fill into a verb. Pure: no engine state, no I/O, no clock.
+
+    Returns (verb, leader_pos_after) where verb is one of:
+        OPEN              leader was flat/dust -> now holds. The only true entry signal.
+        ADD               same direction as the tracked leg.
+        REVERSE           flipped THROUGH ZERO on a leg WE hold, landing above the floor.
+        REDUCE_NOT_HELD   trim/close on a coin we do not hold (track + forensics, never route to base).
+        REDUCE_WE_HOLD    trim/close on a leg we hold (base exit machinery owns it).
+
+    THIS IS THE ONE IMPLEMENTATION (codex 2026-07-28 P2). It lives here, next to the convergence math,
+    for the reason stated at the top of this module: the code that decides a live order must be the
+    SAME code the test and the replay harness call. The previous test re-implemented this chain and
+    stayed green while the live reverse path was broken in five separate ways -- exactly the failure
+    this module exists to prevent.
+
+    `prev` is the UNCONDITIONAL leader tracker (updated for every target fill on a whitelisted coin,
+    whether or not we copied it), so classification never depends on whether an entry was guarded off.
+    """
+    signed = sz if is_buy else -sz
+    after = prev + signed
+    is_open = abs(prev) * px < leg_dust_usd
+    is_add = (not is_open) and ((prev > 0) == is_buy)
+
+    if is_add:
+        return "ADD", after
+    # Sign flip, stated explicitly. NOT `(prev > 0) != (after > 0)`: that reads prev == 0 as negative
+    # and would call a plain OPEN a reverse whenever we happened to hold a leg.
+    crossed = (prev > 0 and after < 0) or (prev < 0 and after > 0)
+    # `is_open` deliberately does NOT gate this. A leader sitting on $0.50 of dust who sells into a
+    # material short is a REVERSE against a leg we hold, even though their prior leg was sub-dust.
+    # Gating on is_open routed exactly that case to the base handler as an OPEN while we still held
+    # the copied long (codex 2026-07-28 P1 #4).
+    if we_hold and crossed and abs(after) * px >= reverse_min_usd:
+        return "REVERSE", after
+    if (not is_open) and (not we_hold):
+        return "REDUCE_NOT_HELD", after
+    if is_open:
+        return "OPEN", after
+    return "REDUCE_WE_HOLD", after
+
+
 # ----------------------------------------------------------------------------- self-test
 def _selftest() -> None:
     ok = 0
