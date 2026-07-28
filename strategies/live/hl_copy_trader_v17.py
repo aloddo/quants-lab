@@ -5619,21 +5619,33 @@ class V16CopyTrader(CopyTrader):
                 pass
             return False
 
-        # FLAT AND CONFIRMED. Drop the persisted row now; the far-side entry will upsert its own
-        # AFTER the list rebuild, so the two cannot collide on the (wallet, coin) key.
-        self._remove_persisted_position(wallet, coin)
-        # Clear the per-leg exit state, exactly as every other full-exit caller does (codex r6 P1
-        # #5). Without this a reopened leg inherits the OLD leg's accumulated notional, so its close
-        # ratio is computed against the wrong denominator -- the inflated-denominator bug behind the
-        # 2026-07-27 orphans, reintroduced through the back door.
+        # FLAT AND CONFIRMED.
+        #
+        # ORDER OF OPERATIONS IS THE POINT HERE (codex r6 P1 #4). The obligation to open the far
+        # side must become DURABLE *before* the old lifecycle is retired, otherwise there is a
+        # window in which the position row is deleted, the knet stamp is popped, and nothing has
+        # recorded that we owe a leg -- a crash or a Mongo failure inside that window loses the
+        # reverse permanently and silently. So: decide the far side and persist the request FIRST,
+        # then drop the old row and its state. At every instant, at least one durable record of the
+        # leg exists.
         acc_key = (wallet, coin)
-        self._position_accumulated.pop(acc_key, None)
-        self._exit_twap_buffer.pop(acc_key, None)
-        pos.pop('_pending_reverse', None)
+
+        def _retire_old_leg():
+            """Drop the old row + its per-leg exit state. Called only once the far side is either
+            durably recorded or deliberately declined."""
+            self._remove_persisted_position(wallet, coin)
+            # Every other full-exit caller clears these two (codex r6 P1 #5); without it a reopened
+            # leg computes its close ratio against the PREVIOUS leg's accumulated notional -- the
+            # inflated-denominator bug behind the 2026-07-27 orphans.
+            self._position_accumulated.pop(acc_key, None)
+            self._exit_twap_buffer.pop(acc_key, None)
+            pos.pop('_pending_reverse', None)
+            pos.pop('_reverse_attempts', None)
 
         if not self.copy_reverse_enabled:
             logger.info(f"REVERSE {coin} {wallet[:10]}: flattened and confirmed flat; "
                         f"copy_reverse_enabled=False so NOT opening the far side")
+            _retire_old_leg()
             return True
 
         # Re-read the leader NOW rather than trusting the intent: the intent may have been
@@ -5643,6 +5655,7 @@ class V16CopyTrader(CopyTrader):
         if mid <= 0 or abs(cur) * mid < self.reverse_min_notional:
             logger.info(f"REVERSE {coin} {wallet[:10]}: leader now {cur:+.4f} "
                         f"(${abs(cur) * mid:,.0f}) -- under the floor after flatten, staying flat")
+            _retire_old_leg()
             return True
         # CONSUME the actual signal-time stamp minted by V17._on_hl_trade for this flip (codex r5
         # P1 #1). Recomputing a fresh knet here was wrong twice over: the value was measured at
@@ -5650,10 +5663,15 @@ class V16CopyTrader(CopyTrader):
         # later same-direction OPEN could consume it as stale authorization.
         knet_at_signal, knet_ts = None, None
         want_buy = cur > 0
+        my_gen = intent.get("gen")
         fifo = self._v17_knet_pending.get((wallet, coin)) if hasattr(self, "_v17_knet_pending") else None
         if fifo:
             for i, cand in enumerate(list(fifo)):
                 if len(cand) > 2 and cand[2] != want_buy:
+                    continue
+                # GENERATION BINDING (codex r6 P1 #3): only the stamp minted for THIS flip may
+                # authorize it. A 3-tuple is an ordinary OPEN stamp and is not ours to consume.
+                if len(cand) < 4 or (my_gen is not None and cand[3] != my_gen):
                     continue
                 knet_at_signal, knet_ts = cand[0], cand[1]
                 fifo.pop(i)
@@ -5663,6 +5681,7 @@ class V16CopyTrader(CopyTrader):
         if knet_at_signal is None:
             logger.warning(f"REVERSE {coin} {wallet[:10]}: no signal-time knet stamp for the far "
                            f"side -- staying flat rather than opening on unproven authorization")
+            _retire_old_leg()
             return True
         req = {"wallet": wallet, "coin": coin, "is_buy": want_buy, "gen": intent.get("gen"),
                "knet": knet_at_signal, "knet_ts": knet_ts,
@@ -5675,12 +5694,18 @@ class V16CopyTrader(CopyTrader):
                 self.db[DB_PENDING_REVERSE].update_one(
                     {"wallet": wallet, "coin": coin}, {"$set": req}, upsert=True)
             except Exception as e:
+                # The far side is NOT durably recorded, so do not retire the old leg's record on the
+                # strength of it. We are flat on the exchange either way; leaving the row for the
+                # next cycle is recoverable, losing both records is not.
                 logger.error(f"REVERSE {coin}: FAILED to persist the far-side request ({e}) -- "
                              f"not queueing, we stay flat rather than owe an untracked leg")
+                _retire_old_leg()
                 return True
         self._reverse_opens = [r for r in self._reverse_opens
                                if not (r["wallet"] == wallet and r["coin"] == coin)]
         self._reverse_opens.append(req)
+        # The obligation is durable now -- safe to retire the old leg.
+        _retire_old_leg()
         logger.info(f"REVERSE {coin} {wallet[:10]}: flat confirmed, far side "
                     f"{'LONG' if cur > 0 else 'SHORT'} queued for this cycle")
         return True
@@ -6723,6 +6748,12 @@ class V17CopyTrader(V16CopyTrader):
                     _signed_v17 = float(trade.get("sz", 0) or 0) * (1 if is_buy else -1)
                     _after_v17 = prev + _signed_v17
                     _flip_v17 = (prev > 0 and _after_v17 < 0) or (prev < 0 and _after_v17 > 0)
+                    if _flip_v17:
+                        # A flip SUPERSEDES every stamp outstanding on this leg (codex r6 P1 #3).
+                        # Leaving them meant the reverse could bind to an older same-direction
+                        # stamp, and that a stale opposite-direction stamp survived to authorize a
+                        # later genuine OPEN. The flip is a new signal; the old ones are void.
+                        self._v17_knet_pending.pop((wallet, coin), None)
                     if abs(prev) * px < 1.0 or (_flip_v17 and
                                                 getattr(self, 'copy_reverse_enabled', False)):
                         k = self._v17_knet(coin, is_buy, wallet, px)
@@ -6730,8 +6761,16 @@ class V17CopyTrader(V16CopyTrader):
                         # stamp and a subsequent opposite-direction open share the (wallet, coin)
                         # FIFO, and consuming the wrong one gates a real entry on a knet computed
                         # for the other side (codex r2).
-                        self._v17_knet_pending.setdefault((wallet, coin), []).append(
-                            (k, time.time(), is_buy))
+                        # 4-tuple for a flip: (knet, ts, is_buy, gen). `gen` binds the stamp to the
+                        # exact reverse V16 is about to classify, so a double flip cannot consume an
+                        # earlier flip's authorization. Non-flip opens stay 3-tuples.
+                        if _flip_v17:
+                            _g = self._reverse_gen.get((wallet, coin), 0) + 1
+                            self._v17_knet_pending.setdefault((wallet, coin), []).append(
+                                (k, time.time(), is_buy, _g))
+                        else:
+                            self._v17_knet_pending.setdefault((wallet, coin), []).append(
+                                (k, time.time(), is_buy))
                         if len(self._v17_knet_pending) > 500:   # prune stale queues
                             cut = time.time() - 120
                             self._v17_knet_pending = {
@@ -6814,6 +6853,11 @@ class V17CopyTrader(V16CopyTrader):
             # entry; dropping it here also drains reverse stamps that were never acted on (e.g.
             # copy_reverse_enabled False), which would otherwise gate a later genuine open.
             if len(cand) > 2 and cand[2] != is_buy:
+                continue
+            # A 4-tuple is a REVERSE stamp, bound to a specific reverse generation and delivered to
+            # the entry via knet_override. An ordinary OPEN must never consume one, or a reverse
+            # that was declined/expired would silently authorize an unrelated entry (codex r6 P1 #3).
+            if len(cand) > 3:
                 continue
             if (time.time() - cand[1]) < 60.0:
                 k = cand[0]

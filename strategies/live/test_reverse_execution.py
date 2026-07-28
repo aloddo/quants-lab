@@ -36,7 +36,10 @@ class StubEngine:
         self._v16_leader_pos = {("0xA", "CHIP"): leader_pos}
         # signal-time knet FIFO: (knet, ts, is_buy). The reverse CONSUMES the real stamp rather
         # than recomputing one (codex r5 P1 #1), so the stub must provide it.
-        self._v17_knet_pending = {("0xA", "CHIP"): [(3, __import__("time").time(), leader_pos > 0)]}
+        # 4-tuple = a REVERSE stamp bound to a generation (codex r6 P1 #3). mkpos() writes gen 1,
+        # so the stamp must carry gen 1 or the reverse must refuse to consume it.
+        self._v17_knet_pending = {
+            ("0xA", "CHIP"): [(3, __import__("time").time(), leader_pos > 0, 1)]}
         self._reverse_opens = []
         # per-leg exit state the reverse must clear on a confirmed flatten (codex r6 P1 #5) --
         # seeded non-empty so the test can prove it IS cleared
@@ -380,6 +383,38 @@ _load = inspect.getsource(V16CopyTrader.__mro__[-2]._load_persisted_positions
                           else V16CopyTrader._load_persisted_positions)
 assert "_pending_reverse" in _load, "_load_persisted_positions must restore the reverse intent"
 ok += 3
+
+# ── 13. r6 P1 #3: GENERATION BINDING on the knet stamp. ─────────────────────────────────────────
+# 13a. A stamp bound to a DIFFERENT generation must not authorize this reverse -- otherwise a double
+#      flip binds the current intent to an earlier same-direction flip's authorization.
+eng = StubEngine(leader_pos=-7.0)
+eng._v17_knet_pending = {("0xA", "CHIP"): [(3, _t.time(), False, 99)]}
+pos = mkpos()                                   # intent gen = 1
+reaped = run(eng, pos)
+assert reaped is True and eng._reverse_opens == [], (
+    "a stamp from another generation must never authorize this reverse")
+ok += 2
+
+# 13b. A plain 3-tuple OPEN stamp is not a reverse authorization either.
+eng = StubEngine(leader_pos=-7.0)
+eng._v17_knet_pending = {("0xA", "CHIP"): [(3, _t.time(), False)]}
+pos = mkpos()
+reaped = run(eng, pos)
+assert eng._reverse_opens == [], "an ordinary OPEN stamp is not a reverse authorization"
+ok += 1
+
+# ── 14. r6 P1 #4: DURABILITY ORDERING. The old leg's records must not be retired until the far-side
+#     obligation is durable. Persist failure -> we are flat on the exchange, the old row is retired,
+#     and NOTHING is owed; the dangerous outcome would be retiring the row while believing a
+#     far-side leg is queued.
+eng = StubEngine(leader_pos=-7.0)
+pos = mkpos()
+run(eng, pos)
+# happy path: request queued AND the old leg fully retired, in that order
+assert eng._reverse_opens and eng.removed == [("0xA", "CHIP")], (eng._reverse_opens, eng.removed)
+assert eng.calls.index("remove_persisted") > eng.calls.index("exch_check"), eng.calls
+assert "_pending_reverse" not in pos and "_reverse_attempts" not in pos, pos
+ok += 4
 
 print(f"reverse-EXECUTION self-test PASSED ({ok} assertions, real V16CopyTrader method)")
 print("  covers: happy path + ordering, failed flatten, bounded escalation, exchange-not-flat,")
