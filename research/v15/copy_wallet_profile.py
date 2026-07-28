@@ -176,10 +176,45 @@ def profile(panel: pd.DataFrame, outcome: str) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("abs_spread", ascending=False)
 
 
+def null_reference(panel: pd.DataFrame, outcome: str, n_perm: int = 200, seed: int = 20260728) -> dict:
+    """WHAT DOES NOISE LOOK LIKE. Alberto does not want p-values, but an effect size with no yardstick
+    is unreadable: the smoke test showed a PURE-NOISE attribute hitting 11/13 fold-consistency. So
+    shuffle the outcome WITHIN each fold (destroying any attribute->outcome link while preserving the
+    per-fold return distribution and the panel shape), recompute the whole profile, and record how big
+    a spread / how high a consistency noise alone produces across the same 16 attributes.
+
+    Report an attribute only if it beats this. No hypothesis test, just a ruler."""
+    rng = np.random.default_rng(seed)
+    max_spreads, max_cons, best_cons_spread = [], [], []
+    for _ in range(n_perm):
+        p = panel.copy()
+        p[outcome] = p.groupby("fold_id", observed=True)[outcome].transform(
+            lambda s: s.to_numpy()[rng.permutation(len(s))])
+        r = profile(p, outcome)
+        if r.empty:
+            continue
+        max_spreads.append(float(r["abs_spread"].max()))
+        max_cons.append(float(r["consistency"].max()))
+        top = r.iloc[0]
+        best_cons_spread.append(float(top["consistency"]))
+    if not max_spreads:
+        return {}
+    return {
+        "n_perm": len(max_spreads),
+        # the bar an attribute must clear to be interesting at all
+        "noise_max_abs_spread_p50": float(np.percentile(max_spreads, 50)),
+        "noise_max_abs_spread_p95": float(np.percentile(max_spreads, 95)),
+        "noise_max_consistency_p50": float(np.percentile(max_cons, 50)),
+        "noise_max_consistency_p95": float(np.percentile(max_cons, 95)),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True, help="funnel run dir (holds m07_pretest/ and m07_test/)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--n-perm", type=int, default=200,
+                    help="permutations for the noise yardstick (0 to skip)")
     args = ap.parse_args()
     d = Path(args.dir)
     out_dir = Path(args.out) if args.out else d
@@ -213,15 +248,31 @@ def main():
     }
     log.info("BASELINE (copy an unselected wallet): %s", json.dumps(base, indent=2))
 
-    results = {}
+    nulls = {}
     for outcome in ("test_mean_r", "test_exposure_r"):
         p = profile(panel, outcome)
+        if args.n_perm > 0:
+            nz = null_reference(panel, outcome, n_perm=args.n_perm)
+            nulls[outcome] = nz
+            if nz:
+                # Mark what actually clears the noise bar. This is the column to read.
+                p["beats_noise_p95"] = p["abs_spread"] > nz["noise_max_abs_spread_p95"]
+                p["spread_vs_noise_x"] = p["abs_spread"] / nz["noise_max_abs_spread_p95"]
+                log.info("NOISE YARDSTICK vs %s (%d permutations, outcome shuffled within fold): "
+                         "max |spread| p50=%.6f p95=%.6f | max consistency p50=%.2f p95=%.2f",
+                         outcome, nz["n_perm"], nz["noise_max_abs_spread_p50"],
+                         nz["noise_max_abs_spread_p95"], nz["noise_max_consistency_p50"],
+                         nz["noise_max_consistency_p95"])
         p.to_csv(out_dir / f"profile_attributes_{outcome}.csv", index=False)
-        results[outcome] = p
         log.info("\n=== ATTRIBUTE PROFILE vs %s (ranked by effect size) ===\n%s",
                  outcome, p.to_string(index=False))
+        if "beats_noise_p95" in p.columns:
+            n_beat = int(p["beats_noise_p95"].sum())
+            log.info("vs %s: %d/%d attributes clear the noise p95 bar%s", outcome, n_beat, len(p),
+                     "" if n_beat else "  <-- NOTHING beats noise; there is no profile on this axis")
 
-    (out_dir / "profile_baseline.json").write_text(json.dumps(base, indent=2))
+    (out_dir / "profile_baseline.json").write_text(
+        json.dumps({"baseline": base, "noise_reference": nulls}, indent=2))
     log.info("wrote profile_panel.parquet + profile_attributes_*.csv + profile_baseline.json -> %s",
              out_dir)
 
