@@ -1221,9 +1221,28 @@ def main():
                          "(BH-FDR) and writes m06b_confirmed.parquet. Needs the full-fold action bootstrap.")
     ap.add_argument("--fee-schedule-version", default=None)
     ap.add_argument("--slippage-calibration-version", default=None)
+    # OOS-gate overrides (2026-07-28). The M6bManifest defaults are the temporary FLOOR (2 folds /
+    # 30 journeys) chosen when only 3 OOS folds existed; the docstring says the CODEX STANDARD is
+    # 4 folds / 50 journeys "once the FULL 12-fold action bootstrap exists". The 13-fold calendar now
+    # exists, so the standard must be settable WITHOUT editing the dataclass (which would silently
+    # re-gate every other caller). Defaults None -> manifest defaults unchanged.
+    ap.add_argument("--oos-min-folds", type=int, default=None)
+    ap.add_argument("--oos-min-journeys-pooled", type=int, default=None)
+    ap.add_argument("--oos-min-frac-folds-pos", type=float, default=None)
+    ap.add_argument("--oos-margin", type=float, default=None)
+    ap.add_argument("--fdr-q", type=float, default=None)
     args = ap.parse_args()
+    _over = {k: v for k, v in (
+        ("oos_min_folds", args.oos_min_folds),
+        ("oos_min_journeys_pooled", args.oos_min_journeys_pooled),
+        ("oos_min_frac_folds_pos", args.oos_min_frac_folds_pos),
+        ("oos_margin", args.oos_margin),
+        ("fdr_q", args.fdr_q),
+    ) if v is not None}
     m = M6bManifest(fee_schedule_version=args.fee_schedule_version,
-                    slippage_calibration_version=args.slippage_calibration_version)
+                    slippage_calibration_version=args.slippage_calibration_version, **_over)
+    if _over:
+        logger.info("M6b OOS-gate overrides: %s", _over)
     inputs = load_inputs(
         Path(args.m07_dir), data_dir=Path(args.data_dir),
         m04_dir=Path(args.m04_dir) if args.m04_dir else None,
