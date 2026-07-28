@@ -59,7 +59,7 @@ SCRIPT="strategies/live/hl_copy_trader_v17.py"
 # Alberto capital GO TG10911/10913/10914/10916/10917 (150/order, waive codex, 5x lev, fail-fast). Ledger:
 # brain projects/quant/copy/2026-07-06-gate1-golive-validation-ledger. NOTE for CoS: plist UNCHANGED; only
 # this launcher repointed (established pattern). Supervised takeover needs halt flags removed + daemon loaded.
-ARGS="--config config/copy_trader_econ20_20260724.json"   # 2026-07-24 (quant): 8 active double-validated wallets (12-fold sim OOS + real PnL/Calmar + live<=7d). Revert prior: config/copy_trader_wallets_gate1_v4.json
+ARGS="--config config/copy_trader_totalreturn5_20260726.json"   # 2026-07-26 (quant): TOTAL-RETURN 5 roster. No alpha/benchmark -- return from leaders own fills. Screen: hold<2d + positive total return net of our fee + not-martingale + p95 MAE<=300 + p99 MAE<=600 => 285; then recency<=14d (143/285 were DEAD) + operator-correlation (4 earlier picks were ONE operator, dead since May) => 96; final 5 on distinct coin sets. Alberto GO TG 11861. Revert prior: config/copy_trader_printalpha3_20260726.json
 
 cd "$WORKDIR"
 

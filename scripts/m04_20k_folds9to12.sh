@@ -1,0 +1,48 @@
+#!/bin/bash
+# m04 authenticity at 20k scale for folds 9-12 — the OVERNIGHT job that extends the profile from
+# "Jan 26 - May 18" to "Jan 26 - Jul 13".
+#
+# WHY: today's profile rests on folds 1-8, whose TEST windows end 2026-05-18. Alberto wants to copy
+# NOW. If the attribute->outcome relationship is structural it will hold, but that has to be shown on
+# recent ground, not assumed. The M02 store already reaches 2026-07-13, so folds 9-12 are available
+# data-wise; only M4 is missing (f1..f8 already exist at 20k and are provenance-verified via as_of_ms).
+#
+# Fold 12's test window is [2026-06-29, 2026-07-13) = exactly the store edge. Fold 13 would need data
+# to 2026-07-27 and is NOT possible from this store.
+#
+# COST: unverified. m04 on 1,630 wallets took 11.5 min (first fold, cold) / 3.5-8 min (warm). STAGE A
+# is per-wallet, so 20,378/1,630 = 12.5x implies ~2.4h/fold => ~9.6h for four folds. MEASURE fold 9
+# before assuming the rest; do not report an ETA off the extrapolation alone.
+#
+# RUN ONLY WHEN M7 IS DONE — it needs the RAM (plan_memory_budget will abort rather than thrash, and
+# last night's lesson was that a second concurrent worker made everything SLOWER, not faster).
+set -u
+cd /Users/hermes/quants-lab
+PY=/Users/hermes/miniforge3/envs/quants-lab/bin/python
+OUT=app/data/v15
+W=$OUT/m01_universe_20k_wallets.txt
+LOG=/tmp/ql_m04_20k_f9to12.log
+
+# fold_id:as_of  (as_of = that fold's test_start; start 2025-12-01, 42d train / 14d val / 14d test, step 14d)
+FOLDS="9:2026-05-18 10:2026-06-01 11:2026-06-15 12:2026-06-29"
+
+echo "=== m04 20k folds 9-12 start $(date -u +%FT%TZ) ===" >> "$LOG"
+printf '%s\n' $FOLDS | while read -r pair; do
+  fid="${pair%%:*}"; asof="${pair##*:}"
+  o="$OUT/m04_authenticity_f${fid}.parquet"
+  e="$OUT/m04_entities_f${fid}.parquet"
+  if [ -s "$o" ] && [ -s "$e" ]; then echo "[f$fid] SKIP (exists)" >> "$LOG"; continue; fi
+  echo "[f$fid] as-of $asof START $(date -u +%FT%TZ)" >> "$LOG"
+  $PY research/v15/v15_m04_authenticity.py \
+    --wallets-file "$W" --as-of "$asof" \
+    --out "$o" --entities-out "$e" \
+    --procs 1 --per-worker-gb 1.5 --headroom-gb 0.5 >> "$LOG" 2>&1
+  rc=$?
+  echo "[f$fid] rc=$rc END $(date -u +%FT%TZ)" >> "$LOG"
+  [ $rc -ne 0 ] && { echo "[f$fid] FAILED - stopping (fail closed)" >> "$LOG"; exit 1; }
+done
+echo "=== m04 20k folds 9-12 done $(date -u +%FT%TZ) ===" >> "$LOG"
+
+# NOTE: these land in app/data/v15/ alongside f1..f8, so the funnel20k run dir's symlinks pick them up.
+# Extending the funnel to 12 folds then needs: m03 --n-folds 12 -> m05 -> a fresh profile seat sample
+# -> m07 both windows. Do NOT reuse the 8-fold m05/shortlist against a 12-fold m03.
