@@ -660,11 +660,17 @@ class CopyTrader:
         # position dict does NOT persist it. The reverse intent and its attempt counter were being
         # dropped on every restart -- the "durable latch" was in-memory only, exactly the defect the
         # intent design was supposed to remove. Carry both.
+        update = {"$set": doc}
         if pos.get("_pending_reverse"):
             doc["_pending_reverse"] = pos["_pending_reverse"]
             doc["_reverse_attempts"] = pos.get("_reverse_attempts", 0)
+        else:
+            # $unset, not merely "omit from $set" (codex r4 P1 #4). Popping the key in memory left
+            # the field in the document, so a restart restored an ABANDONED reverse alongside the
+            # _force_exit that replaced it -- and _check_exits prioritises _pending_reverse.
+            update["$unset"] = {"_pending_reverse": "", "_reverse_attempts": ""}
         try:
-            self.db[DB_OPEN_POSITIONS].update_one(key, {"$set": doc}, upsert=True)
+            self.db[DB_OPEN_POSITIONS].update_one(key, update, upsert=True)
         except Exception as e:
             logger.warning(f"Failed to persist position {pos['coin']}: {e}")
 
@@ -1731,7 +1737,13 @@ class CopyTrader:
         for payload in payloads:
             r = requests.post(f"{HL_API}/info", json=payload, timeout=5)
             r.raise_for_status()
-            for ap in r.json().get("assetPositions", []):
+            body = r.json()
+            # A 200 with a malformed body ({}, {"error": ...}, anything without assetPositions) is
+            # NOT an empty book (codex r4 P1 #5). Absence of the field must raise, not read as flat,
+            # because 0.0 here authorises opening opposite risk.
+            if not isinstance(body, dict) or "assetPositions" not in body:
+                raise RuntimeError(f"clearinghouseState missing assetPositions: {str(body)[:120]}")
+            for ap in body.get("assetPositions", []):
                 pp = ap["position"]
                 if pp["coin"] == coin:
                     total += float(pp["szi"])
@@ -5331,16 +5343,19 @@ class V16CopyTrader(CopyTrader):
             # Reload anything a crash or restart left behind. The position row is deliberately gone
             # by this point, so this collection is the only record of the obligation.
             if not self.shadow_mode and not getattr(self, "_reverse_opens_loaded", False):
-                self._reverse_opens_loaded = True
                 try:
                     self._reverse_opens = [
                         {k: v for k, v in d.items() if k != "_id"}
                         for d in self.db[DB_PENDING_REVERSE].find()]
+                    # Latch only AFTER a SUCCESSFUL read (codex r4 P2): setting it first meant a
+                    # single transient Mongo error disabled recovery for the whole process life.
+                    self._reverse_opens_loaded = True
                     if self._reverse_opens:
                         logger.warning(f"REVERSE: recovered {len(self._reverse_opens)} pending "
                                        f"far-side open(s) from a previous run")
                 except Exception as e:
-                    logger.warning(f"REVERSE: could not reload pending far-side opens ({e})")
+                    logger.warning(f"REVERSE: could not reload pending far-side opens ({e}) -- "
+                                   f"will retry next cycle")
             if not self._reverse_opens:
                 return
 
@@ -5355,7 +5370,20 @@ class V16CopyTrader(CopyTrader):
                 else:
                     logger.warning(f"REVERSE {c} {w[:10]}: a leg on the OLD side reappeared before "
                                    f"the far-side entry -- abandoning the request")
-                self._clear_pending_reverse(w, c)
+                if not self._clear_pending_reverse(w, c, req.get("gen")):
+                    keep.append(req)          # Mongo delete failed: do NOT drift, retry the clear
+                continue
+
+            # REVALIDATE DIRECTION against the tracker (codex r4 P1 #3): the captured `is_buy` was
+            # correct when the flatten completed, but a leader who flipped back since then must not
+            # be chased onto a side they have left.
+            cur = self._v16_leader_pos.get((w, c), 0.0)
+            mid = self.mid_prices.get(c, 0) or 0
+            if mid <= 0 or abs(cur) * mid < self.reverse_min_notional or (cur > 0) != want_buy:
+                logger.info(f"REVERSE {c} {w[:10]}: leader is now {cur:+.4f} -- the queued "
+                            f"{'LONG' if want_buy else 'SHORT'} is stale, dropping it and staying flat")
+                if not self._clear_pending_reverse(w, c, req.get("gen")):
+                    keep.append(req)
                 continue
 
             req["attempts"] = int(req.get("attempts", 0)) + 1
@@ -5363,11 +5391,14 @@ class V16CopyTrader(CopyTrader):
                 logger.error(f"REVERSE {c} {w[:10]}: far-side entry never took after "
                              f"{req['attempts'] - 1} attempts -- giving up, staying flat")
                 _tg(f"REVERSE {c}: far-side entry failed x{req['attempts'] - 1}, staying flat")
-                self._clear_pending_reverse(w, c)
+                if not self._clear_pending_reverse(w, c, req.get("gen")):
+                    keep.append(req)
                 continue
 
             try:
-                await self._enter_position(c, want_buy, wallet=w)
+                # knet carried on the request, so retries and restart-recovered requests are
+                # authorized by the SAME signal-time value the first attempt used.
+                await self._enter_position(c, want_buy, wallet=w, knet_override=req.get("knet"))
             except Exception as e:
                 logger.error(f"REVERSE {c} {w[:10]}: far-side entry raised {e}", exc_info=True)
             # Do NOT drop the request here. `_enter_position` reports no success status, so the only
@@ -5382,13 +5413,28 @@ class V16CopyTrader(CopyTrader):
             keep.append(req)
         self._reverse_opens = keep
 
-    def _clear_pending_reverse(self, wallet: str, coin: str) -> None:
+    def _clear_pending_reverse(self, wallet: str, coin: str, gen=None) -> bool:
+        """Retire a durable far-side request. COMPARE-AND-DELETE on `gen` (codex r4 P1 #2): a newer
+        flip supersedes an older one, and an older request must never delete the newer obligation.
+
+        Returns True if memory may drop the request. On a Mongo failure it returns False so the
+        caller KEEPS it in memory rather than drifting out of sync with the durable record (r4 P2).
+        """
+        self._reverse_opens = [r for r in self._reverse_opens
+                               if not (r["wallet"] == wallet and r["coin"] == coin
+                                       and (gen is None or r.get("gen") == gen))]
         if self.shadow_mode:
-            return
+            return True
+        q = {"wallet": wallet, "coin": coin}
+        if gen is not None:
+            q["gen"] = gen
         try:
-            self.db[DB_PENDING_REVERSE].delete_one({"wallet": wallet, "coin": coin})
+            self.db[DB_PENDING_REVERSE].delete_one(q)
+            return True
         except Exception as e:
-            logger.warning(f"REVERSE {coin}: could not clear pending far-side record ({e})")
+            logger.warning(f"REVERSE {coin}: could not clear pending far-side record ({e}) -- "
+                           f"keeping it in memory so the two cannot drift")
+            return False
 
     async def _execute_pending_reverse(self, pos: dict) -> bool:
         """Flatten a leg carrying a `_pending_reverse` intent. Returns True if it may be REAPED.
@@ -5407,6 +5453,24 @@ class V16CopyTrader(CopyTrader):
         intent = pos.get('_pending_reverse') or {}
         attempts = int(pos.get('_reverse_attempts', 0)) + 1
         pos['_reverse_attempts'] = attempts
+
+        # STALE-INTENT CANCEL (codex r4 P1 #3). The flatten used to fire before the leader was ever
+        # consulted, so a restart-recovered intent -- or one whose leader flipped BACK while we were
+        # deferred -- closed a position that was correctly aligned, then tried to reopen it. Check
+        # first: if the leader is once again on the side we are holding, the reverse is void.
+        cur_leader = self._v16_leader_pos.get((wallet, coin), 0.0)
+        held_long = (pos.get('side') == 'BUY')
+        if cur_leader != 0 and (cur_leader > 0) == held_long:
+            logger.info(f"REVERSE {coin} {wallet[:10]}: leader is back on our side "
+                        f"({cur_leader:+.4f}, we are {'LONG' if held_long else 'SHORT'}) -- "
+                        f"cancelling the stale reverse intent, keeping the leg")
+            pos.pop('_pending_reverse', None)
+            pos.pop('_reverse_attempts', None)
+            try:
+                self._persist_position(pos)
+            except Exception:
+                pass
+            return False
 
         # LEG LOCK (codex r3 P1 #2). _converge_add_once is still a background task and holds this
         # lock across its entry order, so without taking it here an add already in flight can fill
@@ -5454,15 +5518,23 @@ class V16CopyTrader(CopyTrader):
             logger.warning(f"REVERSE {coin}: exchange confirm failed ({exc}) -- retrying next cycle")
             return False
         if abs(exch_sz) > 1e-10:
-            # Another wallet's leg on the same coin is legitimate; only OUR side matters, and we
-            # cannot distinguish them from the net. Refuse to add opposite risk on top of a non-flat
-            # coin: missing the reverse is the cheap failure.
+            # The residual may be another wallet's leg on the same coin, or it may be OUR failed
+            # close -- the net does not distinguish them (codex r4 P1 #6). The earlier version
+            # reaped the row and DELETED persistence here, which drops tracking of real exchange
+            # exposure. Keep the position tracked and hand it to the force-exit machinery instead;
+            # abandoning the far side is the cheap half of this failure, losing the leg is not.
             logger.error(f"REVERSE {coin} {wallet[:10]}: exit reported success but exchange still "
-                         f"shows {exch_sz:+.6f} on this coin -- NOT opening the far side")
-            _tg(f"REVERSE {coin}: exchange not flat after exit ({exch_sz:+.6f}), far side skipped")
+                         f"shows {exch_sz:+.6f} on this coin -- NOT opening the far side, "
+                         f"latching _force_exit and KEEPING the position tracked")
+            _tg(f"REVERSE {coin}: exchange not flat after exit ({exch_sz:+.6f}), force-exit latched")
             pos.pop('_pending_reverse', None)
-            self._remove_persisted_position(wallet, coin)
-            return True
+            pos.pop('_reverse_attempts', None)
+            pos['_force_exit'] = True
+            try:
+                self._persist_position(pos)
+            except Exception:
+                pass
+            return False
 
         # FLAT AND CONFIRMED. Drop the persisted row now; the far-side entry will upsert its own
         # AFTER the list rebuild, so the two cannot collide on the (wallet, coin) key.
@@ -5482,8 +5554,14 @@ class V16CopyTrader(CopyTrader):
             logger.info(f"REVERSE {coin} {wallet[:10]}: leader now {cur:+.4f} "
                         f"(${abs(cur) * mid:,.0f}) -- under the floor after flatten, staying flat")
             return True
+        # Capture the SIGNAL-TIME knet now, onto the obligation, so every retry and any restart
+        # recovery carries the same authorization the first attempt had.
+        try:
+            knet_at_signal = self._v17_knet(coin, cur > 0, wallet, mid)
+        except Exception:
+            knet_at_signal = None
         req = {"wallet": wallet, "coin": coin, "is_buy": cur > 0, "gen": intent.get("gen"),
-               "attempts": 0, "created_ts": time.time()}
+               "knet": knet_at_signal, "attempts": 0, "created_ts": time.time()}
         # PERSIST FIRST, then queue in memory. The position row is already gone at this point, so
         # this collection is the ONLY record that we owe an opposite-side leg; a crash between here
         # and the drain would otherwise lose the reverse silently.
@@ -5495,6 +5573,8 @@ class V16CopyTrader(CopyTrader):
                 logger.error(f"REVERSE {coin}: FAILED to persist the far-side request ({e}) -- "
                              f"not queueing, we stay flat rather than owe an untracked leg")
                 return True
+        self._reverse_opens = [r for r in self._reverse_opens
+                               if not (r["wallet"] == wallet and r["coin"] == coin)]
         self._reverse_opens.append(req)
         logger.info(f"REVERSE {coin} {wallet[:10]}: flat confirmed, far side "
                     f"{'LONG' if cur > 0 else 'SHORT'} queued for this cycle")
@@ -6559,7 +6639,8 @@ class V17CopyTrader(V16CopyTrader):
     # ── order path: gate + caps + seed/staleness kills, then defer to V16 (whitelist) ──
     async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None,
                               skip_cooldown: bool = False, backfill: bool = False,
-                              notional_override: float = None, converge: bool = False):
+                              notional_override: float = None, converge: bool = False,
+                              knet_override: float = None):
         # converge=True (leader ADD mirroring only): skip ONLY the knet stamp block. Rationale: knet
         # counts how many OTHER cohort wallets currently hold this coin on this side, and exists to
         # gate opening NEW risk on a coin we are not in. For an ADD, that question was asked and
@@ -6615,8 +6696,13 @@ class V17CopyTrader(V16CopyTrader):
         # and non-signal paths must not open NEW risk). For backfill: do NOT even read _v17_knet_pending
         # (q=None => stamp never consumed, so a concurrently-pending REAL signal is untouched), k stays
         # None, and both the no-stamp reject and the knet-min gate below are skipped.
-        q = self._v17_knet_pending.get((wallet, coin)) if not (backfill or converge) else None
-        k = None
+        # REVERSE re-entry carries its SIGNAL-TIME knet on the durable request (codex r4 P1 #1).
+        # Without this, retries 2-5 and every Mongo-recovered request hit NO-STAMP REJECT, because
+        # the FIFO stamp is volatile and was consumed by attempt 1 (and is empty after a restart) --
+        # so the durable queue could never actually deliver a leg.
+        q = self._v17_knet_pending.get((wallet, coin)) if not (
+            backfill or converge or knet_override is not None) else None
+        k = knet_override
         while q:
             cand = q.pop(0)
             # Direction must match. A stamp minted for the OTHER side is not evidence about this
@@ -6629,7 +6715,7 @@ class V17CopyTrader(V16CopyTrader):
                 break
         if q is not None and not q:
             self._v17_knet_pending.pop((wallet, coin), None)
-        if k is None and not (backfill or converge):
+        if k is None and not (backfill or converge or knet_override is not None):
             self._v17_stale_rejects += 1
             logger.warning(f"V17 NO-STAMP REJECT: {coin} {'BUY' if is_buy else 'SELL'} wallet={wallet} "
                            f"(no fresh signal-time knet; non-signal entries do not open risk)")

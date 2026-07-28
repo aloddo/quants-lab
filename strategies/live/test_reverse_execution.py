@@ -136,10 +136,14 @@ ok += 3
 eng = StubEngine(exit_ok=True, exch_after_exit=3.5)
 pos = mkpos()
 reaped = run(eng, pos)
-assert reaped is True, "the leg is done with as far as this engine is concerned"
+# codex r4 P1 #6: the residual may be another wallet's leg OR our own failed close -- the net does
+# not distinguish them. Reaping and deleting persistence here dropped tracking of real exchange
+# exposure. Keep it tracked and hand it to force-exit; abandoning the far side is the cheap half.
+assert reaped is False, "must NOT reap a leg while the exchange still shows size on the coin"
+assert pos.get("_force_exit") is True, "must latch force-exit on an unproven flat"
 assert eng._reverse_opens == [], "NEVER open the far side while the exchange shows size on the coin"
-assert eng.removed == [("0xA", "CHIP")], eng.removed
-ok += 3
+assert eng.removed == [], "must not delete persistence for a leg that may still be live"
+ok += 4
 
 # 3b. Exchange check RAISES -> fail closed: not reaped, retried next cycle, nothing opened.
 eng = StubEngine(exit_ok=True, exch_raises=True)
@@ -164,11 +168,24 @@ ok += 3
 # ── 5. DOUBLE FLIP: the leader is re-read at execution time, so a stale intent cannot win. ──────
 #     The intent says target_long=False (leader went short) but by the time the flatten completes
 #     the leader is LONG again. Last-writer-wins on the tracker is the correct semantics.
+#     We hold a LONG. Intent said the leader went short. If by execution time the leader is LONG
+#     again, the reverse is VOID -- codex r4 P1 #3: the old code flattened first and consulted the
+#     leader afterwards, so it closed a correctly-aligned leg and then tried to reopen it.
 eng = StubEngine(leader_pos=+7.0)
+pos = mkpos()                                  # pos side BUY, leader now +7 -> aligned
+reaped = run(eng, pos)
+assert reaped is False, "an aligned leg must be KEPT, not flattened"
+assert "exit" not in eng.calls, "must not flatten a leg the leader is back on"
+assert "_pending_reverse" not in pos, "the stale intent must be cancelled"
+assert eng._reverse_opens == [], eng._reverse_opens
+ok += 4
+
+# 5b. Leader flipped the OTHER way (we are LONG, leader now SHORT harder) -> genuine reverse, and
+#     the far side follows the CURRENT tracker value.
+eng = StubEngine(leader_pos=-7.0)
 pos = mkpos()
 run(eng, pos)
-assert eng._reverse_opens[0]["is_buy"] is True, (
-    "must open the side the leader is on NOW, not the one captured when the intent was written")
+assert eng._reverse_opens[0]["is_buy"] is False, eng._reverse_opens
 ok += 1
 
 # ── 6. LEADER BACK UNDER THE FLOOR after the flatten -> stay flat, do not open a sub-floor leg. ──
@@ -184,6 +201,16 @@ pos = mkpos()
 reaped = run(eng, pos)
 assert reaped is True and eng._reverse_opens == [], eng._reverse_opens
 ok += 2
+
+# 6c. knet is captured onto the durable request at flatten time, so retries and restart-recovered
+#     requests carry the SAME signal-time authorization (codex r4 P1 #1: without it, attempts 2-5
+#     and every recovered request hit NO-STAMP REJECT and the queue could never deliver a leg).
+eng = StubEngine(leader_pos=-7.0)
+eng._v17_knet = lambda coin, is_buy, wallet, px: 3
+pos = mkpos()
+run(eng, pos)
+assert eng._reverse_opens[0]["knet"] == 3, eng._reverse_opens
+ok += 1
 
 # ══ ROUND-3 REGRESSIONS (codex r3 P1 #1-#4) ═════════════════════════════════════════════════════
 
