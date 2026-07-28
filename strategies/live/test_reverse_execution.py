@@ -38,6 +38,10 @@ class StubEngine:
         # than recomputing one (codex r5 P1 #1), so the stub must provide it.
         self._v17_knet_pending = {("0xA", "CHIP"): [(3, __import__("time").time(), leader_pos > 0)]}
         self._reverse_opens = []
+        # per-leg exit state the reverse must clear on a confirmed flatten (codex r6 P1 #5) --
+        # seeded non-empty so the test can prove it IS cleared
+        self._position_accumulated = {("0xA", "CHIP"): 4321.0}
+        self._exit_twap_buffer = {("0xA", "CHIP"): {"reverse_notional": 999.0}}
         # call log, so ORDERING is assertable -- ordering is what every prior version got wrong
         self.calls = []
         self.persisted = {}
@@ -246,6 +250,52 @@ eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 
 asyncio.run(eng._drain_reverse_opens())
 assert eng.entered == [], "must not open the far side once the coin is no longer flat"
 ok += 1
+
+# ── 10. r6 P1 #5: a confirmed flatten must clear the per-leg exit state. ────────────────────────
+#     Every other full-exit caller pops these two maps. The reverse did not, so a reopened leg
+#     computed its close ratio against the PREVIOUS leg's accumulated notional -- the inflated
+#     denominator behind the 2026-07-27 orphans, reintroduced through the back door. Active even
+#     with copy_reverse_enabled=False, because the flatten still runs.
+eng = StubEngine(leader_pos=-7.0)
+pos = mkpos()
+run(eng, pos)
+assert eng._position_accumulated.get(("0xA", "CHIP")) is None, eng._position_accumulated
+assert eng._exit_twap_buffer.get(("0xA", "CHIP")) is None, eng._exit_twap_buffer
+ok += 2
+
+# ── 11. r6 P1 #1+#2: SINGLE-LEG PRECONDITION. HL nets by COIN, so an account-level read cannot
+#     prove OUR leg is flat while another roster wallet holds the same coin. Declined explicitly
+#     rather than deferred forever (dead-end) or force-exited against the aggregate net (which
+#     could close the OTHER wallet's position).
+eng = StubEngine(leader_pos=-7.0)
+pos = mkpos()
+eng.positions = [pos, {"coin": "CHIP", "wallet": "0xB", "filled": True, "side": "BUY", "size": 5.0}]
+reaped = run(eng, pos)
+assert reaped is False, "must not reap a leg it declined to flatten"
+assert "exit" not in eng.calls, "must NOT flatten when per-wallet flatness is unprovable"
+assert "_pending_reverse" not in pos, "the intent is declined, not left pending forever"
+assert eng._reverse_opens == [], eng._reverse_opens
+ok += 4
+
+# 11b. A single roster leg on the coin proceeds normally.
+eng = StubEngine(leader_pos=-7.0)
+pos = mkpos()
+eng.positions = [pos]
+reaped = run(eng, pos)
+assert "exit" in eng.calls and reaped is True, eng.calls
+ok += 2
+
+# ── 12. r6 P1 #6: attempts bound ORDER SUBMISSIONS, not cycles. Transient pre-order REST failures
+#     must not burn the budget without an order ever being sent.
+eng = StubEngine(leader_pos=-7.0)
+eng._exch_raises = True
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert eng.entered == [], "no order was submitted"
+assert eng._reverse_opens and eng._reverse_opens[0]["attempts"] == 0, (
+    "a failed pre-order read must NOT consume an order attempt")
+ok += 2
 
 # ══ ROUND-3 REGRESSIONS (codex r3 P1 #1-#4) ═════════════════════════════════════════════════════
 

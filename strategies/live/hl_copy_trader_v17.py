@@ -5352,9 +5352,11 @@ class V16CopyTrader(CopyTrader):
                     for bad in [r for r in recovered if r.get("gen") is None]:
                         logger.error(f"REVERSE: dropping generationless pending record "
                                      f"{bad.get('coin')} {str(bad.get('wallet'))[:10]}")
-                        self.db[DB_PENDING_REVERSE].delete_one(
+                        # match BOTH shapes: field absent, and field explicitly null. The previous
+                        # $exists-only predicate left a `gen: null` document durable forever.
+                        self.db[DB_PENDING_REVERSE].delete_many(
                             {"wallet": bad.get("wallet"), "coin": bad.get("coin"),
-                             "gen": {"$exists": False}})
+                             "$or": [{"gen": {"$exists": False}}, {"gen": None}]})
                     # Latch only AFTER a SUCCESSFUL read (codex r4 P2): setting it first meant a
                     # single transient Mongo error disabled recovery for the whole process life.
                     self._reverse_opens_loaded = True
@@ -5378,6 +5380,7 @@ class V16CopyTrader(CopyTrader):
                 else:
                     logger.warning(f"REVERSE {c} {w[:10]}: a leg on the OLD side reappeared before "
                                    f"the far-side entry -- abandoning the request")
+                    _tg(f"REVERSE {c}: far side ABANDONED, a leg reappeared on the old side")
                 if not self._clear_pending_reverse(w, c, req.get("gen")):
                     keep.append(req)          # Mongo delete failed: do NOT drift, retry the clear
                 continue
@@ -5390,15 +5393,7 @@ class V16CopyTrader(CopyTrader):
             if mid <= 0 or abs(cur) * mid < self.reverse_min_notional or (cur > 0) != want_buy:
                 logger.info(f"REVERSE {c} {w[:10]}: leader is now {cur:+.4f} -- the queued "
                             f"{'LONG' if want_buy else 'SHORT'} is stale, dropping it and staying flat")
-                if not self._clear_pending_reverse(w, c, req.get("gen")):
-                    keep.append(req)
-                continue
-
-            req["attempts"] = int(req.get("attempts", 0)) + 1
-            if req["attempts"] > 5:
-                logger.error(f"REVERSE {c} {w[:10]}: far-side entry never took after "
-                             f"{req['attempts'] - 1} attempts -- giving up, staying flat")
-                _tg(f"REVERSE {c}: far-side entry failed x{req['attempts'] - 1}, staying flat")
+                _tg(f"REVERSE {c}: far side dropped, leader moved to {cur:+.4f}")
                 if not self._clear_pending_reverse(w, c, req.get("gen")):
                     keep.append(req)
                 continue
@@ -5410,6 +5405,7 @@ class V16CopyTrader(CopyTrader):
                 logger.info(f"REVERSE {c} {w[:10]}: signal-time knet is stale "
                             f"({'missing' if kts is None else f'{time.time() - kts:.0f}s'}) -- "
                             f"dropping the far-side request, staying flat")
+                _tg(f"REVERSE {c}: far side ABANDONED, signal-time knet stale")
                 if not self._clear_pending_reverse(w, c, req.get("gen")):
                     keep.append(req)
                 continue
@@ -5420,7 +5416,7 @@ class V16CopyTrader(CopyTrader):
             # that window -- and _enter_position treats another wallet's leg on the coin as
             # permission to open a NEW position rather than a reason to refuse.
             try:
-                exch_now = self._exchange_position_size_strict(c)
+                exch_now = await asyncio.to_thread(self._exchange_position_size_strict, c)
             except Exception as exc:
                 logger.warning(f"REVERSE {c} {w[:10]}: pre-order flat check failed ({exc}) -- "
                                f"retrying next cycle")
@@ -5429,6 +5425,22 @@ class V16CopyTrader(CopyTrader):
             if abs(exch_now) > 1e-10:
                 logger.warning(f"REVERSE {c} {w[:10]}: coin is no longer flat ({exch_now:+.6f}) at "
                                f"order time -- far side NOT opened")
+                _tg(f"REVERSE {c}: far side ABANDONED, coin not flat at order time "
+                    f"({exch_now:+.6f})")
+                if not self._clear_pending_reverse(w, c, req.get("gen")):
+                    keep.append(req)
+                continue
+
+            # ATTEMPT COUNTING, here and nowhere earlier (codex r6 P1 #6): it bounds ORDER
+            # SUBMISSIONS, not cycles. When this sat above the TTL and flat checks, five transient
+            # REST failures exhausted the budget and abandoned the reverse without a single order
+            # ever having been sent. Every precondition has now passed, so this cycle really is an
+            # attempt.
+            req["attempts"] = int(req.get("attempts", 0)) + 1
+            if req["attempts"] > 5:
+                logger.error(f"REVERSE {c} {w[:10]}: far-side entry never took after "
+                             f"{req['attempts'] - 1} attempts -- giving up, staying flat")
+                _tg(f"REVERSE {c}: far-side entry failed x{req['attempts'] - 1}, staying flat")
                 if not self._clear_pending_reverse(w, c, req.get("gen")):
                     keep.append(req)
                 continue
@@ -5493,6 +5505,31 @@ class V16CopyTrader(CopyTrader):
         attempts = int(pos.get('_reverse_attempts', 0)) + 1
         pos['_reverse_attempts'] = attempts
 
+        # SINGLE-LEG PRECONDITION (codex r6 P1 #1 + #2). Hyperliquid nets by COIN, so
+        # `_exchange_position_size_strict` returns the ACCOUNT's net on this coin, not this wallet's
+        # leg. If another roster wallet also holds the coin, that number can never go to zero and
+        # every downstream guarantee built on it is false: the residual becomes unattributable
+        # (and the old code would have force-exited it, trading against the aggregate net and
+        # potentially closing the OTHER wallet's position), and the pre-order flat proof becomes a
+        # permanent dead-end rather than a delay. State the precondition instead of patching the
+        # symptoms: reverse only where our own book holds exactly one leg on the coin.
+        same_coin = [p for p in self.positions
+                     if p.get('coin') == coin and p.get('filled') and not p.get('_ws_exited')]
+        if len(same_coin) > 1:
+            holders = sorted({str(p.get('wallet'))[:10] for p in same_coin})
+            logger.warning(f"REVERSE {coin} {wallet[:10]}: {len(same_coin)} roster legs on this coin "
+                           f"({', '.join(holders)}) -- flatness is unprovable per-wallet on a "
+                           f"coin-netted venue, so the reverse is DECLINED, not deferred")
+            _tg(f"REVERSE {coin}: declined, {len(same_coin)} roster legs on the coin "
+                f"(per-wallet flat is unprovable on HL)")
+            pos.pop('_pending_reverse', None)
+            pos.pop('_reverse_attempts', None)
+            try:
+                self._persist_position(pos)
+            except Exception:
+                pass
+            return False
+
         # STALE-INTENT CANCEL (codex r4 P1 #3). The flatten used to fire before the leader was ever
         # consulted, so a restart-recovered intent -- or one whose leader flipped BACK while we were
         # deferred -- closed a position that was correctly aligned, then tried to reopen it. Check
@@ -5552,7 +5589,10 @@ class V16CopyTrader(CopyTrader):
         # when the tracked side merely disagrees with an already-opposite net position, which is NOT
         # the same as flat). Hard Rule 8: the exchange is the source of truth for positions.
         try:
-            exch_sz = self._exchange_position_size_strict(coin)
+            # OFF the event loop (codex r6 P1 #7): this is synchronous `requests` work, up to 3
+            # sequential calls at a 5s timeout. Awaiting it inline blocked the websocket reader and
+            # every other task for as long as 15s per reverse.
+            exch_sz = await asyncio.to_thread(self._exchange_position_size_strict, coin)
         except Exception as exc:
             logger.warning(f"REVERSE {coin}: exchange confirm failed ({exc}) -- retrying next cycle")
             return False
@@ -5582,6 +5622,13 @@ class V16CopyTrader(CopyTrader):
         # FLAT AND CONFIRMED. Drop the persisted row now; the far-side entry will upsert its own
         # AFTER the list rebuild, so the two cannot collide on the (wallet, coin) key.
         self._remove_persisted_position(wallet, coin)
+        # Clear the per-leg exit state, exactly as every other full-exit caller does (codex r6 P1
+        # #5). Without this a reopened leg inherits the OLD leg's accumulated notional, so its close
+        # ratio is computed against the wrong denominator -- the inflated-denominator bug behind the
+        # 2026-07-27 orphans, reintroduced through the back door.
+        acc_key = (wallet, coin)
+        self._position_accumulated.pop(acc_key, None)
+        self._exit_twap_buffer.pop(acc_key, None)
         pos.pop('_pending_reverse', None)
 
         if not self.copy_reverse_enabled:
