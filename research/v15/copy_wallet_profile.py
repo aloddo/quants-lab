@@ -45,10 +45,27 @@ MIN_POS_TEST = 3        # positions needed in the test window to score it
 N_BUCKETS = 5
 
 
-def _read_parts(p: Path) -> pd.DataFrame | None:
-    """ShardedParquetWriter may emit either one file or a .parts dir."""
+# Only the columns each stage actually consumes. The pretest positions frame is ~3M rows; reading all
+# 20 columns and then .copy()-ing it inside describe() is a needless multi-GB peak on a box that has
+# been sitting at ~2.7GB free (CLAUDE.md Key Rule 8).
+DESCRIBE_COLS = ["entity_id", "fold_id", "coin", "side", "entry_ts", "exit_ts", "peak_notional",
+                 "realized_pnl_after_cost", "r_i", "n_addon", "n_trim", "underwater_add_ratio",
+                 "mae", "mfe", "mfe_giveback", "time_underwater", "close_reason"]
+SCORE_COLS = ["entity_id", "fold_id", "r_i", "peak_notional", "realized_pnl_after_cost"]
+
+
+def _read_parts(p: Path, columns: list[str] | None = None) -> pd.DataFrame | None:
+    """ShardedParquetWriter may emit either one file or a .parts dir. `columns` is projected at the
+    parquet layer, so unused columns are never materialised."""
+    def _rd(path):
+        if columns is None:
+            return pd.read_parquet(path)
+        import pyarrow.parquet as pq
+        have = set(pq.ParquetFile(path).schema_arrow.names)
+        return pd.read_parquet(path, columns=[c for c in columns if c in have])
+
     if p.exists():
-        return pd.read_parquet(p)
+        return _rd(p)
     parts = sorted(p.parent.glob(p.stem + "*.parquet"))
     parts = [x for x in parts if x != p]
     if not parts:
@@ -57,7 +74,7 @@ def _read_parts(p: Path) -> pd.DataFrame | None:
             parts = sorted(d.glob("*.parquet"))
     if not parts:
         return None
-    return pd.concat([pd.read_parquet(x) for x in parts], ignore_index=True)
+    return pd.concat([_rd(x) for x in parts], ignore_index=True)
 
 
 def describe(pos: pd.DataFrame) -> pd.DataFrame:
@@ -245,8 +262,8 @@ def main():
     d = Path(args.dir)
     out_dir = Path(args.out) if args.out else d
 
-    pre = _read_parts(d / "m07_pretest" / "m07_positions.parquet")
-    tst = _read_parts(d / "m07_test" / "m07_positions.parquet")
+    pre = _read_parts(d / "m07_pretest" / "m07_positions.parquet", DESCRIBE_COLS)
+    tst = _read_parts(d / "m07_test" / "m07_positions.parquet", SCORE_COLS)
     if pre is None or tst is None:
         raise SystemExit(f"missing m07_positions (pretest={pre is not None}, test={tst is not None})")
     log.info("pretest positions %d | test positions %d", len(pre), len(tst))
