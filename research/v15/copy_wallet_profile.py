@@ -85,10 +85,24 @@ def describe(pos: pd.DataFrame) -> pd.DataFrame:
         "median_hold_h": g["hold_h"].median(),
         # --- risk shape (Alberto 2026-07-24: MAE/MFE are crucial) ---
         "mean_mae": g["mae"].mean() if "mae" in pos.columns else np.nan,
+        # mae is <=0 (worst underwater frac vs entry VWAP), so the P90 WORST case is the 10th
+        # percentile. Reported as a POSITIVE magnitude so "bigger = worse" reads correctly.
+        # Alberto 2026-07-28 asked for the p90 MAE constraint explicitly, not just the mean.
+        "mae_p90": (g["mae"].quantile(0.10).abs() if "mae" in pos.columns else np.nan),
         "mean_mfe": g["mfe"].mean() if "mfe" in pos.columns else np.nan,
         "mean_giveback": g["mfe_giveback"].mean() if "mfe_giveback" in pos.columns else np.nan,
         "mean_time_underwater": (g["time_underwater"].mean()
                                  if "time_underwater" in pos.columns else np.nan),
+        # --- QUICK/CLEAN CLOSING (Alberto 2026-07-28). A position closed in one exit is cheap to
+        # mirror; one dribbled out over many trims multiplies our fills, our fees and our slippage,
+        # and widens the window in which our 4s lag can hurt us. ---
+        "clean_close_rate": (g["n_trim"].apply(lambda s: float((s == 0).mean()))
+                             if "n_trim" in pos.columns else np.nan),
+        # --- LONG/SHORT BALANCE (Alberto 2026-07-28). frac_long near 0.5 = genuinely two-sided;
+        # near 0/1 = a directional bet whose "edge" is really beta we would be buying. ls_balance
+        # is 1.0 when perfectly balanced and 0.0 when entirely one-sided. ---
+        "frac_long": (g["side"].apply(lambda s: float((pd.to_numeric(s, errors="coerce") > 0).mean()))
+                      if "side" in pos.columns else np.nan),
         # --- scaling behaviour (DCA-whale detector) ---
         "mean_underwater_add": (g["underwater_add_ratio"].mean()
                                 if "underwater_add_ratio" in pos.columns else np.nan),
@@ -103,6 +117,9 @@ def describe(pos: pd.DataFrame) -> pd.DataFrame:
     days = ((pd.to_numeric(span["max"], errors="coerce")
              - pd.to_numeric(span["min"], errors="coerce")) / 86_400_000.0).clip(lower=1.0)
     out["pos_per_day"] = (out["n_pos"].to_numpy() / days.to_numpy())
+    # 1.0 = perfectly two-sided, 0.0 = entirely one-sided. Derived (not grouped) so it stays defined
+    # even when `side` is absent.
+    out["ls_balance"] = 1.0 - (2.0 * out["frac_long"] - 1.0).abs()
     return out
 
 
@@ -123,8 +140,9 @@ def score(pos: pd.DataFrame) -> pd.DataFrame:
 
 
 ATTRS = ["pre_mean_r", "pre_median_r", "pre_win_rate", "pre_r_std", "median_hold_h",
-         "mean_mae", "mean_mfe", "mean_giveback", "mean_time_underwater",
-         "mean_underwater_add", "addon_rate", "trim_rate",
+         "mean_mae", "mae_p90", "mean_mfe", "mean_giveback", "mean_time_underwater",
+         "mean_underwater_add", "addon_rate", "trim_rate", "clean_close_rate",
+         "frac_long", "ls_balance",
          "median_peak_notional", "n_coins", "pos_per_day", "n_pos"]
 
 
