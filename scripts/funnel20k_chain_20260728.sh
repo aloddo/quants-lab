@@ -47,7 +47,16 @@ else say "M6a SKIP (exists)"; fi
 # --- M7 both windows. --copy-latency-ms 4000 = MEASURED live V17 latency, matching m05's
 #     P95_COPY_LATENCY_S=4.0. The first window pays the wallet-shard build; the second gets a
 #     content-hash cache HIT (concurrent runs into a shared cache are explicitly out of scope, so
-#     these MUST stay sequential). ---
+#     these MUST stay sequential).
+#
+#     --sizing-mode fixed_position IS MANDATORY HERE. The default is leader_equity, which sizes from
+#     the action's `target_exposure_pct` -- and that column is 100% NULL in BOTH the 20k store and the
+#     screenset store (neither was built with --equity-enrichment). Under the default, every target is
+#     NaN, so the engine emits ZERO orders: the first run produced 16,000 summaries, 46,180,870 actions
+#     read, and 0 fills / 0 positions. fixed_position derives the target from
+#     sign(position_after) * fixed_target_exposure and needs no equity data. It is also the RIGHT
+#     choice for profiling: a constant 10% exposure per position isolates the wallet's SIGNAL from its
+#     sizing, so r_i is comparable across wallets. ---
 for W in pretest test; do
   if [ -z "$(ls $D/m07_${W}/m07_summary*.parquet 2>/dev/null)" ]; then
     say "M7 $W start"
@@ -58,7 +67,9 @@ for W in pretest test; do
       --out "$D/m07_${W}" \
       --window "$W" \
       --slip-calib "$D/slippage_calib.json" \
-      --copy-latency-ms 4000 >> "$LOG" 2>&1 || { say "ABORT: M7 $W failed"; exit 1; }
+      --copy-latency-ms 4000 \
+      --sizing-mode fixed_position \
+      --fixed-target-exposure 0.10 >> "$LOG" 2>&1 || { say "ABORT: M7 $W failed"; exit 1; }
     say "M7 $W done"
   else say "M7 $W SKIP (exists)"; fi
 done
