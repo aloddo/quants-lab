@@ -53,6 +53,8 @@ class StubEngine:
         self.entered = []
         self._reverse_opens_loaded = True     # skip the Mongo recovery read
         self._entry_fills = True              # does the far-side entry actually take?
+        self._persist_ok = True               # simulate Mongo write failures
+        self._pending_db = {}                 # stands in for DB_PENDING_REVERSE
 
     async def _exit_position(self, pos, trim_size=None):
         self.calls.append("exit")
@@ -69,11 +71,15 @@ class StubEngine:
 
     def _persist_position(self, pos):
         self.calls.append("persist")
+        if not self._persist_ok:
+            return False
         self.persisted[(pos.get("wallet"), pos.get("coin"))] = dict(pos)
+        return True
 
     def _remove_persisted_position(self, wallet, coin):
         self.calls.append("remove_persisted")
         self.removed.append((wallet, coin))
+        return True
 
     # bind the REAL methods under test
     _leg_lock = V16CopyTrader._leg_lock
@@ -415,6 +421,57 @@ assert eng._reverse_opens and eng.removed == [("0xA", "CHIP")], (eng._reverse_op
 assert eng.calls.index("remove_persisted") > eng.calls.index("exch_check"), eng.calls
 assert "_pending_reverse" not in pos and "_reverse_attempts" not in pos, pos
 ok += 4
+
+# ── 15. r7 P1 #1: FAILURE INJECTION on the far-side persist. ────────────────────────────────────
+#     This is the test that was missing. Codex found the defect by injecting this failure: the code
+#     said in a comment "do not retire the old leg" and then called _retire_old_leg() anyway,
+#     destroying the intent, the queue entry and the position row in one go. Losing the obligation
+#     silently is the worst available outcome, so assert the whole post-state, not just one field.
+class _FailingPersistEngine(StubEngine):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.shadow_mode = False              # exercise the real Mongo branch
+        self.db = self                        # self-serving stub
+
+    def __getitem__(self, name):
+        return self
+
+    def update_one(self, *a, **kw):
+        raise RuntimeError("mongo down")
+
+    def delete_one(self, *a, **kw):
+        raise RuntimeError("mongo down")
+
+    def find(self, *a, **kw):
+        return []
+
+
+eng = _FailingPersistEngine(leader_pos=-7.0)
+pos = mkpos()
+eng.positions = [pos]
+reaped = run(eng, pos)
+assert reaped is False, "a lost obligation must NOT be reaped -- the next cycle has to retry"
+assert pos.get("_pending_reverse"), "the intent must SURVIVE a failed far-side persist"
+assert eng._reverse_opens == [], "nothing may be queued if it could not be persisted"
+assert eng.removed == [], "the old leg's record must not be retired on a failed persist"
+ok += 4
+
+# ── 16. r7 P1 #2: a DECLINED multi-leg reverse must be quarantined from the convergence path too.
+#     Declining in _execute_pending_reverse is pointless if _converge_positions closes the same leg
+#     microseconds later against the aggregate net -- the exact hazard the decline exists to avoid.
+eng = StubEngine(leader_pos=-7.0)
+pos = mkpos()
+other = {"coin": "CHIP", "wallet": "0xB", "filled": True, "side": "BUY", "size": 5.0}
+eng.positions = [pos, other]
+run(eng, pos)
+assert pos.get("_reverse_declined") is True, "a declined leg must be marked for quarantine"
+ok += 1
+
+# 16b. The quarantine lifts by itself once the coin is back to a single roster leg.
+eng.positions = [pos]
+same = [q for q in eng.positions if q.get("coin") == "CHIP" and q.get("filled")]
+assert len(same) == 1, same
+ok += 1
 
 print(f"reverse-EXECUTION self-test PASSED ({ok} assertions, real V16CopyTrader method)")
 print("  covers: happy path + ordering, failed flatten, bounded escalation, exchange-not-flat,")

@@ -671,8 +671,13 @@ class CopyTrader:
             update["$unset"] = {"_pending_reverse": "", "_reverse_attempts": ""}
         try:
             self.db[DB_OPEN_POSITIONS].update_one(key, update, upsert=True)
+            return True
         except Exception as e:
+            # RETURN A STATUS (codex r7 P1 #5). Swallowing this made every "intent cleared" claim
+            # unverifiable: memory dropped the field while Mongo kept it, so a restart resurrected
+            # an abandoned reverse. Callers that must know now check; legacy callers ignore it.
             logger.warning(f"Failed to persist position {pos['coin']}: {e}")
+            return False
 
     def _adopt_orphan(self, coin: str, exch_sz: float, notional: float):
         """Re-attach a re-detected orphan to the LIVE copy signal (Alberto 9696/9699), instead of blindly
@@ -743,11 +748,13 @@ class CopyTrader:
     def _remove_persisted_position(self, wallet: str, coin: str):
         """Remove a closed position from persistent state."""
         if self.shadow_mode:
-            return
+            return True
         try:
             self.db[DB_OPEN_POSITIONS].delete_one({"wallet": wallet, "coin": coin})
+            return True
         except Exception as e:
             logger.warning(f"Failed to remove persisted position {coin}: {e}")
+            return False
 
     def _load_persisted_positions(self) -> list:
         """Load all open positions from MongoDB. Returns list of position dicts."""
@@ -5524,10 +5531,16 @@ class V16CopyTrader(CopyTrader):
                 f"(per-wallet flat is unprovable on HL)")
             pos.pop('_pending_reverse', None)
             pos.pop('_reverse_attempts', None)
-            try:
-                self._persist_position(pos)
-            except Exception:
-                pass
+            # QUARANTINE (codex r7 P1 #2). Declining here is pointless if _converge_positions then
+            # closes the same leg microseconds later -- it runs right after _check_exits, reads the
+            # leader/our-side mismatch as a full close, and calls _exit_position, which trades
+            # against the AGGREGATE net and can hit the OTHER wallet's leg. That is precisely the
+            # hazard this precondition exists to avoid, so the leg must be quarantined from the
+            # convergence path too, not merely skipped here.
+            pos['_reverse_declined'] = True
+            if not self._persist_position(pos):
+                _tg(f"REVERSE {coin}: intent cleared in memory but NOT in Mongo -- it will "
+                    f"resurrect on restart until this write succeeds")
             return False
 
         # STALE-INTENT CANCEL (codex r4 P1 #3). The flatten used to fire before the leader was ever
@@ -5542,10 +5555,9 @@ class V16CopyTrader(CopyTrader):
                         f"cancelling the stale reverse intent, keeping the leg")
             pos.pop('_pending_reverse', None)
             pos.pop('_reverse_attempts', None)
-            try:
-                self._persist_position(pos)
-            except Exception:
-                pass
+            if not self._persist_position(pos):
+                _tg(f"REVERSE {coin}: stale-intent clear did not reach Mongo -- it will resurrect "
+                    f"on restart until this write succeeds")
             return False
 
         # LEG LOCK (codex r3 P1 #2). _converge_add_once is still a background task and holds this
@@ -5613,10 +5625,9 @@ class V16CopyTrader(CopyTrader):
             # alert -- the sweep and reconciliation own an unattributable residual, not this path.
             pos.pop('_pending_reverse', None)
             pos.pop('_reverse_attempts', None)
-            try:
-                self._persist_position(pos)
-            except Exception:
-                pass
+            if not self._persist_position(pos):
+                _tg(f"REVERSE {coin}: residual-path intent clear did not reach Mongo -- it will "
+                    f"resurrect on restart until this write succeeds")
             return False
 
         # FLAT AND CONFIRMED.
@@ -5655,6 +5666,8 @@ class V16CopyTrader(CopyTrader):
         if mid <= 0 or abs(cur) * mid < self.reverse_min_notional:
             logger.info(f"REVERSE {coin} {wallet[:10]}: leader now {cur:+.4f} "
                         f"(${abs(cur) * mid:,.0f}) -- under the floor after flatten, staying flat")
+            _tg(f"REVERSE {coin}: flattened, far side NOT opened (leader ${abs(cur) * mid:,.0f} "
+                f"under the ${self.reverse_min_notional:.0f} floor)")
             _retire_old_leg()
             return True
         # CONSUME the actual signal-time stamp minted by V17._on_hl_trade for this flip (codex r5
@@ -5681,6 +5694,7 @@ class V16CopyTrader(CopyTrader):
         if knet_at_signal is None:
             logger.warning(f"REVERSE {coin} {wallet[:10]}: no signal-time knet stamp for the far "
                            f"side -- staying flat rather than opening on unproven authorization")
+            _tg(f"REVERSE {coin}: flattened, far side NOT opened (no signal-time knet stamp)")
             _retire_old_leg()
             return True
         req = {"wallet": wallet, "coin": coin, "is_buy": want_buy, "gen": intent.get("gen"),
@@ -5694,13 +5708,15 @@ class V16CopyTrader(CopyTrader):
                 self.db[DB_PENDING_REVERSE].update_one(
                     {"wallet": wallet, "coin": coin}, {"$set": req}, upsert=True)
             except Exception as e:
-                # The far side is NOT durably recorded, so do not retire the old leg's record on the
-                # strength of it. We are flat on the exchange either way; leaving the row for the
-                # next cycle is recoverable, losing both records is not.
+                # NOT durable -> do NOT retire. The previous version said exactly this in a comment
+                # and then called _retire_old_leg() anyway, destroying the only record of the
+                # obligation (codex r7 P1 #1, reproduced by failure injection). We are already flat
+                # on the exchange, so keeping the intent costs nothing and the next cycle retries;
+                # the position row is what carries it.
                 logger.error(f"REVERSE {coin}: FAILED to persist the far-side request ({e}) -- "
-                             f"not queueing, we stay flat rather than owe an untracked leg")
-                _retire_old_leg()
-                return True
+                             f"KEEPING the intent for the next cycle rather than losing it")
+                _tg(f"REVERSE {coin}: far-side request could not be persisted, retrying next cycle")
+                return False
         self._reverse_opens = [r for r in self._reverse_opens
                                if not (r["wallet"] == wallet and r["coin"] == coin)]
         self._reverse_opens.append(req)
@@ -5841,6 +5857,17 @@ class V16CopyTrader(CopyTrader):
                 continue
             if not pos.get("filled"):
                 continue
+            # QUARANTINE: a leg whose reverse was declined because per-wallet flatness is
+            # unprovable on this coin (more than one roster leg) must not be closed here either --
+            # the close would trade against the aggregate net and could hit the other wallet's leg
+            # (codex r7 P1 #2). Cleared automatically once the coin is down to a single leg.
+            if pos.get("_reverse_declined"):
+                _same = [q for q in self.positions
+                         if q.get("coin") == pos.get("coin") and q.get("filled")
+                         and not q.get("_ws_exited")]
+                if len(_same) > 1:
+                    continue
+                pos.pop("_reverse_declined", None)
             coin, wallet = pos.get("coin"), pos.get("wallet")
             if not coin or not wallet:
                 continue
@@ -6754,6 +6781,15 @@ class V17CopyTrader(V16CopyTrader):
                         # stamp, and that a stale opposite-direction stamp survived to authorize a
                         # later genuine OPEN. The flip is a new signal; the old ones are void.
                         self._v17_knet_pending.pop((wallet, coin), None)
+                    # A flip only becomes a REVERSE in V16 if we actually hold the leg AND the new
+                    # leg clears the floor. Minting outside those conditions leaves an orphan
+                    # 4-tuple no one can consume (codex r7 P2).
+                    if _flip_v17:
+                        _we_hold_v17 = any(pp.get('coin') == coin and pp.get('wallet') == wallet
+                                           and pp.get('filled') and not pp.get('_ws_exited')
+                                           for pp in self.positions)
+                        _floor_v17 = getattr(self, 'reverse_min_notional', 10.0)
+                        _flip_v17 = _we_hold_v17 and abs(_after_v17) * px >= _floor_v17
                     if abs(prev) * px < 1.0 or (_flip_v17 and
                                                 getattr(self, 'copy_reverse_enabled', False)):
                         k = self._v17_knet(coin, is_buy, wallet, px)
