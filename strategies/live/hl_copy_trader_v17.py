@@ -75,6 +75,11 @@ DB_COLLECTION = "unified_copy_trades"
 DB_SHADOW_COLLECTION = "unified_shadow_signals"
 DB_FILLS_COLLECTION = "hl_copy_target_fills"
 DB_OPEN_POSITIONS = "v17_open_positions"  # persistent position state (per-wallet)
+# Durable far-side-open requests for a reverse whose flatten already succeeded. A separate
+# collection because at that instant the POSITION row is deliberately gone (it was reaped so the
+# entry scan cannot see it), yet the obligation to open the opposite leg must survive a crash
+# (codex r3 P1 #4: the in-memory queue was cleared before the entries were attempted).
+DB_PENDING_REVERSE = "v17_pending_reverse"
 DB_EXCHANGE_FILLS = "v17_exchange_fills"  # exchange fills (source of truth for PnL)
 DB_ORDER_IDS = "v17_order_ids"  # every oid V17 generates (for fill attribution)
 
@@ -651,6 +656,13 @@ class CopyTrader:
         if pos.get("_force_exit"):
             doc["_force_exit"] = True
             doc["_force_exit_attempts"] = pos.get("_force_exit_attempts", 0)
+        # 2026-07-28 (codex r3 P1 #1): this doc is an explicit WHITELIST, so setting a key on the
+        # position dict does NOT persist it. The reverse intent and its attempt counter were being
+        # dropped on every restart -- the "durable latch" was in-memory only, exactly the defect the
+        # intent design was supposed to remove. Carry both.
+        if pos.get("_pending_reverse"):
+            doc["_pending_reverse"] = pos["_pending_reverse"]
+            doc["_reverse_attempts"] = pos.get("_reverse_attempts", 0)
         try:
             self.db[DB_OPEN_POSITIONS].update_one(key, {"$set": doc}, upsert=True)
         except Exception as e:
@@ -758,6 +770,11 @@ class CopyTrader:
                     # 2026-06-18 (codex review): preserve the give-up backstop counter across restarts
                     # so a stuck force-exit can't retry forever by resetting to 0 each reboot.
                     pos["_force_exit_attempts"] = doc.get("_force_exit_attempts", 0)
+                # 2026-07-28: restore a reverse intent so a restart mid-reverse resumes it rather
+                # than silently reloading a leg whose leader has gone the other way.
+                if doc.get("_pending_reverse"):
+                    pos["_pending_reverse"] = doc["_pending_reverse"]
+                    pos["_reverse_attempts"] = doc.get("_reverse_attempts", 0)
                 positions.append(pos)
             return positions
         except Exception as e:
@@ -1696,6 +1713,30 @@ class CopyTrader:
             self._exch_pos_cache_ts = now
         return self._exch_pos_cache.get(coin, 0.0)
 
+    def _exchange_position_size_strict(self, coin: str) -> float:
+        """UNCACHED exchange read that RAISES on failure. Use whenever 'flat' must be PROVEN.
+
+        codex r3 P1 #3: `_exchange_position_size` serves a 5s cache and swallows every REST
+        exception, installing an empty cache and returning 0.0 -- so a failed or stale read is
+        indistinguishable from a genuinely flat coin. That is fine for the add-on reconstruct path
+        that only wants a hint, and fatal for a reverse, where 0.0 authorises opening opposite risk.
+        """
+        total = 0.0
+        # MAIN dex first, then every builder dex -- same surface the cached helper covers. Any
+        # failure RAISES rather than being swallowed: an unverifiable book is not a flat book.
+        payloads = [{"type": "clearinghouseState", "user": self.parent_address}]
+        for dex_name in BUILDER_DEXES:
+            payloads.append({"type": "clearinghouseState", "user": self.parent_address,
+                             "dex": dex_name})
+        for payload in payloads:
+            r = requests.post(f"{HL_API}/info", json=payload, timeout=5)
+            r.raise_for_status()
+            for ap in r.json().get("assetPositions", []):
+                pp = ap["position"]
+                if pp["coin"] == coin:
+                    total += float(pp["szi"])
+        return total
+
     def _round_price(self, px: float) -> float:
         if px <= 0:
             return 0.0
@@ -2530,21 +2571,7 @@ class CopyTrader:
         #      side and reject the opposite one;
         #   2. the old row's `(wallet, coin)`-keyed persistence delete has already run, so the new
         #      leg's upsert cannot be deleted by it.
-        if self._reverse_opens:
-            pending, self._reverse_opens = self._reverse_opens, []
-            for req in pending:
-                w, c = req["wallet"], req["coin"]
-                # Re-check under current state: a leg may have been re-established on this coin
-                # between the flatten and now (another wallet, or a same-cycle entry).
-                if any(p.get("coin") == c and p.get("wallet") == w and p.get("filled")
-                       for p in self.positions):
-                    logger.info(f"REVERSE {c} {w[:10]}: leg present again at drain time -- far side "
-                                f"NOT opened")
-                    continue
-                try:
-                    await self._enter_position(c, req["is_buy"], wallet=w)
-                except Exception as e:
-                    logger.error(f"REVERSE {c} {w[:10]}: far-side entry raised {e}", exc_info=True)
+        await self._drain_reverse_opens()
 
         # LEADER-BOOK SWEEP. Runs INLINE here (not as its own asyncio task) so it cannot mutate
         # self.positions concurrently with the exit machinery above. Its own 60s timer lives inside,
@@ -5286,6 +5313,83 @@ class V16CopyTrader(CopyTrader):
             self._leg_locks[(wallet, coin)] = lk
         return lk
 
+    async def _drain_reverse_opens(self) -> None:
+        """Open the far side for every reverse whose flatten is already confirmed.
+
+        Runs at the END of _check_exits, after the position list has been rebuilt, so:
+          - the old row is gone from self.positions and `_enter_position`'s existing-position scan
+            (which filters on `filled` and ignores `_ws_exited`) can no longer reject the far side;
+          - the old row's (wallet, coin)-keyed persistence delete has already run, so it cannot wipe
+            the new leg's freshly upserted row.
+
+        NON-DESTRUCTIVE (codex r3 P1 #4): a request is removed ONLY once the leg is observed open, or
+        after a bounded number of attempts. The earlier version cleared the in-memory list before
+        attempting the entries, so a crash -- or an entry that was simply rejected by a gate, since
+        `_enter_position` returns no success status -- lost the reverse permanently.
+        """
+        if not self._reverse_opens:
+            # Reload anything a crash or restart left behind. The position row is deliberately gone
+            # by this point, so this collection is the only record of the obligation.
+            if not self.shadow_mode and not getattr(self, "_reverse_opens_loaded", False):
+                self._reverse_opens_loaded = True
+                try:
+                    self._reverse_opens = [
+                        {k: v for k, v in d.items() if k != "_id"}
+                        for d in self.db[DB_PENDING_REVERSE].find()]
+                    if self._reverse_opens:
+                        logger.warning(f"REVERSE: recovered {len(self._reverse_opens)} pending "
+                                       f"far-side open(s) from a previous run")
+                except Exception as e:
+                    logger.warning(f"REVERSE: could not reload pending far-side opens ({e})")
+            if not self._reverse_opens:
+                return
+
+        keep = []
+        for req in self._reverse_opens:
+            w, c, want_buy = req["wallet"], req["coin"], req["is_buy"]
+            held = next((p for p in self.positions if p.get("coin") == c and p.get("wallet") == w
+                         and p.get("filled") and not p.get("_ws_exited")), None)
+            if held is not None:
+                if (held.get("side") == "BUY") == want_buy:
+                    logger.info(f"REVERSE {c} {w[:10]}: far side is open -- request satisfied")
+                else:
+                    logger.warning(f"REVERSE {c} {w[:10]}: a leg on the OLD side reappeared before "
+                                   f"the far-side entry -- abandoning the request")
+                self._clear_pending_reverse(w, c)
+                continue
+
+            req["attempts"] = int(req.get("attempts", 0)) + 1
+            if req["attempts"] > 5:
+                logger.error(f"REVERSE {c} {w[:10]}: far-side entry never took after "
+                             f"{req['attempts'] - 1} attempts -- giving up, staying flat")
+                _tg(f"REVERSE {c}: far-side entry failed x{req['attempts'] - 1}, staying flat")
+                self._clear_pending_reverse(w, c)
+                continue
+
+            try:
+                await self._enter_position(c, want_buy, wallet=w)
+            except Exception as e:
+                logger.error(f"REVERSE {c} {w[:10]}: far-side entry raised {e}", exc_info=True)
+            # Do NOT drop the request here. `_enter_position` reports no success status, so the only
+            # honest confirmation is seeing the leg on the next cycle -- which the top of this loop
+            # does. Persist the bumped attempt counter so the bound survives a restart.
+            if not self.shadow_mode:
+                try:
+                    self.db[DB_PENDING_REVERSE].update_one(
+                        {"wallet": w, "coin": c}, {"$set": {"attempts": req["attempts"]}})
+                except Exception:
+                    pass
+            keep.append(req)
+        self._reverse_opens = keep
+
+    def _clear_pending_reverse(self, wallet: str, coin: str) -> None:
+        if self.shadow_mode:
+            return
+        try:
+            self.db[DB_PENDING_REVERSE].delete_one({"wallet": wallet, "coin": coin})
+        except Exception as e:
+            logger.warning(f"REVERSE {coin}: could not clear pending far-side record ({e})")
+
     async def _execute_pending_reverse(self, pos: dict) -> bool:
         """Flatten a leg carrying a `_pending_reverse` intent. Returns True if it may be REAPED.
 
@@ -5304,6 +5408,25 @@ class V16CopyTrader(CopyTrader):
         attempts = int(pos.get('_reverse_attempts', 0)) + 1
         pos['_reverse_attempts'] = attempts
 
+        # LEG LOCK (codex r3 P1 #2). _converge_add_once is still a background task and holds this
+        # lock across its entry order, so without taking it here an add already in flight can fill
+        # AFTER our flatten and rebuild the side we just closed. Non-blocking acquire: _check_exits
+        # is the 1Hz heartbeat and must never park on a leg lock, so if an add owns the leg we skip
+        # this cycle and retry on the next one (the intent is persisted, so nothing is lost).
+        lock = self._leg_lock(wallet, coin)
+        if lock.locked():
+            logger.info(f"REVERSE {coin} {wallet[:10]}: leg busy with an in-flight add -- deferring "
+                        f"to the next cycle")
+            pos['_reverse_attempts'] = attempts - 1      # a deferral is not an attempt
+            return False
+        await lock.acquire()
+        try:
+            return await self._reverse_flatten_locked(pos, coin, wallet, intent, attempts)
+        finally:
+            lock.release()
+
+    async def _reverse_flatten_locked(self, pos, coin, wallet, intent, attempts) -> bool:
+        """Body of the reverse flatten. Runs with the per-leg lock HELD."""
         ok = await self._exit_position(pos)
         if not ok:
             # NOT flat. Keep the intent (it is persisted, so it survives a restart too) and let the
@@ -5326,7 +5449,7 @@ class V16CopyTrader(CopyTrader):
         # when the tracked side merely disagrees with an already-opposite net position, which is NOT
         # the same as flat). Hard Rule 8: the exchange is the source of truth for positions.
         try:
-            exch_sz = self._exchange_position_size(coin)
+            exch_sz = self._exchange_position_size_strict(coin)
         except Exception as exc:
             logger.warning(f"REVERSE {coin}: exchange confirm failed ({exc}) -- retrying next cycle")
             return False
@@ -5359,8 +5482,20 @@ class V16CopyTrader(CopyTrader):
             logger.info(f"REVERSE {coin} {wallet[:10]}: leader now {cur:+.4f} "
                         f"(${abs(cur) * mid:,.0f}) -- under the floor after flatten, staying flat")
             return True
-        self._reverse_opens.append({"wallet": wallet, "coin": coin, "is_buy": cur > 0,
-                                    "gen": intent.get("gen")})
+        req = {"wallet": wallet, "coin": coin, "is_buy": cur > 0, "gen": intent.get("gen"),
+               "attempts": 0, "created_ts": time.time()}
+        # PERSIST FIRST, then queue in memory. The position row is already gone at this point, so
+        # this collection is the ONLY record that we owe an opposite-side leg; a crash between here
+        # and the drain would otherwise lose the reverse silently.
+        if not self.shadow_mode:
+            try:
+                self.db[DB_PENDING_REVERSE].update_one(
+                    {"wallet": wallet, "coin": coin}, {"$set": req}, upsert=True)
+            except Exception as e:
+                logger.error(f"REVERSE {coin}: FAILED to persist the far-side request ({e}) -- "
+                             f"not queueing, we stay flat rather than owe an untracked leg")
+                return True
+        self._reverse_opens.append(req)
         logger.info(f"REVERSE {coin} {wallet[:10]}: flat confirmed, far side "
                     f"{'LONG' if cur > 0 else 'SHORT'} queued for this cycle")
         return True
