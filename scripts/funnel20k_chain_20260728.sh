@@ -56,13 +56,21 @@ else say "M6a SKIP (exists)"; fi
 #     read, and 0 fills / 0 positions. fixed_position derives the target from
 #     sign(position_after) * fixed_target_exposure and needs no equity data. It is also the RIGHT
 #     choice for profiling: a constant 10% exposure per position isolates the wallet's SIGNAL from its
-#     sizing, so r_i is comparable across wallets. ---
+#     sizing, so r_i is comparable across wallets.
+#
+#     SEATS COME FROM m06a_shortlist_profile.parquet, NOT the raw m06a top-N. m06a ranks by
+#     source_score_pretest = persistence * log1p(n_journeys) in the activity_only lane, i.e. pure
+#     ACTIVITY. Its top-2000/fold cut truncates exactly the attributes the profile measures, and it
+#     dropped 8 of Alberto's 12 live candidates (0x25f000da is rankable in 8/8 folds and still got 0
+#     seats). The profile shortlist instead takes a RANDOM stratified sample of RANKABLE seats
+#     (unbiased attribute range, seed 20260728) plus EVERY rankable seat of the 12 candidates:
+#     15,993 seats = 41 forced + 15,952 random, over 9,592 wallets. ---
 for W in pretest test; do
   if [ -z "$(ls $D/m07_${W}/m07_summary*.parquet 2>/dev/null)" ]; then
     say "M7 $W start"
     $PY research/v15/v15_m07_engine.py \
       --actions "$D/m02_actions.parquet" \
-      --shortlist "$D/m06a_shortlist.parquet" \
+      --shortlist "$D/m06a_shortlist_profile.parquet" \
       --folds "$D/m03_folds.parquet" \
       --out "$D/m07_${W}" \
       --window "$W" \
