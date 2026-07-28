@@ -8,8 +8,13 @@
 #    No accessible-coins JSON exists, so --strict is impossible. Non-strict fails OPEN on
 #    accessibility = PERMISSIVE. A NO-GO under permissive settings is the STRONGER conclusion;
 #    a GO would require the strict rerun (m01 rebuild + accessible-coins) before any capital.
-#  - m06a manifest OMITTED -> default v1, shortlist_n_per_fold=1000, pre-registered by Alberto.
-#    N is fixed BEFORE any rank is inspected (multiple-testing control).
+#  - m06a manifest v1-profile-20260728: shortlist_n_per_fold=2000, i.e. ABOVE the 1,630-wallet
+#    universe, so the engine runs on EVERY eligible entity and nothing is truncated. The default
+#    N=1000 is a multiple-testing control for picking a pool; the deliverable here is Alberto's
+#    WALLET PROFILE (2026-07-28: "I just want the right wallet profile to copy live"), and a
+#    top-1000 cut would truncate the attribute range and could hide the very gradient being
+#    measured. Raising N REMOVES selection rather than adding any -> conservative for profiling.
+#    Everything else (recency_gate, score_basis, horizon) is left at the pre-registered v1 values.
 #  - m07 --copy-latency-ms 4000 = MEASURED live V17 latency (matches m05 P95_COPY_LATENCY_S=4.0).
 #    NOT the 2000ms default. Consistency between the copyability gate and the sim is the point.
 #  - FINAL stamp requires BOTH version strings; verified present:
@@ -57,6 +62,7 @@ if [ ! -s "$DIR/m06a_shortlist.parquet" ]; then
     --folds "$DIR/m03_folds.parquet" \
     --m04-dir "$DIR" \
     --actions "$DIR/m02_actions.parquet" \
+    --manifest "$DIR/m06a_manifest_profile.json" \
     --outdir "$DIR" >> "$LOG" 2>&1 || die M6a $?
   say "M6a done"
 else say "M6a SKIP (exists)"; fi
@@ -76,6 +82,16 @@ for W in pretest test; do
     say "M7 $W done"
   else say "M7 $W SKIP (exists)"; fi
 done
+
+# --- WALLET PROFILE (Alberto's actual deliverable, 2026-07-28) ---
+# Which observable wallet ATTRIBUTES predict a positive COPIED after-cost return.
+# Attributes from each fold's PRETEST positions, outcome from the SAME fold's TEST positions.
+# RUNS BEFORE M6b ON PURPOSE: walk_forward_confirm hard-requires m07_positions and has never executed
+# against real data (no m07_positions exists in ANY prior run dir), so it is the most likely step to
+# crash. The profile must not be hostage to it.
+say "PROFILE start"
+$PY research/v15/copy_wallet_profile.py --dir "$DIR" >> "$LOG" 2>&1 || say "PROFILE rc=$? (non-fatal)"
+say "PROFILE done"
 
 # --- M6b ranking + pooled BH-FDR OOS confirmation ---
 # PRE-REGISTERED OOS GATE (written BEFORE any result exists, 2026-07-28 08:55 CEST).
@@ -98,7 +114,7 @@ $PY research/v15/v15_m06b_ranking.py \
   --fdr-q 0.10 \
   --oos-margin 0.0 \
   --fee-schedule-version "$FEE_VER" \
-  --slippage-calibration-version "$SLIP_VER" >> "$LOG" 2>&1 || die M6b $?
+  --slippage-calibration-version "$SLIP_VER" >> "$LOG" 2>&1 || say "M6b PRIMARY rc=$? (non-fatal; profile already written)"
 say "M6b done (primary)"
 
 # SENSITIVITY ONLY (floor gate). Separate out dir so it can never overwrite the primary artefacts.

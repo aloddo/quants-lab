@@ -1189,15 +1189,23 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
         confirmed = eligible[eligible["bh_discovery"]].copy()
     _wcol = [c for c in ("primary_wallet", "m6b_score") if c in pre_entity.columns]
     confirmed = confirmed.merge(pre_entity[["entity_id"] + _wcol], on="entity_id", how="left")
+    # The note was a HARDCODED "only 3 OOS folds available ... needs the FULL 12-fold action
+    # bootstrap" string. Once that bootstrap exists the artifact would assert the opposite of its own
+    # provenance. Data-derive it so a stamped artifact can never lie about the gate it ran at.
+    _folds_avail = int(pd.to_numeric(tpos["fold_id"], errors="coerce").nunique())
+    _at_standard = (m.oos_min_folds >= 4) and (m.oos_min_journeys_pooled >= 50)
     summ = {
         "pretest_rankable_entities": len(cand),
         "eligible_for_fdr": int(len(eligible)),
         "confirmed": int(len(confirmed)),
         "fdr_q": m.fdr_q, "oos_min_folds": m.oos_min_folds,
         "oos_min_journeys_pooled": m.oos_min_journeys_pooled,
-        "note": ("only 3 OOS folds available (recency actions Apr06-Jul22); Codex standard is >=4 folds/>=50 "
-                 "journeys -> needs the FULL 12-fold action bootstrap. FREEZE this gate + validate on an "
-                 "untouched future window before capital."),
+        "oos_folds_available": _folds_avail,
+        "gate_level": "codex_standard" if _at_standard else "floor_below_standard",
+        "note": (f"{_folds_avail} OOS test folds present in the M7 test run; gate ran at "
+                 f"{m.oos_min_folds} folds / {m.oos_min_journeys_pooled} pooled journeys "
+                 f"({'CODEX STANDARD' if _at_standard else 'BELOW the codex standard of 4/50'}). "
+                 "FREEZE this gate + validate on an untouched future window before capital."),
     }
     logger.info("WALK-FORWARD CONFIRM (pooled+BH-FDR q=%.2f): cand_entities=%d eligible=%d CONFIRMED=%d",
                 m.fdr_q, len(cand), summ["eligible_for_fdr"], summ["confirmed"])
