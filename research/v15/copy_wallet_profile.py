@@ -103,6 +103,14 @@ def describe(pos: pd.DataFrame) -> pd.DataFrame:
         # is 1.0 when perfectly balanced and 0.0 when entirely one-sided. ---
         "frac_long": (g["side"].apply(lambda s: float((pd.to_numeric(s, errors="coerce") > 0).mean()))
                       if "side" in pos.columns else np.nan),
+        # --- RUIN RATE. Measured on real engine output: of 252,509 pretest positions, 249,069 closed
+        # 'normal' (mean r_i -0.098%), 3,084 by 'liquidation' (-2.98%) and 356 by 'backstop' (-4.44%).
+        # So 1.2% of positions carry ~30x the average loss. This is the sharpest expression of
+        # Alberto's MAE-p90 concern: a wallet whose positions blow up on us at a constant 10%
+        # exposure is disqualifying no matter how good its average trade looks. ---
+        "liq_rate": (g["close_reason"].apply(
+            lambda s: float(s.isin(("liquidation", "backstop")).mean()))
+            if "close_reason" in pos.columns else np.nan),
         # --- scaling behaviour (DCA-whale detector) ---
         "mean_underwater_add": (g["underwater_add_ratio"].mean()
                                 if "underwater_add_ratio" in pos.columns else np.nan),
@@ -141,7 +149,7 @@ def score(pos: pd.DataFrame) -> pd.DataFrame:
 
 ATTRS = ["pre_mean_r", "pre_median_r", "pre_win_rate", "pre_r_std", "median_hold_h",
          "mean_mae", "mae_p90", "mean_mfe", "mean_giveback", "mean_time_underwater",
-         "mean_underwater_add", "addon_rate", "trim_rate", "clean_close_rate",
+         "mean_underwater_add", "addon_rate", "trim_rate", "clean_close_rate", "liq_rate",
          "frac_long", "ls_balance",
          "median_peak_notional", "n_coins", "pos_per_day", "n_pos"]
 
