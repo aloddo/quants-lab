@@ -279,6 +279,23 @@ def main():
     if panel.empty:
         raise SystemExit("empty panel - nothing to profile")
 
+    # Attach the WALLET ADDRESS. entity_id is a positional index that is NOT stable across folds
+    # (16,457/17,082 ids map to >1 wallet: findings/quant/2026-07-28-entity-id-positional-index-
+    # collides-across-folds), so it must never be the identity in an output a human acts on.
+    # (entity_id, fold_id) IS a valid key within a fold, which is exactly how this joins.
+    for cand in ("m06a_shortlist_profile.parquet", "m06a_shortlist.parquet"):
+        sp = d / cand
+        if sp.exists():
+            sl = pd.read_parquet(sp, columns=["entity_id", "fold_id", "primary_wallet"])
+            panel = panel.merge(sl.drop_duplicates(["entity_id", "fold_id"]),
+                                on=["entity_id", "fold_id"], how="left")
+            n_named = int(panel["primary_wallet"].notna().sum())
+            log.info("attached primary_wallet from %s: %d/%d cells named", cand, n_named, len(panel))
+            break
+    else:
+        log.warning("no m06a shortlist found - panel will carry entity_id ONLY, which is not a "
+                    "stable identity across folds. Do not read wallet-level results from it.")
+
     panel.to_parquet(out_dir / "profile_panel.parquet", index=False)
 
     # BASELINE: what does copying an unselected wallet do, after costs?
