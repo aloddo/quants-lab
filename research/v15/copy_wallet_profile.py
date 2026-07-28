@@ -195,24 +195,35 @@ def profile(panel: pd.DataFrame, outcome: str) -> pd.DataFrame:
         if bmax not in pooled.index or 0 not in pooled.index:
             continue
         top, bot = float(pooled.loc[bmax]), float(pooled.loc[0])
-        # fold consistency: in how many folds does the top bucket beat the bottom
+        # FOLD CONSISTENCY MUST BE DIRECTION-AWARE. Counting "top bucket > bottom bucket" reads
+        # INVERTED for a lower_is_better attribute: liq_rate scored 0/4, which actually means it held
+        # in 4 of 4 folds in its OWN direction. Score each fold against the pooled direction instead,
+        # so 8/8 means "held every fold" for every attribute regardless of sign.
+        higher_better = top > bot
         per_fold = d.groupby(["fold_id", "b"], observed=True)[outcome].mean().unstack()
         ok = 0
         tot = 0
         if bmax in per_fold.columns and 0 in per_fold.columns:
             cmp = per_fold[[0, bmax]].dropna()
             tot = len(cmp)
-            ok = int((cmp[bmax] > cmp[0]).sum())
+            ok = int((cmp[bmax] > cmp[0]).sum() if higher_better else (cmp[bmax] < cmp[0]).sum())
+        # the better-performing end of the attribute, and whether copying it is actually profitable
+        best_bucket_r = max(top, bot)
         rows.append({
             "attribute": a,
             "bottom_bucket_r": bot,
             "top_bucket_r": top,
             "spread": top - bot,
             "abs_spread": abs(top - bot),
-            "direction": "higher_is_better" if top > bot else "lower_is_better",
+            "direction": "higher_is_better" if higher_better else "lower_is_better",
             "folds_consistent": ok,
             "folds_total": tot,
             "consistency": (ok / tot) if tot else np.nan,
+            # THE question: is the GOOD end of this attribute profitable after costs, or merely
+            # less unprofitable? `top_bucket_positive` alone answered the wrong one for
+            # lower_is_better attributes, where the good end is the BOTTOM bucket.
+            "best_bucket_r": best_bucket_r,
+            "best_bucket_positive": best_bucket_r > 0,
             "top_bucket_positive": top > 0,
             "n_cells": len(d),
         })
