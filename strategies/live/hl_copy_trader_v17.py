@@ -5318,6 +5318,19 @@ class V16CopyTrader(CopyTrader):
             self._converge_inflight.discard(key)
             self._converge_dirty.discard(key)
 
+    def _coin_inflight_usd(self, coin: str) -> float:
+        """Reserved notional for orders on `coin` that are ACCEPTED but not yet reflected in
+        self.positions or in an exchange read.
+
+        codex r7 P1 #3/#4: both the single-leg precondition and the pre-order flat proof read only
+        settled state, so an entry that had already consumed its stamp could fill AFTER our REST
+        snapshot and invalidate the proof. The engine already tracks these reservations in
+        `_v17_pending_coin_side` for its gross caps; reusing them is cheaper and less invasive than
+        a coin-wide lock spanning proof-and-submit, and it closes the same window.
+        """
+        m = getattr(self, "_v17_pending_coin_side", None) or {}
+        return sum(abs(float(v)) for (c, _side), v in m.items() if c == coin)
+
     def _leg_lock(self, wallet: str, coin: str) -> asyncio.Lock:
         """ONE lock per (wallet, coin) leg, shared by every verb that mutates it.
 
@@ -5429,6 +5442,14 @@ class V16CopyTrader(CopyTrader):
                                f"retrying next cycle")
                 keep.append(req)
                 continue
+            inflight_now = self._coin_inflight_usd(c)
+            if inflight_now > 0:
+                # An accepted order can fill between the REST snapshot and our submission, so a zero
+                # read is not a proof while anything is in flight. Defer, do not abandon.
+                logger.info(f"REVERSE {c} {w[:10]}: ${inflight_now:,.0f} in flight on this coin at "
+                            f"order time -- deferring the far side to the next cycle")
+                keep.append(req)
+                continue
             if abs(exch_now) > 1e-10:
                 logger.warning(f"REVERSE {c} {w[:10]}: coin is no longer flat ({exch_now:+.6f}) at "
                                f"order time -- far side NOT opened")
@@ -5522,6 +5543,11 @@ class V16CopyTrader(CopyTrader):
         # symptoms: reverse only where our own book holds exactly one leg on the coin.
         same_coin = [p for p in self.positions
                      if p.get('coin') == coin and p.get('filled') and not p.get('_ws_exited')]
+        inflight = self._coin_inflight_usd(coin)
+        if inflight > 0:
+            logger.info(f"REVERSE {coin} {wallet[:10]}: ${inflight:,.0f} of orders in flight on this "
+                        f"coin -- deferring, settled state is not yet knowable")
+            return False
         if len(same_coin) > 1:
             holders = sorted({str(p.get('wallet'))[:10] for p in same_coin})
             logger.warning(f"REVERSE {coin} {wallet[:10]}: {len(same_coin)} roster legs on this coin "

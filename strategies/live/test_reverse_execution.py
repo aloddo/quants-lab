@@ -55,6 +55,7 @@ class StubEngine:
         self._entry_fills = True              # does the far-side entry actually take?
         self._persist_ok = True               # simulate Mongo write failures
         self._pending_db = {}                 # stands in for DB_PENDING_REVERSE
+        self._v17_pending_coin_side = {}       # accepted-but-unsettled order reservations
 
     async def _exit_position(self, pos, trim_size=None):
         self.calls.append("exit")
@@ -83,6 +84,7 @@ class StubEngine:
 
     # bind the REAL methods under test
     _leg_lock = V16CopyTrader._leg_lock
+    _coin_inflight_usd = V16CopyTrader._coin_inflight_usd
     _execute_pending_reverse = V16CopyTrader._execute_pending_reverse
     _reverse_flatten_locked = V16CopyTrader._reverse_flatten_locked
     _drain_reverse_opens = V16CopyTrader._drain_reverse_opens
@@ -471,6 +473,39 @@ ok += 1
 eng.positions = [pos]
 same = [q for q in eng.positions if q.get("coin") == "CHIP" and q.get("filled")]
 assert len(same) == 1, same
+ok += 1
+
+# ── 17. r7 P1 #3/#4: IN-FLIGHT ORDERS make settled state unknowable. ────────────────────────────
+#     An entry that already consumed its stamp can fill AFTER our REST snapshot, so a zero read is
+#     not a proof of flat while anything is in flight on the coin. Both the single-leg precondition
+#     and the pre-order check must DEFER (not abandon) in that state.
+eng = StubEngine(leader_pos=-7.0)
+pos = mkpos()
+eng.positions = [pos]
+eng._v17_pending_coin_side = {("CHIP", 1): 120.0}
+reaped = run(eng, pos)
+assert reaped is False, "must defer while an order is in flight on the coin"
+assert "exit" not in eng.calls, "must not flatten against unknowable settled state"
+assert pos.get("_pending_reverse"), "the intent survives a deferral"
+ok += 3
+
+# 17b. The drain defers the far side too, and KEEPS the request rather than dropping it.
+eng = StubEngine(leader_pos=-7.0)
+eng._v17_pending_coin_side = {("CHIP", -1): 50.0}
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert eng.entered == [], "no order while another is in flight on the coin"
+assert len(eng._reverse_opens) == 1, "a deferral must not lose the obligation"
+assert eng._reverse_opens[0]["attempts"] == 0, "a deferral is not an order attempt"
+ok += 3
+
+# 17c. With nothing in flight the same request proceeds normally.
+eng = StubEngine(leader_pos=-7.0)
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert len(eng.entered) == 1, eng.entered
 ok += 1
 
 print(f"reverse-EXECUTION self-test PASSED ({ok} assertions, real V16CopyTrader method)")
