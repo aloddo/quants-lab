@@ -75,6 +75,28 @@ if [ -f /tmp/v12_pause ] || [ -f "$WORKDIR/.HALT_COPY" ]; then
   exit 0
 fi
 
+# 2026-07-29 (quant): FAIL CLOSED. Everything above is a STOP signal, so the launcher ran unless
+# something stopped it -- absence of a file WAS permission to trade live. That shape already bit us
+# once (the 2026-06-10 note above: launchd KeepAlive re-armed an unapproved basket on machine-wake),
+# and it was patched with a stronger stop flag rather than inverted. It was still one `git clean -fdx`
+# away from live: .HALT_COPY is gitignored and untracked, and `git clean -ndx` listed it as
+# "Would remove" -- on a branch named `cleanup`. See findings/quant/2026-07-29-kill-switch-fails-open.
+#
+# So the launcher now requires a POSITIVE authorization. Losing a file means "do not trade" instead of
+# "trade". Deleting a file can no longer start trading; only creating one can.
+#
+#   ARM:    touch "$WORKDIR/.ARM_COPY"      (and remove BOTH halt flags)
+#   DISARM: rm -f "$WORKDIR/.ARM_COPY"
+#
+# .ARM_COPY is deliberately NOT gitignored -- an untracked-and-ignored file is exactly what made
+# .HALT_COPY deletable by routine tooling. Keep the halt flags too: they still win over the ARM file,
+# so an emergency stop stays a one-touch operation.
+if [ ! -f "$WORKDIR/.ARM_COPY" ]; then
+  echo "[$(date '+%F %T %Z')] v12_launcher: NOT ARMED (no $WORKDIR/.ARM_COPY), exiting (fail-closed)"
+  sleep 5
+  exit 0
+fi
+
 # Source .env safely (auto-export, then disable)
 if [ -f .env ]; then
   set -a
