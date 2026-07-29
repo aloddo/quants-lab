@@ -675,6 +675,15 @@ class CopyTrader:
             # the field in the document, so a restart restored an ABANDONED reverse alongside the
             # _force_exit that replaced it -- and _check_exits prioritises _pending_reverse.
             update["$unset"] = {"_pending_reverse": "", "_reverse_attempts": ""}
+        # Same for the three markers (codex r12 P2): without an $unset an operator could not durably
+        # clear a quarantine by popping it in memory and persisting -- the flag came straight back on
+        # the next restart.
+        _un = update.setdefault("$unset", {})
+        for _f in ("_reverse_declined", "_residual_quarantine", "_awaiting_retire"):
+            if not pos.get(_f):
+                _un[_f] = ""
+        if not _un:
+            update.pop("$unset", None)
         try:
             self.db[DB_OPEN_POSITIONS].update_one(key, update, upsert=True)
             return True
@@ -1862,12 +1871,12 @@ class CopyTrader:
         """
         if getattr(self, '_kill_switch_active', False):
             logger.debug(f"Entry blocked (kill switch active): {coin}")
-            return
+            return False
         # codex 2026-06-15 #2: explicitly block NEW entries while the gross-backstop TRIM is in progress
         # (do not rely on the possibly-stale gross-gate cache; no trim+open loop).
         if getattr(self, '_trim_requested', False):
             logger.info(f"Entry blocked (gross-backstop TRIM in progress): {coin}")
-            return
+            return False
 
         # Force CROSS margin + capped leverage on this coin before trading it (once per coin).
         # Stops the xyz isolated-margin liquidations (Alberto 9430).
@@ -1882,7 +1891,7 @@ class CopyTrader:
         cooldown_key = (twap_wallet, coin)
         if not skip_cooldown and now - self.last_entry.get(cooldown_key, 0) < cooldown_s:
             logger.debug(f"Cooldown active for {coin} from {twap_wallet[:10]}")
-            return
+            return False
 
         # Check existing position for add-on vs new entry
         existing = None
@@ -1945,10 +1954,10 @@ class CopyTrader:
         if existing:
             if max_addon_mult <= 1:
                 logger.debug(f"Skipping {coin}: add-ons disabled for {twap_wallet[:10]}")
-                return
+                return False
             if (existing["side"] == "BUY") != is_buy:
                 logger.debug(f"Skipping {coin}: existing {existing['side']}, new {'BUY' if is_buy else 'SELL'}")
-                return
+                return False
             logger.info(f"ADD-ON: {twap_wallet[:10]} {coin} -- existing size={existing['size']}")
 
         # V15: book/mid is computed FIRST (proportional sizing needs mid before the margin check, which
@@ -1973,13 +1982,13 @@ class CopyTrader:
             else:
                 logger.info(f"V15 SKIP {coin}: no live book and fallback mid stale/missing "
                             f"(age={fallback_age:.0f}s > {self.mark_max_age_s:.0f}s)")
-                return
+                return False
         else:
             # codex #1: gate live book staleness too -- a non-zero but OLD book ts must not size an order.
             book_age = time.time() - book.get("ts", 0)
             if book_age > self.mark_max_age_s:
                 logger.info(f"V15 SKIP {coin}: live book stale (age={book_age:.0f}s > {self.mark_max_age_s:.0f}s)")
-                return
+                return False
         best_bid = book["best_bid"]
         best_ask = book["best_ask"]
         mid = (best_bid + best_ask) / 2
@@ -2000,13 +2009,13 @@ class CopyTrader:
             if tgt_notional is None:
                 logger.info(f"V15 SKIP {coin} {twap_wallet[:10]}: cannot size off leader equity "
                             f"(stale/missing leader equity or mark)")
-                return
+                return False
             our_cur_abs = abs(existing["size"] * mid) if existing else 0.0
             entry_notional = abs(tgt_notional) - our_cur_abs   # add toward the leader's exposure level
             if entry_notional < self.min_entry_notional:
                 logger.debug(f"V15 {coin} {twap_wallet[:10]}: at/above leader exposure "
                              f"(delta ${entry_notional:.0f} < min ${self.min_entry_notional:.0f}) -- no add")
-                return
+                return False
         else:
             # notional_override (backfill only): use the EXACT per-order notional threaded in, never the
             # shared self.order_size (which a concurrent live WS entry must keep reading). None => config
@@ -2034,13 +2043,13 @@ class CopyTrader:
             shadow_util = (shadow_margin + entry_notional / self._get_coin_leverage(coin)) / equity
             if shadow_util > self.global_config["max_margin_util"]:
                 logger.info(f"SHADOW margin blocked {coin}: {shadow_util:.0%} util")
-                return
+                return False
         elif not self._check_margin_budget(coin, entry_notional, wallet=twap_wallet):
-            return
+            return False
 
         sz = self._round_size(coin, entry_notional / mid)
         if sz <= 0:
-            return
+            return False
 
         # Track pending margin BEFORE await. codex r2 #5: reserve pending margin at the SAME conservative
         # leverage the budget check uses (cap at margin_reserve_max_lev in proportional mode), else
@@ -2087,7 +2096,7 @@ class CopyTrader:
             })
             self._pending_margin = max(0, self._pending_margin - pending_add)
             self._pending_gross_notional = max(0, self._pending_gross_notional - entry_notional)
-            return
+            return False
 
         # IOC taker entry.
         # The rest of the engine already retries transient failures (exit poll, leverage-set 60s
@@ -2593,9 +2602,20 @@ class CopyTrader:
 
             still_open.append(pos)
 
-        # Remove exited positions from persistent DB state
+        # Remove exited positions from persistent DB state.
+        # OWNERSHIP CHECK (codex r12 P1 #1): the delete is keyed by (wallet, coin) only, so if a NEW
+        # leg on the same key has already been opened and persisted -- which the corrected entry scan
+        # now permits, since it no longer treats a logically-closed row as blocking -- this would
+        # delete the NEW leg's row. Only delete when no live successor holds the key.
+        _survivors = {(p.get('wallet', ''), p['coin']) for p in still_open
+                      if p.get('filled') and not p.get('_ws_exited') and not p.get('_awaiting_retire')}
         for pos in self.positions:
             if id(pos) in exited_ids:
+                _k = (pos.get('wallet', ''), pos['coin'])
+                if _k in _survivors:
+                    logger.info(f"EXIT CLEANUP: {pos['coin']} a live leg already holds this key -- "
+                                f"NOT deleting its persisted row")
+                    continue
                 self._remove_persisted_position(pos.get('wallet', ''), pos['coin'])
 
         # Merge still_open with NEW entries appended during awaits
@@ -5902,6 +5922,7 @@ class V16CopyTrader(CopyTrader):
             # Mark it, or the drain in this SAME cycle sees the retained row, reads it as the old
             # side reappearing, and clears the far-side request we just persisted (codex r10 P1 #3).
             pos['_awaiting_retire'] = True
+            self._persist_position(pos)          # the marker must survive a restart too
             logger.warning(f"REVERSE {coin} {wallet[:10]}: far side is queued but the old row's "
                            f"durable delete failed -- keeping it tracked until the delete lands")
             return False
