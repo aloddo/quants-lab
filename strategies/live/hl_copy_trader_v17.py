@@ -5206,11 +5206,24 @@ class V16CopyTrader(CopyTrader):
                                 "leader_pos": after,
                                 "requested_ts": time.time(),
                             }
+                            # A NEW generation gets a CLEAN budget (codex r9 P1 #1 + P2). Carrying
+                            # the previous intent's counters meant gen 1's four failures made gen 3's
+                            # first failure escalate immediately to _force_exit, and made the
+                            # "continuously busy" deferral alerts cumulative across unrelated flips.
+                            p.pop("_reverse_attempts", None)
+                            p.pop("_reverse_defers", None)
                             # PERSIST the intent (codex r2: the old _force_exit latch was in-memory
                             # only, so a restart silently dropped it). _check_exits executes it.
+                            # The intent must be DURABLE before we rely on it (codex r9 P1 #2).
+                            # A silent Mongo failure here plus a crash before the next exit cycle
+                            # reloads the leg with no intent and the reverse is lost.
                             try:
-                                self._persist_position(p)
+                                if not self._persist_position(p):
+                                    p["_pending_reverse"]["needs_persist"] = True
+                                    _tg(f"REVERSE {coin}: intent NOT durable yet (Mongo write "
+                                        f"failed) -- will retry before flattening")
                             except Exception as e:
+                                p["_pending_reverse"]["needs_persist"] = True
                                 logger.warning(f"REVERSE {coin}: intent persist failed ({e})")
                             break
                     return          # NEVER fall through to the base handler on a flip
@@ -5539,6 +5552,18 @@ class V16CopyTrader(CopyTrader):
         attempts = int(pos.get('_reverse_attempts', 0)) + 1
         pos['_reverse_attempts'] = attempts
 
+        # DURABILITY FIRST (codex r9 P1 #2): if the intent never reached Mongo, land it BEFORE
+        # flattening. Flattening on a non-durable intent means a crash loses the reverse entirely.
+        if intent.get("needs_persist"):
+            if self._persist_position(pos):
+                intent.pop("needs_persist", None)
+                logger.info(f"REVERSE {coin} {wallet[:10]}: intent is now durable")
+            else:
+                logger.warning(f"REVERSE {coin} {wallet[:10]}: intent still not durable -- deferring "
+                               f"the flatten rather than risk losing the reverse")
+                pos['_reverse_attempts'] = max(0, attempts - 1)
+                return False
+
         # SINGLE-LEG PRECONDITION (codex r6 P1 #1 + #2). Hyperliquid nets by COIN, so
         # `_exchange_position_size_strict` returns the ACCOUNT's net on this coin, not this wallet's
         # leg. If another roster wallet also holds the coin, that number can never go to zero and
@@ -5550,6 +5575,8 @@ class V16CopyTrader(CopyTrader):
         same_coin = [p for p in self.positions
                      if p.get('coin') == coin and p.get('filled') and not p.get('_ws_exited')]
         inflight = self._coin_inflight_usd(coin)
+        if inflight <= 0:
+            pos.pop('_reverse_defers', None)     # not busy -> the streak is over (codex r9 P2)
         if inflight > 0:
             # A DEFERRAL IS NOT AN ATTEMPT (codex r8 P1 #3). attempts was incremented at the top of
             # _execute_pending_reverse; leaving it raised meant five deferrals on a busy coin sent
@@ -5776,9 +5803,13 @@ class V16CopyTrader(CopyTrader):
                                if not (r["wallet"] == wallet and r["coin"] == coin)]
         self._reverse_opens.append(req)
         # The obligation is durable now -- safe to retire the old leg. If the durable DELETE fails
-        # we still return True: the far-side request IS persisted, so the reverse is not lost, and
-        # _check_exits' own cleanup gets another attempt at the row.
-        _retire_old_leg()
+        # we must NOT reap from memory (codex r9 P1 #4): the stale intent would survive in Mongo and
+        # resurrect on restart. The far-side request is already persisted, so returning False costs
+        # only a retry of the delete, not the reverse.
+        if not _retire_old_leg():
+            logger.warning(f"REVERSE {coin} {wallet[:10]}: far side is queued but the old row's "
+                           f"durable delete failed -- keeping it tracked until the delete lands")
+            return False
         logger.info(f"REVERSE {coin} {wallet[:10]}: flat confirmed, far side "
                     f"{'LONG' if cur > 0 else 'SHORT'} queued for this cycle")
         return True
@@ -5918,6 +5949,12 @@ class V16CopyTrader(CopyTrader):
             # unprovable on this coin (more than one roster leg) must not be closed here either --
             # the close would trade against the aggregate net and could hit the other wallet's leg
             # (codex r7 P1 #2). Cleared automatically once the coin is down to a single leg.
+            # A row still carrying a pending reverse (including one retained because its durable
+            # delete failed) must not be traded by convergence (codex r9 P1 #3): if another wallet's
+            # entry lands on the coin meanwhile, convergence could close THAT exposure using this
+            # stale old-side row.
+            if pos.get("_pending_reverse"):
+                continue
             if pos.get("_reverse_declined"):
                 _same = [q for q in self.positions
                          if q.get("coin") == pos.get("coin") and q.get("filled")
