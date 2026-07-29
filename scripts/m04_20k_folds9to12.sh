@@ -28,15 +28,18 @@ if [ "${_busy:-0}" -gt 0 ]; then
   ps ax -o command= | grep -E 'v15_m06b_ranking|v15_m07_engine|v15_m04_authenticity' | grep -v grep >&2
   exit 1
 fi
-# free pages * 16KB, in GB. The M4 memory budget needs ~4GB usable; below 5GB it will refuse anyway,
-# so fail here with a readable reason instead of inside the budget planner.
-_freegb=$(vm_stat | awk '/Pages free/ {gsub(/\./,"",$3); printf "%.1f", $3*16384/1073741824}')
-if [ "$(printf '%.0f' "${_freegb:-0}")" -lt 5 ]; then
-  echo "REFUSING TO START: only ${_freegb}GB free (need ~5GB). macOS compressor may be holding" >&2
+# AVAILABLE = free + inactive, which is what the M4 budget planner actually measures. Using RAW
+# free pages here was wrong and would have refused forever: right after heavy parquet work raw free
+# sits near 0.1GB while 3GB+ is reclaimable inactive. Caught by running the gate instead of
+# assuming it -- the same lesson as everything else today.
+_freegb=$(vm_stat | awk '/Pages free/ {gsub(/\./,"",$3); f=$3} /Pages inactive/ {gsub(/\./,"",$3); i=$3} END {printf "%.1f", (f+i)*16384/1073741824}')
+# M4 needs usable = avail - 0.5 headroom - 1.5 main_reserve >= 1.9 per worker, i.e. ~4GB available.
+if [ "$(printf '%.0f' "${_freegb:-0}")" -lt 4 ]; then
+  echo "REFUSING TO START: only ${_freegb}GB available (need ~4GB). macOS compressor may hold" >&2
   echo "reclaimable pages after heavy parquet work; let the box settle or reboot, then re-run." >&2
   exit 1
 fi
-echo "precondition OK: ${_freegb}GB free, no competing V15 job"
+echo "precondition OK: ${_freegb}GB available, no competing V15 job"
 PY=/Users/hermes/miniforge3/envs/quants-lab/bin/python
 OUT=app/data/v15
 W=$OUT/m01_universe_20k_wallets.txt
