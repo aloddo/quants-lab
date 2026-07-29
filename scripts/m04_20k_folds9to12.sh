@@ -18,6 +18,25 @@
 # last night's lesson was that a second concurrent worker made everything SLOWER, not faster).
 set -u
 cd /Users/hermes/quants-lab
+
+# ── PRECONDITION GATE (2026-07-29). Folds 9-10 completed here; fold 11 was OOM-KILLED (rc=137)
+# because M6b ranking was running concurrently -- which the note above already forbade, in prose.
+# Prose did not stop it. This checks.
+_busy=$(ps ax -o command= | grep -E 'v15_m06b_ranking|v15_m07_engine|v15_m04_authenticity' | grep -v grep | grep -vc "$$" || true)
+if [ "${_busy:-0}" -gt 0 ]; then
+  echo "REFUSING TO START: another heavy V15 job is running:" >&2
+  ps ax -o command= | grep -E 'v15_m06b_ranking|v15_m07_engine|v15_m04_authenticity' | grep -v grep >&2
+  exit 1
+fi
+# free pages * 16KB, in GB. The M4 memory budget needs ~4GB usable; below 5GB it will refuse anyway,
+# so fail here with a readable reason instead of inside the budget planner.
+_freegb=$(vm_stat | awk '/Pages free/ {gsub(/\./,"",$3); printf "%.1f", $3*16384/1073741824}')
+if [ "$(printf '%.0f' "${_freegb:-0}")" -lt 5 ]; then
+  echo "REFUSING TO START: only ${_freegb}GB free (need ~5GB). macOS compressor may be holding" >&2
+  echo "reclaimable pages after heavy parquet work; let the box settle or reboot, then re-run." >&2
+  exit 1
+fi
+echo "precondition OK: ${_freegb}GB free, no competing V15 job"
 PY=/Users/hermes/miniforge3/envs/quants-lab/bin/python
 OUT=app/data/v15
 W=$OUT/m01_universe_20k_wallets.txt
