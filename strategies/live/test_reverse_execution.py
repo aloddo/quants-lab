@@ -96,7 +96,12 @@ class StubEngine:
     _drain_reverse_opens = V16CopyTrader._drain_reverse_opens
     _clear_pending_reverse = V16CopyTrader._clear_pending_reverse
 
-    async def _enter_position(self, coin, is_buy, wallet=None, **kw):
+    async def _enter_position(self, coin, is_buy, wallet=None, barrier_token=None, **kw):
+        # Mirrors the REAL V17 admission check (the token is a PARAMETER, not shared state).
+        owner = self._coin_barrier_owner(coin)
+        if owner is not None and owner is not barrier_token:
+            self.calls.append(f"barrier_refused:{coin}")
+            return
         self.calls.append(f"enter:{coin}:{'BUY' if is_buy else 'SELL'}")
         self.entered.append((wallet, coin, is_buy))
         if self._entry_fills:
@@ -628,6 +633,71 @@ eng2._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen":
 asyncio.run(eng2._drain_reverse_opens())
 assert eng2._coin_barrier_owner("CHIP") is None, "barrier leaked after a failed REST proof"
 ok += 2
+
+# ══ ROUND-10 REGRESSIONS ════════════════════════════════════════════════════════════════════════
+
+# ── 25. r10 P1 #1: the barrier credential must identify ONE caller. Reading it from shared state
+#     meant every concurrent entry on the barriered coin compared equal and was admitted -- the
+#     barrier let through exactly the callers it existed to exclude.
+async def _barrier_admission():
+    eng = StubEngine(leader_pos=-7.0)
+    tok = object()
+    assert eng._install_coin_barrier("CHIP", tok)
+    await eng._enter_position("CHIP", False, wallet="0xB")          # no token -> refused
+    await eng._enter_position("CHIP", False, wallet="0xA", barrier_token=object())  # wrong -> refused
+    await eng._enter_position("CHIP", False, wallet="0xA", barrier_token=tok)       # right -> admitted
+    return eng
+
+
+eng = asyncio.run(_barrier_admission())
+assert eng.calls.count("barrier_refused:CHIP") == 2, eng.calls
+assert len(eng.entered) == 1 and eng.entered[0][0] == "0xA", eng.entered
+ok += 2
+
+# ── 26. r10 P1 #3: a row retained because its DURABLE DELETE failed is not an "old side
+#     reappeared". Without the _awaiting_retire mark the drain in the SAME cycle retired the
+#     far-side request that had just been persisted.
+eng = StubEngine(leader_pos=-7.0)
+stale = mkpos(_awaiting_retire=True)
+eng.positions = [stale]
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert len(eng.entered) == 1, "an awaiting-retire row must not block the far side: %r" % (eng.calls,)
+ok += 1
+
+# 26b. a GENUINE old-side leg (no mark) still retires the request.
+eng = StubEngine(leader_pos=-7.0)
+eng.positions = [mkpos()]
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert eng.entered == [] and eng._reverse_opens == [], (eng.entered, eng._reverse_opens)
+ok += 2
+
+# ── 27. r10 P1 #4: the unattributable residual row must be QUARANTINED, or convergence closes the
+#     very residual this branch refused to touch.
+eng = StubEngine(exit_ok=True, exch_after_exit=3.5)
+pos = mkpos()
+eng.positions = [pos]
+run(eng, pos)
+assert pos.get("_reverse_declined") is True, "residual row must carry the convergence quarantine"
+ok += 1
+
+# ── 28. r10 P1 #2: a non-durable intent must not block the FLATTEN forever. Durability protects the
+#     far side; being flat is the risk-reducing state. Bounded at 60 cycles, then flatten anyway.
+eng = StubEngine(leader_pos=-7.0)
+eng._persist_ok = False
+pos = mkpos()
+pos["_pending_reverse"]["needs_persist"] = True
+eng.positions = [pos]
+for i in range(59):
+    run(eng, pos)
+assert "exit" not in eng.calls, "must defer the flatten while retrying, for a bounded time"
+assert pos["_pending_reverse"]["persist_tries"] == 59, pos["_pending_reverse"]
+run(eng, pos)                       # try 60 -> proceed regardless
+assert "exit" in eng.calls, "after the bound it MUST flatten rather than spin forever"
+ok += 3
 
 print(f"reverse-EXECUTION self-test PASSED ({ok} assertions, real V16CopyTrader method)")
 print("  covers: happy path + ordering, failed flatten, bounded escalation, exchange-not-flat,")

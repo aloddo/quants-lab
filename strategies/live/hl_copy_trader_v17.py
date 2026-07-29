@@ -5441,8 +5441,11 @@ class V16CopyTrader(CopyTrader):
         keep = []
         for req in self._reverse_opens:
             w, c, want_buy = req["wallet"], req["coin"], req["is_buy"]
+            # `_awaiting_retire` rows are exchange-flat legs whose durable delete has not landed
+            # yet. They are NOT a reappearance of the old side, and must not retire the request.
             held = next((p for p in self.positions if p.get("coin") == c and p.get("wallet") == w
-                         and p.get("filled") and not p.get("_ws_exited")), None)
+                         and p.get("filled") and not p.get("_ws_exited")
+                         and not p.get("_awaiting_retire")), None)
             if held is not None:
                 if (held.get("side") == "BUY") == want_buy:
                     logger.info(f"REVERSE {c} {w[:10]}: far side is open -- request satisfied")
@@ -5487,7 +5490,6 @@ class V16CopyTrader(CopyTrader):
                 logger.info(f"REVERSE {c} {w[:10]}: coin busy or already barriered -- deferring")
                 keep.append(req)
                 continue
-            self._reverse_barrier_token = _tok
             try:
                 # PROVE FLAT, inside the barrier (codex r5 P1 #3 + r9 P1 #2). The read must be
                 # covered by the barrier or another wallet's entry can settle during the await and
@@ -5533,7 +5535,8 @@ class V16CopyTrader(CopyTrader):
                 try:
                     # knet carried on the request, so retries and restart-recovered requests are
                     # authorized by the SAME signal-time value the first attempt used.
-                    await self._enter_position(c, want_buy, wallet=w, knet_override=req.get("knet"))
+                    await self._enter_position(c, want_buy, wallet=w, knet_override=req.get("knet"),
+                                           barrier_token=_tok)
                 except Exception as e:
                     logger.error(f"REVERSE {c} {w[:10]}: far-side entry raised {e}", exc_info=True)
                 # Do NOT drop the request here. `_enter_position` reports no success status, so the only
@@ -5549,7 +5552,6 @@ class V16CopyTrader(CopyTrader):
                 keep.append(req)
             finally:
                 self._release_coin_barrier(c, _tok)
-                self._reverse_barrier_token = None
         self._reverse_opens = keep
 
     def _clear_pending_reverse(self, wallet: str, coin: str, gen=None) -> bool:
@@ -5598,12 +5600,31 @@ class V16CopyTrader(CopyTrader):
         if intent.get("needs_persist"):
             if self._persist_position(pos):
                 intent.pop("needs_persist", None)
+                intent.pop("persist_tries", None)
                 logger.info(f"REVERSE {coin} {wallet[:10]}: intent is now durable")
             else:
-                logger.warning(f"REVERSE {coin} {wallet[:10]}: intent still not durable -- deferring "
-                               f"the flatten rather than risk losing the reverse")
+                # BOUNDED, and it must escalate (codex r10 P1 #2). A 305-cycle injection showed this
+                # spinning silently forever: attempts rolled back every cycle, no counter advanced,
+                # convergence skipping the row, and the leg never flattening while the leader sat on
+                # the other side. Durability protects the FAR side; it must never block the FLATTEN,
+                # which is the risk-reducing half.
+                tries = int(intent.get("persist_tries", 0)) + 1
+                intent["persist_tries"] = tries
                 pos['_reverse_attempts'] = max(0, attempts - 1)
-                return False
+                if tries in (10, 60) or tries % 300 == 0:
+                    _tg(f"REVERSE {coin}: intent still not durable after {tries} cycles (Mongo "
+                        f"write failing) -- flatten is being deferred")
+                if tries >= 60:
+                    logger.error(f"REVERSE {coin} {wallet[:10]}: intent non-durable for {tries} "
+                                 f"cycles -- proceeding with the FLATTEN anyway; being flat is the "
+                                 f"safe state and a lost far-side request is the cheaper failure")
+                    _tg(f"REVERSE {coin}: proceeding to flatten with a non-durable intent after "
+                        f"{tries} cycles")
+                    intent.pop("needs_persist", None)
+                else:
+                    logger.warning(f"REVERSE {coin} {wallet[:10]}: intent not durable (try {tries}) "
+                                   f"-- deferring the flatten")
+                    return False
 
         # SINGLE-LEG PRECONDITION (codex r6 P1 #1 + #2). Hyperliquid nets by COIN, so
         # `_exchange_position_size_strict` returns the ACCOUNT's net on this coin, not this wallet's
@@ -5735,6 +5756,10 @@ class V16CopyTrader(CopyTrader):
             # alert -- the sweep and reconciliation own an unattributable residual, not this path.
             pos.pop('_pending_reverse', None)
             pos.pop('_reverse_attempts', None)
+            # QUARANTINE (codex r10 P1 #4). We kept this row precisely because the residual is
+            # unattributable; without the mark, _converge_positions closes it moments later against
+            # the aggregate net -- the exact trade this branch refused to make.
+            pos['_reverse_declined'] = True
             if not self._persist_position(pos):
                 _tg(f"REVERSE {coin}: residual-path intent clear did not reach Mongo -- it will "
                     f"resurrect on restart until this write succeeds")
@@ -5848,6 +5873,9 @@ class V16CopyTrader(CopyTrader):
         # resurrect on restart. The far-side request is already persisted, so returning False costs
         # only a retry of the delete, not the reverse.
         if not _retire_old_leg():
+            # Mark it, or the drain in this SAME cycle sees the retained row, reads it as the old
+            # side reappearing, and clears the far-side request we just persisted (codex r10 P1 #3).
+            pos['_awaiting_retire'] = True
             logger.warning(f"REVERSE {coin} {wallet[:10]}: far side is queued but the old row's "
                            f"durable delete failed -- keeping it tracked until the delete lands")
             return False
@@ -6955,7 +6983,7 @@ class V17CopyTrader(V16CopyTrader):
     async def _enter_position(self, coin: str, is_buy: bool, twap_dedup_key=None, wallet: str = None,
                               skip_cooldown: bool = False, backfill: bool = False,
                               notional_override: float = None, converge: bool = False,
-                              knet_override: float = None):
+                              knet_override: float = None, barrier_token=None):
         # converge=True (leader ADD mirroring only): skip ONLY the knet stamp block. Rationale: knet
         # counts how many OTHER cohort wallets currently hold this coin on this side, and exists to
         # gate opening NEW risk on a coin we are not in. For an ADD, that question was asked and
@@ -7179,8 +7207,11 @@ class V17CopyTrader(V16CopyTrader):
         # BARRIER CHECK -- synchronous, immediately before the reservation, no await between the
         # two. A reverse holding the barrier owns this coin across its flat proof and submission;
         # its own entry carries the token and is the only one admitted.
+        # The token is a PARAMETER, not shared state (codex r10 P1 #1). Reading it from
+        # self._reverse_barrier_token meant every concurrent entry on the barriered coin compared
+        # equal and was admitted -- the barrier admitted exactly the callers it existed to exclude.
         _b = self._coin_barrier_owner(coin)
-        if _b is not None and _b is not getattr(self, "_reverse_barrier_token", None):
+        if _b is not None and _b is not barrier_token:
             logger.info(f"V17 BARRIER: {coin} entry deferred, a reverse owns this coin")
             return
         self._v17_pending_net += side_new * resv
