@@ -22,10 +22,23 @@ cd /Users/hermes/quants-lab
 # ── PRECONDITION GATE (2026-07-29). Folds 9-10 completed here; fold 11 was OOM-KILLED (rc=137)
 # because M6b ranking was running concurrently -- which the note above already forbade, in prose.
 # Prose did not stop it. This checks.
-_busy=$(ps ax -o command= | grep -E 'v15_m06b_ranking|v15_m07_engine|v15_m04_authenticity' | grep -v grep | grep -vc "$$" || true)
+#
+# 2026-07-29 FIX: the first version grepped the module NAMES anywhere in a command line, so an
+# unrelated shell whose heredoc merely QUOTED "v15_m04_authenticity" (a markdown note on its way to
+# the brain) tripped the gate and refused a legitimate run at 5.7GB free. Decide on the EXECUTABLE
+# that was actually run -- first token of the command line -- so a shell can never match, whatever it
+# happens to quote. `comm` is unusable here: macOS truncates it to 16 chars.
+# Verified by running it, not by reading it: idle->0, real python invocation->1, a zsh merely echoing
+# the module path->no change, after exit->0.
+_BUSY_AWK='{ exe=$2; n=split(exe,p,"/"); base=p[n];
+             if (base !~ /^[Pp]ython[0-9.]*$/) next;
+             if ($0 ~ /research\/v15\/(v15_m06b_ranking|v15_m07_engine|v15_m04_authenticity)\.py/) c++ }
+           END { print c+0 }'
+_busy=$(ps -axo pid=,args= | awk "$_BUSY_AWK")
 if [ "${_busy:-0}" -gt 0 ]; then
   echo "REFUSING TO START: another heavy V15 job is running:" >&2
-  ps ax -o command= | grep -E 'v15_m06b_ranking|v15_m07_engine|v15_m04_authenticity' | grep -v grep >&2
+  ps -axo pid=,args= | awk '{ exe=$2; n=split(exe,p,"/"); base=p[n];
+      if (base ~ /^[Pp]ython[0-9.]*$/ && $0 ~ /research\/v15\/(v15_m06b_ranking|v15_m07_engine|v15_m04_authenticity)\.py/) print }' >&2
   exit 1
 fi
 # AVAILABLE = free + inactive, which is what the M4 budget planner actually measures. Using RAW
