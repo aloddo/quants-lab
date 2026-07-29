@@ -5337,6 +5337,36 @@ class V16CopyTrader(CopyTrader):
             self._converge_inflight.discard(key)
             self._converge_dirty.discard(key)
 
+    # ── COIN ADMISSION BARRIER (design: codex r9) ───────────────────────────────────────────────
+    # The reservation map narrowed the snapshot-to-submit race but could not close it: an entry can
+    # SETTLE and RELEASE its reservation during our REST await, so a stale flat snapshot still
+    # authorized the far side. This closes it, and cannot deadlock, because BOTH halves are
+    # SYNCHRONOUS -- there is no await between checking the barrier and mutating the reservation:
+    #   - an entry checks the barrier immediately before incrementing its reservation;
+    #   - the reverse installs the barrier only when reservations are already zero.
+    # So an entry that was already reserved when the barrier went up is VISIBLE to the reverse (it
+    # refuses to install), and one arriving afterwards cannot reserve. Nobody ever WAITS on the
+    # barrier, so there is no leg-lock -> coin-lock cycle to deadlock on.
+    def _coin_barrier_owner(self, coin: str):
+        return (getattr(self, "_coin_barriers", None) or {}).get(coin)
+
+    def _install_coin_barrier(self, coin: str, token) -> bool:
+        """Synchronously claim exclusive entry rights on `coin`. False if anything is already in
+        flight or another barrier owns it."""
+        if not hasattr(self, "_coin_barriers"):
+            self._coin_barriers = {}
+        if self._coin_barriers.get(coin) is not None:
+            return False
+        if self._coin_inflight_usd(coin) > 0:
+            return False
+        self._coin_barriers[coin] = token
+        return True
+
+    def _release_coin_barrier(self, coin: str, token) -> None:
+        b = getattr(self, "_coin_barriers", None)
+        if b is not None and b.get(coin) == token:
+            b.pop(coin, None)
+
     def _coin_inflight_usd(self, coin: str) -> float:
         """Reserved notional for orders on `coin` that are ACCEPTED but not yet reflected in
         self.positions or in an exchange read.
@@ -5449,66 +5479,77 @@ class V16CopyTrader(CopyTrader):
                     keep.append(req)
                 continue
 
-            # PROVE FLAT AGAIN, here, immediately before submitting (codex r5 P1 #3). The strict
-            # read in the flatten happened before the lock was released and the list rebuilt; a
-            # background entry for another wallet, or a late external fill, can reopen the coin in
-            # that window -- and _enter_position treats another wallet's leg on the coin as
-            # permission to open a NEW position rather than a reason to refuse.
-            try:
-                exch_now = await asyncio.to_thread(self._exchange_position_size_strict, c)
-            except Exception as exc:
-                logger.warning(f"REVERSE {c} {w[:10]}: pre-order flat check failed ({exc}) -- "
-                               f"retrying next cycle")
+            # Install the barrier BEFORE the REST proof and hold it through submission, so no other
+            # wallet's entry can settle inside the window the proof is supposed to cover. try/finally
+            # means every `continue` below still releases it.
+            _tok = object()
+            if not self._install_coin_barrier(c, _tok):
+                logger.info(f"REVERSE {c} {w[:10]}: coin busy or already barriered -- deferring")
                 keep.append(req)
                 continue
-            inflight_now = self._coin_inflight_usd(c)
-            if inflight_now > 0:
-                # An accepted order can fill between the REST snapshot and our submission, so a zero
-                # read is not a proof while anything is in flight. Defer, do not abandon.
-                logger.info(f"REVERSE {c} {w[:10]}: ${inflight_now:,.0f} in flight on this coin at "
-                            f"order time -- deferring the far side to the next cycle")
-                keep.append(req)
-                continue
-            if abs(exch_now) > 1e-10:
-                logger.warning(f"REVERSE {c} {w[:10]}: coin is no longer flat ({exch_now:+.6f}) at "
-                               f"order time -- far side NOT opened")
-                _tg(f"REVERSE {c}: far side ABANDONED, coin not flat at order time "
-                    f"({exch_now:+.6f})")
-                if not self._clear_pending_reverse(w, c, req.get("gen")):
-                    keep.append(req)
-                continue
-
-            # ATTEMPT COUNTING, here and nowhere earlier (codex r6 P1 #6): it bounds ORDER
-            # SUBMISSIONS, not cycles. When this sat above the TTL and flat checks, five transient
-            # REST failures exhausted the budget and abandoned the reverse without a single order
-            # ever having been sent. Every precondition has now passed, so this cycle really is an
-            # attempt.
-            req["attempts"] = int(req.get("attempts", 0)) + 1
-            if req["attempts"] > 5:
-                logger.error(f"REVERSE {c} {w[:10]}: far-side entry never took after "
-                             f"{req['attempts'] - 1} attempts -- giving up, staying flat")
-                _tg(f"REVERSE {c}: far-side entry failed x{req['attempts'] - 1}, staying flat")
-                if not self._clear_pending_reverse(w, c, req.get("gen")):
-                    keep.append(req)
-                continue
-
+            self._reverse_barrier_token = _tok
             try:
-                # knet carried on the request, so retries and restart-recovered requests are
-                # authorized by the SAME signal-time value the first attempt used.
-                await self._enter_position(c, want_buy, wallet=w, knet_override=req.get("knet"))
-            except Exception as e:
-                logger.error(f"REVERSE {c} {w[:10]}: far-side entry raised {e}", exc_info=True)
-            # Do NOT drop the request here. `_enter_position` reports no success status, so the only
-            # honest confirmation is seeing the leg on the next cycle -- which the top of this loop
-            # does. Persist the bumped attempt counter so the bound survives a restart.
-            if not self.shadow_mode:
+                # PROVE FLAT, inside the barrier (codex r5 P1 #3 + r9 P1 #2). The read must be
+                # covered by the barrier or another wallet's entry can settle during the await and
+                # invalidate exactly the snapshot we are about to trade on.
                 try:
-                    self.db[DB_PENDING_REVERSE].update_one(
-                        {"wallet": w, "coin": c, "gen": req.get("gen")},
-                        {"$set": {"attempts": req["attempts"]}})
-                except Exception:
-                    pass
-            keep.append(req)
+                    exch_now = await asyncio.to_thread(self._exchange_position_size_strict, c)
+                except Exception as exc:
+                    logger.warning(f"REVERSE {c} {w[:10]}: pre-order flat check failed ({exc}) -- "
+                                   f"retrying next cycle")
+                    keep.append(req)
+                    continue
+                inflight_now = self._coin_inflight_usd(c)
+                if inflight_now > 0:
+                    # An accepted order can fill between the REST snapshot and our submission, so a zero
+                    # read is not a proof while anything is in flight. Defer, do not abandon.
+                    logger.info(f"REVERSE {c} {w[:10]}: ${inflight_now:,.0f} in flight on this coin at "
+                                f"order time -- deferring the far side to the next cycle")
+                    keep.append(req)
+                    continue
+                if abs(exch_now) > 1e-10:
+                    logger.warning(f"REVERSE {c} {w[:10]}: coin is no longer flat ({exch_now:+.6f}) at "
+                                   f"order time -- far side NOT opened")
+                    _tg(f"REVERSE {c}: far side ABANDONED, coin not flat at order time "
+                        f"({exch_now:+.6f})")
+                    if not self._clear_pending_reverse(w, c, req.get("gen")):
+                        keep.append(req)
+                    continue
+
+                # ATTEMPT COUNTING, here and nowhere earlier (codex r6 P1 #6): it bounds ORDER
+                # SUBMISSIONS, not cycles. When this sat above the TTL and flat checks, five transient
+                # REST failures exhausted the budget and abandoned the reverse without a single order
+                # ever having been sent. Every precondition has now passed, so this cycle really is an
+                # attempt.
+                req["attempts"] = int(req.get("attempts", 0)) + 1
+                if req["attempts"] > 5:
+                    logger.error(f"REVERSE {c} {w[:10]}: far-side entry never took after "
+                                 f"{req['attempts'] - 1} attempts -- giving up, staying flat")
+                    _tg(f"REVERSE {c}: far-side entry failed x{req['attempts'] - 1}, staying flat")
+                    if not self._clear_pending_reverse(w, c, req.get("gen")):
+                        keep.append(req)
+                    continue
+
+                try:
+                    # knet carried on the request, so retries and restart-recovered requests are
+                    # authorized by the SAME signal-time value the first attempt used.
+                    await self._enter_position(c, want_buy, wallet=w, knet_override=req.get("knet"))
+                except Exception as e:
+                    logger.error(f"REVERSE {c} {w[:10]}: far-side entry raised {e}", exc_info=True)
+                # Do NOT drop the request here. `_enter_position` reports no success status, so the only
+                # honest confirmation is seeing the leg on the next cycle -- which the top of this loop
+                # does. Persist the bumped attempt counter so the bound survives a restart.
+                if not self.shadow_mode:
+                    try:
+                        self.db[DB_PENDING_REVERSE].update_one(
+                            {"wallet": w, "coin": c, "gen": req.get("gen")},
+                            {"$set": {"attempts": req["attempts"]}})
+                    except Exception:
+                        pass
+                keep.append(req)
+            finally:
+                self._release_coin_barrier(c, _tok)
+                self._reverse_barrier_token = None
         self._reverse_opens = keep
 
     def _clear_pending_reverse(self, wallet: str, coin: str, gen=None) -> bool:
@@ -7135,6 +7176,13 @@ class V17CopyTrader(V16CopyTrader):
         # reserve in-flight exposure for the duration of the entry attempt (codex P1.4).
         # FIX 2: reserve the SAME conservative notional (order_size * _tilt_cap) the cap check used,
         # so concurrent in-flight entries can't collectively exceed the cap via tilted sizing.
+        # BARRIER CHECK -- synchronous, immediately before the reservation, no await between the
+        # two. A reverse holding the barrier owns this coin across its flat proof and submission;
+        # its own entry carries the token and is the only one admitted.
+        _b = self._coin_barrier_owner(coin)
+        if _b is not None and _b is not getattr(self, "_reverse_barrier_token", None):
+            logger.info(f"V17 BARRIER: {coin} entry deferred, a reverse owns this coin")
+            return
         self._v17_pending_net += side_new * resv
         self._v17_pending_coin_side[(coin, side_new)] = \
             self._v17_pending_coin_side.get((coin, side_new), 0.0) + resv

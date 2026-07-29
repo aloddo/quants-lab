@@ -88,6 +88,9 @@ class StubEngine:
     # bind the REAL methods under test
     _leg_lock = V16CopyTrader._leg_lock
     _coin_inflight_usd = V16CopyTrader._coin_inflight_usd
+    _coin_barrier_owner = V16CopyTrader._coin_barrier_owner
+    _install_coin_barrier = V16CopyTrader._install_coin_barrier
+    _release_coin_barrier = V16CopyTrader._release_coin_barrier
     _execute_pending_reverse = V16CopyTrader._execute_pending_reverse
     _reverse_flatten_locked = V16CopyTrader._reverse_flatten_locked
     _drain_reverse_opens = V16CopyTrader._drain_reverse_opens
@@ -574,6 +577,56 @@ _load2 = inspect.getsource(V16CopyTrader._load_persisted_positions
                            if hasattr(V16CopyTrader, "_load_persisted_positions")
                            else V16CopyTrader.__mro__[-2]._load_persisted_positions)
 assert "_reverse_declined" in _load2, "_load_persisted_positions must restore the quarantine mark"
+ok += 2
+
+# ══ ROUND-9 REGRESSIONS ═════════════════════════════════════════════════════════════════════════
+
+# ── 22. r9 P1 #1: a NEW generation must start with a CLEAN failure budget. Carrying counters meant
+#     gen 1's four failures made gen 3's FIRST failure escalate straight to _force_exit.
+import hl_copy_trader_v17 as _m  # noqa: E402
+_src3 = inspect.getsource(_m.V16CopyTrader._on_hl_trade)
+assert '_reverse_attempts", None)' in _src3 or "_reverse_attempts\", None)" in _src3, (
+    "installing a new intent must clear _reverse_attempts")
+assert "_reverse_defers" in _src3, "installing a new intent must clear _reverse_defers"
+ok += 2
+
+# ── 23. r9 P1 #3: convergence must skip a row that still carries a pending reverse.
+_srcc = inspect.getsource(_m.V16CopyTrader._converge_positions)
+assert '_pending_reverse' in _srcc, "convergence must exclude rows with a pending reverse"
+ok += 1
+
+# ── 24. COIN ADMISSION BARRIER. Synchronous install/refuse, held across proof and submit.
+eng = StubEngine(leader_pos=-7.0)
+t1, t2 = object(), object()
+assert eng._install_coin_barrier("CHIP", t1) is True, "first claim succeeds on an idle coin"
+assert eng._install_coin_barrier("CHIP", t2) is False, "second claim is refused, never waits"
+assert eng._coin_barrier_owner("CHIP") is t1
+eng._release_coin_barrier("CHIP", t2)                      # wrong token must not release
+assert eng._coin_barrier_owner("CHIP") is t1, "a foreign token must not release the barrier"
+eng._release_coin_barrier("CHIP", t1)
+assert eng._coin_barrier_owner("CHIP") is None
+ok += 5
+
+# 24b. The barrier refuses to install while anything is already in flight -- that ordering is what
+#      makes it sound: an entry reserved BEFORE the barrier is visible, one after cannot reserve.
+eng = StubEngine(leader_pos=-7.0)
+eng._v17_pending_coin_side = {("CHIP", 1): 25.0}
+assert eng._install_coin_barrier("CHIP", object()) is False, (
+    "must not barrier a coin that already has an unsettled order")
+ok += 1
+
+# 24c. The drain releases the barrier on EVERY exit path, including the deferral ones.
+eng = StubEngine(leader_pos=-7.0)
+eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                       "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng._drain_reverse_opens())
+assert eng._coin_barrier_owner("CHIP") is None, "barrier leaked after a successful drain"
+eng2 = StubEngine(leader_pos=-7.0)
+eng2._exch_raises = True
+eng2._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 1,
+                        "knet": 3, "knet_ts": _t.time(), "attempts": 0}]
+asyncio.run(eng2._drain_reverse_opens())
+assert eng2._coin_barrier_owner("CHIP") is None, "barrier leaked after a failed REST proof"
 ok += 2
 
 print(f"reverse-EXECUTION self-test PASSED ({ok} assertions, real V16CopyTrader method)")
