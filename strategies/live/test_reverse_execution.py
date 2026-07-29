@@ -681,7 +681,11 @@ eng = StubEngine(exit_ok=True, exch_after_exit=3.5)
 pos = mkpos()
 eng.positions = [pos]
 run(eng, pos)
-assert pos.get("_reverse_declined") is True, "residual row must carry the convergence quarantine"
+# STICKY marker, not _reverse_declined (codex r11 P1 #1): _reverse_declined self-clears when the
+# coin has a single tracked leg, which is ALWAYS true for a residual (it lives on the exchange, not
+# in self.positions), so the quarantine evaporated in the same cycle.
+assert pos.get("_residual_quarantine") is True, "residual row must carry the STICKY quarantine"
+assert pos.get("_reverse_declined") is not True, "must not use the self-clearing marker here"
 ok += 1
 
 # ── 28. r10 P1 #2: a non-durable intent must not block the FLATTEN forever. Durability protects the

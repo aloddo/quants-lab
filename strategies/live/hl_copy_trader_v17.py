@@ -663,6 +663,10 @@ class CopyTrader:
         update = {"$set": doc}
         if pos.get("_reverse_declined"):
             doc["_reverse_declined"] = True
+        if pos.get("_residual_quarantine"):
+            doc["_residual_quarantine"] = True
+        if pos.get("_awaiting_retire"):
+            doc["_awaiting_retire"] = True
         if pos.get("_pending_reverse"):
             doc["_pending_reverse"] = pos["_pending_reverse"]
             doc["_reverse_attempts"] = pos.get("_reverse_attempts", 0)
@@ -794,6 +798,10 @@ class CopyTrader:
                 # perform exactly the ambiguous aggregate-net close the mark exists to prevent.
                 if doc.get("_reverse_declined"):
                     pos["_reverse_declined"] = True
+                if doc.get("_residual_quarantine"):
+                    pos["_residual_quarantine"] = True
+                if doc.get("_awaiting_retire"):
+                    pos["_awaiting_retire"] = True
                 positions.append(pos)
             return positions
         except Exception as e:
@@ -1880,6 +1888,12 @@ class CopyTrader:
         existing = None
         max_addon_mult = wc.get("max_addon_multiplier", 50)
         for p in self.positions:
+            # `filled` alone is not enough (codex r11 P1 #3). A row can be filled yet LOGICALLY
+            # CLOSED: reaped by the WS handler (_ws_exited), or exchange-flat and merely waiting on
+            # a durable delete (_awaiting_retire). Treating those as an existing position blocked
+            # the opposite-side entry -- the same defect three times under three flag names.
+            if p.get("_ws_exited") or p.get("_awaiting_retire"):
+                continue
             if p.get("filled") and p["coin"] == coin and p.get("wallet") == twap_wallet:
                 existing = p
                 break
@@ -5245,7 +5259,7 @@ class V16CopyTrader(CopyTrader):
             logger.error(f"V16 GUARD BREACH BLOCKED: _enter_position called for non-whitelist {coin} "
                          f"(wallet={wallet}) -- investigate the caller")
             _tg(f"V16 GUARD: blocked non-whitelist entry attempt {coin}")
-            return
+            return False
         return await super()._enter_position(coin, is_buy, twap_dedup_key=twap_dedup_key,
                                              wallet=wallet, skip_cooldown=skip_cooldown,
                                              notional_override=notional_override)
@@ -5523,11 +5537,14 @@ class V16CopyTrader(CopyTrader):
                 # REST failures exhausted the budget and abandoned the reverse without a single order
                 # ever having been sent. Every precondition has now passed, so this cycle really is an
                 # attempt.
-                req["attempts"] = int(req.get("attempts", 0)) + 1
-                if req["attempts"] > 5:
+                # Charged only on an actual SUBMISSION (codex r11 P1 #4): a gate refusal --
+                # cooldown, caps, knet, barrier -- is a DEFERRAL, not a failed order. Charging those
+                # meant five one-second retries inside the ordinary 30s post-exit cooldown exhausted
+                # the request with ZERO orders sent.
+                if int(req.get("attempts", 0)) >= 5:
                     logger.error(f"REVERSE {c} {w[:10]}: far-side entry never took after "
-                                 f"{req['attempts'] - 1} attempts -- giving up, staying flat")
-                    _tg(f"REVERSE {c}: far-side entry failed x{req['attempts'] - 1}, staying flat")
+                                 f"{req['attempts']} submissions -- giving up, staying flat")
+                    _tg(f"REVERSE {c}: far-side entry failed x{req['attempts']}, staying flat")
                     if not self._clear_pending_reverse(w, c, req.get("gen")):
                         keep.append(req)
                     continue
@@ -5535,8 +5552,13 @@ class V16CopyTrader(CopyTrader):
                 try:
                     # knet carried on the request, so retries and restart-recovered requests are
                     # authorized by the SAME signal-time value the first attempt used.
-                    await self._enter_position(c, want_buy, wallet=w, knet_override=req.get("knet"),
-                                           barrier_token=_tok)
+                    submitted = await self._enter_position(
+                        c, want_buy, wallet=w, knet_override=req.get("knet"), barrier_token=_tok)
+                    if submitted is False:
+                        logger.info(f"REVERSE {c} {w[:10]}: far-side entry refused by a gate -- "
+                                    f"deferring, no attempt charged")
+                    else:
+                        req["attempts"] = int(req.get("attempts", 0)) + 1
                 except Exception as e:
                     logger.error(f"REVERSE {c} {w[:10]}: far-side entry raised {e}", exc_info=True)
                 # Do NOT drop the request here. `_enter_position` reports no success status, so the only
@@ -5759,7 +5781,11 @@ class V16CopyTrader(CopyTrader):
             # QUARANTINE (codex r10 P1 #4). We kept this row precisely because the residual is
             # unattributable; without the mark, _converge_positions closes it moments later against
             # the aggregate net -- the exact trade this branch refused to make.
-            pos['_reverse_declined'] = True
+            # STICKY quarantine (codex r11 P1 #1). NOT _reverse_declined: that one self-clears
+            # when the coin drops to a single tracked leg, which is ALWAYS true here -- the residual
+            # is on the exchange, not in self.positions -- so the mark evaporated in the same cycle
+            # and convergence issued exactly the aggregate-net exit this branch refused to make.
+            pos['_residual_quarantine'] = True
             if not self._persist_position(pos):
                 _tg(f"REVERSE {coin}: residual-path intent clear did not reach Mongo -- it will "
                     f"resurrect on restart until this write succeeds")
@@ -6023,6 +6049,10 @@ class V16CopyTrader(CopyTrader):
             # entry lands on the coin meanwhile, convergence could close THAT exposure using this
             # stale old-side row.
             if pos.get("_pending_reverse"):
+                continue
+            # STICKY: an unattributable residual is never auto-cleared. Only an operator, or the
+            # normal exit machinery closing the leg, ends this state.
+            if pos.get("_residual_quarantine"):
                 continue
             if pos.get("_reverse_declined"):
                 _same = [q for q in self.positions
@@ -7006,16 +7036,16 @@ class V17CopyTrader(V16CopyTrader):
         wc = self._wallet_config(wallet or "")
         if bool(wc.get("entry_disabled", False)):
             logger.warning(f"V17 ENTRY BLOCKED (wallet entry_disabled): {coin} {wallet}")
-            return
+            return False
         if not self._v17_trading_enabled:
             self._v17_stale_rejects += 1
             logger.warning(f"V17 ENTRY BLOCKED (trading_disabled/seed): {coin} {wallet}")
-            return
+            return False
         # codex 2026-06-15 (trim cleanup): block at the TOP of the V17 override too, so no V17 knet/cap
         # metrics/stamps are consumed during a gross-backstop trim (base also blocks; this is for clean attribution).
         if getattr(self, '_trim_requested', False):
             logger.info(f"V17 ENTRY BLOCKED (gross-backstop TRIM in progress): {coin}")
-            return
+            return False
         # EXPANSION KILL gate (codex req #2/#3): block NEW ENTRIES on a disabled new coin. A coin is
         # disabled by its own per-coin kill or by the expansion-wide kill (which disables ALL new
         # coins). Existing positions on the coin are NOT touched here -- the exit machinery in
@@ -7025,14 +7055,14 @@ class V17CopyTrader(V16CopyTrader):
         if coin in self._v17_disabled_coins:
             logger.warning(f"V17 EXPANSION KILL: ENTRY blocked for disabled new coin {coin} "
                            f"(wallet={wallet}); existing position exits normally.")
-            return
+            return False
         # stale-tracker kill (class A, signal-freshness): knet is meaningless if we have not seen
         # target flow recently. Bypassed for backfill (currently-held position has no recent fill).
         age = time.time() - self._v17_last_target_fill_ts
         if age > 30.0 and not backfill:
             self._v17_stale_rejects += 1
             logger.warning(f"V17 STALE-TRACKER: last target fill {age:.0f}s ago; entry blocked {coin}")
-            return
+            return False
 
         # knet gate (class A, signal-freshness): consume the signal-time stamp (FIFO). Missing/expired
         # stamp = REJECT (codex P1.3: recompute-at-entry-time is a different, unvalidated gate; recovery
@@ -7067,7 +7097,7 @@ class V17CopyTrader(V16CopyTrader):
             self._v17_stale_rejects += 1
             logger.warning(f"V17 NO-STAMP REJECT: {coin} {'BUY' if is_buy else 'SELL'} wallet={wallet} "
                            f"(no fresh signal-time knet; non-signal entries do not open risk)")
-            return
+            return False
         if converge:
             # Distinct log line + gate-log class so converge adds are auditable separately and do not
             # pollute the accepted-entry knet attribution with null-knet rows (which would silently
@@ -7126,7 +7156,7 @@ class V17CopyTrader(V16CopyTrader):
                         "ts": datetime.now(timezone.utc)})
                 except Exception:
                     pass
-                return
+                return False
 
         # exposure caps from OUR live filled positions PLUS in-flight reservations (codex P1.4:
         # concurrent entry tasks could all pass the cap before any IOC fill lands in positions).
@@ -7181,7 +7211,7 @@ class V17CopyTrader(V16CopyTrader):
                 _tag = self._v17_coin_tag(coin) + " "
             logger.info(f"V17 NETX CAP: rejected {_tag}{coin} (net {net:+.0f} +resv {resv:.0f} cap "
                         f"{self._v17_netx_cap_x}x${eq:.0f}; total {self._v17_netx_rejects})")
-            return
+            return False
         if coin_side + resv > self._v17_coin_side_cap_x * eq:
             self._v17_coinside_rejects += 1
             _tag = ""
@@ -7191,7 +7221,7 @@ class V17CopyTrader(V16CopyTrader):
             logger.info(f"V17 COIN-SIDE CAP: rejected {_tag}{coin} "
                         f"({coin_side:.0f}+{resv:.0f} > {self._v17_coin_side_cap_x}x${eq:.0f}; "
                         f"total {self._v17_coinside_rejects})")
-            return
+            return False
 
         # record accepted-entry knet for attribution (week-1 KPI: knet-bucket PnL)
         try:
@@ -7213,7 +7243,7 @@ class V17CopyTrader(V16CopyTrader):
         _b = self._coin_barrier_owner(coin)
         if _b is not None and _b is not barrier_token:
             logger.info(f"V17 BARRIER: {coin} entry deferred, a reverse owns this coin")
-            return
+            return False
         self._v17_pending_net += side_new * resv
         self._v17_pending_coin_side[(coin, side_new)] = \
             self._v17_pending_coin_side.get((coin, side_new), 0.0) + resv
