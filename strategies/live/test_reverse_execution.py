@@ -54,6 +54,7 @@ class StubEngine:
         self._reverse_opens_loaded = True     # skip the Mongo recovery read
         self._entry_fills = True              # does the far-side entry actually take?
         self._persist_ok = True               # simulate Mongo write failures
+        self._delete_ok = True                # simulate Mongo delete failures
         self._pending_db = {}                 # stands in for DB_PENDING_REVERSE
         self._v17_pending_coin_side = {}       # accepted-but-unsettled order reservations
 
@@ -79,6 +80,8 @@ class StubEngine:
 
     def _remove_persisted_position(self, wallet, coin):
         self.calls.append("remove_persisted")
+        if not getattr(self, "_delete_ok", True):
+            return False
         self.removed.append((wallet, coin))
         return True
 
@@ -507,6 +510,71 @@ eng._reverse_opens = [{"wallet": "0xA", "coin": "CHIP", "is_buy": False, "gen": 
 asyncio.run(eng._drain_reverse_opens())
 assert len(eng.entered) == 1, eng.entered
 ok += 1
+
+# ══ ROUND-8 REGRESSIONS ═════════════════════════════════════════════════════════════════════════
+
+# ── 18. r8 P1 #1: TWO-CYCLE persist failure. Cycle 1 fails to persist the far-side request; the
+#     stamp must be RESTORED so cycle 2 still has its authorization. Without the restore the retry
+#     found no stamp, took the terminal no-stamp branch and retired the intent -- so "keep it and
+#     retry" was false end to end. My round-7 test only checked cycle 1, which is why it passed.
+eng = _FailingPersistEngine(leader_pos=-7.0)
+pos = mkpos()
+eng.positions = [pos]
+c1 = run(eng, pos)
+assert c1 is False and pos.get("_pending_reverse"), "cycle 1 keeps the intent"
+assert eng._v17_knet_pending.get(("0xA", "CHIP")), "the stamp must be PUT BACK for the retry"
+# cycle 2, Mongo now healthy
+eng2 = StubEngine(leader_pos=-7.0)
+eng2._v17_knet_pending = eng._v17_knet_pending
+eng2.positions = [pos]
+c2 = run(eng2, pos)
+assert eng2._reverse_opens, "cycle 2 must be able to queue the far side using the restored stamp"
+ok += 4
+
+# ── 19. r8 P1 #3: an in-flight DEFERRAL is not a reverse attempt. Five deferrals on a busy coin
+#     used to leave attempts at 5, so the first genuine flatten failure escalated straight to
+#     _force_exit and abandoned the far side.
+eng = StubEngine(leader_pos=-7.0)
+pos = mkpos()
+eng.positions = [pos]
+eng._v17_pending_coin_side = {("CHIP", 1): 100.0}
+for _ in range(5):
+    run(eng, pos)
+assert pos.get("_reverse_attempts", 0) == 0, (
+    "deferrals must not consume the attempt budget, got %r" % pos.get("_reverse_attempts"))
+assert pos.get("_reverse_defers") == 5, pos.get("_reverse_defers")
+assert pos.get("_pending_reverse"), "the intent survives repeated deferrals"
+ok += 3
+
+# ── 20. r8 P1 #5 (REACHABLE WITH THE FLAG OFF): if the durable DELETE fails, memory must NOT drop
+#     the leg -- the stale _pending_reverse row would survive in Mongo and resurrect on restart.
+eng = StubEngine(leader_pos=-7.0, reverse_enabled=False)
+eng._delete_ok = False
+pos = mkpos()
+eng.positions = [pos]
+reaped = run(eng, pos)
+assert reaped is False, "a failed durable delete must NOT reap the leg from memory"
+assert pos.get("_pending_reverse"), "the intent stays until the durable delete lands"
+ok += 2
+
+# 20b. With the delete healthy the same flag-off path retires cleanly.
+eng = StubEngine(leader_pos=-7.0, reverse_enabled=False)
+pos = mkpos()
+eng.positions = [pos]
+assert run(eng, pos) is True and "_pending_reverse" not in pos
+ok += 1
+
+# ── 21. r8 P1 #4: the quarantine mark must be DURABLE, or a restart lets convergence perform the
+#     ambiguous aggregate-net close it exists to prevent. Asserted against the real serializer.
+_src2 = inspect.getsource(V16CopyTrader._persist_position
+                          if hasattr(V16CopyTrader, "_persist_position")
+                          else V16CopyTrader.__mro__[-2]._persist_position)
+assert "_reverse_declined" in _src2, "_persist_position must serialize the quarantine mark"
+_load2 = inspect.getsource(V16CopyTrader._load_persisted_positions
+                           if hasattr(V16CopyTrader, "_load_persisted_positions")
+                           else V16CopyTrader.__mro__[-2]._load_persisted_positions)
+assert "_reverse_declined" in _load2, "_load_persisted_positions must restore the quarantine mark"
+ok += 2
 
 print(f"reverse-EXECUTION self-test PASSED ({ok} assertions, real V16CopyTrader method)")
 print("  covers: happy path + ordering, failed flatten, bounded escalation, exchange-not-flat,")

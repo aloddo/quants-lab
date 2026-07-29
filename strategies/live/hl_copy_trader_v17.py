@@ -633,10 +633,10 @@ class CopyTrader:
 
     # ── Persistent position state ─────────────────────────────────────────────
 
-    def _persist_position(self, pos: dict):
-        """Save/update an open position to MongoDB. Keyed by (wallet, coin)."""
+    def _persist_position(self, pos: dict) -> bool:
+        """Save/update an open position to MongoDB. Keyed by (wallet, coin). Returns success."""
         if self.shadow_mode:
-            return
+            return True          # nothing to persist is not a failure (codex r8 P2)
         key = {"wallet": pos.get("wallet", ""), "coin": pos["coin"]}
         doc = {
             "wallet": pos.get("wallet", ""),
@@ -661,6 +661,8 @@ class CopyTrader:
         # dropped on every restart -- the "durable latch" was in-memory only, exactly the defect the
         # intent design was supposed to remove. Carry both.
         update = {"$set": doc}
+        if pos.get("_reverse_declined"):
+            doc["_reverse_declined"] = True
         if pos.get("_pending_reverse"):
             doc["_pending_reverse"] = pos["_pending_reverse"]
             doc["_reverse_attempts"] = pos.get("_reverse_attempts", 0)
@@ -788,6 +790,10 @@ class CopyTrader:
                 if doc.get("_pending_reverse"):
                     pos["_pending_reverse"] = doc["_pending_reverse"]
                     pos["_reverse_attempts"] = doc.get("_reverse_attempts", 0)
+                # Quarantine must survive a restart (codex r8 P1 #4): without it convergence would
+                # perform exactly the ambiguous aggregate-net close the mark exists to prevent.
+                if doc.get("_reverse_declined"):
+                    pos["_reverse_declined"] = True
                 positions.append(pos)
             return positions
         except Exception as e:
@@ -5545,8 +5551,18 @@ class V16CopyTrader(CopyTrader):
                      if p.get('coin') == coin and p.get('filled') and not p.get('_ws_exited')]
         inflight = self._coin_inflight_usd(coin)
         if inflight > 0:
+            # A DEFERRAL IS NOT AN ATTEMPT (codex r8 P1 #3). attempts was incremented at the top of
+            # _execute_pending_reverse; leaving it raised meant five deferrals on a busy coin sent
+            # the first genuine flatten failure straight to _force_exit.
+            pos['_reverse_attempts'] = max(0, attempts - 1)
+            defers = int(pos.get('_reverse_defers', 0)) + 1
+            pos['_reverse_defers'] = defers
             logger.info(f"REVERSE {coin} {wallet[:10]}: ${inflight:,.0f} of orders in flight on this "
-                        f"coin -- deferring, settled state is not yet knowable")
+                        f"coin -- deferring (#{defers}), settled state is not yet knowable")
+            # A permanently busy coin must not silently leave us wrong-side forever.
+            if defers in (30, 120) or defers % 300 == 0:
+                _tg(f"REVERSE {coin}: deferred {defers} cycles, coin continuously busy -- we are "
+                    f"still on the leader's OLD side")
             return False
         if len(same_coin) > 1:
             holders = sorted({str(p.get('wallet'))[:10] for p in same_coin})
@@ -5667,10 +5683,19 @@ class V16CopyTrader(CopyTrader):
         # leg exists.
         acc_key = (wallet, coin)
 
-        def _retire_old_leg():
+        def _retire_old_leg() -> bool:
             """Drop the old row + its per-leg exit state. Called only once the far side is either
-            durably recorded or deliberately declined."""
-            self._remove_persisted_position(wallet, coin)
+            durably recorded or deliberately declined.
+
+            Returns False when the DURABLE delete failed (codex r8 P1 #5). In that case memory must
+            NOT drop the leg: the stale _pending_reverse row would survive in Mongo and resurrect the
+            reverse on the next restart while the in-memory engine believed it was done. This path is
+            reachable with copy_reverse_enabled=False, i.e. it is live behaviour today.
+            """
+            if not self._remove_persisted_position(wallet, coin):
+                _tg(f"REVERSE {coin}: durable delete FAILED -- keeping the leg tracked so the stale "
+                    f"intent cannot resurrect on restart")
+                return False
             # Every other full-exit caller clears these two (codex r6 P1 #5); without it a reopened
             # leg computes its close ratio against the PREVIOUS leg's accumulated notional -- the
             # inflated-denominator bug behind the 2026-07-27 orphans.
@@ -5678,12 +5703,12 @@ class V16CopyTrader(CopyTrader):
             self._exit_twap_buffer.pop(acc_key, None)
             pos.pop('_pending_reverse', None)
             pos.pop('_reverse_attempts', None)
+            return True
 
         if not self.copy_reverse_enabled:
             logger.info(f"REVERSE {coin} {wallet[:10]}: flattened and confirmed flat; "
                         f"copy_reverse_enabled=False so NOT opening the far side")
-            _retire_old_leg()
-            return True
+            return _retire_old_leg()
 
         # Re-read the leader NOW rather than trusting the intent: the intent may have been
         # overwritten by a later flip while this exit was in flight, and last-writer-wins is correct.
@@ -5694,8 +5719,7 @@ class V16CopyTrader(CopyTrader):
                         f"(${abs(cur) * mid:,.0f}) -- under the floor after flatten, staying flat")
             _tg(f"REVERSE {coin}: flattened, far side NOT opened (leader ${abs(cur) * mid:,.0f} "
                 f"under the ${self.reverse_min_notional:.0f} floor)")
-            _retire_old_leg()
-            return True
+            return _retire_old_leg()
         # CONSUME the actual signal-time stamp minted by V17._on_hl_trade for this flip (codex r5
         # P1 #1). Recomputing a fresh knet here was wrong twice over: the value was measured at
         # flatten time rather than signal time, and the original FIFO entry was left behind where a
@@ -5721,8 +5745,7 @@ class V16CopyTrader(CopyTrader):
             logger.warning(f"REVERSE {coin} {wallet[:10]}: no signal-time knet stamp for the far "
                            f"side -- staying flat rather than opening on unproven authorization")
             _tg(f"REVERSE {coin}: flattened, far side NOT opened (no signal-time knet stamp)")
-            _retire_old_leg()
-            return True
+            return _retire_old_leg()
         req = {"wallet": wallet, "coin": coin, "is_buy": want_buy, "gen": intent.get("gen"),
                "knet": knet_at_signal, "knet_ts": knet_ts,
                "attempts": 0, "created_ts": time.time()}
@@ -5739,14 +5762,22 @@ class V16CopyTrader(CopyTrader):
                 # obligation (codex r7 P1 #1, reproduced by failure injection). We are already flat
                 # on the exchange, so keeping the intent costs nothing and the next cycle retries;
                 # the position row is what carries it.
+                # RESTORE THE STAMP (codex r8 P1 #1). It was popped from the FIFO above; without
+                # putting it back the retry finds no stamp, takes the terminal no-stamp branch and
+                # retires the intent -- so "keep the intent and retry" was false end-to-end. Verified
+                # by two-cycle failure injection.
+                self._v17_knet_pending.setdefault((wallet, coin), []).insert(
+                    0, (knet_at_signal, knet_ts, want_buy, my_gen))
                 logger.error(f"REVERSE {coin}: FAILED to persist the far-side request ({e}) -- "
-                             f"KEEPING the intent for the next cycle rather than losing it")
+                             f"stamp restored, KEEPING the intent for the next cycle")
                 _tg(f"REVERSE {coin}: far-side request could not be persisted, retrying next cycle")
                 return False
         self._reverse_opens = [r for r in self._reverse_opens
                                if not (r["wallet"] == wallet and r["coin"] == coin)]
         self._reverse_opens.append(req)
-        # The obligation is durable now -- safe to retire the old leg.
+        # The obligation is durable now -- safe to retire the old leg. If the durable DELETE fails
+        # we still return True: the far-side request IS persisted, so the reverse is not lost, and
+        # _check_exits' own cleanup gets another attempt at the row.
         _retire_old_leg()
         logger.info(f"REVERSE {coin} {wallet[:10]}: flat confirmed, far side "
                     f"{'LONG' if cur > 0 else 'SHORT'} queued for this cycle")
