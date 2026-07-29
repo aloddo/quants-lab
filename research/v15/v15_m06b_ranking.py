@@ -719,9 +719,15 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
     # --- M6a provenance/copyability + n_journeys + tier + alloc + G5 fields.
     #     active_pretest_folds = # active 14d pretest sub-splits (m06a active_blocks), NOT
     #     active_test_folds (post-test_start info -> look-ahead). G5 uses active_pretest_folds. ---
-    m6a_cols = m06a[["entity_id", "fold_id", "copyable", "rankable", "n_journeys_pretest",
-                     "m4_tier", "entity_alloc_weight", "active_blocks",
-                     "g5_pool_candidate_pass"]].copy()
+    # primary_wallet is CARRIED (2026-07-29, P0). walk_forward_confirm pools ACROSS FOLDS and must
+    # key on the ADDRESS: entity_id is a positional index that maps to 7-8 different wallets across
+    # folds, so pooling on it blends unrelated traders.
+    # findings/quant/2026-07-29-m06b-confirm-pools-on-colliding-entity-id
+    _m6a_keep = ["entity_id", "fold_id", "copyable", "rankable", "n_journeys_pretest",
+                 "m4_tier", "entity_alloc_weight", "active_blocks", "g5_pool_candidate_pass"]
+    if "primary_wallet" in m06a.columns:
+        _m6a_keep.append("primary_wallet")
+    m6a_cols = m06a[_m6a_keep].copy()
     m6a_cols = m6a_cols.rename(columns={"active_blocks": "active_pretest_folds"})
 
     # --- assemble: UNIVERSE = M6a (every shortlist row), LEFT-join M7 engine results. A M6a row with
@@ -1175,8 +1181,15 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
         raise ValueError("walk_forward_confirm: no m07_positions in the TEST dir (need per-position emit).")
     tpos = tpos.copy()
     tpos["r_i"] = pd.to_numeric(tpos["r_i"], errors="coerce")
-    # attach the ADDRESS on the only valid key, (entity_id, fold_id)
-    _map = pre[["entity_id", "fold_id", "primary_wallet"]].drop_duplicates(["entity_id", "fold_id"])
+    # attach the ADDRESS on the only valid key, (entity_id, fold_id).
+    # The map MUST come from the FULL M6a shortlist, not from `pre`: `pre` is filtered to
+    # pretest-RANKABLE rows, so using it as the naming source left 96.96% of test positions unnamed
+    # and silently reduced the eligible set from ~5,900 wallets to 41. Naming is an identity join and
+    # must be independent of any ranking filter.
+    _src = inputs_pretest.get("m06a")
+    if _src is None or "primary_wallet" not in getattr(_src, "columns", []):
+        _src = pre
+    _map = _src[["entity_id", "fold_id", "primary_wallet"]].drop_duplicates(["entity_id", "fold_id"])
     tpos = tpos.merge(_map, on=["entity_id", "fold_id"], how="left")
     _unnamed = float(tpos["primary_wallet"].isna().mean()) if len(tpos) else 0.0
     if _unnamed > 0:

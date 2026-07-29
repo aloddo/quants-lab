@@ -2385,15 +2385,45 @@ class CopyTrader:
                 coin = pos['coin']
                 force_attempts = pos.get('_force_exit_attempts', 0) + 1
                 pos['_force_exit_attempts'] = force_attempts
+                # Persist the counter (codex r13 P2): it was incremented in memory only, so a restart
+                # reset the give-up backstop to whatever the last unrelated write happened to carry.
+                if force_attempts % 5 == 1:
+                    self._persist_position(pos)
                 if force_attempts > 30:
                     mid = self.mid_prices.get(coin, 0)
                     notional = pos['size'] * mid if mid > 0 else 0
-                    logger.error(
-                        f"FORCE EXIT GAVE UP: {coin} after {force_attempts} attempts "
-                        f"(${notional:.2f} notional). Dropping from tracker."
-                    )
-                    _tg(f"FORCE EXIT FAILED: {coin} ${notional:.2f} -- gave up after {force_attempts} tries")
-                    exited_ids.add(id(pos))
+                    # DO NOT DROP A LEG WE HAVE NOT PROVEN FLAT (2026-07-29, codex r12/r13 P1).
+                    # This branch used to add the row to exited_ids -- so cleanup deleted its
+                    # persistence -- while the EXCHANGE may still hold the position. That is real
+                    # capital going untracked, and every _force_exit producer inherits it, which is
+                    # why it is fixed here where it lives rather than inside the reverse path.
+                    # Reap ONLY on a strict, uncached exchange-flat proof; otherwise keep tracking,
+                    # quarantine it from the trading paths, and keep alerting.
+                    _flat = None
+                    try:
+                        _flat = await asyncio.to_thread(self._exchange_position_size_strict, coin)
+                    except Exception as _e:
+                        logger.warning(f"FORCE EXIT: {coin} flat-proof unavailable ({_e})")
+                    if _flat is not None and abs(_flat) <= 1e-10:
+                        logger.error(
+                            f"FORCE EXIT GAVE UP: {coin} after {force_attempts} attempts, but the "
+                            f"exchange CONFIRMS FLAT -- safe to drop from the tracker.")
+                        _tg(f"FORCE EXIT: {coin} gave up after {force_attempts} tries; exchange "
+                            f"confirms flat, dropped")
+                        exited_ids.add(id(pos))
+                    else:
+                        pos['_residual_quarantine'] = True
+                        self._persist_position(pos)
+                        if force_attempts in (31, 60, 120) or force_attempts % 300 == 0:
+                            logger.error(
+                                f"FORCE EXIT STUCK: {coin} after {force_attempts} attempts "
+                                f"(${notional:.2f} notional), exchange shows "
+                                f"{'unknown' if _flat is None else f'{_flat:+.6f}'} -- KEEPING it "
+                                f"tracked and quarantined. Manual intervention required.")
+                            _tg(f"FORCE EXIT STUCK: {coin} ${notional:.2f}, exchange NOT proven "
+                                f"flat after {force_attempts} tries -- position kept tracked, "
+                                f"needs manual attention")
+                        still_open.append(pos)
                 else:
                     logger.info(f"FORCE EXIT: {coin} (unmatched orphan, attempt {force_attempts})")
                     if await self._exit_position(pos):
