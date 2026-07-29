@@ -1156,23 +1156,41 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
     the wallet's OOS folds (stability). Ranking still comes from build_ranking (the module)."""
     pool, mani = build_ranking(inputs_pretest, m)
     pre = pool[pool["m6b_rankable"] & pool["m6b_score"].notna()].copy()
-    # per-ENTITY best pretest score (pool the pretest-rankable across folds)
-    pre_entity = pre.sort_values("m6b_score", ascending=False).drop_duplicates("entity_id")
-    cand = set(pre_entity["entity_id"].astype(int))
+    # ── IDENTITY (2026-07-29, P0). This function pools ACROSS FOLDS, so it MUST key on the wallet
+    # ADDRESS. `entity_id` is a POSITIONAL index that is NOT stable across folds
+    # (findings/quant/2026-07-28-entity-id-positional-index-collides-across-folds): on the 20k
+    # census EVERY confirmed entity_id mapped to 7-8 DISTINCT wallets, so each "confirmed wallet"
+    # was a blend of unrelated traders and its bootstrap p-value + BH-FDR were computed on that
+    # mixture. `(entity_id, fold_id)` is valid WITHIN a fold, which is exactly what the join below
+    # uses. See findings/quant/2026-07-29-m06b-confirm-pools-on-colliding-entity-id.
+    if "primary_wallet" not in pre.columns:
+        raise ValueError("walk_forward_confirm: pool lacks primary_wallet; cannot pool across folds "
+                         "on entity_id (positional index, collides). Re-run M6a to emit it.")
+    pre = pre[pre["primary_wallet"].notna()].copy()
+    pre_entity = pre.sort_values("m6b_score", ascending=False).drop_duplicates("primary_wallet")
+    cand = set(pre_entity["primary_wallet"].astype(str))
     # RAW per-journey OOS returns from the held-out test window(s)
     tpos = _read_parquet_maybe_parts(Path(m07_test_dir) / "m07_positions.parquet")
     if tpos is None or tpos.empty:
         raise ValueError("walk_forward_confirm: no m07_positions in the TEST dir (need per-position emit).")
     tpos = tpos.copy()
     tpos["r_i"] = pd.to_numeric(tpos["r_i"], errors="coerce")
-    tpos = tpos[tpos["entity_id"].astype(int).isin(cand)].dropna(subset=["r_i"])
+    # attach the ADDRESS on the only valid key, (entity_id, fold_id)
+    _map = pre[["entity_id", "fold_id", "primary_wallet"]].drop_duplicates(["entity_id", "fold_id"])
+    tpos = tpos.merge(_map, on=["entity_id", "fold_id"], how="left")
+    _unnamed = float(tpos["primary_wallet"].isna().mean()) if len(tpos) else 0.0
+    if _unnamed > 0:
+        logger.warning("walk_forward_confirm: %.2f%% of test positions could not be named and are "
+                    "EXCLUDED (an unnamed row cannot be attributed to a trader)", _unnamed * 100)
+    tpos = tpos.dropna(subset=["primary_wallet", "r_i"])
+    tpos = tpos[tpos["primary_wallet"].astype(str).isin(cand)]
     rows = []
-    for eid, g in tpos.groupby("entity_id"):
+    for wal, g in tpos.groupby("primary_wallet"):
         r = g["r_i"].to_numpy("float64")
         folds = g["fold_id"].nunique()
         fold_means = g.groupby("fold_id")["r_i"].mean()
         frac_pos = float((fold_means > 0).mean()) if len(fold_means) else 0.0
-        rows.append({"entity_id": int(eid), "oos_n": len(r), "oos_folds": int(folds),
+        rows.append({"primary_wallet": str(wal), "oos_n": len(r), "oos_folds": int(folds),
                      "oos_mean_r": float(r.mean()), "oos_frac_folds_pos": frac_pos,
                      "p_boot": _boot_p_mean_gt(r, m.oos_margin)})
     stats = pd.DataFrame(rows)
@@ -1187,15 +1205,16 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
         disc = _bh_fdr_mask(eligible["p_boot"].to_numpy("float64"), m.fdr_q)
         eligible["bh_discovery"] = disc
         confirmed = eligible[eligible["bh_discovery"]].copy()
-    _wcol = [c for c in ("primary_wallet", "m6b_score") if c in pre_entity.columns]
-    confirmed = confirmed.merge(pre_entity[["entity_id"] + _wcol], on="entity_id", how="left")
+    _wcol = [c for c in ("entity_id", "m6b_score") if c in pre_entity.columns]
+    confirmed = confirmed.merge(pre_entity[["primary_wallet"] + _wcol], on="primary_wallet",
+                                how="left")
     # The note was a HARDCODED "only 3 OOS folds available ... needs the FULL 12-fold action
     # bootstrap" string. Once that bootstrap exists the artifact would assert the opposite of its own
     # provenance. Data-derive it so a stamped artifact can never lie about the gate it ran at.
     _folds_avail = int(pd.to_numeric(tpos["fold_id"], errors="coerce").nunique())
     _at_standard = (m.oos_min_folds >= 4) and (m.oos_min_journeys_pooled >= 50)
     summ = {
-        "pretest_rankable_entities": len(cand),
+        "pretest_rankable_wallets": len(cand),
         "eligible_for_fdr": int(len(eligible)),
         "confirmed": int(len(confirmed)),
         "fdr_q": m.fdr_q, "oos_min_folds": m.oos_min_folds,
