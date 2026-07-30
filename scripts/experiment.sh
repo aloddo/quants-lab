@@ -131,6 +131,13 @@ while [ "$_p" != "." ] && [ "$_p" != "/" ]; do
   _p="$(dirname "$_p")"
 done
 
+# Provision the run dir with the small artifacts modules expect to find beside their outputs.
+# m06b (--data-dir) and m08 both read m03_folds.parquet from their data dir and neither has a flag for
+# it in every path; it is 11KB, and a run dir that carries its own fold geometry is better provenance.
+# The BIG inputs (m02_actions 4.65GB, m02_journeys 1GB) are passed explicitly instead -- never copied,
+# never symlinked (symlinking is the cross-run corruption hazard).
+if [ ! -s "$RUN/m03_folds.parquet" ]; then cp "$IN_FOLDS" "$RUN/m03_folds.parquet"; fi
+
 log "=== EXPERIMENT '$M_NAME' manifest=$MANIFEST run_dir=$RUN ==="
 T_START=$(date +%s)
 
@@ -273,7 +280,8 @@ PYEOF
     # shellcheck disable=SC2086  # deliberate word-split: M06B_ARGS is a pre-quoted flag list
     $SAFE --label m06b_"$M_NAME" -- $PY research/v15/v15_m06b_ranking.py \
       --m07-dir "$RUN/m07_pretest" --m07-test-dir "$RUN/m07_test" \
-      --m04-dir "$IN_M04_DIR" --out "$RUN" $M06B_ARGS >>"$LOG" 2>&1 || rc=$?
+      --m04-dir "$IN_M04_DIR" --out "$RUN" --data-dir "$RUN" \
+      --m02-journeys "$IN_JOURNEYS" $M06B_ARGS >>"$LOG" 2>&1 || rc=$?
     log "[m06b] rc=${rc:-0}"
     if [ "${rc:-0}" -ne 0 ]; then log "[m06b] FAILED -- stopping"; exit 1; fi
     mark_stage m06b

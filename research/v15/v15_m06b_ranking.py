@@ -335,7 +335,8 @@ def _same_coin_alpha(m07_dir: Path, folds: "pd.DataFrame", n_boot: int = 2000, s
     return agg.groupby(["entity_id", "fold_id"]).apply(_agg_alpha).reset_index()
 
 
-def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None) -> dict:
+def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None = None,
+                m02_journeys: str | None = None) -> dict:
     """Load the M7 pretest-window engine results + upstream M6a/M5/M4/M3 inputs.
 
     Returns a dict of DataFrames. Provenance fail-closed checks happen in build_ranking once we
@@ -361,7 +362,19 @@ def load_inputs(m07_dir: Path, data_dir: Path = DATA_DIR, m04_dir: Path | None =
         m04_entities = _load_m04_by_fold(m04_dir, folds, "m04_entities")
         m04_auth = _load_m04_by_fold(m04_dir, folds, "m04_authenticity")
         m04_fold_pure = True
-    m02_journeys_path = data_dir / "m02_journeys.parquet"
+    # 2026-07-30: explicit override. This defaulted to data_dir/m02_journeys.parquet, and when that file
+    # is ABSENT _blocks_activity silently yields zero journeys -> no block counts as active ->
+    # n_active_subsplits=0 for EVERY seat -> "active_subsplits<2" excludes the whole pool -> a confident
+    # "0 confirmed" that is a WRONG ANSWER, not a null result. Verified: cohort_search excluded all 7,811
+    # scored seats this way while the census run (same code, file present) had median 4 active subsplits.
+    m02_journeys_path = Path(m02_journeys) if m02_journeys else (data_dir / "m02_journeys.parquet")
+    if not Path(m02_journeys_path).exists():
+        raise FileNotFoundError(
+            f"m06b needs m02_journeys for the consistency activeness test; {m02_journeys_path} is absent. "
+            f"Without it EVERY seat scores n_active_subsplits=0 and the whole pool is excluded as "
+            f"'active_subsplits<2' -- a confident zero that means 'no input', not 'no edge'. "
+            f"Pass --m02-journeys explicitly."
+        )
 
     # optional: per-action equity path (FINAL consistency source). Absent in current shipped runner.
     eq_path = m07_dir / "m07_equity.parquet"
@@ -1254,6 +1267,10 @@ def main():
         "--data-dir", default=str(DATA_DIR),
         help="Directory containing this lane's M2-M6a artifacts.",
     )
+    ap.add_argument("--m02-journeys", default=None,
+                    help="m02_journeys.parquet (default: <data-dir>/m02_journeys.parquet). Required for "
+                         "the consistency activeness test; absent -> m06b now REFUSES instead of "
+                         "excluding every seat as active_subsplits<2.")
     ap.add_argument("--m04-dir", default=None,
                     help="directory with m04_authenticity_f{fold_id}.parquet and m04_entities_f{fold_id}.parquet")
     ap.add_argument("--m07-test-dir", default=None,
@@ -1310,7 +1327,7 @@ def main():
     if _over:
         logger.info("M6b OOS-gate overrides: %s", _over)
     inputs = load_inputs(
-        Path(args.m07_dir), data_dir=Path(args.data_dir),
+        Path(args.m07_dir), data_dir=Path(args.data_dir), m02_journeys=args.m02_journeys,
         m04_dir=Path(args.m04_dir) if args.m04_dir else None,
     )
     out, manifest = build_ranking(inputs, m)
