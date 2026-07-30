@@ -1,0 +1,76 @@
+# ACCEPTANCE CONDITION 2 (Fable plan gate): a DIFFERENT experiment, expressed as a manifest diff,
+# running end to end with ZERO .py edited.
+#
+# This is a copy of golden.yml with ONE block changed: the m06b weight vector. It exists to prove the
+# mechanism -- that a selection hypothesis is now data, not code. Before today the V2.2 vector lived
+# only in the dataclass, so testing a hypothesis meant editing a module, which is precisely how three
+# weeks of bespoke screens got written.
+#
+# THE HYPOTHESIS: the shipped vector has NO term for the ratio of mean win to mean loss, which is what
+# actually decides profitability after our ~9bps round-trip fee. Measured OOS on 2026-07-30: 60.5% of
+# wallet-weeks positive (binomial p=0.024, so direction is REAL) but mean win +43.0 bps against mean
+# loss -56.4 bps -> expectancy +3.7 bps, t-test p=0.547. They are right more often than chance and
+# still make nothing, because they lose bigger than they win.
+#
+# w_pp_std is the closest available proxy: it penalises the STANDARD DEVIATION of per-position return.
+# It was deliberately cut to 0.05 for the fat-edge reweight ("do NOT penalize fat-edge variance",
+# Alberto 2026-07-23). This run raises it to 0.35 and takes the weight off raw edge magnitude.
+#
+# HONEST LIMITATION, stated because it matters for interpreting the result: std is SYMMETRIC -- it
+# punishes upside variance exactly as hard as downside. It is therefore a blunt instrument for an
+# ASYMMETRY hypothesis. A proper test needs a real downside term (Omega / gain-to-pain / mean-loss)
+# added to m06b, which is Phase-2 code and deliberately NOT in this manifest. Read this run as
+# "does penalising variance harder change who gets selected", not as "asymmetry is fixed".
+
+name: asym_std
+description: >-
+  Acceptance condition 2 + first pass at the asymmetry hypothesis. Identical to golden except the m06b
+  weight vector: variance penalty 0.05 -> 0.35, edge magnitude 0.45 -> 0.20. No code changed.
+
+inputs:
+  run_dir: app/data/v15/census20k_20260728
+  actions: app/data/v15/census20k_20260728/m02_actions.parquet
+  journeys: app/data/v15/census20k_20260728/m02_journeys.parquet
+  folds: app/data/v15/census20k_20260728/m03_folds.parquet
+  m04_dir: app/data/v15/census20k_20260728
+  m03_activity: app/data/v15/census20k_20260728/m03_wallet_activity_summary.parquet
+  slip_calib: app/data/v15/census20k_20260728/slippage_calib.json
+
+output:
+  dir: app/data/v15/experiments/asym_std
+
+m05:
+  mode: copyability
+  skip_if_exists: true
+
+# IDENTICAL to golden -- so the m07 stage can reuse golden's outputs rather than recompute 90 minutes
+# of simulation. Only the ranking changes, which is the whole point of the experiment.
+m07:
+  windows: [pretest, test]
+  sizing_mode: fixed_position
+  fixed_target_exposure: 0.10
+  copy_policy: full_mirror
+  copy_latency_ms: 4000
+  shortlist: app/data/v15/census20k_20260728/m06a_shortlist.parquet
+
+# ---- THE ONLY SUBSTANTIVE DIFF FROM golden.yml ---------------------------------------------------- #
+m06b:
+  w_pp_mean_r: 0.20      # golden: 0.45  -- take weight OFF raw edge magnitude
+  w_pp_t: 0.15           # unchanged
+  w_pp_std: 0.35         # golden: 0.05  -- penalise per-position variance HARD
+  w_pp_mtm_dd: 0.20      # unchanged
+  w_pp_quick: 0.15       # unchanged
+  pp_min_positions: 25
+  fdr_q: 0.10
+  oos_min_folds: 4
+  oos_min_journeys_pooled: 50
+  fee_schedule_version: hl_fee_schedule_2026-06-01
+
+oos:
+  tool: forward_oos_hot
+  mark_source: asset_ctxs
+  min_trades: 5
+  windows: [2026-05-18, 2026-05-25, 2026-06-01, 2026-06-08, 2026-06-15, 2026-06-22, 2026-06-29]
+
+resources:
+  mem_safe_floor_gb: 2

@@ -1,0 +1,89 @@
+# GOLDEN MANIFEST — reproduces the already-known answer, bit-for-bit.
+#
+# This is the Phase-1 acceptance test (Fable plan gate, 2026-07-30). It must re-derive the result the
+# pipeline produced on 2026-07-28 from ONE command, twice, with identical output hashes:
+#     966 rankable -> 353 eligible -> 53 confirmed at FDR q=0.1
+#     full_mirror  = +23.59 bps/position over 308 seats
+#
+# A NEW EXPERIMENT IS A COPY OF THIS FILE WITH FIELDS CHANGED. Never a new script.
+# That is the whole point: the standing correction is "ANY SELECTION MUST GO THROUGH THE PIPELINE" and
+# "NEVER AGAIN waste tokens building custom shit". If a hypothesis is not expressible here, fix the
+# manifest schema -- do not hand-roll a screen.
+
+name: golden
+description: >-
+  Reproduction baseline. Folds 1-8, census20k inputs, fixed_position sizing, full_mirror policy,
+  V2.2 m06b weights exactly as shipped.
+
+# --- inputs (read-only; never written to) -------------------------------------------------------- #
+inputs:
+  run_dir: app/data/v15/census20k_20260728     # existing artifacts are REUSED, not rebuilt
+  actions: app/data/v15/census20k_20260728/m02_actions.parquet
+  journeys: app/data/v15/census20k_20260728/m02_journeys.parquet
+  folds: app/data/v15/census20k_20260728/m03_folds.parquet
+  m04_dir: app/data/v15/census20k_20260728
+  m03_activity: app/data/v15/census20k_20260728/m03_wallet_activity_summary.parquet
+  slip_calib: app/data/v15/census20k_20260728/slippage_calib.json
+
+# --- where THIS experiment writes (own dir; never a symlink -- the writer refuses) --------------- #
+output:
+  dir: app/data/v15/experiments/golden
+
+# --- m05 eligibility ----------------------------------------------------------------------------- #
+m05:
+  mode: copyability        # equity lane needs M1, which is OUT OF SCOPE (Alberto 2026-07-17/30)
+  skip_if_exists: true     # reuse the shipped m05 for the golden reproduction
+
+# --- m07 engine ---------------------------------------------------------------------------------- #
+m07:
+  # BOTH windows are required and they are NOT interchangeable: m06b RANKS on pretest
+  # [train_start, test_start) and CONFIRMS out-of-sample on test. Feeding it the test window as the
+  # ranking input is look-ahead, and m06b's own provenance gate correctly refuses it -- which is exactly
+  # what it did on the first golden run (2026-07-30): "308_rows_window!=[train_start,test_start)".
+  windows: [pretest, test]
+  sizing_mode: fixed_position     # leader_equity is DEPRECATED (reads a 100%-null column)
+  fixed_target_exposure: 0.10
+  copy_policy: full_mirror        # A/B 2026-07-30: beat entry_trail at every trail threshold
+  copy_latency_ms: 4000           # MEASURED live 2026-07-27
+  # THE FULL m06a shortlist -- this is what produced the reference 966 -> 353 -> 53.
+  # First attempt pointed at m06a_shortlist_confirmed53.parquet (the 308-seat slice built for the
+  # 2026-07-30 exit-policy A/B). That is a DIFFERENT experiment: m06b returned
+  # pretest_rankable_entities=0, eligible=0, confirmed=0, because 53 wallets x 8 folds cannot support
+  # the rankable gates. A golden reproduction must consume the same input as the run it reproduces.
+  shortlist: app/data/v15/census20k_20260728/m06a_shortlist.parquet
+
+# --- m06b ranking: the SELECTION HYPOTHESIS lives here ------------------------------------------- #
+# V2.2 shipped vector. NOTE for Phase 2: there is NO term for the ratio of mean win to mean loss,
+# which is what actually decides profitability after our ~9bps round-trip fee. w_pp_std is symmetric
+# (it punishes upside variance too) and was deliberately cut to near-zero for the fat-edge reweight.
+m06b:
+  w_pp_mean_r: 0.45
+  w_pp_t: 0.15
+  w_pp_std: 0.05
+  w_pp_mtm_dd: 0.20
+  w_pp_quick: 0.15
+  pp_min_positions: 25
+  fdr_q: 0.10
+  oos_min_folds: 4
+  oos_min_journeys_pooled: 50
+  fee_schedule_version: hl_fee_schedule_2026-06-01
+
+# --- out-of-sample validation (LOCAL data only; no API) ------------------------------------------ #
+# two_regime_test's live-API path lost 97% of the population to rate limits and is unnecessary:
+# local m02 reaches 2026-07-13 and the S3 hot dailies reach 2026-07-29.
+oos:
+  tool: forward_oos_hot
+  mark_source: asset_ctxs        # coverage is ASSERTED against the window; a gap now exits non-zero
+  min_trades: 5
+  windows:
+    - 2026-05-18                 # fold 8 test_end_excl -> everything after is strictly OOS
+    - 2026-05-25
+    - 2026-06-01
+    - 2026-06-08
+    - 2026-06-15
+    - 2026-06-22
+    - 2026-06-29
+
+# --- memory envelope (acceptance condition 4: complete, or refuse with a reason) ----------------- #
+resources:
+  mem_safe_floor_gb: 2

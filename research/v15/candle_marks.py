@@ -57,10 +57,23 @@ def coverage_ms() -> tuple[int, int] | None:
     if not _idx:
         _load()
     if not _idx:
-        return None
+        # codex 2026-07-30 #10: this used to return None, which the caller read as "source has no
+        # coverage API" and merely WARNED about. For candles, empty means _load() found NO DATA -- the
+        # exact all-unmarkable state that produces a silent n=0. Signal it distinctly so the caller can
+        # refuse rather than shrug.
+        return (0, 0)
     lo = min(int(ts[0]) for ts, _ in _idx.values())
     hi = max(int(ts[-1]) for ts, _ in _idx.values())
     return lo, hi
+
+
+def per_coin_coverage_ms() -> dict[str, tuple[int, int]]:
+    """Per-COIN (min,max) ts. codex 2026-07-30 #9: the global min/max is not a coverage guarantee --
+    one coin can supply the early bound and a different coin the late bound while NEITHER covers the
+    window, so the aggregate check can print OK while every relevant mark returns None."""
+    if not _idx:
+        _load()
+    return {c: (int(ts[0]), int(ts[-1])) for c, (ts, _) in _idx.items()}
 
 
 def candle_mark_at(coin: str, ts_ms: int):

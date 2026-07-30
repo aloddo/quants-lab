@@ -138,6 +138,12 @@ class ShardedParquetWriter:
         # Symlink-write guard at the ONE chokepoint every v15 module already funnels output through,
         # so it cannot be forgotten by a future caller (Fable plan gate Step 3).
         self.out = assert_not_symlinked_output(out_path, "parquet output")
+        # codex 2026-07-30 #5: checking ONLY the final output left both STAGING paths open. An existing
+        # `<out>.parts` symlink is followed by mkdir + stale-part deletion + every part write, and an
+        # existing `<out>.tmp` symlink is followed and its target TRUNCATED during the final stitch.
+        # Either clobbers another run despite the guard. Check every path this class writes to.
+        assert_not_symlinked_output(self.out.with_suffix(self.out.suffix + ".parts"), "parts dir")
+        assert_not_symlinked_output(self.out.with_suffix(self.out.suffix + ".tmp"), "stitch tmp file")
         self.parts_dir = self.out.with_suffix(self.out.suffix + ".parts")
         self.parts_dir.mkdir(parents=True, exist_ok=True)
         # codex perf-r1 #1: WIPE any stale parts from a prior aborted/failed run so close() can never

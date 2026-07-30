@@ -157,12 +157,35 @@ def assert_mark_coverage(source: str, cov, lo_ms: int, hi_ms: int) -> None:
     `cov=None` means the source does not expose coverage yet (asset_ctxs, live) -> we cannot check, so we
     warn rather than silently pass. Adding coverage_ms() to those sources closes the gap properly.
     """
+    import os
     import pandas as _pd
     _d = lambda t: _pd.Timestamp(t, unit="ms", tz="UTC").strftime("%Y-%m-%d")
+    _ACK = "QL_ALLOW_UNVERIFIED_MARKS"
+    if cov == (0, 0):
+        raise SystemExit(
+            f"MARK SOURCE EMPTY: {source!r} loaded NO data at all, so every mark would return None and "
+            f"every window would score n=0 -- which reads as 'these wallets stopped trading'. That is a "
+            f"wrong answer, not a null result. Check the store exists and covers "
+            f"{_d(lo_ms)}..{_d(hi_ms)}."
+        )
     if cov is None:
-        print(f"[mark-coverage] WARNING: source {source!r} does not report coverage; requested "
-              f"{_d(lo_ms)}..{_d(hi_ms)} is UNVERIFIED. A silent n=0 is possible.", flush=True)
-        return
+        # codex 2026-07-30 #2: this used to WARN and continue. `cov is None` is the case for asset_ctxs --
+        # THE DEFAULT SOURCE -- and for live, so the original silent-n=0 wrong-answer path stayed fully
+        # open on the default configuration while the manifest claimed coverage was asserted. An
+        # unverifiable safety check must refuse, not shrug. Acknowledge explicitly to proceed.
+        if os.environ.get(_ACK) == "1":
+            print(f"[mark-coverage] UNVERIFIED for {source!r} over {_d(lo_ms)}..{_d(hi_ms)}; proceeding "
+                  f"only because {_ACK}=1. A silent n=0 is possible -- treat any zero-n window as "
+                  f"SUSPECT, not as evidence.", flush=True)
+            return
+        raise SystemExit(
+            f"MARK COVERAGE UNVERIFIABLE: source {source!r} does not report its coverage, so this run "
+            f"cannot prove it can price {_d(lo_ms)}..{_d(hi_ms)}. Uncovered windows score n=0, which "
+            f"reads as 'no trading' -- a WRONG ANSWER, not a null result (this exact path produced a "
+            f"false '0 of 53 pass' verdict on 2026-07-30). Either use 'candles' (which reports "
+            f"coverage), split the run to a window you can verify, or set {_ACK}=1 to proceed with the "
+            f"risk acknowledged and every zero-n window treated as suspect."
+        )
     c_lo, c_hi = cov
     gap_lo = max(0, c_lo - lo_ms) / 86_400_000.0
     gap_hi = max(0, hi_ms - c_hi) / 86_400_000.0

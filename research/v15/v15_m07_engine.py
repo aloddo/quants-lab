@@ -1911,40 +1911,62 @@ def assert_sizing_input_usable(dataset, sizing_mode: str, actions_path) -> None:
     # 20k store has no stats on this column, so an assume-usable fallback left this guard inert on
     # exactly the file it exists to catch (verified 2026-07-30). Fall back to reading a BOUNDED sample
     # of the column instead: enough to prove "entirely null", cheap enough to never matter.
-    total = nulls = 0
-    used_stats = False
-    try:
+    # codex 2026-07-30 #3 and #15 rewrote this. Three bugs in the previous version, all of which made a
+    # SAFETY CHECK PASS when it should have refused:
+    #   #3 a no-stats row group reset the counters and raised _NoStats but left used_stats=True, so the
+    #      fallback scan was skipped and `total == 0` suppressed the rejection -> a MIXED-statistics
+    #      all-null store sailed through and still emitted zero orders.
+    #   #15 the bounded 200k prefix could FALSELY REJECT a store whose nulls happen to be at the front,
+    #      and any metadata/scanner exception `return`ed, i.e. turned an inspection failure into
+    #      PERMISSION. A fail-loud check must never fail open.
+    # Correct semantics: the question is only "does even ONE non-null value exist?". Stats can answer it
+    # definitively when present for EVERY row group; otherwise scan and STOP AT THE FIRST non-null value.
+    # That is cheap for usable stores (early exit) and only walks the whole column for the all-null case,
+    # which is exactly the case being rejected.
+    def _stats_say_all_null():
+        """True/False from row-group stats, or None if any row group lacks them."""
+        total = nulls = 0
         for frag in dataset.get_fragments():
             md = frag.metadata
             if md is None or col not in md.schema.names:
-                continue
+                return None
             idx = md.schema.names.index(col)
             for rg in range(md.num_row_groups):
                 c = md.row_group(rg).column(idx)
-                st = c.statistics
-                if st is None:
-                    total = nulls = 0
-                    raise _NoStats
-                used_stats = True
+                if c.statistics is None:
+                    return None          # ANY gap invalidates the whole stats path
                 total += c.num_values
-                nulls += st.null_count
-    except _NoStats:
-        pass
-    except Exception:               # never let a metadata quirk block a legitimate run
-        return
-    if not used_stats:
-        try:                        # bounded sample: first ~200k values is plenty to prove all-null
-            import pyarrow as _pa
-            scanner = dataset.scanner(columns=[col], batch_size=65_536)
-            for batch in scanner.to_batches():
+                nulls += c.statistics.null_count
+        return (total > 0 and nulls >= total, total, nulls) if total else None
+
+    verdict = None
+    try:
+        verdict = _stats_say_all_null()
+    except Exception as e:               # inspection failure must NOT become permission
+        logger.warning("[sizing-guard] stats inspection failed on %s (%s); falling back to a scan",
+                       actions_path, e)
+        verdict = None
+
+    if verdict is None:                  # scan: stop at the FIRST non-null; no prefix guessing
+        seen = 0
+        try:
+            for batch in dataset.scanner(columns=[col], batch_size=65_536).to_batches():
                 arr = batch.column(0)
-                total += len(arr)
-                nulls += arr.null_count
-                if total >= 200_000:
-                    break
-        except Exception:
-            return
-    if total > 0 and nulls >= total:
+                seen += len(arr)
+                if arr.null_count < len(arr):
+                    return               # a real value exists -> the mode can size. Done.
+        except Exception as e:
+            raise ValueError(
+                f"sizing_mode='leader_equity' refuses to run: could not verify {col} in "
+                f"{actions_path} ({e}). A safety check that cannot inspect its input must refuse, not "
+                f"assume. Use sizing_mode='fixed_position'."
+            ) from e
+        if seen == 0:
+            return                       # genuinely empty dataset; nothing to size either way
+        verdict = (True, seen, seen)
+
+    all_null, total, nulls = verdict
+    if all_null:
         raise ValueError(
             f"sizing_mode='leader_equity' refuses to run: {col} is 100% NULL in {actions_path} "
             f"({nulls:,}/{total:,} values). It sizes from leader equity (M1, out of scope), so this "

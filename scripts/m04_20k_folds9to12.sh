@@ -62,7 +62,12 @@ LOG=/tmp/ql_m04_20k_f9to12.log
 FOLDS="9:2026-05-18 10:2026-06-01 11:2026-06-15 12:2026-06-29"
 
 echo "=== m04 20k folds 9-12 start $(date -u +%FT%TZ) ===" >> "$LOG"
-printf '%s\n' $FOLDS | while read -r pair; do
+# codex 2026-07-30 #6: the loop USED TO be the right side of `printf | while read`, which bash runs in a
+# SUBSHELL -- so `exit 1` inside it exited only the subshell, and with neither `set -e` nor `pipefail` the
+# script fell through to the "done" echo and exited 0. An OOM refusal, a wrapper kill, or a module failure
+# was therefore MASKED at the driver boundary: the very rc=137 signal this driver exists to surface.
+# Fixed by iterating in the CURRENT shell (`for` over the word-split list) so `exit` exits the script.
+for pair in $FOLDS; do
   fid="${pair%%:*}"; asof="${pair##*:}"
   o="$OUT/m04_authenticity_f${fid}.parquet"
   e="$OUT/m04_entities_f${fid}.parquet"

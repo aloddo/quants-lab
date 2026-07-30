@@ -1271,6 +1271,23 @@ def main():
     ap.add_argument("--oos-min-frac-folds-pos", type=float, default=None)
     ap.add_argument("--oos-margin", type=float, default=None)
     ap.add_argument("--fdr-q", type=float, default=None)
+    # PER-POSITION SCORE WEIGHTS + rankable gates, settable from the CLI (2026-07-30).
+    # WHY: the V2.2 weight vector lived ONLY in the dataclass, so testing a different selection
+    # hypothesis meant editing a .py -- which is exactly how bespoke one-off screens get written instead
+    # (the standing correction: "ANY SELECTION MUST GO THROUGH THE PIPELINE" /
+    # "NEVER AGAIN waste tokens building custom shit"). With these exposed, a new selection hypothesis is
+    # a MANIFEST DIFF, not a script. This is the enabling change for the asymmetry hypothesis (the current
+    # vector has NO term for the ratio of mean win to mean loss, which is what decides profitability
+    # after our ~9bps fee). Defaults None -> dataclass unchanged, so every existing caller is byte-identical.
+    ap.add_argument("--w-pp-mean-r", type=float, default=None, help="weight: mean per-position net return")
+    ap.add_argument("--w-pp-t", type=float, default=None, help="weight: consistency (edge/noise t-stat)")
+    ap.add_argument("--w-pp-std", type=float, default=None, help="weight SUBTRACTED: std of per-position return")
+    ap.add_argument("--w-pp-mtm-dd", type=float, default=None, help="weight SUBTRACTED: MTM position drawdown")
+    ap.add_argument("--w-pp-quick", type=float, default=None, help="weight: fraction closed <=48h")
+    ap.add_argument("--pp-min-positions", type=int, default=None, help="gate: min round-trips to be rankable")
+    ap.add_argument("--pp-min-lcb-mean-r", type=float, default=None, help="gate: 95%% LCB on net per-position return")
+    ap.add_argument("--pp-max-med-hold-h", type=float, default=None, help="gate: max median hold (h)")
+    ap.add_argument("--pp-max-mtm-dd", type=float, default=None, help="gate: max MTM drawdown")
     args = ap.parse_args()
     _over = {k: v for k, v in (
         ("oos_min_folds", args.oos_min_folds),
@@ -1278,6 +1295,15 @@ def main():
         ("oos_min_frac_folds_pos", args.oos_min_frac_folds_pos),
         ("oos_margin", args.oos_margin),
         ("fdr_q", args.fdr_q),
+        ("w_pp_mean_r", args.w_pp_mean_r),
+        ("w_pp_t", args.w_pp_t),
+        ("w_pp_std", args.w_pp_std),
+        ("w_pp_mtm_dd", args.w_pp_mtm_dd),
+        ("w_pp_quick", args.w_pp_quick),
+        ("pp_min_positions", args.pp_min_positions),
+        ("pp_min_lcb_mean_r", args.pp_min_lcb_mean_r),
+        ("pp_max_med_hold_h", args.pp_max_med_hold_h),
+        ("pp_max_mtm_dd", args.pp_max_mtm_dd),
     ) if v is not None}
     m = M6bManifest(fee_schedule_version=args.fee_schedule_version,
                     slippage_calibration_version=args.slippage_calibration_version, **_over)
