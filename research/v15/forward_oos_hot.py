@@ -200,6 +200,28 @@ def assert_mark_coverage(source: str, cov, lo_ms: int, hi_ms: int) -> None:
     print(f"[mark-coverage] OK: {source!r} covers {_d(c_lo)}..{_d(c_hi)} ⊇ requested "
           f"{_d(lo_ms)}..{_d(hi_ms)}", flush=True)
 
+    # codex 2026-07-30 #9: the aggregate (min,max) is NOT a coverage guarantee. It is the global minimum
+    # over ALL coins and the global maximum over ALL coins, so coin A can supply the early bound while
+    # coin B supplies the late one and NEITHER covers the window -- the check prints OK while every
+    # relevant mark returns None. Report per-coin coverage so a thin coin is visible instead of silent.
+    if source == "candles":
+        try:
+            import candle_marks
+            per = candle_marks.per_coin_coverage_ms()
+        except Exception:
+            per = {}
+        if per:
+            short = {c: (lo, hi) for c, (lo, hi) in per.items() if lo > lo_ms or hi < hi_ms}
+            if short:
+                worst = sorted(short.items(), key=lambda kv: (kv[1][0] - lo_ms) + (hi_ms - kv[1][1]),
+                               reverse=True)[:6]
+                print(f"[mark-coverage] PARTIAL: {len(short)} of {len(per)} coins do NOT span the whole "
+                      f"window. Positions in those coins can be unmarkable even though the aggregate "
+                      f"range looks fine. Worst: "
+                      + ", ".join(f"{c} {_d(lo)}..{_d(hi)}" for c, (lo, hi) in worst), flush=True)
+            else:
+                print(f"[mark-coverage] all {len(per)} coins individually span the window", flush=True)
+
 
 def main():
     import argparse
