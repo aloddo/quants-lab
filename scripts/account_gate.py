@@ -38,6 +38,21 @@ from datetime import datetime, timezone
 INFO = "https://api.hyperliquid.xyz/info"
 
 # --- thresholds. Each one is here because it would have caught a specific real failure today. ---
+# 2026-07-30: all four are now CLI-OVERRIDABLE (defaults unchanged, so existing callers behave
+# identically). They must be, because under the CURRENT thesis three of the four are wrong:
+#   MIN_PERP_EQUITY_USD  -- void. Alberto 2026-07-17/30: "No M1 no equity" / "I don't care about
+#                           equity". We copy a leader's ACTIONS, not their balance sheet.
+#   MIN_LIFETIME_PERP_PNL-- actively CONTRADICTS the thesis. The 2026-07-30 cohort deliberately copies
+#                           the ENTRIES of traders whose position management loses money: 12 of 13 are
+#                           lifetime-negative while their mean per-position return is positive, because
+#                           we size fixed and never inherit their size concentration.
+#   MAX_ACCOUNT_LEVERAGE -- 10x conflicts with Alberto's own spec that HL default leverage is 20x on
+#                           majors; a leader running 20x BTC is normal, not disqualifying.
+#   MAX_STALE_DAYS       -- the ONLY one that is unconditionally disqualifying for COPY trading. A
+#                           dormant leader emits no signal, so there is nothing to copy at any size.
+# On 2026-07-30 the gate refused all 13 cohort wallets and was RIGHT, but for a mix of reasons: the
+# load-bearing one was that 8 of 13 had not traded in 23-121 days (including the only lifetime-positive
+# leader, dormant 121d). Keep staleness strict; let the caller relax the rest deliberately and on the record.
 MIN_PERP_EQUITY_USD = 10_000.0   # kills the $0 / $969 / $2,658 accounts (9 of 11 + 3 of 4)
 MIN_LIFETIME_PERP_PNL = 0.0      # kills lifetime-negative traders (-$23,637 / -$19,920 / -$881 / -$190)
 MAX_STALE_DAYS = 7.0             # kills the dormant (5 of 11 had no fill in 30d; one never filled)
@@ -127,22 +142,43 @@ def load_wallets(args) -> list[str]:
 
 
 def main() -> int:
+    # Declared up front: the argparse defaults below READ these constants, and a `global` statement
+    # must precede every use of the name inside the function.
+    global MIN_PERP_EQUITY_USD, MIN_LIFETIME_PERP_PNL, MAX_STALE_DAYS, MAX_ACCOUNT_LEVERAGE
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", help="copy_trader roster JSON")
     ap.add_argument("--wallets", help="comma-separated wallets (overrides --config)")
     ap.add_argument("--json-out", help="write full results here")
+    # Overrides (defaults = the module constants, so omitting them changes nothing). See the note at
+    # the constants: under the entries-only thesis, staleness is the load-bearing criterion and the
+    # other three are either void (equity) or contradict the thesis (lifetime PnL, leverage).
+    ap.add_argument("--min-equity", type=float, default=MIN_PERP_EQUITY_USD,
+                    help="perp equity floor. 0 disables. Alberto: 'I don't care about equity'.")
+    ap.add_argument("--min-lifetime-pnl", type=float, default=MIN_LIFETIME_PERP_PNL,
+                    help="lifetime perp PnL floor. Use -inf to disable: the entries-only thesis "
+                         "deliberately copies traders who are lifetime-negative.")
+    ap.add_argument("--max-stale-days", type=float, default=MAX_STALE_DAYS,
+                    help="days since last fill. THE load-bearing copy criterion: a dormant leader "
+                         "emits no signal, so there is nothing to copy at any size.")
+    ap.add_argument("--max-leverage", type=float, default=MAX_ACCOUNT_LEVERAGE,
+                    help="account leverage cap. HL default is 20x on majors, so 10x is strict.")
     args = ap.parse_args()
     if not args.config and not args.wallets:
         print("ERROR: need --config or --wallets", file=sys.stderr)
         return 2
+
+    MIN_PERP_EQUITY_USD = args.min_equity
+    MIN_LIFETIME_PERP_PNL = args.min_lifetime_pnl
+    MAX_STALE_DAYS = args.max_stale_days
+    MAX_ACCOUNT_LEVERAGE = args.max_leverage
 
     wallets = load_wallets(args)
     if not wallets:
         print("ERROR: no wallets resolved -- failing closed", file=sys.stderr)
         return 2
 
-    print(f"ACCOUNT GATE  equity>=${MIN_PERP_EQUITY_USD:,.0f} | lifetime perp PnL>0 | "
-          f"fill<={MAX_STALE_DAYS:.0f}d | leverage<={MAX_ACCOUNT_LEVERAGE:.0f}x")
+    print(f"ACCOUNT GATE  equity>=${MIN_PERP_EQUITY_USD:,.0f} | lifetime perp PnL>{MIN_LIFETIME_PERP_PNL:,.0f} | "
+          f"fill<={MAX_STALE_DAYS:.0f}d | leverage<={MAX_ACCOUNT_LEVERAGE:,.0f}x")
     print(f"{'wallet':14s} {'perp_eq':>12s} {'lifetime':>13s} {'lev':>6s} {'stale_d':>8s}  verdict")
     results = []
     for w in wallets:
