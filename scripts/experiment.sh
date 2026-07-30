@@ -264,6 +264,14 @@ print(f'{len(w)} wallets -> $UNIV')" >>"$LOG" 2>&1 || rc=$?
     fi
     log "[oos] universe: $(wc -l < "$UNIV" | tr -d ' ') wallets"
     rc=0
+    # An unverifiable mark source is a hard refusal unless the MANIFEST acknowledges it (auditable in
+    # provenance), rather than an env var someone sets by hand and forgets.
+    if [ "${OOS_ALLOW_UNVERIFIED_MARKS:-false}" = "True" ] || [ "${OOS_ALLOW_UNVERIFIED_MARKS:-false}" = "true" ]; then
+      export QL_ALLOW_UNVERIFIED_MARKS=1
+      log "[oos] manifest acknowledges UNVERIFIED mark coverage -- any n=0 window in this run is SUSPECT, not evidence"
+    else
+      unset QL_ALLOW_UNVERIFIED_MARKS || true
+    fi
     log "[oos] START mark_source=$OOS_MARK_SOURCE windows=$OOS_WINDOWS"
     $PY research/v15/forward_oos_hot.py --universe-file "$UNIV" \
       --windows "$OOS_WINDOWS" --mark-source "$OOS_MARK_SOURCE" \

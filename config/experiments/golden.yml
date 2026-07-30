@@ -73,7 +73,14 @@ m06b:
 # local m02 reaches 2026-07-13 and the S3 hot dailies reach 2026-07-29.
 oos:
   tool: forward_oos_hot
-  mark_source: asset_ctxs        # coverage is ASSERTED against the window; a gap now exits non-zero
+  mark_source: asset_ctxs
+  # asset_ctxs does NOT report its coverage, so the runner cannot PROVE it can price this window. Since
+  # 2026-07-30 that is a hard refusal by default (it was the silent-n=0 path that produced a false
+  # "0 of 53 pass" verdict). This manifest acknowledges the risk EXPLICITLY because it reproduces a
+  # historical run that used this source, and a faithful reproduction must not change the source.
+  # CONSEQUENCE, and it is the point of making this explicit: any window scoring n=0 in this run is
+  # SUSPECT, not evidence. Prefer 'candles' (which reports coverage) for new experiments.
+  allow_unverified_marks: true
   min_trades: 5
   windows:
     - 2026-05-18                 # fold 8 test_end_excl -> everything after is strictly OOS
