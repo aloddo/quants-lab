@@ -43,6 +43,26 @@ def _load(lo_ms: int | None = None, hi_ms: int | None = None) -> None:
         _idx[coin] = (g["timestamp_utc"].to_numpy(), g["close"].to_numpy(dtype="float64"))
 
 
+def coverage_ms() -> tuple[int, int] | None:
+    """(min_ts_ms, max_ts_ms) actually available from this mark source, or None if it has no data.
+
+    2026-07-30 FAIL-LOUD: added because choosing a mark source that does not cover the requested
+    window returns a silent n=0 rather than an error. On 2026-07-30 this produced a false
+    "0 of 53 wallets pass" OOS verdict: `--mark-source candles` was used for windows starting
+    2026-05-18, but this store holds only 2026-06-24..07-29 (36 dailies, ZERO for May), so the first
+    five windows priced nothing. The wallets were trading heavily throughout -- raw fills show 2,332
+    on 05-19 and 3,022 on 06-02, MORE than in July. Callers must assert coverage BEFORE scoring;
+    see forward_oos_hot.assert_mark_coverage.
+    """
+    if not _idx:
+        _load()
+    if not _idx:
+        return None
+    lo = min(int(ts[0]) for ts, _ in _idx.values())
+    hi = max(int(ts[-1]) for ts, _ in _idx.values())
+    return lo, hi
+
+
 def candle_mark_at(coin: str, ts_ms: int):
     if not _idx:
         _load()

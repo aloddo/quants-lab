@@ -144,6 +144,40 @@ def taker_edge(fills, lo_ms, hi_ms, lat_ms):
             "n_open_marked": n_open_marked, "n_open_unmarked": n_open_unmarked, "n_open_reduced": n_open_reduced}
 
 
+def assert_mark_coverage(source: str, cov, lo_ms: int, hi_ms: int) -> None:
+    """FAIL LOUD if the chosen mark source cannot price the requested window (2026-07-30).
+
+    WHY: a mark source with no data over the window does NOT error -- every roundtrip simply fails to
+    price and the window reports n=0, which reads as "these wallets stopped trading". On 2026-07-30 that
+    produced a false "0 of 53 pass" OOS verdict: `--mark-source candles` over windows starting
+    2026-05-18, against a candle store holding only 2026-06-24..07-29. The wallets were trading heavily
+    (raw fills: 2,332 on 05-19, 3,022 on 06-02 -- more than in July). A reproducible wrong answer is
+    worse than a crash, so this raises with the actual coverage and the size of the gap.
+
+    `cov=None` means the source does not expose coverage yet (asset_ctxs, live) -> we cannot check, so we
+    warn rather than silently pass. Adding coverage_ms() to those sources closes the gap properly.
+    """
+    import pandas as _pd
+    _d = lambda t: _pd.Timestamp(t, unit="ms", tz="UTC").strftime("%Y-%m-%d")
+    if cov is None:
+        print(f"[mark-coverage] WARNING: source {source!r} does not report coverage; requested "
+              f"{_d(lo_ms)}..{_d(hi_ms)} is UNVERIFIED. A silent n=0 is possible.", flush=True)
+        return
+    c_lo, c_hi = cov
+    gap_lo = max(0, c_lo - lo_ms) / 86_400_000.0
+    gap_hi = max(0, hi_ms - c_hi) / 86_400_000.0
+    if gap_lo > 0 or gap_hi > 0:
+        raise SystemExit(
+            f"MARK COVERAGE GAP: source {source!r} covers {_d(c_lo)}..{_d(c_hi)} but the requested "
+            f"window is {_d(lo_ms)}..{_d(hi_ms)} -- missing {gap_lo:.1f}d at the start and "
+            f"{gap_hi:.1f}d at the end. Uncovered windows would score n=0 and read as 'no trading', "
+            f"which is a WRONG ANSWER, not a null result. Pick a source that covers the window "
+            f"(asset_ctxs reaches ~06-29; candles 06-24 onward; live 07-09 onward), or split the run."
+        )
+    print(f"[mark-coverage] OK: {source!r} covers {_d(c_lo)}..{_d(c_hi)} ⊇ requested "
+          f"{_d(lo_ms)}..{_d(hi_ms)}", flush=True)
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -163,10 +197,17 @@ def main():
     PENALIZE_UNMARKABLE = args.penalize_unmarkable
     if PENALIZE_UNMARKABLE:
         print("[sensitivity] unmarkable open-at-boundary legs scored as worst-case -CAP-fee", flush=True)
+    ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
+    breaks = [b.strip() for b in args.windows.split(",") if b.strip()]
+    bms = [ms(b) for b in breaks]
+    nwin = len(breaks) - 1
+
     global _MARK_FN
+    _cov = None                      # (min_ms, max_ms) actually available from the chosen source
     if args.mark_source == "candles":
         import candle_marks
         _MARK_FN = candle_marks.candle_mark_at
+        _cov = candle_marks.coverage_ms()
         print("[mark-source] candle-close (fills-reconstructed, fresh; ~9bps basis vs exact mark)", flush=True)
     elif args.mark_source == "live":
         import live_marks
@@ -174,10 +215,7 @@ def main():
         print("[mark-source] live captured mark (exact; coverage from 2026-07-09 onward)", flush=True)
     else:
         print("[mark-source] asset_ctxs exact mark (lags ~10d, frontier 06-29)", flush=True)
-    ms = lambda d: int(pd.Timestamp(d, tz="UTC").timestamp() * 1000)
-    breaks = [b.strip() for b in args.windows.split(",") if b.strip()]
-    bms = [ms(b) for b in breaks]
-    nwin = len(breaks) - 1
+    assert_mark_coverage(args.mark_source, _cov, bms[0], bms[-1])
     wallets = [l.strip().lower().split(",")[0] for l in open(args.universe_file)
                if l.strip() and not l.lower().startswith("wallet") and not l.startswith("#")]
     # P2 rule-8 guard (codex r2): the by_wallet carry-in stitch holds prehistory tuples for EVERY wallet in
