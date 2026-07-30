@@ -70,6 +70,43 @@ LOG="$RUN/experiment.log"
 PROV="$RUN/provenance.json"
 SAFE="scripts/mem_safe_run.sh --floor-gb ${MEM_FLOOR:-2}"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
+
+# ---- stage fingerprints (codex #1): bind every artifact to the manifest slice that produced it ------ #
+# stage_fp <stage> -> sha256 of the manifest sections that stage depends on + its input file hashes.
+stage_fp(){ $PY - "$MANIFEST" "$1" <<'PYEOF'
+import sys, yaml, json, hashlib, os
+m = yaml.safe_load(open(sys.argv[1])) or {}
+stage = sys.argv[2]
+DEPS = {  # which manifest sections + inputs each stage's result actually depends on
+    "m07":  (["m07"], ["actions", "folds", "slip_calib"]),
+    "m06b": (["m07", "m06b"], ["m04_dir"]),
+    "oos":  (["m07", "m06b", "oos"], []),
+}
+secs, ins = DEPS[stage]
+blob = {s: m.get(s) for s in secs}
+for key in ins:
+    path = (m.get("inputs") or {}).get(key)
+    if isinstance(path, str) and os.path.isfile(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
+        blob[f"input:{key}"] = h.hexdigest()
+    else:
+        blob[f"input:{key}"] = f"nonfile:{path}"
+print(hashlib.sha256(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()[:16])
+PYEOF
+}
+# skip_stage <stage> <sentinel_artifact> -> 0 (skip) only if the artifact exists AND its fingerprint matches
+skip_stage(){
+  local stage="$1" artifact="$2" fpfile="$RUN/.fp_$1"
+  [ -s "$artifact" ] || return 1
+  [ -f "$fpfile" ] || { log "[$stage] artifact exists but has NO fingerprint -- rerunning (cannot prove it came from this manifest)"; return 1; }
+  local want; want=$(stage_fp "$stage")
+  if [ "$(cat "$fpfile")" = "$want" ]; then return 0; fi
+  log "[$stage] fingerprint MISMATCH (manifest or inputs changed since that artifact) -- rerunning"
+  return 1
+}
+mark_stage(){ stage_fp "$1" > "$RUN/.fp_$1"; }
 stage_wanted(){ [ -z "$ONLY_STAGE" ] || [ "$ONLY_STAGE" = "$1" ]; }
 
 # Refuse to write into a symlinked run dir -- census20k's m05 files are symlinks into funnel20k, and
@@ -130,8 +167,11 @@ log "provenance written"
 if stage_wanted m07; then
   for W in $M07_WINDOWS; do
     M07_OUT="$RUN/m07_${W}"
-    if [ -s "$M07_OUT/m07_summary.parquet" ]; then
-      log "[m07:$W] SKIP (exists)"
+    # codex #4: the summary is written BEFORE equity and positions, so a run that failed after the
+    # summary closed would leave a non-empty summary and be skipped as complete. Require ALL of them.
+    if [ -s "$M07_OUT/m07_summary.parquet" ] && [ -s "$M07_OUT/m07_positions.parquet" ] \
+       && [ -s "$M07_OUT/m07_equity.parquet" ] && skip_stage "m07" "$M07_OUT/m07_summary.parquet"; then
+      log "[m07:$W] SKIP (complete + fingerprint matches)"
       continue
     fi
     log "[m07:$W] START sizing=$M07_SIZING_MODE policy=$M07_COPY_POLICY"
@@ -145,34 +185,55 @@ if stage_wanted m07; then
     log "[m07:$W] rc=${rc:-0}"
     if [ "${rc:-0}" -ne 0 ]; then log "[m07:$W] FAILED -- stopping (fail closed)"; exit 1; fi
   done
+  mark_stage m07
 fi
 
 # ---- STAGE m06b: ranking + walk-forward confirm (THE SELECTION HYPOTHESIS) ----------------------- #
 if stage_wanted m06b; then
-  if [ -s "$RUN/m06b_confirmed.parquet" ]; then
-    log "[m06b] SKIP (exists)"
+  if skip_stage "m06b" "$RUN/m06b_confirmed.parquet"; then
+    log "[m06b] SKIP (fingerprint matches)"
   else
     rc=0
     log "[m06b] START weights mean_r=$M06B_W_PP_MEAN_R t=$M06B_W_PP_T std=$M06B_W_PP_STD mtm_dd=$M06B_W_PP_MTM_DD quick=$M06B_W_PP_QUICK fdr_q=$M06B_FDR_Q"
+    # Arg list derived FROM THE MANIFEST (codex #11). Every m06b key must map to a real CLI flag or the
+    # run refuses -- a manifest must never record a hypothesis it did not execute.
+    M06B_ARGS=$($PY - "$MANIFEST" <<'PYEOF'
+import sys, yaml, shlex
+FLAG = {  # manifest key -> m06b CLI flag. Anything absent here is a HARD ERROR, never silently dropped.
+    "w_pp_mean_r": "--w-pp-mean-r", "w_pp_t": "--w-pp-t", "w_pp_std": "--w-pp-std",
+    "w_pp_mtm_dd": "--w-pp-mtm-dd", "w_pp_quick": "--w-pp-quick",
+    "pp_min_positions": "--pp-min-positions", "pp_min_lcb_mean_r": "--pp-min-lcb-mean-r",
+    "pp_max_med_hold_h": "--pp-max-med-hold-h", "pp_max_mtm_dd": "--pp-max-mtm-dd",
+    "fdr_q": "--fdr-q", "oos_min_folds": "--oos-min-folds",
+    "oos_min_journeys_pooled": "--oos-min-journeys-pooled",
+    "oos_min_frac_folds_pos": "--oos-min-frac-folds-pos", "oos_margin": "--oos-margin",
+    "fee_schedule_version": "--fee-schedule-version",
+    "slippage_calibration_version": "--slippage-calibration-version",
+}
+m6 = (yaml.safe_load(open(sys.argv[1])) or {}).get("m06b") or {}
+unknown = [k for k in m6 if k not in FLAG]
+if unknown:
+    sys.exit(f"MANIFEST ERROR: m06b keys {unknown} have no CLI flag -- they would be recorded in "
+             f"provenance and NEVER APPLIED. Add them to FLAG in experiment.sh or remove them.")
+print(" ".join(f"{FLAG[k]} {shlex.quote(str(v))}" for k, v in m6.items()))
+PYEOF
+) || { log "[m06b] FAILED -- manifest/flag mismatch"; exit 1; }
+    log "[m06b] forwarding: $M06B_ARGS"
+    # shellcheck disable=SC2086  # deliberate word-split: M06B_ARGS is a pre-quoted flag list
     $SAFE --label m06b_"$M_NAME" -- $PY research/v15/v15_m06b_ranking.py \
       --m07-dir "$RUN/m07_pretest" --m07-test-dir "$RUN/m07_test" \
-      --m04-dir "$IN_M04_DIR" --out "$RUN" \
-      --fee-schedule-version "$M06B_FEE_SCHEDULE_VERSION" \
-      --w-pp-mean-r "$M06B_W_PP_MEAN_R" --w-pp-t "$M06B_W_PP_T" --w-pp-std "$M06B_W_PP_STD" \
-      --w-pp-mtm-dd "$M06B_W_PP_MTM_DD" --w-pp-quick "$M06B_W_PP_QUICK" \
-      --pp-min-positions "$M06B_PP_MIN_POSITIONS" --fdr-q "$M06B_FDR_Q" \
-      --oos-min-folds "$M06B_OOS_MIN_FOLDS" \
-      --oos-min-journeys-pooled "$M06B_OOS_MIN_JOURNEYS_POOLED" >>"$LOG" 2>&1 || rc=$?
+      --m04-dir "$IN_M04_DIR" --out "$RUN" $M06B_ARGS >>"$LOG" 2>&1 || rc=$?
     log "[m06b] rc=${rc:-0}"
     if [ "${rc:-0}" -ne 0 ]; then log "[m06b] FAILED -- stopping"; exit 1; fi
+    mark_stage m06b
   fi
 fi
 
 # ---- STAGE oos: forward validation on LOCAL data (never the API) --------------------------------- #
 if stage_wanted oos; then
   OOS_OUT="$RUN/forward_oos.parquet"
-  if [ -s "$OOS_OUT" ]; then
-    log "[oos] SKIP (exists)"
+  if skip_stage "oos" "$OOS_OUT"; then
+    log "[oos] SKIP (fingerprint matches)"
   elif [ ! -s "$RUN/m06b_confirmed.parquet" ]; then
     # If the caller ASKED for oos, having no input is a FAILURE, not a skip -- otherwise "the guard
     # fired" and "nothing ran" are indistinguishable and a negative test reports a false pass (codex #11).
@@ -210,6 +271,7 @@ print(f'{len(w)} wallets -> $UNIV')" >>"$LOG" 2>&1 || rc=$?
     log "[oos] rc=${rc:-0}"
     # rc!=0 here is usually the mark-coverage assertion firing -- that is a CORRECT refusal, not a bug.
     if [ "${rc:-0}" -ne 0 ]; then log "[oos] FAILED (check for MARK COVERAGE above) -- stopping"; exit 1; fi
+    mark_stage oos
   fi
 fi
 
