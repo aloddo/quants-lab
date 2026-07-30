@@ -265,7 +265,8 @@ def _load_m04_entities(data_dir: Path, folds: pd.DataFrame, m04_dir: Optional[Pa
 
 def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optional[str] = None,
             limit: Optional[int] = None, pool_path: Optional[Path] = None,
-            m04_dir: Optional[Path] = None, allow_global_m04: bool = False) -> dict:
+            m04_dir: Optional[Path] = None, allow_global_m04: bool = False,
+            actions_path: Optional[Path] = None, folds_path: Optional[Path] = None) -> dict:
     """Tier the M6b INVESTABLE POOL: per pooled (entity, fold) run the counterfactual-survival
     primitive (M7 stress) + inferential scorers (phase-2 stub) -> tier; emit m08_tiers + attribution."""
     import pyarrow.dataset as ds
@@ -280,7 +281,7 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
             "M8 requires an investable M6b pool with a boolean `investable` column all True; "
             "provisional/uncalibrated ranking (or a non-bool column) cannot be tiered for deployment"
         )
-    folds = pd.read_parquet(data_dir / "m03_folds.parquet")
+    folds = pd.read_parquet(Path(folds_path) if folds_path else (data_dir / "m03_folds.parquet"))
     # AUDIT 2026-07-10 (codex P0#3): the global m04_entities.parquet maps entity->primary_wallet using
     # FULL-history (post-decision) knowledge = look-ahead. A deployable M8 must use fold-pure per-fold M4
     # (--m04-dir, provenance-checked below). Fail closed unless the caller EXPLICITLY opts into the global
@@ -316,7 +317,7 @@ def run_m08(m07_dir: Path, data_dir: Path, m: M8Manifest, slip_calib_path: Optio
         per_fold = {int(k): v for k, v in cal.get("per_fold_asof", {}).items()}
     else:
         per_fold = {}
-    acts_ds = ds.dataset(str(data_dir / "m02_actions.parquet"))
+    acts_ds = ds.dataset(str(Path(actions_path) if actions_path else (data_dir / "m02_actions.parquet")))
 
     rows = []
     seats = pool.itertuples()
@@ -416,6 +417,12 @@ def main():
     ap.add_argument("--out", default=str(DATA_DIR))
     ap.add_argument("--slip-calib", default=str(DATA_DIR / "slippage_calib_v11.json"))
     ap.add_argument("--limit", type=int, default=None)
+    # 2026-07-30: m08 previously required m02_actions.parquet and m03_folds.parquet to sit INSIDE --out.
+    # That forces --out to be the shared data dir, which the canonical per-experiment runner cannot do
+    # (the actions store is 4.65GB; copying is absurd and symlinking it back is the cross-run-corruption
+    # risk). Explicit inputs, defaulting to the old locations -> existing callers unchanged.
+    ap.add_argument("--actions", default=None, help="m02_actions.parquet (default: <out>/m02_actions.parquet)")
+    ap.add_argument("--folds", default=None, help="m03_folds.parquet (default: <out>/m03_folds.parquet)")
     ap.add_argument("--m04-dir", default=None,
                     help="directory with fold-pure m04_entities_f{fold_id}.parquet (REQUIRED for a trusted run)")
     ap.add_argument("--allow-global-m04", action="store_true",
@@ -434,6 +441,8 @@ def main():
         fixed_target_exposure=args.fixed_target_exposure,
     )
     run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
+            actions_path=Path(args.actions) if args.actions else None,
+            folds_path=Path(args.folds) if args.folds else None,
             limit=args.limit, m04_dir=Path(args.m04_dir) if args.m04_dir else None,
             allow_global_m04=args.allow_global_m04)
 

@@ -285,10 +285,14 @@ if stage_wanted m08; then
   if skip_stage "m08" "$RUN/m08_survival.parquet"; then
     log "[m08] SKIP (fingerprint matches)"
   else
+    # m08 has no --folds flag: it reads m03_folds.parquet from its --out dir (v15_m08_survival.py:283).
+    # COPY it in (11KB) rather than symlink -- the symlink-write guard correctly refuses links, and a run
+    # dir that carries its own fold geometry is better provenance anyway.
     rc=0
     log "[m08] START"
     $SAFE --label m08_"$M_NAME" -- $PY research/v15/v15_m08_survival.py \
       --m07-dir "$RUN/m07_pretest" --out "$RUN" --m04-dir "$IN_M04_DIR" \
+      --actions "$IN_ACTIONS" --folds "$IN_FOLDS" \
       --slip-calib "$IN_SLIP_CALIB" >>"$LOG" 2>&1 || rc=$?
     log "[m08] rc=${rc:-0}"
     if [ "${rc:-0}" -ne 0 ]; then log "[m08] FAILED -- stopping"; exit 1; fi
