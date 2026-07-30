@@ -223,11 +223,24 @@ def expected_leverage(
         return float(max(gross)) if gross else 1.0
     if sizing_mode != "leader_equity":
         raise ValueError(f"unknown sizing_mode {sizing_mode!r}")
+    # 2026-07-30 FAIL-LOUD (Fable plan gate, Step 1). This branch derives per-leader leverage from the
+    # p75 of |target_exposure_pct| -- a column that is 100% NULL in every m02 actions store ever built
+    # (no store was made with --equity-enrichment; m02_journey_trace computes it from source_equity_post,
+    # so with M1 out of scope it is permanently NO_ANCHOR). The old `return 1.0` fallbacks meant an
+    # all-null input silently produced 1.0x leverage for EVERY leader -- a degenerate sim reported as a
+    # normal one. Same silent-degradation class as m07's zero-orders default.
+    #
+    # leader_equity is also an M1 remnant by decree (Alberto 2026-07-17, reconfirmed 2026-07-30
+    # "No M1 no equity"), so this refuses rather than being repaired.
+    _msg = ("m09 sizing_mode='leader_equity' is DEPRECATED and refuses to run: it derives leverage from "
+            "the p75 of |target_exposure_pct|, which is 100% NULL in every m02 store (M1 out of scope), "
+            "so it would silently return 1.0x leverage for every leader. Use "
+            "sizing_mode='fixed_position'. See card/quant-engineer/canonical-pipeline-and-engine.")
     if "target_exposure_pct" not in adf.columns:
-        return 1.0
+        raise ValueError(_msg + " [column absent]")
     te = pd.to_numeric(adf["target_exposure_pct"], errors="coerce").abs().dropna()
     if te.empty:
-        return 1.0
+        raise ValueError(_msg + " [column present but entirely null]")
     return float(max(1.0, te.quantile(0.75)))
 
 

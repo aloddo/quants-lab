@@ -229,8 +229,31 @@ def test_expected_leverage_uses_abs_target_exposure():
     adf = pd.DataFrame({"target_exposure_pct": [2.0, -3.0, 4.0, -1.0]})
     lev = M9.expected_leverage(adf)
     assert lev >= 1.0 and lev == pytest.approx(pd.Series([2, 3, 4, 1]).quantile(0.75))
-    assert M9.expected_leverage(None) == 1.0                   # no actions -> unlevered budgeting
-    assert M9.expected_leverage(pd.DataFrame({"x": [1]})) == 1.0   # missing col -> 1.0
+    assert M9.expected_leverage(None) == 1.0                   # no actions at all -> unlevered budgeting
+
+
+def test_expected_leverage_leader_equity_refuses_unusable_input():
+    """CONTRACT CHANGE 2026-07-30 (Fable plan gate, fail-loud pass).
+
+    This file previously asserted `expected_leverage(pd.DataFrame({"x": [1]})) == 1.0` -- "missing col
+    -> 1.0", i.e. degrade silently to unlevered budgeting. That degradation is now a RAISE, because in
+    the no-M1 world it is not a graceful fallback, it is a wrong answer:
+
+      m02_journey_trace derives target_exposure_pct from source_equity_post. With M1 out of scope
+      (Alberto 2026-07-17, reconfirmed 2026-07-30 "No M1 no equity") that anchor never exists, so the
+      column is permanently NO_ANCHOR/null in EVERY actions store. The old fallback therefore returned
+      1.0x leverage for EVERY leader on EVERY real run -- a degenerate sim reported as a normal one.
+
+    `adf is None` still returns 1.0: "no actions supplied" is a genuinely different question from
+    "actions supplied but the sizing input is unusable".
+    """
+    with pytest.raises(ValueError, match="DEPRECATED"):
+        M9.expected_leverage(pd.DataFrame({"x": [1]}))                             # column absent
+    with pytest.raises(ValueError, match="entirely null"):
+        M9.expected_leverage(pd.DataFrame({"target_exposure_pct": [None, None]}))   # present, all null
+    # the supported mode is unaffected
+    acts = pd.DataFrame({"coin": ["BTC"], "position_after": [1.0]})
+    assert M9.expected_leverage(acts, "fixed_position", 0.25) == pytest.approx(0.25)
 
 
 # ---- chained-sim integration with a tiny fake engine (exercises wiring end-to-end) ----

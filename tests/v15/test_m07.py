@@ -2,6 +2,16 @@
 
 Design: brain projects/quant/v15/modules/m07. Run:
   /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m07.py -q
+
+NOTE (2026-07-30): most cases below pass sizing_mode="leader_equity" EXPLICITLY. They previously relied
+on it being the dataclass DEFAULT -- and that default was itself the bug: leader_equity sizes from
+`target_exposure_pct`, which is 100% NULL in every real m02 store (M1 is out of scope), so any
+production invocation that did not override it emitted ZERO orders and reported success. The default is
+now `fixed_position`. These tests exercise ENGINE MECHANICS (backstop, liquidation, follower-trail,
+min-order skip, ruin accounting) and use leader_equity purely as the vehicle, with a synthetic non-null
+column, so pinning it here preserves exactly what they were written to verify. The all-null production
+case is caught at load time by v15_m07_engine.assert_sizing_input_usable(). When the canonical
+gross-notional sizing lands (shared by engine + sim), these should migrate onto it.
 """
 import sys
 from pathlib import Path
@@ -103,7 +113,7 @@ END = T0 + 500 * E.MS_MIN
 
 
 def _run(acts, md, eq=10_000.0, params=None, end=END, **kw):
-    return E.step_subaccount(acts, md, eq, params or E.EngineParams(copy_latency_ms=0), end_ts_ms=end, **kw)
+    return E.step_subaccount(acts, md, eq, params or E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"), end_ts_ms=end, **kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -285,12 +295,12 @@ def test_im_admissibility_rejects_on_tier_jump():
     md.meta = TierMeta(); md.meta.coin_szdec["BTC"] = 3
     st = E.AccountState(cross_collateral={"main": 14000.0})
     st.positions["BTC"] = E.Position("BTC", szi=900.0, entry_px=100.0, mode="cross", leverage=10.0)
-    summary = E._new_summary(None, None, 14000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+    summary = E._new_summary(None, None, 14000.0, 0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"), md)
     summary["_fills_ref"] = []
     fills, events = [], []
     # add 200 -> new notional 110k, total IM = 22k > ~14k cash -> must reject
     E._apply_order(st, md, "BTC", 200.0, 100.0, T0 + 5 * E.MS_MIN, {"ts": T0 + 5 * E.MS_MIN},
-                   E.EngineParams(copy_latency_ms=0), 1.0, fills, events, summary)
+                   E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"), 1.0, fills, events, summary)
     assert summary["n_rejected"] == 1 and len(fills) == 0
 
 
@@ -323,7 +333,7 @@ def test_market_liquidation_charges_full_order_adv_impact_above_floor():
     st.positions["BTC"] = E.Position(
         "BTC", szi=1_000.0, entry_px=100.0, mode="cross", leverage=10.0
     )
-    summary = E._new_summary(None, None, 20_000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+    summary = E._new_summary(None, None, 20_000.0, 0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"), md)
     summary["_fills_ref"] = []
     E._rt_open(summary, "BTC")
     E._liq_close(st, md, "BTC", 100.0, T0 + E.MS_MIN, summary)
@@ -414,7 +424,7 @@ def test_pure_does_not_mutate_caller_state():
     md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
     start = E.AccountState(cross_collateral={"main": 10_000.0})
     acts = pd.DataFrame([_action("BTC", T0 + 5 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0)])
-    E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0), end_ts_ms=END, start_state=start)
+    E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"), end_ts_ms=END, start_state=start)
     assert start.cross_collateral == {"main": 10_000.0}
     assert start.positions == {}
 
@@ -428,7 +438,7 @@ def test_start_state_open_position_advances_risk_with_no_actions():
     md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
     start = E.AccountState(cross_collateral={"main": 2000.0})
     start.positions["BTC"] = E.Position("BTC", szi=400.0, entry_px=100.0, mode="cross", leverage=10.0)  # $40k @ 5% maint
-    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=T0 + 390 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     s = res["summary"]
     assert set(s["outcome_states"]) & {"backstop", "account_ruin", "position_liquidated"}
@@ -446,7 +456,7 @@ def test_funding_stops_after_liquidation():
                                           np.array([0.001] * 6))}, maxlev=10.0)
     start = E.AccountState(cross_collateral={"main": 2000.0})
     start.positions["BTC"] = E.Position("BTC", szi=400.0, entry_px=100.0, mode="cross", leverage=10.0)
-    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=T0 + 390 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     # liquidated around the crash; funding only accrues on hours BEFORE liquidation, not all 6
     assert set(res["summary"]["outcome_states"]) & {"backstop", "position_liquidated", "account_ruin"}
@@ -465,7 +475,7 @@ def test_post_funding_boundary_liquidation():
                         maxlev=10.0)
     start = E.AccountState(cross_collateral={"main": 600.0})       # thin buffer over maint
     start.positions["BTC"] = E.Position("BTC", szi=100.0, entry_px=100.0, mode="cross", leverage=10.0)  # $10k, maint $500
-    res = E.step_subaccount(pd.DataFrame([]), md, 600.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(pd.DataFrame([]), md, 600.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=last_h + E.MS_MIN, start_ts_ms=T0, start_state=start)
     s = res["summary"]
     assert s["total_funding"] < 0                       # paid the funding
@@ -482,7 +492,7 @@ def test_liquidation_cooldown_no_same_ts_double_fill():
     md = FakeMarketData(ohlc={"BTC": (mins, px.copy(), px.copy(), px.copy(), px.copy())}, maxlev=10.0)
     start = E.AccountState(cross_collateral={"main": 8000.0})
     start.positions["BTC"] = E.Position("BTC", szi=1500.0, entry_px=100.0, mode="cross", leverage=10.0)  # $150k
-    res = E.step_subaccount(pd.DataFrame([]), md, 8000.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(pd.DataFrame([]), md, 8000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=T0 + 190 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     liq_ts = [f["our_ts"] for f in res["fills"] if f["fill_type"] == "market_liq_order"]
     assert len(liq_ts) == len(set(liq_ts))           # no two forced fills at the same instant
@@ -500,7 +510,7 @@ def test_no_same_ts_double_when_funding_at_fold_end():
                         funding={"BTC": (np.array([t1], "int64"), np.array([0.5]))}, maxlev=10.0)
     start = E.AccountState(cross_collateral={"main": 7600.0})
     start.positions["BTC"] = E.Position("BTC", szi=1500.0, entry_px=100.0, mode="cross", leverage=10.0)  # $150k
-    res = E.step_subaccount(pd.DataFrame([]), md, 7600.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(pd.DataFrame([]), md, 7600.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=t1, start_ts_ms=T0, start_state=start)
     liq_ts = [f["our_ts"] for f in res["fills"] if f["fill_type"] == "market_liq_order"]
     assert len(liq_ts) == len(set(liq_ts))           # no same-ts double at the funding==fold-end boundary
@@ -513,7 +523,7 @@ def test_carry_in_seeds_short_not_long():
     act = _action("BTC", T0 + 5 * E.MS_MIN, -1.0, "ADDON", position_after=-110.0, signed_size=-10.0,
                   carry_in_status="carry")
     res = E.step_subaccount(pd.DataFrame([act]), md, 10_000.0,
-                            E.EngineParams(copy_latency_ms=0, start_policy="causal_carry_in"),
+                            E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity", start_policy="causal_carry_in"),
                             end_ts_ms=T0 + 20 * E.MS_MIN)
     # ending position is a SHORT (negative szi), ~the source's -110/-100 ratio scaled to our equity
     bt = res["ending_account_state"]["positions"].get("BTC")
@@ -566,7 +576,7 @@ def test_change1_boundary_equity_samples_emitted():
     md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, n, 100.0))
     end = T0 + 30 * DAY
     acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 0.5)])
-    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
     eq = pd.DataFrame(res["equity"])
     flags = set(eq["event_flag"])
@@ -584,7 +594,7 @@ def test_change1_boundary_anchor_count_matches_blocks():
     md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, n, 100.0))
     end = T0 + 30 * DAY                       # 30d -> boundaries at k=0,1,2 (0,14,28d); 42d would be 3
     acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 0.5)])
-    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
     eq = pd.DataFrame(res["equity"])
     anchors = sorted(eq[eq.event_flag.isin(["fold_start", "block_boundary"])]["ts"].unique())
@@ -597,7 +607,7 @@ def test_change2_te_zero_when_tracking_well():
     md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, n, 100.0))
     end = T0 + 20 * DAY
     acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 0.5)])
-    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
     s = res["summary"]
     assert s["tracking_error"] is not None
@@ -640,7 +650,7 @@ def test_d2_wipeout_emits_zero_equity_anchors():
     end = T0 + 30 * DAY
     acts = pd.DataFrame([_action("BTC", T0 + 10 * E.MS_MIN, 5.0),
                          _action("BTC", T0 + 25 * DAY, 5.0)])     # post-crash action -> _ruin
-    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0),
+    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
                             end_ts_ms=end, start_ts_ms=T0, entity_id=1, fold_id=1)
     s = res["summary"]
     eq = pd.DataFrame(res["equity"])
@@ -673,7 +683,7 @@ def test_follower_trail_fires_flattens_and_halts():
         _action("BTC", T0 + 5 * E.MS_MIN, 1.0, "ADDON"),       # @102 -> pre-action breaker fires
         _action("BTC", T0 + 7 * E.MS_MIN, 1.0, "ADDON"),       # @120 -> MUST be ignored (halted)
     ])
-    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, follower_trail=0.07),
+    res = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity", follower_trail=0.07),
                             end_ts_ms=T0 + 9 * E.MS_MIN)
     exits = [e for e in res["events"] if e.get("event_type") == "follower_trail_exit"]
     assert len(exits) == 1, "breaker must fire exactly once"
@@ -694,7 +704,7 @@ def test_follower_trail_disabled_is_byte_identical():
         _action("BTC", T0 + 5 * E.MS_MIN, 1.0, "ADDON"),
         _action("BTC", T0 + 7 * E.MS_MIN, 1.0, "ADDON"),
     ])
-    base = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, follower_trail=None),
+    base = E.step_subaccount(acts, md, 10_000.0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity", follower_trail=None),
                              end_ts_ms=T0 + 9 * E.MS_MIN)
     # disabled path: NO breaker event, and a position remains open (verbatim copy)
     assert not any(e.get("event_type") == "follower_trail_exit" for e in base["events"])
@@ -710,7 +720,7 @@ def test_follower_trail_fires_at_fold_end_no_action():
     start.cross_collateral["main"] = 10_000.0 - 100.0 * 100.0 + 100.0 * 100.0  # cash s.t. eq@100 ~ 10k
     # peak seeded from real equity at fold start (#8); breach realized only via fold-end MTM.
     res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0,
-                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+                            E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity", follower_trail=0.07, start_policy="causal_carry_in"),
                             end_ts_ms=T0 + 8 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     assert any(e.get("event_type") == "follower_trail_exit" for e in res["events"]), "fold-end breach must fire"
     assert res["ending_account_state"]["positions"] == {}
@@ -728,7 +738,7 @@ def test_follower_trail_force_close_ignores_min_notional_and_capacity():
     start.positions["BTC"] = E.Position("BTC", szi=100.0, entry_px=100.0, mode="cross", leverage=1.0)
     start.positions["ETH"] = E.Position("ETH", szi=0.01, entry_px=100.0, mode="cross", leverage=1.0)  # dust ($1)
     res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0,
-                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+                            E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity", follower_trail=0.07, start_policy="causal_carry_in"),
                             end_ts_ms=T0 + 8 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     assert any(e.get("event_type") == "follower_trail_exit" for e in res["events"])
     assert res["ending_account_state"]["positions"] == {}, "no position (incl dust) may survive a breaker flatten"
@@ -875,7 +885,7 @@ def test_finding2_flip_fee_split_across_round_trips():
     assert s["n_round_trips"] == 2
     # build the SAME scenario but inspect per-RT booking via a controlled _book_fill replay to assert
     # the split is proportional. Equity-flat so realized=0 on the flip; both RTs differ ONLY by fees.
-    summ = E._new_summary(1, 1, 10_000.0, 0, E.EngineParams(copy_latency_ms=0), md)
+    summ = E._new_summary(1, 1, 10_000.0, 0, E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"), md)
     st = E.AccountState(cross_collateral={"main": 10_000.0})
     # open long 100 @100 (entry fee on 100 sz)
     E._book_fill(st, md, "BTC", 100.0, 100.0, "cross", fee=100.0 * 100.0 * 0.00045, summary=summ)
@@ -939,7 +949,7 @@ def test_finding4_latency_drift_in_slip_diagnostic():
     # execution haircut). Same up-bar; higher latency -> bigger drift -> bigger reported slip.
     md = FakeMarketData(ohlc=_drift_ohlc("BTC", 200, 100.0, 102.0), maxlev=10.0)  # +2% bars
     acts = pd.DataFrame([_action("BTC", T0 + 50 * E.MS_MIN, 0.5, "ENTRY", position_after=50.0)])
-    s_lo = _run(acts, md, params=E.EngineParams(copy_latency_ms=0))["summary"]
+    s_lo = _run(acts, md, params=E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"))["summary"]
     s_hi = _run(acts, md, params=E.EngineParams(copy_latency_ms=30_000))["summary"]
     assert s_hi["slip_bps_notional_weighted"] > s_lo["slip_bps_notional_weighted"], \
         "latency drift must raise the reported notional-weighted slip"
@@ -1002,7 +1012,7 @@ def test_follower_trail_records_ruin_if_flatten_nonpositive():
     start = E.AccountState(cross_collateral={"main": 100.0})
     start.positions["BTC"] = E.Position("BTC", szi=100.0, entry_px=100.0, mode="cross", leverage=10.0)
     res = E.step_subaccount(pd.DataFrame([]), md, 10_100.0,
-                            E.EngineParams(copy_latency_ms=0, follower_trail=0.07, start_policy="causal_carry_in"),
+                            E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity", follower_trail=0.07, start_policy="causal_carry_in"),
                             end_ts_ms=T0 + 8 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     assert res["ending_account_state"]["positions"] == {}
     assert res["summary"]["ruin"], "non-positive post-flatten equity must record ruin"

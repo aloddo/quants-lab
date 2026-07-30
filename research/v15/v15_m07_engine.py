@@ -509,24 +509,12 @@ class EngineParams:
 def _action_target_pct(action: dict, params: EngineParams) -> float:
     """Return the declared source target under the selected sizing policy."""
     if params.sizing_mode == "leader_equity":
-        # 2026-07-30 FAIL-LOUD (Fable plan gate, Step 2). `target_exposure_pct` is 100% NULL in every
-        # m02 actions store ever built -- sampled 8 of 1,137 row groups: 904,494 values, 904,494 null
-        # (no store was built with --equity-enrichment). Under this mode every target resolved to NaN,
-        # so the engine emitted ZERO orders and STILL REPORTED SUCCESS: one documented run read
-        # 46,180,870 actions and produced 0 fills / 0 positions. Exactly the silent-degradation class
-        # this pass exists to kill -- an n=0 must be a loud error, never a verdict.
-        #
-        # It is ALSO an M1 remnant: sizing from LEADER EQUITY *is* the equity reconstruction Alberto
-        # put out of scope (2026-07-17, reconfirmed 2026-07-30 "No M1 no equity. I don't care about
-        # equity. Why would I."). Backfilling the column would reinstate M1 through the back door.
-        # So: DEPRECATED and refuses, not repaired. Canonical sizing is the gross-notional ceiling.
-        raise ValueError(
-            "sizing_mode='leader_equity' is DEPRECATED and refuses to run: it sizes from leader "
-            "equity (M1, out of scope) via action['target_exposure_pct'], which is 100% NULL in "
-            "every m02 store, so it would emit ZERO orders and report success. Use "
-            "sizing_mode='fixed_position' with --fixed-target-exposure. "
-            "See card/quant-engineer/canonical-pipeline-and-engine."
-        )
+        # DEPRECATED (2026-07-30). Kept functional for the unit tests that exercise engine mechanics
+        # (backstop, liquidation, follower-trail, min-order) through this path with a synthetic column.
+        # The production trap -- an ALL-NULL column silently producing zero orders -- is caught ONCE at
+        # load time by assert_sizing_input_usable(), not per action, because "all null" is only knowable
+        # over the whole store. See that function for the full reasoning.
+        return _f(action.get("target_exposure_pct"))
     if params.sizing_mode == "fixed_position":
         pa = _f(action.get("position_after"))
         if pa != pa:
@@ -1892,6 +1880,80 @@ def _require_action_schema(dataset) -> None:
         )
 
 
+class _NoStats(Exception):
+    """Internal: parquet column statistics unavailable -> fall back to a bounded data sample."""
+
+
+def assert_sizing_input_usable(dataset, sizing_mode: str, actions_path) -> None:
+    """FAIL LOUD if the selected sizing mode cannot size anything from this store (2026-07-30).
+
+    THE BUG THIS CLOSES: `sizing_mode="leader_equity"` sizes from `target_exposure_pct`, which is 100%
+    NULL in every m02 actions store ever built -- m02_journey_trace derives it from `source_equity_post`,
+    and with M1 out of scope (Alberto 2026-07-17, reconfirmed 2026-07-30 "No M1 no equity") that anchor
+    never exists, so the column is permanently NO_ANCHOR/null. Sampled 8 of 1,137 row groups on the 20k
+    store: 904,494 values, 904,494 null. Under that mode EVERY target resolves to NaN, so the engine
+    emitted ZERO orders and STILL REPORTED SUCCESS -- one documented run read 46,180,870 actions and
+    produced 0 fills / 0 positions. A verdict of "this cohort has no edge" that actually means "no input".
+
+    Checked ONCE here rather than per action, because "entirely null" is only knowable over the store.
+    Uses parquet column statistics where available so it costs no data scan.
+
+    Deliberately NOT raising for `leader_equity` unconditionally: the unit tests exercise engine
+    mechanics (backstop, liquidation, follower-trail, min-order) through that path with a synthetic
+    non-null column, and those are legitimate. It is the ALL-NULL store that is the wrong answer.
+    """
+    if sizing_mode != "leader_equity":
+        return
+    col = "target_exposure_pct"
+    if col not in set(dataset.schema.names):
+        raise ValueError(f"sizing_mode='leader_equity' needs {col!r}, absent from {actions_path}")
+    # Prefer parquet column statistics (free). If they are ABSENT we must NOT assume usable -- the real
+    # 20k store has no stats on this column, so an assume-usable fallback left this guard inert on
+    # exactly the file it exists to catch (verified 2026-07-30). Fall back to reading a BOUNDED sample
+    # of the column instead: enough to prove "entirely null", cheap enough to never matter.
+    total = nulls = 0
+    used_stats = False
+    try:
+        for frag in dataset.get_fragments():
+            md = frag.metadata
+            if md is None or col not in md.schema.names:
+                continue
+            idx = md.schema.names.index(col)
+            for rg in range(md.num_row_groups):
+                c = md.row_group(rg).column(idx)
+                st = c.statistics
+                if st is None:
+                    total = nulls = 0
+                    raise _NoStats
+                used_stats = True
+                total += c.num_values
+                nulls += st.null_count
+    except _NoStats:
+        pass
+    except Exception:               # never let a metadata quirk block a legitimate run
+        return
+    if not used_stats:
+        try:                        # bounded sample: first ~200k values is plenty to prove all-null
+            import pyarrow as _pa
+            scanner = dataset.scanner(columns=[col], batch_size=65_536)
+            for batch in scanner.to_batches():
+                arr = batch.column(0)
+                total += len(arr)
+                nulls += arr.null_count
+                if total >= 200_000:
+                    break
+        except Exception:
+            return
+    if total > 0 and nulls >= total:
+        raise ValueError(
+            f"sizing_mode='leader_equity' refuses to run: {col} is 100% NULL in {actions_path} "
+            f"({nulls:,}/{total:,} values). It sizes from leader equity (M1, out of scope), so this "
+            f"store can never populate it -- the run would emit ZERO orders and report success. "
+            f"Use sizing_mode='fixed_position' with --fixed-target-exposure. "
+            f"See card/quant-engineer/canonical-pipeline-and-engine."
+        )
+
+
 try:
     import pyarrow as _pa_mod
     _PA_VER = _pa_mod.__version__
@@ -1969,6 +2031,7 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
     # memory-bounded (no per-wallet writer held open buffering rows). Hive-partitioned by wallet.
     dataset = ds.dataset(actions_path, format="parquet")
     _require_action_schema(dataset)
+    assert_sizing_input_usable(dataset, sizing_mode, actions_path)
     cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size", "position_after",
             "target_exposure_pct", "is_liquidation", "carry_in_status",
             "lifecycle_valid", "stream_replay_valid"]
