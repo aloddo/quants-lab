@@ -37,6 +37,58 @@ import pyarrow.parquet as pq
 
 logger = logging.getLogger("streaming_io")
 
+# Opt-out for the rare deliberate case. Unset by default: the guard must be the default, not the flag.
+_ALLOW_SYMLINK_WRITE_ENV = "QL_ALLOW_SYMLINK_WRITE"
+
+
+def assert_not_symlinked_output(path: str | Path, what: str = "output") -> Path:
+    """Refuse to write to a path that IS a symlink, or that lives under a symlinked directory.
+
+    WHY (2026-07-30, Fable plan gate Step 3): `app/data/v15/` holds three parallel run dirs wired
+    together with symlinks -- 18 in funnel20k_20260728, 27 in census20k_20260728, of which 9 point INTO
+    funnel20k, with a MIX of relative and absolute targets. Writing m05 output into census20k therefore
+    writes THROUGH into funnel20k and silently overwrites the inputs of a different run. On 2026-07-30 I
+    came one command away from doing exactly that and caught it only by running `ls -l` by hand. The
+    hash inventory in app/data/v15/_provenance/ exists because of that near miss.
+
+    Silent cross-run corruption is the worst failure mode available here: the clobbered file is then
+    read as an input and reasoned from. So this is a hard refusal, not a warning.
+
+    Set QL_ALLOW_SYMLINK_WRITE=1 to override deliberately (logged loudly).
+    """
+    p = Path(path)
+    if os.environ.get(_ALLOW_SYMLINK_WRITE_ENV) == "1":
+        logger.warning("SYMLINK-WRITE GUARD BYPASSED via %s=1 for %s %s",
+                       _ALLOW_SYMLINK_WRITE_ENV, what, p)
+        return p
+    if p.is_symlink():
+        raise ValueError(
+            f"REFUSING to write {what} through a SYMLINK: {p} -> {os.readlink(p)}. "
+            f"Writing here would silently overwrite another run's file. Write to a real path inside "
+            f"this run's own directory. (Override: {_ALLOW_SYMLINK_WRITE_ENV}=1)"
+        )
+    # Parent walk is SCOPED TO THE REPO. Walking to `/` produced a false positive on the first version:
+    # on macOS `/var` and `/tmp` are themselves symlinks (-> private/var), so every legitimate temp write
+    # was refused. An over-broad guard is worse than none -- it is the kind operators learn to disable.
+    # Only symlinked parents INSIDE the repo can cause the cross-run corruption this exists to prevent.
+    repo = Path(__file__).resolve().parents[2]
+    try:
+        p_abs = p if p.is_absolute() else (Path.cwd() / p)
+        inside_repo = repo in p_abs.parents
+    except Exception:
+        inside_repo = False
+    if inside_repo:
+        for parent in p_abs.parents:
+            if parent == repo:
+                break
+            if parent.is_symlink():
+                raise ValueError(
+                    f"REFUSING to write {what} {p}: its parent directory {parent} is a SYMLINK -> "
+                    f"{os.readlink(parent)}. The write would land in another run's directory. "
+                    f"(Override: {_ALLOW_SYMLINK_WRITE_ENV}=1)"
+                )
+    return p
+
 
 class ShardedParquetWriter:
     """Buffer rows, flush a part-file every `flush_rows`, stitch parts -> ONE parquet on close().
@@ -47,7 +99,9 @@ class ShardedParquetWriter:
     part schemas (so an all-null column in one chunk that is typed in another reconciles cleanly)."""
 
     def __init__(self, out_path: str | Path, flush_rows: int = 100_000, keep_parts: bool = False):
-        self.out = Path(out_path)
+        # Symlink-write guard at the ONE chokepoint every v15 module already funnels output through,
+        # so it cannot be forgotten by a future caller (Fable plan gate Step 3).
+        self.out = assert_not_symlinked_output(out_path, "parquet output")
         self.parts_dir = self.out.with_suffix(self.out.suffix + ".parts")
         self.parts_dir.mkdir(parents=True, exist_ok=True)
         # codex perf-r1 #1: WIPE any stale parts from a prior aborted/failed run so close() can never
