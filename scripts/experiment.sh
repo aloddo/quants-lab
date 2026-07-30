@@ -218,6 +218,20 @@ fi
 # m06b requires the pretest run as --m07-dir; passing the test run there is look-ahead and its
 # provenance gate refuses it (verified: first golden run failed exactly this way).
 if stage_wanted m07; then
+  # 2026-07-30 (Alberto TG 12095/12097): start_equity is REQUIRED, never defaulted. m07 sizes every
+  # position as `fixed_target_exposure * cur_eq` (v15_m07_engine.py:786), so start_equity IS the
+  # position size and therefore decides which leader actions clear the $10 MIN_ORDER_NOTIONAL floor
+  # (:1049). The engine's own CLI default is $10,000 and this runner never passed it, so EVERY
+  # experiment silently simulated a book 10.7x our real $937 -- the cohort search included. At $1,015
+  # simulated positions the sim copied 0.13 adds/position against the leaders' 2.32; at our real size
+  # the mean surviving add ($25.21, 2.5% of position) falls to $2.36 and every add vanishes under the
+  # floor. A capital assumption that changes WHICH actions execute must be declared by the experiment,
+  # not inherited from a library default.
+  if [ -z "${M07_START_EQUITY:-}" ]; then
+    log "[m07] FAILED -- manifest does not set m07.start_equity. It is REQUIRED: it sets position size"
+    log "[m07]           and thus which actions clear the \$10 minimum. Declare it (ours: 937.47)."
+    exit 1
+  fi
   for W in $M07_WINDOWS; do
     M07_OUT="$RUN/m07_${W}"
     # codex #4: the summary is written BEFORE equity and positions, so a run that failed after the
@@ -231,13 +245,14 @@ if stage_wanted m07; then
     # the manifest explicitly supplies it (e.g. the golden reproduction, which pins the census artifact).
     SL="${M07_SHORTLIST:-$RUN/m06a_shortlist.parquet}"
     if [ ! -s "$SL" ]; then log "[m07:$W] FAILED -- no shortlist at $SL"; exit 1; fi
-    log "[m07:$W] START sizing=$M07_SIZING_MODE policy=$M07_COPY_POLICY shortlist=$(basename "$SL")${M07_LIMIT_ENTITIES:+ limit=$M07_LIMIT_ENTITIES}"
+    log "[m07:$W] START sizing=$M07_SIZING_MODE policy=$M07_COPY_POLICY start_equity=\$$M07_START_EQUITY shortlist=$(basename "$SL")${M07_LIMIT_ENTITIES:+ limit=$M07_LIMIT_ENTITIES}"
     rc=0
     $SAFE --label m07_"${M_NAME}_$W" -- $PY research/v15/v15_m07_engine.py \
       --actions "$IN_ACTIONS" --shortlist "$SL" --folds "$IN_FOLDS" \
       --out "$M07_OUT" --window "$W" --slip-calib "$IN_SLIP_CALIB" \
       --copy-latency-ms "$M07_COPY_LATENCY_MS" --sizing-mode "$M07_SIZING_MODE" \
       --fixed-target-exposure "$M07_FIXED_TARGET_EXPOSURE" \
+      --start-equity "$M07_START_EQUITY" \
       --copy-policy "$M07_COPY_POLICY" ${M07_LIMIT_ENTITIES:+--limit $M07_LIMIT_ENTITIES} \
       >>"$LOG" 2>&1 || rc=$?
     log "[m07:$W] rc=${rc:-0}"

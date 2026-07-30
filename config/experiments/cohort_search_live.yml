@@ -10,7 +10,7 @@
 # "NEVER AGAIN waste tokens building custom shit". If a hypothesis is not expressible here, fix the
 # manifest schema -- do not hand-roll a screen.
 
-name: cohort_search
+name: cohort_search_live
 description: >-
   FULL cohort search: m05 -> m06a -> m07(pretest+test) -> m06b -> m08 -> OOS from one manifest, with NO
   pinned shortlist, so m06a produces its own from m05's eligibility. This is the manifest that answers
@@ -29,7 +29,7 @@ inputs:
 
 # --- where THIS experiment writes (own dir; never a symlink -- the writer refuses) --------------- #
 output:
-  dir: app/data/v15/experiments/cohort_search
+  dir: app/data/v15/experiments/cohort_search_live
 
 # --- m05 eligibility ----------------------------------------------------------------------------- #
 m05:
@@ -63,7 +63,7 @@ m07:
   # 10_000.0 = the value the engine CLI silently defaulted to and this manifest inherited before
   # 2026-07-30. Pinned EXPLICITLY so the historical assumption is visible, NOT because it is right:
   # it is 10.7x our real $937.47 and it decides which leader actions clear the $10 minimum.
-  start_equity: 10_000.0
+  start_equity: 937.47
 
 # --- m06b ranking: the SELECTION HYPOTHESIS lives here ------------------------------------------- #
 # V2.2 shipped vector. NOTE for Phase 2: there is NO term for the ratio of mean win to mean loss,

@@ -10,7 +10,7 @@
 # "NEVER AGAIN waste tokens building custom shit". If a hypothesis is not expressible here, fix the
 # manifest schema -- do not hand-roll a screen.
 
-name: cohort_search
+name: cohort_search_slip0
 description: >-
   FULL cohort search: m05 -> m06a -> m07(pretest+test) -> m06b -> m08 -> OOS from one manifest, with NO
   pinned shortlist, so m06a produces its own from m05's eligibility. This is the manifest that answers
@@ -25,11 +25,11 @@ inputs:
   folds: app/data/v15/census20k_20260728/m03_folds.parquet
   m04_dir: app/data/v15/census20k_20260728
   m03_activity: app/data/v15/census20k_20260728/m03_wallet_activity_summary.parquet
-  slip_calib: app/data/v15/census20k_20260728/slippage_calib.json
+  slip_calib: app/data/v15/slippage_calib_ZERO_sensitivity.json
 
 # --- where THIS experiment writes (own dir; never a symlink -- the writer refuses) --------------- #
 output:
-  dir: app/data/v15/experiments/cohort_search
+  dir: app/data/v15/experiments/cohort_search_slip0
 
 # --- m05 eligibility ----------------------------------------------------------------------------- #
 m05:

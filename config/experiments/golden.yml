@@ -52,6 +52,10 @@ m07:
   fixed_target_exposure: 0.10
   copy_policy: full_mirror        # A/B 2026-07-30: beat entry_trail at every trail threshold
   copy_latency_ms: 4000           # MEASURED live 2026-07-27
+  # 10_000.0 = the value the engine CLI silently defaulted to and this manifest inherited before
+  # 2026-07-30. Pinned EXPLICITLY so the historical assumption is visible, NOT because it is right:
+  # it is 10.7x our real $937.47 and it decides which leader actions clear the $10 minimum.
+  start_equity: 10_000.0
   # THE FULL m06a shortlist -- this is what produced the reference 966 -> 353 -> 53.
   # First attempt pointed at m06a_shortlist_confirmed53.parquet (the 308-seat slice built for the
   # 2026-07-30 exit-policy A/B). That is a DIFFERENT experiment: m06b returned

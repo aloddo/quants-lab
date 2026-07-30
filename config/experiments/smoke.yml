@@ -53,6 +53,8 @@ m07:
   fixed_target_exposure: 0.10
   copy_policy: full_mirror        # A/B 2026-07-30: beat entry_trail at every trail threshold
   copy_latency_ms: 4000           # MEASURED live 2026-07-27
+  # OUR REAL equity. Positions = fixed_target_exposure * start_equity.
+  start_equity: 937.47
   # SMOKE SLICE: m07's own --limit, so this is a manifest field rather than a hand-built shortlist
   # (constructing a cut-down shortlist myself would be the custom-filtering pattern I was corrected for).
   # Full scale is 56,732 seats = ~3.8h pretest + ~1.3h test. This proves the runner's four acceptance
