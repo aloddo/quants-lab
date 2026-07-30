@@ -148,15 +148,47 @@ def _read_parquet_maybe_parts(path: Path) -> pd.DataFrame:
 
 
 def _load_m04_by_fold(m04_dir: Path, folds: pd.DataFrame, stem: str) -> pd.DataFrame:
+    """Load the fold-pure M4 files, REFUSING a present-but-EMPTY one.
+
+    2026-07-30: existence was checked, emptiness was not. `app/data/v15/census20k_20260728/`
+    holds m04_authenticity_f1..f8 that are 30 BYTES each -- structurally valid parquet with ZERO
+    rows. They passed `p.exists()`, loaded as empty frames, and every downstream M4 consumer then
+    silently agreed with everything:
+      - authenticity/danger tiering never excluded a wallet (no bot / wash / copy-farm filtering),
+      - entity clustering never collapsed one trader's several wallets into one entity,
+      - `_blocks_activity` maps journeys to entity via this table, so its wallet->entity join
+        matched nothing.
+    The whole 2026-07-30 cohort search ran that way and produced a 13-wallet cohort of which 8 had
+    not traded in 23-121 days and 12 had negative lifetime perp PnL. The filter built to catch
+    exactly that was reading an empty file. Caught only because the ARMING gate refused on exchange
+    truth -- i.e. after selection, not during it.
+    This is the same failure shape as the empty-m02_journeys bug fixed earlier the same day: an
+    absent/empty input producing a CONFIDENT result rather than an error. Emptiness is now fatal,
+    and the message names the real directory so the fix is obvious.
+    """
     parts = []
+    empty: list[str] = []
     for fid in sorted(folds["fold_id"].astype(int).unique()):
         p = m04_dir / f"{stem}_f{fid}.parquet"
         if not p.exists():
             raise FileNotFoundError(f"missing fold-pure M4 file for fold {fid}: {p}")
         df = pd.read_parquet(p).copy()
+        if df.empty:
+            empty.append(f"f{fid} ({p.stat().st_size}B)")
         df["fold_id"] = int(fid)
         parts.append(df)
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if empty:
+        raise ValueError(
+            f"M4 '{stem}' is PRESENT BUT EMPTY for {len(empty)} fold(s) under {m04_dir}: "
+            f"{', '.join(empty)}. An empty authenticity/entity table does not mean 'nothing was "
+            f"filtered' -- it means the input is MISSING, and every M4 gate downstream would pass "
+            f"everything (no bot/wash exclusion, no entity de-duplication). Point --m04-dir at a "
+            f"populated run (fold-pure files are ~1.5-2MB at 20k scale, not ~30B).")
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if out.empty:
+        raise ValueError(f"M4 '{stem}' loaded ZERO rows across all folds from {m04_dir}; refusing "
+                         f"to rank on an absent authenticity/entity table.")
+    return out
 
 
 def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
