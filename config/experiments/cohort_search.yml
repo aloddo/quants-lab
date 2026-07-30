@@ -1,0 +1,92 @@
+# GOLDEN MANIFEST — reproduces the already-known answer, bit-for-bit.
+#
+# This is the Phase-1 acceptance test (Fable plan gate, 2026-07-30). It must re-derive the result the
+# pipeline produced on 2026-07-28 from ONE command, twice, with identical output hashes:
+#     966 rankable -> 353 eligible -> 53 confirmed at FDR q=0.1
+#     full_mirror  = +23.59 bps/position over 308 seats
+#
+# A NEW EXPERIMENT IS A COPY OF THIS FILE WITH FIELDS CHANGED. Never a new script.
+# That is the whole point: the standing correction is "ANY SELECTION MUST GO THROUGH THE PIPELINE" and
+# "NEVER AGAIN waste tokens building custom shit". If a hypothesis is not expressible here, fix the
+# manifest schema -- do not hand-roll a screen.
+
+name: cohort_search
+description: >-
+  FULL cohort search: m05 -> m06a -> m07(pretest+test) -> m06b -> m08 -> OOS from one manifest, with NO
+  pinned shortlist, so m06a produces its own from m05's eligibility. This is the manifest that answers
+  "find the cohort THROUGH the pipeline" -- golden.yml only re-ranks a shortlist the census run had
+  already produced, which is a reproduction, not a search.
+
+# --- inputs (read-only; never written to) -------------------------------------------------------- #
+inputs:
+  run_dir: app/data/v15/census20k_20260728     # existing artifacts are REUSED, not rebuilt
+  actions: app/data/v15/census20k_20260728/m02_actions.parquet
+  journeys: app/data/v15/census20k_20260728/m02_journeys.parquet
+  folds: app/data/v15/census20k_20260728/m03_folds.parquet
+  m04_dir: app/data/v15/census20k_20260728
+  m03_activity: app/data/v15/census20k_20260728/m03_wallet_activity_summary.parquet
+  slip_calib: app/data/v15/census20k_20260728/slippage_calib.json
+
+# --- where THIS experiment writes (own dir; never a symlink -- the writer refuses) --------------- #
+output:
+  dir: app/data/v15/experiments/cohort_search
+
+# --- m05 eligibility ----------------------------------------------------------------------------- #
+m05:
+  mode: copyability        # equity lane needs M1, which is OUT OF SCOPE (Alberto 2026-07-17/30)
+  # no skip: this manifest exists to run m05 itself, not to reuse a prior one
+
+# --- m07 engine ---------------------------------------------------------------------------------- #
+m07:
+  # BOTH windows are required and they are NOT interchangeable: m06b RANKS on pretest
+  # [train_start, test_start) and CONFIRMS out-of-sample on test. Feeding it the test window as the
+  # ranking input is look-ahead, and m06b's own provenance gate correctly refuses it -- which is exactly
+  # what it did on the first golden run (2026-07-30): "308_rows_window!=[train_start,test_start)".
+  windows: [pretest, test]
+  sizing_mode: fixed_position     # leader_equity is DEPRECATED (reads a 100%-null column)
+  fixed_target_exposure: 0.10
+  copy_policy: full_mirror        # A/B 2026-07-30: beat entry_trail at every trail threshold
+  copy_latency_ms: 4000           # MEASURED live 2026-07-27
+
+# --- m06b ranking: the SELECTION HYPOTHESIS lives here ------------------------------------------- #
+# V2.2 shipped vector. NOTE for Phase 2: there is NO term for the ratio of mean win to mean loss,
+# which is what actually decides profitability after our ~9bps round-trip fee. w_pp_std is symmetric
+# (it punishes upside variance too) and was deliberately cut to near-zero for the fat-edge reweight.
+m06b:
+  w_pp_mean_r: 0.45
+  w_pp_t: 0.15
+  w_pp_std: 0.05
+  w_pp_mtm_dd: 0.20
+  w_pp_quick: 0.15
+  pp_min_positions: 25
+  fdr_q: 0.10
+  oos_min_folds: 4
+  oos_min_journeys_pooled: 50
+  fee_schedule_version: hl_fee_schedule_2026-06-01
+
+# --- out-of-sample validation (LOCAL data only; no API) ------------------------------------------ #
+# two_regime_test's live-API path lost 97% of the population to rate limits and is unnecessary:
+# local m02 reaches 2026-07-13 and the S3 hot dailies reach 2026-07-29.
+oos:
+  tool: forward_oos_hot
+  mark_source: asset_ctxs
+  # asset_ctxs does NOT report its coverage, so the runner cannot PROVE it can price this window. Since
+  # 2026-07-30 that is a hard refusal by default (it was the silent-n=0 path that produced a false
+  # "0 of 53 pass" verdict). This manifest acknowledges the risk EXPLICITLY because it reproduces a
+  # historical run that used this source, and a faithful reproduction must not change the source.
+  # CONSEQUENCE, and it is the point of making this explicit: any window scoring n=0 in this run is
+  # SUSPECT, not evidence. Prefer 'candles' (which reports coverage) for new experiments.
+  allow_unverified_marks: true
+  min_trades: 5
+  windows:
+    - 2026-05-18                 # fold 8 test_end_excl -> everything after is strictly OOS
+    - 2026-05-25
+    - 2026-06-01
+    - 2026-06-08
+    - 2026-06-15
+    - 2026-06-22
+    - 2026-06-29
+
+# --- memory envelope (acceptance condition 4: complete, or refuse with a reason) ----------------- #
+resources:
+  mem_safe_floor_gb: 2

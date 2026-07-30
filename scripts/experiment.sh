@@ -10,6 +10,12 @@
 #
 # Guarantees (Fable plan-gate acceptance conditions):
 #   1. Golden reproduction  -- same manifest twice => identical output hashes.
+#
+# STAGES: m05 -> m06a -> m07(pretest+test) -> m06b -> m08 -> oos, all from one manifest.
+# (2026-07-30: the first version invoked ONLY m07/m06b/oos and consumed a pre-existing m06a shortlist,
+#  so it could RE-RANK a shortlist but could not FIND a cohort. Alberto caught the overclaim; codex had
+#  flagged "the runner has no M05 stage at all" inside defect #11 and I fixed only the arg-forwarding
+#  half. m05/m06a/m08 are now real stages.)
 #   2. Second experiment, zero code -- change the m06b weight vector in YAML, no .py touched.
 #   3. Negative test        -- a mark source that cannot cover the OOS window exits non-zero.
 #   4. Hostile box          -- every heavy stage runs under mem_safe_run.sh, which refuses or aborts
@@ -32,8 +38,8 @@ if [ "${2:-}" = "--stage" ]; then
   ONLY_STAGE="${3:?--stage needs a name}"
   # codex #11: an UNKNOWN stage name silently ran nothing and exited 0. Validate against the real list.
   case "$ONLY_STAGE" in
-    m07|m06b|oos) ;;
-    *) echo "unknown --stage '$ONLY_STAGE' (valid: m07 m06b oos)" >&2; exit 2;;
+    m05|m06a|m07|m06b|m08|oos) ;;
+    *) echo "unknown --stage '$ONLY_STAGE' (valid: m05 m06a m07 m06b m08 oos)" >&2; exit 2;;
   esac
 fi
 
@@ -78,9 +84,12 @@ import sys, yaml, json, hashlib, os
 m = yaml.safe_load(open(sys.argv[1])) or {}
 stage = sys.argv[2]
 DEPS = {  # which manifest sections + inputs each stage's result actually depends on
-    "m07":  (["m07"], ["actions", "folds", "slip_calib"]),
-    "m06b": (["m07", "m06b"], ["m04_dir"]),
-    "oos":  (["m07", "m06b", "oos"], []),
+    "m05":  (["m05"], ["journeys", "folds", "m03_activity"]),
+    "m06a": (["m05", "m06a"], ["folds", "actions"]),
+    "m07":  (["m05", "m06a", "m07"], ["actions", "folds", "slip_calib"]),
+    "m06b": (["m05", "m06a", "m07", "m06b"], ["m04_dir"]),
+    "m08":  (["m05", "m06a", "m07", "m08"], ["slip_calib"]),
+    "oos":  (["m05", "m06a", "m07", "m06b", "oos"], []),
 }
 secs, ins = DEPS[stage]
 blob = {s: m.get(s) for s in secs}
@@ -160,6 +169,41 @@ print(f"provenance -> {out}")
 PYEOF
 log "provenance written"
 
+# ---- STAGE m05: eligibility ---------------------------------------------------------------------- #
+# The equity lane needs M1, which is OUT OF SCOPE (Alberto 2026-07-17, reconfirmed 07-30 "No M1 no
+# equity"), so mode is copyability and the account-quality gates are intentionally absent here.
+if stage_wanted m05; then
+  if skip_stage "m05" "$RUN/m05_eligibility.parquet"; then
+    log "[m05] SKIP (fingerprint matches)"
+  else
+    rc=0
+    log "[m05] START mode=${M05_MODE:-copyability}"
+    $SAFE --label m05_"$M_NAME" -- $PY research/v15/v15_m05_eligibility.py \
+      --mode "${M05_MODE:-copyability}" --folds "$IN_FOLDS" --journeys "$IN_JOURNEYS" \
+      --m04-dir "$IN_M04_DIR" --m03-activity "$IN_M03_ACTIVITY" --outdir "$RUN" >>"$LOG" 2>&1 || rc=$?
+    log "[m05] rc=${rc:-0}"
+    if [ "${rc:-0}" -ne 0 ]; then log "[m05] FAILED -- stopping"; exit 1; fi
+    mark_stage m05
+  fi
+fi
+
+# ---- STAGE m06a: shortlist ---------------------------------------------------------------------- #
+if stage_wanted m06a; then
+  if skip_stage "m06a" "$RUN/m06a_shortlist.parquet"; then
+    log "[m06a] SKIP (fingerprint matches)"
+  else
+    rc=0
+    log "[m06a] START"
+    $SAFE --label m06a_"$M_NAME" -- $PY research/v15/v15_m06a_shortlist.py \
+      --eligibility "$RUN/m05_eligibility.parquet" --pool-summary "$RUN/m05_pool_summary.parquet" \
+      --folds "$IN_FOLDS" --m04-dir "$IN_M04_DIR" --actions "$IN_ACTIONS" \
+      --outdir "$RUN" >>"$LOG" 2>&1 || rc=$?
+    log "[m06a] rc=${rc:-0}"
+    if [ "${rc:-0}" -ne 0 ]; then log "[m06a] FAILED -- stopping"; exit 1; fi
+    mark_stage m06a
+  fi
+fi
+
 # ---- STAGE m07: the copy simulation, ONE RUN PER WINDOW ----------------------------------------- #
 # pretest = the ranking input [train_start, test_start); test = the held-out OOS confirm window.
 # m06b requires the pretest run as --m07-dir; passing the test run there is look-ahead and its
@@ -174,10 +218,14 @@ if stage_wanted m07; then
       log "[m07:$W] SKIP (complete + fingerprint matches)"
       continue
     fi
-    log "[m07:$W] START sizing=$M07_SIZING_MODE policy=$M07_COPY_POLICY"
+    # Use the shortlist THIS run produced when m06a ran; fall back to a manifest-pinned one only if
+    # the manifest explicitly supplies it (e.g. the golden reproduction, which pins the census artifact).
+    SL="${M07_SHORTLIST:-$RUN/m06a_shortlist.parquet}"
+    if [ ! -s "$SL" ]; then log "[m07:$W] FAILED -- no shortlist at $SL"; exit 1; fi
+    log "[m07:$W] START sizing=$M07_SIZING_MODE policy=$M07_COPY_POLICY shortlist=$(basename "$SL")"
     rc=0
     $SAFE --label m07_"${M_NAME}_$W" -- $PY research/v15/v15_m07_engine.py \
-      --actions "$IN_ACTIONS" --shortlist "$M07_SHORTLIST" --folds "$IN_FOLDS" \
+      --actions "$IN_ACTIONS" --shortlist "$SL" --folds "$IN_FOLDS" \
       --out "$M07_OUT" --window "$W" --slip-calib "$IN_SLIP_CALIB" \
       --copy-latency-ms "$M07_COPY_LATENCY_MS" --sizing-mode "$M07_SIZING_MODE" \
       --fixed-target-exposure "$M07_FIXED_TARGET_EXPOSURE" \
@@ -226,6 +274,22 @@ PYEOF
     log "[m06b] rc=${rc:-0}"
     if [ "${rc:-0}" -ne 0 ]; then log "[m06b] FAILED -- stopping"; exit 1; fi
     mark_stage m06b
+  fi
+fi
+
+# ---- STAGE m08: counterfactual survival tiering (POST-engine) ----------------------------------- #
+if stage_wanted m08; then
+  if skip_stage "m08" "$RUN/m08_survival.parquet"; then
+    log "[m08] SKIP (fingerprint matches)"
+  else
+    rc=0
+    log "[m08] START"
+    $SAFE --label m08_"$M_NAME" -- $PY research/v15/v15_m08_survival.py \
+      --m07-dir "$RUN/m07_pretest" --out "$RUN" --m04-dir "$IN_M04_DIR" \
+      --slip-calib "$IN_SLIP_CALIB" >>"$LOG" 2>&1 || rc=$?
+    log "[m08] rc=${rc:-0}"
+    if [ "${rc:-0}" -ne 0 ]; then log "[m08] FAILED -- stopping"; exit 1; fi
+    mark_stage m08
   fi
 fi
 
