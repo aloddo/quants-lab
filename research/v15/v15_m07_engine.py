@@ -489,7 +489,9 @@ class EngineParams:
     adl_stress: bool = False
     start_policy: str = "future_delta_only"   # future_delta_only | causal_carry_in (design D9)
     follower_trail: Optional[float] = None     # FOLLOWER trailing exit ("exit before them"): if our copy
-    sizing_mode: str = "leader_equity"         # leader_equity | fixed_position
+    # 2026-07-30: default was "leader_equity", which is BOTH an M1 remnant and a silent-zero-orders
+    # trap (see _action_target_pct). Default is now the mode every real sim has actually used.
+    sizing_mode: str = "fixed_position"        # fixed_position | leader_equity(DEPRECATED, refuses)
     fixed_target_exposure: float = 0.10         # signed direction gets this absolute follower exposure
     # COPY POLICY (2026-07-23, Alberto HOW: test each wallet BOTH ways):
     #   "full_mirror"  = copy every ENTRY/ADDON/TRIM/EXIT verbatim (default; byte-identical to prior engine).
@@ -507,7 +509,24 @@ class EngineParams:
 def _action_target_pct(action: dict, params: EngineParams) -> float:
     """Return the declared source target under the selected sizing policy."""
     if params.sizing_mode == "leader_equity":
-        return _f(action.get("target_exposure_pct"))
+        # 2026-07-30 FAIL-LOUD (Fable plan gate, Step 2). `target_exposure_pct` is 100% NULL in every
+        # m02 actions store ever built -- sampled 8 of 1,137 row groups: 904,494 values, 904,494 null
+        # (no store was built with --equity-enrichment). Under this mode every target resolved to NaN,
+        # so the engine emitted ZERO orders and STILL REPORTED SUCCESS: one documented run read
+        # 46,180,870 actions and produced 0 fills / 0 positions. Exactly the silent-degradation class
+        # this pass exists to kill -- an n=0 must be a loud error, never a verdict.
+        #
+        # It is ALSO an M1 remnant: sizing from LEADER EQUITY *is* the equity reconstruction Alberto
+        # put out of scope (2026-07-17, reconfirmed 2026-07-30 "No M1 no equity. I don't care about
+        # equity. Why would I."). Backfilling the column would reinstate M1 through the back door.
+        # So: DEPRECATED and refuses, not repaired. Canonical sizing is the gross-notional ceiling.
+        raise ValueError(
+            "sizing_mode='leader_equity' is DEPRECATED and refuses to run: it sizes from leader "
+            "equity (M1, out of scope) via action['target_exposure_pct'], which is 100% NULL in "
+            "every m02 store, so it would emit ZERO orders and report success. Use "
+            "sizing_mode='fixed_position' with --fixed-target-exposure. "
+            "See card/quant-engineer/canonical-pipeline-and-engine."
+        )
     if params.sizing_mode == "fixed_position":
         pa = _f(action.get("position_after"))
         if pa != pa:
@@ -1909,7 +1928,8 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
                   band: str = "base", limit_entities: Optional[int] = None, start_equity: float = 10_000.0,
                   flush_rows: int = 250_000, require_cache: bool = True, window: str = "test",
                   slip_calib_path: Optional[str] = None, follower_trail: Optional[float] = None,
-                  copy_latency_ms: int = 4_000, sizing_mode: str = "leader_equity",  # measured 2026-07-27
+                  copy_latency_ms: int = 4_000, sizing_mode: str = "fixed_position",  # latency measured 2026-07-27;
+                  # sizing default flipped off leader_equity 2026-07-30 (silent-zero-orders trap + M1 remnant)
                   fixed_target_exposure: float = 0.10,
                   copy_policy: str = "full_mirror", trail_pct: float = 0.15):
     import shutil
@@ -2063,7 +2083,10 @@ def main():
                     help="copy entry lag in ms (2000=typical, 15000=P95 tail stress)")
     ap.add_argument(
         "--sizing-mode", choices=("leader_equity", "fixed_position"),
-        default="leader_equity",
+        default="fixed_position",
+        help="fixed_position (default) = signed direction x --fixed-target-exposure. "
+             "leader_equity is DEPRECATED and refuses to run (M1 remnant; the column it reads is "
+             "100%% NULL in every store, so it silently emitted zero orders).",
     )
     ap.add_argument(
         "--fixed-target-exposure", type=float, default=0.10,
