@@ -57,6 +57,7 @@ emit("M_NAME", m.get("name"))
 for k, v in (m.get("inputs") or {}).items():   emit(f"IN_{k.upper()}", v)
 emit("OUT_DIR", (m.get("output") or {}).get("dir"))
 for k, v in (m.get("m05") or {}).items():      emit(f"M05_{k.upper()}", v)
+for k, v in (m.get("m06a") or {}).items():     emit(f"M06A_{k.upper()}", v)
 m07 = m.get("m07") or {}
 for k, v in m07.items():
     if k != "windows": emit(f"M07_{k.upper()}", v)
@@ -193,10 +194,11 @@ if stage_wanted m06a; then
     log "[m06a] SKIP (fingerprint matches)"
   else
     rc=0
-    log "[m06a] START"
+    log "[m06a] START${M06A_MANIFEST:+ manifest=$(basename "$M06A_MANIFEST")}"
     $SAFE --label m06a_"$M_NAME" -- $PY research/v15/v15_m06a_shortlist.py \
       --eligibility "$RUN/m05_eligibility.parquet" --pool-summary "$RUN/m05_pool_summary.parquet" \
       --folds "$IN_FOLDS" --m04-dir "$IN_M04_DIR" --actions "$IN_ACTIONS" \
+      ${M06A_MANIFEST:+--manifest "$M06A_MANIFEST"} \
       --outdir "$RUN" >>"$LOG" 2>&1 || rc=$?
     log "[m06a] rc=${rc:-0}"
     if [ "${rc:-0}" -ne 0 ]; then log "[m06a] FAILED -- stopping"; exit 1; fi
@@ -222,14 +224,15 @@ if stage_wanted m07; then
     # the manifest explicitly supplies it (e.g. the golden reproduction, which pins the census artifact).
     SL="${M07_SHORTLIST:-$RUN/m06a_shortlist.parquet}"
     if [ ! -s "$SL" ]; then log "[m07:$W] FAILED -- no shortlist at $SL"; exit 1; fi
-    log "[m07:$W] START sizing=$M07_SIZING_MODE policy=$M07_COPY_POLICY shortlist=$(basename "$SL")"
+    log "[m07:$W] START sizing=$M07_SIZING_MODE policy=$M07_COPY_POLICY shortlist=$(basename "$SL")${M07_LIMIT_ENTITIES:+ limit=$M07_LIMIT_ENTITIES}"
     rc=0
     $SAFE --label m07_"${M_NAME}_$W" -- $PY research/v15/v15_m07_engine.py \
       --actions "$IN_ACTIONS" --shortlist "$SL" --folds "$IN_FOLDS" \
       --out "$M07_OUT" --window "$W" --slip-calib "$IN_SLIP_CALIB" \
       --copy-latency-ms "$M07_COPY_LATENCY_MS" --sizing-mode "$M07_SIZING_MODE" \
       --fixed-target-exposure "$M07_FIXED_TARGET_EXPOSURE" \
-      --copy-policy "$M07_COPY_POLICY" >>"$LOG" 2>&1 || rc=$?
+      --copy-policy "$M07_COPY_POLICY" ${M07_LIMIT_ENTITIES:+--limit $M07_LIMIT_ENTITIES} \
+      >>"$LOG" 2>&1 || rc=$?
     log "[m07:$W] rc=${rc:-0}"
     if [ "${rc:-0}" -ne 0 ]; then log "[m07:$W] FAILED -- stopping (fail closed)"; exit 1; fi
   done

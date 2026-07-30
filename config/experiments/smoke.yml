@@ -10,9 +10,10 @@
 # "NEVER AGAIN waste tokens building custom shit". If a hypothesis is not expressible here, fix the
 # manifest schema -- do not hand-roll a screen.
 
-name: golden
+name: smoke
 description: >-
-  Reproduction baseline. Folds 1-8, census20k inputs, fixed_position sizing, full_mirror policy,
+  SMOKE: bounded-entity slice used to prove the runner (determinism, manifest-only variation, negative
+  mark test, memory envelope). NOT a cohort and NOT a faithful reproduction of the 53 -- reproduction baseline. Folds 1-8, census20k inputs, fixed_position sizing, full_mirror policy,
   V2.2 m06b weights exactly as shipped.
 
 # --- inputs (read-only; never written to) -------------------------------------------------------- #
@@ -27,7 +28,7 @@ inputs:
 
 # --- where THIS experiment writes (own dir; never a symlink -- the writer refuses) --------------- #
 output:
-  dir: app/data/v15/experiments/golden
+  dir: app/data/v15/experiments/smoke
 
 # --- m05 eligibility ----------------------------------------------------------------------------- #
 m05:
@@ -52,6 +53,11 @@ m07:
   fixed_target_exposure: 0.10
   copy_policy: full_mirror        # A/B 2026-07-30: beat entry_trail at every trail threshold
   copy_latency_ms: 4000           # MEASURED live 2026-07-27
+  # SMOKE SLICE: m07's own --limit, so this is a manifest field rather than a hand-built shortlist
+  # (constructing a cut-down shortlist myself would be the custom-filtering pattern I was corrected for).
+  # Full scale is 56,732 seats = ~3.8h pretest + ~1.3h test. This proves the runner's four acceptance
+  # conditions in minutes; the real box time belongs to cohort_search.yml.
+  limit_entities: 400
   # THE FULL m06a shortlist -- this is what produced the reference 966 -> 353 -> 53.
   # First attempt pointed at m06a_shortlist_confirmed53.parquet (the 308-seat slice built for the
   # 2026-07-30 exit-policy A/B). That is a DIFFERENT experiment: m06b returned

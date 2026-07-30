@@ -36,6 +36,19 @@ m05:
   mode: copyability        # equity lane needs M1, which is OUT OF SCOPE (Alberto 2026-07-17/30)
   # no skip: this manifest exists to run m05 itself, not to reuse a prior one
 
+# --- m06a shortlist: SEAT COUNT is the single biggest cost lever ------------------------------------ #
+# The census run used NO top-N -- every rankable seat, 56,732 of them = ~3.8h pretest + ~1.3h test. It was
+# built that way for a reason (a prior run randomly sampled 2,000 seats/fold and a longitudinal verdict was
+# then reported off a cross-section). shortlist_n_per_fold=1000 is Alberto's PRE-REGISTERED value and
+# brings this to roughly an hour.
+# HONEST CONSEQUENCE: a top-N truncates the seat set. It is NOT random sampling -- m06a ranks on
+# pretest-only activity, so it truncates the ATTRIBUTE RANGE rather than biasing the outcome -- but any
+# result off this manifest is a top-1000-per-fold result, not a census. Whoever reads it should know.
+# score_basis MUST be activity_only: m06a's default equity_roe asserts roe>0, and under the no-M1
+# copyability lane roe is identically 0.0, so the default fails closed.
+m06a:
+  manifest: config/experiments/m06a_manifest_cohort.json
+
 # --- m07 engine ---------------------------------------------------------------------------------- #
 m07:
   # BOTH windows are required and they are NOT interchangeable: m06b RANKS on pretest
