@@ -68,10 +68,23 @@ printf '%s\n' $FOLDS | while read -r pair; do
   e="$OUT/m04_entities_f${fid}.parquet"
   if [ -s "$o" ] && [ -s "$e" ]; then echo "[f$fid] SKIP (exists)" >> "$LOG"; continue; fi
   echo "[f$fid] as-of $asof START $(date -u +%FT%TZ)" >> "$LOG"
+  # 2026-07-30 rc=137 FIX. Fold 11 was OOM-killed TWICE here, and neither cause was the memory guard:
+  #   (1) this invoked $PY DIRECTLY, so scripts/mem_safe_run.sh -- the ONLY component that polls
+  #       SYSTEM-AVAILABLE memory and kills the group before the kernel does -- was absent. The
+  #       in-process guard bounds THIS PROCESS's RSS on a 15s poll; it is structurally blind to the box
+  #       shrinking underneath it, which is exactly what 5 concurrent agents do. The wrapper's own header
+  #       calls itself MANDATORY for every heavy job (decision 2026-06-04-mem-safe-run-backstop) and its
+  #       2026-07-17 note records that it moved to system-available semantics *because the old RSS
+  #       ceiling missed THIS module* reading the 11GB store via mmap.
+  #   (2) --headroom-gb 0.5 against a module default of 6.0. Headroom is reserve for mid-run GROWTH of
+  #       the live baseline; 0.5GB on this box is a rounding error, so the planner certified an
+  #       infeasible plan as feasible. _streaming_io now floors headroom at 2.0GB.
+  # m04's main() now calls require_mem_safe_run(), so running this bare refuses outright.
+  scripts/mem_safe_run.sh --floor-gb 2 --label m04_f$fid -- \
   $PY research/v15/v15_m04_authenticity.py \
     --wallets-file "$W" --as-of "$asof" \
     --out "$o" --entities-out "$e" \
-    --procs 1 --per-worker-gb 1.5 --headroom-gb 0.5 >> "$LOG" 2>&1
+    --procs 1 --per-worker-gb 1.5 >> "$LOG" 2>&1
   rc=$?
   echo "[f$fid] rc=$rc END $(date -u +%FT%TZ)" >> "$LOG"
   [ $rc -ne 0 ] && { echo "[f$fid] FAILED - stopping (fail closed)" >> "$LOG"; exit 1; }

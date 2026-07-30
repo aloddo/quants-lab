@@ -39,7 +39,7 @@ sys.path.insert(0, "/Users/hermes/quants-lab/research/v15")
 import v15_m025_authenticity_gate as g  # noqa: E402  (codex-SHIP helpers)
 import v15_m01_equity_reconstruct as m01  # noqa: E402
 import hl_fills_io as fio  # noqa: E402  (consolidated HOT fills store — same source M02 builds from)
-from _streaming_io import install_memory_guard, plan_memory_budget  # noqa: E402
+from _streaming_io import install_memory_guard, plan_memory_budget, require_mem_safe_run  # noqa: E402
 
 # Route M4 fills through the wallet-partitioned shard (per-wallet partition reads) instead of re-scanning the
 # 11GB store per chunk. That re-read is memory-MAPPED/file-backed -> consumed physical RAM (avail->2.8G, CoS
@@ -421,6 +421,11 @@ def main():
     ap.add_argument("--headroom-gb", type=float, default=6.0,
                     help="RAM reserved for the live baseline (agents + mongod + postgres).")
     args = ap.parse_args()
+
+    # 2026-07-30: refuse to run outside scripts/mem_safe_run.sh. m04 fold 11 was OOM-killed TWICE at
+    # rc=137 precisely because its driver invoked this module bare, so nothing was watching
+    # system-available memory. The in-process guard bounds THIS process; only the wrapper bounds the box.
+    require_mem_safe_run("v15_m04_authenticity")
 
     # AGGREGATE memory budget (2026-06-10 OOM fix): per-process guards do not compose; cap worker
     # count from ACTUAL free RAM so N x per_worker + baseline cannot blow past physical RAM.

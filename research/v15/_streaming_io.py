@@ -40,6 +40,42 @@ logger = logging.getLogger("streaming_io")
 # Opt-out for the rare deliberate case. Unset by default: the guard must be the default, not the flag.
 _ALLOW_SYMLINK_WRITE_ENV = "QL_ALLOW_SYMLINK_WRITE"
 
+# Memory-safety floors (2026-07-30, Fable plan gate Step 5). See plan_memory_budget / require_mem_safe_run.
+_MIN_HEADROOM_GB = 2.0
+_ALLOW_LOW_HEADROOM_ENV = "QL_ALLOW_LOW_HEADROOM"
+_REQUIRE_WRAPPER_ENV = "QL_ALLOW_UNWRAPPED_HEAVY"
+
+
+def require_mem_safe_run(module: str) -> None:
+    """Heavy modules must run under scripts/mem_safe_run.sh. Refuse otherwise.
+
+    WHY (2026-07-30): m04 fold 11 was OOM-killed twice at rc=137. The in-process memory guard did not
+    fail and its design is not wrong -- the guard bounds THE JOB (per-process RSS, 15s poll) while the
+    wrapper bounds THE BOX (polls system-available continuously and kills the group on first breach).
+    scripts/m04_20k_folds9to12.sh invoked the module DIRECTLY, so the only component watching the right
+    variable was absent. The wrapper's own header calls itself "MANDATORY wrapper for every heavy/batch
+    /fan-out job on this box" (binding decision 2026-06-04-mem-safe-run-backstop), and its 2026-07-17 P0
+    note records that it switched to system-available semantics *specifically because* the old RSS
+    ceiling MISSED v15_m04 reading the 11GB store via mmap.
+
+    Prose did not stop it; this does -- and it closes the hole against future drivers too, not just the
+    one that broke.
+    """
+    if os.environ.get("MEM_SAFE_RUN") == "1" or os.environ.get("MEM_SAFE_RUN_CEIL_MB"):
+        return
+    if os.environ.get(_REQUIRE_WRAPPER_ENV) == "1":
+        logger.warning("[mem_safe] %s running UNWRAPPED (permitted by %s=1). Nothing is watching "
+                       "system-available; an OOM SIGKILL will look like a crash.",
+                       module, _REQUIRE_WRAPPER_ENV)
+        return
+    raise RuntimeError(
+        f"{module} must run under scripts/mem_safe_run.sh -- it is the only component that polls "
+        f"SYSTEM-AVAILABLE memory and kills the job group before the kernel does. Running bare is how "
+        f"m04 fold 11 was OOM-killed twice (rc=137). Wrap it:\n"
+        f"    scripts/mem_safe_run.sh --floor-gb 2 --label {module} -- <python ...>\n"
+        f"(Override for a genuinely light run: {_REQUIRE_WRAPPER_ENV}=1)"
+    )
+
 
 def assert_not_symlinked_output(path: str | Path, what: str = "output") -> Path:
     """Refuse to write to a path that IS a symlink, or that lives under a symlinked directory.
@@ -339,6 +375,22 @@ def plan_memory_budget(requested_procs: int,
         raise ValueError("headroom_gb must be >= 0")
     if main_reserve_gb < 0:
         raise ValueError("main_reserve_gb must be >= 0")
+    # HEADROOM FLOOR (2026-07-30, Fable plan gate Step 5). m04 fold 11 was OOM-killed TWICE at rc=137
+    # because scripts/m04_20k_folds9to12.sh passed `--headroom-gb 0.5` against this module's default of
+    # 6.0. Headroom is EXTRA reserve for mid-run GROWTH of the live baseline + FS cache; on a box shared
+    # with ~5 agents that each move by hundreds of MB, 0.5GB is a rounding error, not a safety margin.
+    # The planner did exactly as told and certified an infeasible plan as feasible. A knob that turns a
+    # safety check into a formality must be hard to turn: floor it, and shout when it is overridden.
+    if headroom_gb < _MIN_HEADROOM_GB:
+        if os.environ.get(_ALLOW_LOW_HEADROOM_ENV) == "1":
+            logger.warning("[mem_budget] headroom_gb=%.2f is BELOW the %.1fGB floor; permitted only "
+                           "because %s=1. On a shared box this is how rc=137 happens.",
+                           headroom_gb, _MIN_HEADROOM_GB, _ALLOW_LOW_HEADROOM_ENV)
+        else:
+            logger.warning("[mem_budget] headroom_gb=%.2f raised to the %.1fGB floor (m04 f11 was "
+                           "OOM-killed twice with 0.5GB). Override with %s=1 if truly intended.",
+                           headroom_gb, _MIN_HEADROOM_GB, _ALLOW_LOW_HEADROOM_ENV)
+            headroom_gb = _MIN_HEADROOM_GB
     if free_gb is None:
         free_gb = _available_ram_gb()
 
