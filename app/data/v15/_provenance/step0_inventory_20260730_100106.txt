@@ -1,0 +1,59 @@
+=== STEP 0 SAFETY NET  20260730_100106 ===
+--- git state ---
+7115b6c2766ef785a4b3ab95bb000d32084b4123
+(clean if nothing above)
+--- symlink map across the three data dirs ---
+  funnel20k_20260728 : 18 symlinks
+      m04_authenticity_f4.parquet -> ../m04_authenticity_f4.parquet
+      m04_entities_f3.parquet -> ../m04_entities_f3.parquet
+      m04_authenticity_f5.parquet -> ../m04_authenticity_f5.parquet
+      m04_entities_f2.parquet -> ../m04_entities_f2.parquet
+      m02_journeys.parquet -> ../prefix_backup_20260717_1652/m02_journeys.parquet
+      m04_authenticity_f7.parquet -> ../m04_authenticity_f7.parquet
+      m04_authenticity_f6.parquet -> ../m04_authenticity_f6.parquet
+      m04_entities_f1.parquet -> ../m04_entities_f1.parquet
+      m02_actions.parquet -> ../prefix_backup_20260717_1652/m02_actions.parquet
+      m04_entities_f8.parquet -> ../m04_entities_f8.parquet
+      m04_entities_f4.parquet -> ../m04_entities_f4.parquet
+      m04_authenticity_f3.parquet -> ../m04_authenticity_f3.parquet
+      m04_entities_f5.parquet -> ../m04_entities_f5.parquet
+      m04_authenticity_f2.parquet -> ../m04_authenticity_f2.parquet
+      m04_entities_f7.parquet -> ../m04_entities_f7.parquet
+      m04_authenticity_f8.parquet -> ../m04_authenticity_f8.parquet
+      m04_entities_f6.parquet -> ../m04_entities_f6.parquet
+      m04_authenticity_f1.parquet -> ../m04_authenticity_f1.parquet
+  census20k_20260728 : 27 symlinks
+      m04_authenticity_f4.parquet -> ../m04_authenticity_f4.parquet
+      m04_entities_f3.parquet -> ../m04_entities_f3.parquet
+      m05_eligibility.parquet -> ../funnel20k_20260728/m05_eligibility.parquet
+      m03_wallet_fold_activity.parquet -> /Users/hermes/quants-lab/app/data/v15/funnel20k_20260728/m03_wallet_fold_activity.parquet
+      m04_authenticity_f5.parquet -> ../m04_authenticity_f5.parquet
+      m05_pool_summary.parquet -> ../funnel20k_20260728/m05_pool_summary.parquet
+      m04_entities_f2.parquet -> ../m04_entities_f2.parquet
+      m03_folds.parquet -> /Users/hermes/quants-lab/app/data/v15/funnel20k_20260728/m03_folds.parquet
+      m02_journeys.parquet -> /Users/hermes/quants-lab/app/data/v15/prefix_backup_20260717_1652/m02_journeys.parquet
+      m04_authenticity_f7.parquet -> ../m04_authenticity_f7.parquet
+      m06a_pool_summary.parquet -> ../funnel20k_20260728/m06a_pool_summary.parquet
+      m04_authenticity_f6.parquet -> ../m04_authenticity_f6.parquet
+      m06a_waterfall.json -> ../funnel20k_20260728/m06a_waterfall.json
+      m04_entities_f1.parquet -> ../m04_entities_f1.parquet
+      m02_actions.parquet -> /Users/hermes/quants-lab/app/data/v15/prefix_backup_20260717_1652/m02_actions.parquet
+      m04_entities_f8.parquet -> ../m04_entities_f8.parquet
+      m04_entities_f4.parquet -> ../m04_entities_f4.parquet
+      m04_authenticity_f3.parquet -> ../m04_authenticity_f3.parquet
+      slippage_calib.json -> ../funnel20k_20260728/slippage_calib.json
+      m04_entities_f5.parquet -> ../m04_entities_f5.parquet
+      m04_authenticity_f2.parquet -> ../m04_authenticity_f2.parquet
+      m04_entities_f7.parquet -> ../m04_entities_f7.parquet
+      m05_waterfall.json -> ../funnel20k_20260728/m05_waterfall.json
+      m03_wallet_activity_summary.parquet -> /Users/hermes/quants-lab/app/data/v15/funnel20k_20260728/m03_wallet_activity_summary.parquet
+      m04_authenticity_f8.parquet -> ../m04_authenticity_f8.parquet
+      m04_entities_f6.parquet -> ../m04_entities_f6.parquet
+      m04_authenticity_f1.parquet -> ../m04_authenticity_f1.parquet
+  funnel_20260728 : 2 symlinks
+      m02_journeys.parquet -> ../m02_screenset/closed/run_000001.parquet
+      m02_actions.parquet -> ../m02_screenset_actions/run_000001.parquet
+--- sizes ---
+979M	app/data/v15/funnel20k_20260728
+3.0G	app/data/v15/census20k_20260728
+4.7M	app/data/v15/funnel_20260728
