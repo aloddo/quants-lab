@@ -63,8 +63,32 @@ if [ -f /tmp/v12_pause ] || [ -f "$WORKDIR/.HALT_COPY" ]; then
   exit 2
 fi
 
+# 2026-07-31 (quant): THRESHOLDS COME FROM THE ROSTER, WHEN IT DECLARES THEM.
+# The gate's strict defaults (equity>=$10k, lifetime PnL>0, lev<=10x) encode a DIFFERENT thesis from
+# the entries-only copy strategy: they failed 9/9 of a cohort that had passed its own selection, purely
+# because those leaders are lifetime-negative -- which this thesis expects BY DESIGN, since it copies
+# per-position ENTRY edge rather than the leader's outcome. The only honest options were to --force
+# around the gate (which makes the arm record mean "the gate failed and we went anyway") or to let a
+# roster DECLARE which criteria are load-bearing for it. This is the second. Staleness stays mandatory:
+# a dormant leader emits no signal to copy at any size.
+# A roster with no `global.account_gate` block still gets the strict defaults.
+GATE_ARGS=()
+if $PY -c "import json,sys; sys.exit(0 if json.load(open('$CONFIG')).get('global',{}).get('account_gate') else 1)" 2>/dev/null; then
+  while IFS= read -r _a; do [ -n "$_a" ] && GATE_ARGS+=("$_a"); done < <($PY - "$CONFIG" <<'PYEOF'
+import json, sys
+g = json.load(open(sys.argv[1]))["global"]["account_gate"]
+for flag, key in (("--min-equity", "min_equity"), ("--min-lifetime-pnl", "min_lifetime_pnl"),
+                  ("--max-leverage", "max_leverage"), ("--max-stale-days", "max_stale_days")):
+    if key in g:
+        print(f"{flag}={g[key]}")      # =-form so negative values are not parsed as flags
+PYEOF
+)
+  echo "gate thresholds declared by the roster: ${GATE_ARGS[*]}"
+  echo "  (rationale is recorded in global.account_gate._why in $CONFIG)"
+fi
+
 GATE_JSON="/tmp/account_gate_$(date +%Y%m%d_%H%M%S).json"
-$PY scripts/account_gate.py --config "$CONFIG" --json-out "$GATE_JSON"
+$PY scripts/account_gate.py --config "$CONFIG" --json-out "$GATE_JSON" "${GATE_ARGS[@]+"${GATE_ARGS[@]}"}"
 rc=$?
 
 if [ $rc -ne 0 ] && [ $FORCE -ne 1 ]; then

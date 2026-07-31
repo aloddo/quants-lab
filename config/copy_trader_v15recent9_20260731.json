@@ -321,7 +321,14 @@
     "leader_flat_confirms": 2,
     "leader_flat_min_age_s": 90.0,
     "leader_flat_outage_alert_s": 300.0,
-    "universe_authorization": "ALL live main+xyz perps. Alberto TG 12130 'ALL THE COINS IN THE MAIN + XYZ DEX' + TG 12127 'FUCK SLIPPAGE' (accepts class-default slippage for uncalibrated coins). Delivered via the V17 expansion mechanism (baseline whitelist stays the calibrated 10; expansion coins are admitted at runtime only if present in the live HL universe, fail-closed, behind per-coin and expansion-wide kills). No validator was weakened. Universe snapshot 2026-07-31: 177 main + 88 xyz live."
+    "universe_authorization": "ALL live main+xyz perps. Alberto TG 12130 'ALL THE COINS IN THE MAIN + XYZ DEX' + TG 12127 'FUCK SLIPPAGE' (accepts class-default slippage for uncalibrated coins). Delivered via the V17 expansion mechanism (baseline whitelist stays the calibrated 10; expansion coins are admitted at runtime only if present in the live HL universe, fail-closed, behind per-coin and expansion-wide kills). No validator was weakened. Universe snapshot 2026-07-31: 177 main + 88 xyz live.",
+    "account_gate": {
+      "_why": "Which liveness criteria are LOAD-BEARING for THIS thesis. The gate's strict defaults (equity>=$10k, lifetime PnL>0, lev<=10x) contradict the entries-only thesis and fail 9/9 of a cohort that passed its own selection: we copy per-position ENTRY edge, not the leader's outcome, so lifetime-negative leaders are expected BY DESIGN (9 of 13 in the prior cohort lost money in dollars while their mean per-position return was positive). Equity is void per Alberto. HL's default is 20x on majors, so 10x is arbitrary. Staleness is the ONLY criterion that can invalidate the thesis: a dormant leader emits no signal to copy at any size. Declaring these here means the arm gate enforces THIS strategy's thesis instead of being --force'd around, which would make the arm record meaningless.",
+      "min_equity": 0,
+      "min_lifetime_pnl": -1000000000000.0,
+      "max_leverage": "inf",
+      "max_stale_days": 7
+    }
   },
   "defaults": {
     "group": "v15_recent12_live9",
