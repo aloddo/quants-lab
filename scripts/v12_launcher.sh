@@ -59,7 +59,25 @@ SCRIPT="strategies/live/hl_copy_trader_v17.py"
 # Alberto capital GO TG10911/10913/10914/10916/10917 (150/order, waive codex, 5x lev, fail-fast). Ledger:
 # brain projects/quant/copy/2026-07-06-gate1-golive-validation-ledger. NOTE for CoS: plist UNCHANGED; only
 # this launcher repointed (established pattern). Supervised takeover needs halt flags removed + daemon loaded.
-ARGS="--config config/copy_trader_totalreturn5_20260726.json"   # 2026-07-26 (quant): TOTAL-RETURN 5 roster. No alpha/benchmark -- return from leaders own fills. Screen: hold<2d + positive total return net of our fee + not-martingale + p95 MAE<=300 + p99 MAE<=600 => 285; then recency<=14d (143/285 were DEAD) + operator-correlation (4 earlier picks were ONE operator, dead since May) => 96; final 5 on distinct coin sets. Alberto GO TG 11861. Revert prior: config/copy_trader_printalpha3_20260726.json
+# 2026-07-31 (quant, card engine-parity-fixes): repointed to the V15 cohort_recent12 roster -- 9 wallets,
+# 12 folds, chained OOS 2026-01-26..2026-07-13, m06b FDR q=0.10 confirmed 18 -> 9 by account_gate liveness
+# on exchange truth. +10.24 bps/position OOS, all 9 individually positive. Alberto GO TG 12110/12118.
+# This config also carries the exit-parity settings (exit_type=LEADER_FLAT, copy_trims_enabled=false) that
+# commit aae08ea added; the old totalreturn5 roster predates them and would trade the FIRST_CLOSE rule.
+# The launcher was still pointing at totalreturn5 while every 2026-07-30/31 validation ran on the V15
+# cohort -- i.e. arming would have traded a roster nothing in this card measured.
+# NOTE for CoS: plist UNCHANGED; only this launcher repointed (established pattern).
+# To revert: CONFIG="config/copy_trader_totalreturn5_20260726.json"
+#
+# ONE VARIABLE, NOT A STRING TO BE RE-PARSED (2026-07-31, codex r2 P1). The roster used to live inside
+# an $ARGS string that THREE places re-parsed with different rules: this launcher, arm_copy.sh, and
+# python argparse. They disagree -- `--config a.json --config b.json` makes both shell greps pick a.json
+# while argparse picks b.json, and a `staging/config/x.json` prefix is silently truncated by the regex.
+# Any disagreement means the gate certifies one roster and the engine trades another, which is the whole
+# bug. Now there is exactly one assignment, everyone reads THAT, and argv is built as an array.
+CONFIG="config/copy_trader_v15recent9_20260731.json"
+ARGS=(--config "$CONFIG")
+# PRIOR (2026-07-26, quant): TOTAL-RETURN 5 roster. No alpha/benchmark -- return from leaders own fills. Screen: hold<2d + positive total return net of our fee + not-martingale + p95 MAE<=300 + p99 MAE<=600 => 285; then recency<=14d (143/285 were DEAD) + operator-correlation (4 earlier picks were ONE operator, dead since May) => 96; final 5 on distinct coin sets. Alberto GO TG 11861. Revert prior: config/copy_trader_printalpha3_20260726.json
 
 cd "$WORKDIR"
 
@@ -97,6 +115,51 @@ if [ ! -f "$WORKDIR/.ARM_COPY" ]; then
   exit 0
 fi
 
+# 2026-07-31 (quant, codex r2 P1): THE ARM RECORD AND WHAT WE TRADE MUST BE THE SAME ROSTER.
+# Until now .ARM_COPY recorded `config=<the roster arm_copy.sh gated>` and this launcher ignored it
+# completely, running its own $ARGS. So the sanctioned procedure -- `bash scripts/arm_copy.sh
+# --config <X>` -- could pass the exchange-truth account gate on roster X and then trade roster Y.
+# That is fail-OPEN in the one place the whole arming design exists to make fail-closed: the gate
+# certified wallets we were not going to trade, and produced a PASS that meant nothing. It is the
+# same class as findings/quant/2026-07-29-kill-switch-fails-open.
+#
+# The launcher now REFUSES on mismatch rather than silently preferring either side. A mismatch is an
+# operator error (someone repointed one and not the other) and must be loud, not auto-resolved:
+# auto-preferring the arm record would silently change what trades when someone edits ARGS, and
+# auto-preferring ARGS would restore exactly the hole this closes.
+_refuse() { echo "[$(date '+%F %T %Z')] v12_launcher: REFUSING -- $*"; sleep 5; exit 0; }
+
+# `|| true` on every parse: under `set -euo pipefail` a no-match grep/sed returns 1 and would kill the
+# script BEFORE its own diagnostic could print (codex r2 P2 -- reproduced as a silent exit 1).
+_ARMED_CONFIG=$(sed -n 's/^config=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
+_ARMED_SHA=$(sed -n 's/^config_sha256=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
+_ARMED_RC=$(sed -n 's/^gate_rc=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
+
+# Schema check: a hand-made .ARM_COPY containing only a matching `config=` line used to be accepted,
+# so "armed" could mean "someone wrote a file" rather than "the gate ran" (codex r2 P1).
+[ -n "$_ARMED_CONFIG" ] || _refuse ".ARM_COPY carries no config= line. Re-arm via scripts/arm_copy.sh"
+[ -n "$_ARMED_RC" ]     || _refuse ".ARM_COPY carries no gate_rc= line -- it was not written by arm_copy.sh"
+[ -n "$_ARMED_SHA" ]    || _refuse ".ARM_COPY carries no config_sha256= line -- re-arm via scripts/arm_copy.sh"
+
+[ "$_ARMED_CONFIG" = "$CONFIG" ] || {
+  echo "    gated/armed : $_ARMED_CONFIG"
+  echo "    would trade : $CONFIG"
+  echo "    The account gate certified the armed roster. Trading the other one would put capital on"
+  echo "    wallets nothing validated. Fix CONFIG in this file, or re-arm the roster you intend to trade."
+  _refuse "ARMED ROSTER != LAUNCH ROSTER (fail-closed)"
+}
+[ -f "$WORKDIR/$CONFIG" ] || _refuse "roster file missing: $CONFIG"
+
+# CONTENT binding, not just a pathname (codex r2 P1): the gate certified the BYTES it read. Editing the
+# JSON, swapping a symlink target, or regenerating the roster after arming would otherwise sail through
+# an identical path comparison. Re-arm is the only way to change what trades.
+_NOW_SHA=$(shasum -a 256 "$WORKDIR/$CONFIG" | awk '{print $1}' || true)
+[ "$_NOW_SHA" = "$_ARMED_SHA" ] || {
+  echo "    armed sha : $_ARMED_SHA"
+  echo "    file  sha : $_NOW_SHA"
+  _refuse "roster CONTENT changed since it was gated -- re-arm to re-gate it (fail-closed)"
+}
+
 # Source .env safely (auto-export, then disable)
 if [ -f .env ]; then
   set -a
@@ -105,5 +168,5 @@ if [ -f .env ]; then
   set +a
 fi
 
-echo "[$(date '+%F %T %Z')] v12_launcher: starting $SCRIPT $ARGS"
-exec "$PYTHON" "$SCRIPT" $ARGS
+echo "[$(date '+%F %T %Z')] v12_launcher: starting $SCRIPT ${ARGS[*]} (gate_rc=$_ARMED_RC)"
+exec "$PYTHON" "$SCRIPT" "${ARGS[@]}"

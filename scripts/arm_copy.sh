@@ -41,9 +41,14 @@ done
 # it manufactures a false PASS. Caught by running it.
 #
 # Parse the real assignment instead: uncommented `ARGS=` lines only, LAST one wins (shell semantics).
+# 2026-07-31 (quant, codex r2 P1): read the launcher's single CONFIG assignment instead of re-parsing
+# its $ARGS string. Three parsers (this one, the launcher's, python argparse) disagreed on strings like
+# `--config a.json --config b.json` (shell greps take the first, argparse the last) and on prefixed
+# paths (`staging/config/x.json` truncated to `config/x.json` by the regex). Any disagreement means we
+# gate one roster and trade another -- the exact failure this script exists to prevent.
 if [ -z "$CONFIG" ]; then
-  CONFIG=$(grep -E '^[[:space:]]*ARGS=' scripts/v12_launcher.sh \
-           | tail -1 | grep -oE 'config/[^ "]+\.json' | head -1)
+  CONFIG=$(grep -E '^[[:space:]]*CONFIG=' scripts/v12_launcher.sh \
+           | tail -1 | sed -E 's/^[[:space:]]*CONFIG="?([^"]*)"?.*/\1/')
 fi
 if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
   echo "REFUSING TO ARM: could not resolve the launcher's roster config (got '${CONFIG:-<empty>}')" >&2
@@ -72,6 +77,10 @@ fi
 {
   echo "armed_utc=$(date -u +%FT%TZ)"
   echo "config=$CONFIG"
+  # Bind the CONTENT, not just the pathname (2026-07-31, codex r2 P1). The gate certified the bytes it
+  # read; editing the JSON or repointing a symlink after arming must invalidate the arm, and the
+  # launcher refuses on a sha mismatch.
+  echo "config_sha256=$(shasum -a 256 "$CONFIG" | awk '{print $1}')"
   echo "gate_rc=$rc"
   echo "gate_result=$GATE_JSON"
   echo "forced=$FORCE"
