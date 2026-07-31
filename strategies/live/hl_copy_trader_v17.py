@@ -425,8 +425,9 @@ class CopyTrader:
         # Position lifecycle tracking
         # (wallet, coin) -> (checked_at, leader_szi, came_from_api); rate-limits the LEADER_FLAT
         # ground-truth poll so a busy leader cannot spam clearinghouseState.
-        self._leader_flat_cache = {}
-        self._leader_flat_confirms = {}          # (wallet, coin) -> consecutive flat/flipped reads
+        self._leader_snapshot = {}               # (wallet, dex) -> (ts, {coin: szi}) or (ts, None)
+        self._leader_flat_decision = {}          # streak_key -> (snapshot ts counted, decision)
+        self._leader_flat_confirms = {}          # streak_key -> consecutive fresh flat/flipped reads
         self._leader_flat_outage = {}            # (wallet, coin) -> ts of first consecutive API failure
         self._leader_flat_outage_alerted = {}    # (wallet, coin) -> alert already sent for this outage
         self._position_accumulated = {}
@@ -1124,6 +1125,87 @@ class CopyTrader:
             # API failed, keep the last known value rather than zeroing out
             logger.warning(f"TARGET POS REFRESH FAILED: {wallet[:14]} {coin} -- keeping current tracker value")
 
+    def _snapshot_leader_positions(self, addr: str, dex: str) -> Optional[dict]:
+        """ALL of one leader's positions on one dex, in ONE call. None = unusable response (UNKNOWN).
+
+        Same hardened contract as _query_target_position: `assetPositions` PRESENT-but-empty is a real
+        flat account; ABSENT is an unusable response and must not be read as "flat".
+        """
+        try:
+            payload = {"type": "clearinghouseState", "user": addr}
+            if dex:
+                payload["dex"] = dex
+            r = requests.post(f"{HL_API}/info", json=payload, timeout=5)
+            if r.status_code != 200:
+                logger.warning(f"LEADER SNAPSHOT: HTTP {r.status_code} for {addr[:10]} dex={dex or '-'}")
+                return None
+            data = r.json()
+            if not isinstance(data, dict) or not isinstance(data.get("assetPositions"), list):
+                logger.warning(f"LEADER SNAPSHOT: unusable body for {addr[:10]} dex={dex or '-'}")
+                return None
+            # STRICT ROW PARSE (codex r3 P2): a row with a coin but no szi used to become 0.0, i.e. an
+            # assertion of flatness -- which authorizes a close. A "NaN" size could likewise read as a
+            # sign flip. One unparseable row invalidates the WHOLE snapshot: a partially-understood book
+            # is not evidence about the coins missing from it.
+            out = {}
+            for p in data["assetPositions"]:
+                pos = p.get("position") or {}
+                c = pos.get("coin")
+                if c is None:
+                    continue
+                try:
+                    v = float(pos["szi"])
+                except (KeyError, TypeError, ValueError):
+                    logger.warning(f"LEADER SNAPSHOT: unparseable szi for {addr[:10]} {c} -> UNKNOWN")
+                    return None
+                if v != v or v in (float("inf"), float("-inf")):
+                    logger.warning(f"LEADER SNAPSHOT: non-finite szi for {addr[:10]} {c} -> UNKNOWN")
+                    return None
+                out[c] = v
+            return out
+        except Exception as e:
+            logger.warning(f"LEADER SNAPSHOT: {type(e).__name__} for {addr[:10]} dex={dex or '-'}")
+            return None
+
+    async def _prefetch_leader_snapshots(self, keys) -> None:
+        """Refresh the (wallet, dex) snapshots LEADER_FLAT will read, off the event loop.
+
+        WHY THIS EXISTS (codex r2 P1, 2026-07-31). The first version called clearinghouseState from
+        inside the per-position loop: one BLOCKING 5s request per (wallet, coin), sequentially, on the
+        same loop that services WS ingestion, order updates, the hard/global stops and reconciliation.
+        Several open legs plus a slow API could stall all live handling for tens of seconds -- and the
+        retry traffic helps CAUSE the rate limiting that made it slow. Two fixes, both structural:
+          * ONE request per (wallet, dex) instead of one per coin -- clearinghouseState already returns
+            the whole book, so per-coin polling was redundant as well as slow.
+          * run in a thread executor, concurrently, so the loop keeps serving.
+        After this, _leader_flat_or_flipped does NO I/O at all: it is a pure read of the snapshot.
+        """
+        poll_s = float(self.global_config.get("leader_flat_poll_s", 10.0))
+        now = time.time()
+        stale = [k for k in keys if now - self._leader_snapshot.get(k, (0.0, None))[0] >= poll_s]
+        if not stale:
+            return
+        loop = asyncio.get_event_loop()
+        results = await asyncio.gather(
+            *[loop.run_in_executor(None, self._snapshot_leader_positions, w, dx) for (w, dx) in stale],
+            return_exceptions=True)
+        for (w, dx), res in zip(stale, results):
+            if isinstance(res, Exception):
+                res = None
+            self._leader_snapshot[(w, dx)] = (time.time(), res)
+            if res is None:
+                first = self._leader_flat_outage.setdefault((w, dx), time.time())
+                if time.time() - first > float(self.global_config.get("leader_flat_outage_alert_s", 300.0)) \
+                        and not self._leader_flat_outage_alerted.get((w, dx)):
+                    self._leader_flat_outage_alerted[(w, dx)] = True
+                    _tg(f"LEADER_FLAT: cannot read leader state for {w[:10]} dex={dx or '-'} "
+                        f"({int(time.time() - first)}s) -- HOLDING, no exit signal available")
+            else:
+                self._leader_flat_outage.pop((w, dx), None)
+                self._leader_flat_outage_alerted.pop((w, dx), None)
+                for c, szi in res.items():          # ground truth -> shared tracker
+                    self._target_positions.setdefault(w, {})[c] = szi
+
     def _leader_flat_or_flipped(self, wallet: str, coin: str, our_side: str,
                                 mark: float, entry_ts: float = 0.0) -> Optional[bool]:
         """Is the LEADER out of (or opposite to) this coin? The exit signal for exit_type=LEADER_FLAT.
@@ -1159,7 +1241,7 @@ class CopyTrader:
         g = self.global_config
         grace_s = float(g.get("leader_flat_min_age_s", 90.0))
         need_confirms = int(g.get("leader_flat_confirms", 2))
-        poll_s = float(g.get("leader_flat_poll_s", 10.0))
+        # NOTE: leader_flat_poll_s is enforced in _prefetch_leader_snapshots, which owns all I/O.
 
         if entry_ts and (now - entry_ts) < grace_s:
             return False                                  # too young to judge; REST may not show it yet
@@ -1171,29 +1253,27 @@ class CopyTrader:
         # Leg identity is part of the streak key so a retired leg cannot bequeath a strike to the next
         # leg on the same (wallet, coin) via a retirement path that never cleared state (codex r2 P1).
         streak_key = (wallet, coin, round(float(entry_ts or 0.0), 3))
-        cached = self._leader_flat_cache.get(key)
-        if cached is not None and now - cached[0] < poll_s:
-            return cached[3]                              # (ts, szi, from_api, decision)
 
-        szi = self._query_target_position(wallet, coin)
-        if szi is None:
-            # UNKNOWN. The tracker may never authorize a close. Negative-cache it too, otherwise every
-            # sweep fires another blocking 5s request and the retry storm freezes WS ingestion exactly
-            # when the API is already rate-limiting us (codex r2 P1).
-            first_fail = self._leader_flat_outage.setdefault(key, now)
-            if now - first_fail > float(g.get("leader_flat_outage_alert_s", 300.0)):
-                if not self._leader_flat_outage_alerted.get(key):
-                    self._leader_flat_outage_alerted[key] = True
-                    _tg(f"LEADER_FLAT: cannot read leader state for {coin} "
-                        f"({int(now - first_fail)}s) -- HOLDING, no exit signal available")
+        # PURE READ -- no I/O (codex r2 P1). _prefetch_leader_snapshots refreshes one snapshot per
+        # (wallet, dex) off the event loop; this function only interprets it. A snapshot is counted as
+        # ONE observation: `snap_ts` is the streak's clock, so repeated sweeps within a poll window
+        # cannot manufacture confirmations out of a single REST response.
+        dex = _get_market_type(coin) if ":" in coin else ""
+        if dex in ("perp", "spot"):
+            dex = ""
+        snap_ts, snap = self._leader_snapshot.get((wallet, dex), (0.0, None))
+        if snap is None:
             logger.warning(f"LEADER_FLAT: leader state UNKNOWN for {wallet[:10]} {coin} -- holding")
             self._leader_flat_confirms.pop(streak_key, None)   # an unknown breaks the streak
-            self._leader_flat_cache[key] = (now, None, False, None)
             return None
+        # Decision memo is keyed by LEG, not by (wallet, coin) (codex r3 P2, which he reproduced): when
+        # two leg identities coexist on one coin, a coin-keyed memo let the older leg's decision be
+        # returned for the younger leg, closing it a confirmation early.
+        seen_ts, seen_decision = self._leader_flat_decision.get(streak_key, (0.0, False))
+        if snap_ts <= seen_ts:
+            return seen_decision                          # same observation -> same answer, no new strike
 
-        self._leader_flat_outage.pop(key, None)
-        self._leader_flat_outage_alerted.pop(key, None)
-        self._target_positions.setdefault(wallet, {})[coin] = szi   # ground truth -> shared tracker
+        szi = snap.get(coin, 0.0)     # snapshot is authoritative: absent from a usable body == flat
 
         # Exact flatness and sign reversal do NOT need a mark; only the dust floor does (codex r2 P2).
         # Discarding an unambiguous zero because the mark is missing would hold past the leader's exit.
@@ -1203,7 +1283,6 @@ class CopyTrader:
         elif (szi > 0) != our_is_long:
             leader_out, leader_flipped = False, True
         elif mark is None or mark <= 0:
-            self._leader_flat_cache[key] = (now, szi, True, None)
             return None                                   # a 0 mark would make every position "flat"
         else:
             flat_usd = float(g.get("leader_flat_notional_usd", g.get("min_entry_notional", 10.0)))
@@ -1212,7 +1291,7 @@ class CopyTrader:
 
         if not (leader_out or leader_flipped):
             self._leader_flat_confirms.pop(streak_key, None)
-            self._leader_flat_cache[key] = (now, szi, True, False)
+            self._leader_flat_decision[streak_key] = (snap_ts, False)
             return False
 
         n = self._leader_flat_confirms.get(streak_key, 0) + 1
@@ -1221,7 +1300,7 @@ class CopyTrader:
         if not decision:
             logger.info(f"LEADER_FLAT: {coin} reads "
                         f"{'flat' if leader_out else 'flipped'} ({n}/{need_confirms}) -- waiting")
-        self._leader_flat_cache[key] = (now, szi, True, decision)
+        self._leader_flat_decision[streak_key] = (snap_ts, decision)
         return decision
 
     def _is_opening_trade(self, wallet: str, coin: str, is_buy: bool) -> bool:
@@ -2467,6 +2546,31 @@ class CopyTrader:
                 logger.info("GLOBAL STOP: exchange flat. Halted (manual re-arm to resume).")
             return
 
+        # LEADER_FLAT reads leader state from a snapshot, never by calling out mid-loop. Refresh the
+        # snapshots for exactly the (wallet, dex) pairs we hold, ONE request each, off the event loop
+        # (codex r2 P1: the per-coin blocking call used to run inline with WS ingestion).
+        if any((wc.get("exit_type") or self.default_config.get("exit_type")) == "LEADER_FLAT"
+               for wc in self.wallet_configs.values()):
+            _keys = set()
+            for _p in self.positions:
+                if not _p.get("filled"):
+                    continue
+                _c = _p["coin"]
+                _dx = _get_market_type(_c) if ":" in _c else ""
+                _keys.add((_p.get("wallet", ""), "" if _dx in ("perp", "spot") else _dx))
+            if _keys:
+                await self._prefetch_leader_snapshots(_keys)
+            # PRUNE leg-scoped state against the legs that actually exist (codex r3 P2). These maps are
+            # keyed by (wallet, coin, entry_ts), so without this they grow once per leg forever in a
+            # process meant to run for weeks, and the per-exit cleanup cannot catch legs retired by the
+            # SL / trailing / max-hold / WS paths.
+            _live_legs = {(p.get("wallet", ""), p["coin"],
+                           round(float(p.get('fill_time') or p.get('entry_time') or 0.0), 3))
+                          for p in self.positions if p.get("filled")}
+            for _m in (self._leader_flat_confirms, self._leader_flat_decision):
+                for _sk in [k for k in _m if k not in _live_legs]:
+                    _m.pop(_sk, None)
+
         # Gross-backstop TRIM (Alberto 2026-06-15): self-healing -- close worst-first to the target, then
         # CLEAR the flag and resume normal trading (NOT a permanent kill, unlike the loss stops above).
         if self._trim_requested:
@@ -2711,11 +2815,12 @@ class CopyTrader:
                         # all bypass it, and a surviving strike would let the NEXT leg on the same coin
                         # close on its first observation (codex r2 P1). Leg-scoped keys make the
                         # inheritance impossible rather than relying on every path remembering.
-                        for _d in (self._leader_flat_cache, self._leader_flat_outage,
-                                   self._leader_flat_outage_alerted):
-                            _d.pop((wallet, coin), None)
-                        for _sk in [k for k in self._leader_flat_confirms if k[0] == wallet and k[1] == coin]:
+                        for _sk in [k for k in self._leader_flat_confirms
+                                    if k[0] == wallet and k[1] == coin]:
                             self._leader_flat_confirms.pop(_sk, None)
+                        for _sk in [k for k in self._leader_flat_decision
+                                    if k[0] == wallet and k[1] == coin]:
+                            self._leader_flat_decision.pop(_sk, None)
                         exited_ids.add(id(pos))
                     else:
                         still_open.append(pos)
