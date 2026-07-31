@@ -12,6 +12,7 @@ done here). Read-only.
 
 Run: ~/miniforge3/envs/quants-lab/bin/python scripts/cohort_health_monitor.py
 """
+import argparse
 import json
 import time
 from datetime import datetime, timezone
@@ -19,12 +20,17 @@ import requests
 from pymongo import MongoClient
 
 HL = "https://api.hyperliquid.xyz/info"
-CFG = "config/copy_trader_wallets_v17_expansion.json"
+CFG = "config/copy_trader_wallets_v17_expansion.json"   # legacy default; pass --config for the live roster
 
 
 def main():
+    # 2026-07-31: the roster was hardcoded to the 2026-05-23 cohort, so running this against the LIVE
+    # roster silently reported on wallets we no longer trade. Parameterised rather than rewritten.
+    ap = argparse.ArgumentParser(description="cohort liveness / dormancy monitor (read-only)")
+    ap.add_argument("--config", default=CFG, help="roster JSON to classify")
+    args = ap.parse_args()
     db = MongoClient("mongodb://localhost:27017").quants_lab
-    cfg = json.load(open(CFG))
+    cfg = json.load(open(args.config))
     sk = list(cfg["wallets"].keys())
     whitelist = set(cfg.get("global", {}).get("coins", cfg.get("coins", [])) or [])
     now = datetime.now(timezone.utc).timestamp()
@@ -61,7 +67,7 @@ def main():
         time.sleep(0.12)
 
     n = len(sk)
-    print(f"=== cohort health ({n} wallets, asof 2026-05-23) {datetime.now(timezone.utc):%Y-%m-%d %H:%M}Z ===")
+    print(f"=== cohort health ({n} wallets, {args.config}) {datetime.now(timezone.utc):%Y-%m-%d %H:%M}Z ===")
     print(f"  ACTIVE-captured (<24h):   {active}")
     print(f"  SLOW-captured (1-7d):     {slow}")
     print(f"  OFF-UNIVERSE (alive,off): {off_uni}")
