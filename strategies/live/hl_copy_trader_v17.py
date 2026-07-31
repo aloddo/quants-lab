@@ -423,6 +423,12 @@ class CopyTrader:
         self._last_reconcile = 0
 
         # Position lifecycle tracking
+        # (wallet, coin) -> (checked_at, leader_szi, came_from_api); rate-limits the LEADER_FLAT
+        # ground-truth poll so a busy leader cannot spam clearinghouseState.
+        self._leader_flat_cache = {}
+        self._leader_flat_confirms = {}          # (wallet, coin) -> consecutive flat/flipped reads
+        self._leader_flat_outage = {}            # (wallet, coin) -> ts of first consecutive API failure
+        self._leader_flat_outage_alerted = {}    # (wallet, coin) -> alert already sent for this outage
         self._position_accumulated = {}
         self._twap_buffer = {}
         self._twap_entered = set()
@@ -1068,7 +1074,16 @@ class CopyTrader:
             pass
 
     def _query_target_position(self, addr: str, coin: str) -> Optional[float]:
-        """Get target's current position size for a coin."""
+        """Get target's current position size for a coin. None = UNKNOWN, 0.0 = confirmed flat.
+
+        HARDENED 2026-07-31 (codex P1, card engine-parity-fixes): this used to return 0.0 -- a
+        POSITIVE assertion that the leader is flat -- for any response that merely failed to contain
+        the coin. An HTTP 429/5xx body, a transient `{}`, or a JSON list would all take the
+        `data.get("assetPositions", [])` default and report "flat". Under exit_type=LEADER_FLAT that
+        return value AUTHORIZES CLOSING A LIVE POSITION, so a rate-limit episode could liquidate the
+        book. The distinction that matters: `assetPositions` PRESENT-but-empty is a real flat account;
+        `assetPositions` ABSENT is an unusable response and must be UNKNOWN.
+        """
         dex = _get_market_type(coin) if ":" in coin else ""
         # For regular perps, dex="" works. For builder coins, use the prefix.
         if dex in ("perp", "spot"):
@@ -1078,14 +1093,22 @@ class CopyTrader:
             if dex:
                 payload["dex"] = dex
             r = requests.post(f"{HL_API}/info", json=payload, timeout=5)
-            data = r.json()
-            if data is None:
+            if r.status_code != 200:
+                logger.warning(f"TARGET POS QUERY: HTTP {r.status_code} for {addr[:10]} {coin} -> UNKNOWN")
                 return None
-            for p in data.get("assetPositions", []):
+            data = r.json()
+            if not isinstance(data, dict) or "assetPositions" not in data:
+                logger.warning(f"TARGET POS QUERY: no assetPositions in response for {addr[:10]} "
+                               f"{coin} -> UNKNOWN (not 'flat')")
+                return None
+            aps = data.get("assetPositions")
+            if not isinstance(aps, list):
+                return None
+            for p in aps:
                 pos = p["position"]
                 if pos["coin"] == coin:
                     return float(pos["szi"])
-            return 0.0
+            return 0.0   # assetPositions PRESENT and this coin absent from it => genuinely flat
         except Exception:
             return None
 
@@ -1100,6 +1123,106 @@ class CopyTrader:
         else:
             # API failed, keep the last known value rather than zeroing out
             logger.warning(f"TARGET POS REFRESH FAILED: {wallet[:14]} {coin} -- keeping current tracker value")
+
+    def _leader_flat_or_flipped(self, wallet: str, coin: str, our_side: str,
+                                mark: float, entry_ts: float = 0.0) -> Optional[bool]:
+        """Is the LEADER out of (or opposite to) this coin? The exit signal for exit_type=LEADER_FLAT.
+
+        PARITY (card engine-parity-fixes Step 1, 2026-07-31): the exit condition BOTH scorers behind
+        the +10.24 bps OOS measured -- forward_oos_hot.py roundtrips_boundary() ends a round trip only
+        on close-or-reverse (a partial reduce does NOT end it), and v15_m07_engine.py:518-524 under
+        sizing_mode=fixed_position holds sign(position_after) * fixed size, zeroing only when
+        |position_after| == 0. Deliberately NOT the FIRST_CLOSE trim ratio.
+
+        HONEST DEVIATION FROM PARITY (codex P2, 2026-07-31): m07's zero test is on SIZE (~1e-12) and
+        forward_oos_hot force-closes residuals at the scoring boundary regardless of the leader. Our
+        `leader_flat_notional_usd` floor is a LIVE-TRADING CONCESSION -- a sub-$10 leader residue is
+        not mirrorable at our size -- not a reproduction of either scorer. Named, not dressed up.
+
+        ONLY THE EXCHANGE MAY AUTHORIZE A CLOSE (codex P1, 2026-07-31). The earlier version fell back
+        to the WS tracker on API failure, so a stale-zero or stale-opposite tracker value could return
+        True and close a live position -- the same tracker with the documented drift history that this
+        helper exists to route around. Now: API says flat/flipped -> may exit; anything else (failure,
+        malformed, no data) -> UNKNOWN, and the caller holds. The tracker can still say HOLD (it just
+        cannot say EXIT), because holding is the backtested behaviour and sl_bps / global_stop_pct /
+        the gross backstop remain the risk floor.
+
+        TWO PROTECTIONS COPIED FROM THE ENGINE'S OWN LEADER SWEEP, which I had bypassed (codex P1):
+          * entry-age grace -- our fill can complete BEFORE the leader's position appears in REST, so a
+            fresh leg would read as "leader never had it" and self-close instantly.
+          * consecutive confirmations -- one lagging snapshot must not close a position.
+
+        Returns True (exit), False (hold), None (unknown -> hold).
+        """
+        key = (wallet, coin)
+        now = time.time()
+        g = self.global_config
+        grace_s = float(g.get("leader_flat_min_age_s", 90.0))
+        need_confirms = int(g.get("leader_flat_confirms", 2))
+        poll_s = float(g.get("leader_flat_poll_s", 10.0))
+
+        if entry_ts and (now - entry_ts) < grace_s:
+            return False                                  # too young to judge; REST may not show it yet
+
+        # A CONFIRMATION MUST BE A FRESH OBSERVATION (codex r2 P1, 2026-07-31). The first version
+        # incremented the streak on every ~1Hz sweep while the cache re-served ONE snapshot, so
+        # "2 confirms" was two reads of the same REST response -- the protection was decorative.
+        # The cache now carries the DECISION, and a cached hit returns it without touching the streak.
+        # Leg identity is part of the streak key so a retired leg cannot bequeath a strike to the next
+        # leg on the same (wallet, coin) via a retirement path that never cleared state (codex r2 P1).
+        streak_key = (wallet, coin, round(float(entry_ts or 0.0), 3))
+        cached = self._leader_flat_cache.get(key)
+        if cached is not None and now - cached[0] < poll_s:
+            return cached[3]                              # (ts, szi, from_api, decision)
+
+        szi = self._query_target_position(wallet, coin)
+        if szi is None:
+            # UNKNOWN. The tracker may never authorize a close. Negative-cache it too, otherwise every
+            # sweep fires another blocking 5s request and the retry storm freezes WS ingestion exactly
+            # when the API is already rate-limiting us (codex r2 P1).
+            first_fail = self._leader_flat_outage.setdefault(key, now)
+            if now - first_fail > float(g.get("leader_flat_outage_alert_s", 300.0)):
+                if not self._leader_flat_outage_alerted.get(key):
+                    self._leader_flat_outage_alerted[key] = True
+                    _tg(f"LEADER_FLAT: cannot read leader state for {coin} "
+                        f"({int(now - first_fail)}s) -- HOLDING, no exit signal available")
+            logger.warning(f"LEADER_FLAT: leader state UNKNOWN for {wallet[:10]} {coin} -- holding")
+            self._leader_flat_confirms.pop(streak_key, None)   # an unknown breaks the streak
+            self._leader_flat_cache[key] = (now, None, False, None)
+            return None
+
+        self._leader_flat_outage.pop(key, None)
+        self._leader_flat_outage_alerted.pop(key, None)
+        self._target_positions.setdefault(wallet, {})[coin] = szi   # ground truth -> shared tracker
+
+        # Exact flatness and sign reversal do NOT need a mark; only the dust floor does (codex r2 P2).
+        # Discarding an unambiguous zero because the mark is missing would hold past the leader's exit.
+        our_is_long = our_side == 'BUY'
+        if szi == 0.0:
+            leader_out, leader_flipped = True, False
+        elif (szi > 0) != our_is_long:
+            leader_out, leader_flipped = False, True
+        elif mark is None or mark <= 0:
+            self._leader_flat_cache[key] = (now, szi, True, None)
+            return None                                   # a 0 mark would make every position "flat"
+        else:
+            flat_usd = float(g.get("leader_flat_notional_usd", g.get("min_entry_notional", 10.0)))
+            leader_out = abs(szi) * mark < flat_usd
+            leader_flipped = False
+
+        if not (leader_out or leader_flipped):
+            self._leader_flat_confirms.pop(streak_key, None)
+            self._leader_flat_cache[key] = (now, szi, True, False)
+            return False
+
+        n = self._leader_flat_confirms.get(streak_key, 0) + 1
+        self._leader_flat_confirms[streak_key] = n
+        decision = n >= need_confirms
+        if not decision:
+            logger.info(f"LEADER_FLAT: {coin} reads "
+                        f"{'flat' if leader_out else 'flipped'} ({n}/{need_confirms}) -- waiting")
+        self._leader_flat_cache[key] = (now, szi, True, decision)
+        return decision
 
     def _is_opening_trade(self, wallet: str, coin: str, is_buy: bool) -> bool:
         """Determine if the target's TWAP is an opening (increase) or closing (decrease).
@@ -2548,6 +2671,59 @@ class CopyTrader:
             exit_min_trim_pct = self.global_config.get("exit_min_trim_pct", 0.05)
             # Fix #7: use per-wallet exit_twap_min_notional instead of global
             exit_min_trim_usd = wc.get("exit_twap_min_notional", self.global_config.get("exit_min_trim_usd", 3.0))
+
+            # ── LEADER_FLAT: the exit rule the backtest actually measured ────────────────────────
+            # (card engine-parity-fixes Step 1, 2026-07-31). FIRST_CLOSE below fires when
+            #   leader_reverse_notional / OUR_accumulated_notional >= 0.85
+            # -- a ratio that MIXES SCALES (:3296 accumulates the LEADER's trade notional, :2256 OUR
+            # entry notional). A leader on $2,000 positions taking a $300 trim gives 300/25 = 12 -> capped
+            # to 1.0 -> we exit on their FIRST trim, and 56.1% of journeys contain one. Our return rises
+            # steeply with hold (<=15min -1.69 bps / 1-4h +34.90 / >4h +64.31), so that rule plausibly
+            # inverts the measured edge rather than merely loosening it.
+            # Both scorers behind the +10.24 bps OOS exit ONLY on leader flat-or-flipped: forward_oos_hot
+            # ends a round trip on close-or-reverse (partial reduces do not end it) and m07 holds
+            # sign(position_after) * fixed size. We mirror THAT. No partial trims: our size is fixed, so
+            # scaling it to the leader's reduction is not parity either.
+            # This branch is checked EVERY sweep, not only when a reverse-flow buffer exists, because a
+            # leader can go flat via a fill we never saw on the WS stream (the orphan mode).
+            if wc.get("exit_type") == "LEADER_FLAT":
+                _mark = self.mid_prices.get(coin, 0)
+                _done = self._leader_flat_or_flipped(wallet, coin, pos['side'], _mark,
+                                                     entry_ts=pos.get('fill_time') or pos.get('entry_time') or 0.0)
+                if _done:
+                    if not pos.get('_exit_logged'):
+                        logger.info(f"LEADER FLAT/FLIPPED: {wallet[:10]} {coin} -- closing our leg")
+                        _tg(f"FULL EXIT (leader flat): {coin}")
+                        pos['_exit_logged'] = True
+                    last_exit_attempt = pos.get('_last_exit_attempt', 0)
+                    if now - last_exit_attempt < 10:
+                        still_open.append(pos)
+                        continue
+                    pos['_last_exit_attempt'] = now
+                    exited = await self._exit_position(pos)
+                    if exited:
+                        acc_key = (wallet, coin)
+                        self._exit_twap_buffer.pop(exit_key, None)
+                        self._position_accumulated.pop(acc_key, None)
+                        # Drop LEADER_FLAT state for this key. The confirmation streak is keyed by LEG
+                        # (wallet, coin, entry_ts) precisely because this cleanup is NOT the only way a
+                        # leg retires -- hard SL, trailing, max-hold, pending-reverse and WS retirement
+                        # all bypass it, and a surviving strike would let the NEXT leg on the same coin
+                        # close on its first observation (codex r2 P1). Leg-scoped keys make the
+                        # inheritance impossible rather than relying on every path remembering.
+                        for _d in (self._leader_flat_cache, self._leader_flat_outage,
+                                   self._leader_flat_outage_alerted):
+                            _d.pop((wallet, coin), None)
+                        for _sk in [k for k in self._leader_flat_confirms if k[0] == wallet and k[1] == coin]:
+                            self._leader_flat_confirms.pop(_sk, None)
+                        exited_ids.add(id(pos))
+                    else:
+                        still_open.append(pos)
+                    continue
+                # _done False (leader still in) or None (unknown) -> HOLD. Holding is what the backtest
+                # did; sl_bps, global_stop_pct and the gross backstop remain the risk floor.
+                still_open.append(pos)
+                continue
 
             if exit_key in self._exit_twap_buffer:
                 ebuf = self._exit_twap_buffer[exit_key]
@@ -4897,7 +5073,38 @@ class V16CopyTrader(CopyTrader):
         _req(10.0 <= float(g.get("order_size_usd", 0)) <= 200.0,
              "order_size_usd must be in [10, 200] (Alberto 2026-06-11: full account, up to 10x liquid)")
         _req(d.get("entry_mode") == "instant", "entry_mode must be 'instant' (leader open -> taker entry)")
-        _req(d.get("exit_type") == "FIRST_CLOSE", "exit_type must be FIRST_CLOSE (faithful exit)")
+        # exit_type: FIRST_CLOSE was the 2026-06-11 "faithful exit". It is NOT what the V15 backtest
+        # measured (card engine-parity-fixes Step 1) -- LEADER_FLAT is. Both remain accepted so this
+        # validator stays usable for the older V16 configs; anything else is rejected.
+        _req(d.get("exit_type") in ("FIRST_CLOSE", "LEADER_FLAT"),
+             "exit_type must be FIRST_CLOSE (V16) or LEADER_FLAT (V15 parity)")
+        # PER-WALLET, not just defaults (codex P1 2026-07-31): runtime reads the MERGED per-wallet
+        # config, so validating only `defaults` let a single wallet override exit_type and slip past
+        # every guard below. Mixed exit types are also rejected outright -- convergence and the trim
+        # machinery are process-global, so "half the roster is LEADER_FLAT" has no coherent meaning.
+        # PRESENCE, not truthiness (codex r2 P1): `wc.get(k) or default` silently reads an explicit
+        # null/"" override as the default, so a wallet could validate as LEADER_FLAT and then run the
+        # legacy trim path at runtime. Use the key's presence, and compare exact merged values.
+        _wallet_exits = {(wc["exit_type"] if "exit_type" in wc else d.get("exit_type"))
+                         for wc in self.wallet_configs.values()}
+        _bad = {x for x in _wallet_exits if x not in ("FIRST_CLOSE", "LEADER_FLAT")}
+        _req(not _bad,
+             f"every wallet's exit_type must be FIRST_CLOSE or LEADER_FLAT; got invalid {_bad!r}")
+        _req(len(_wallet_exits) <= 1,
+             f"exit_type must be UNIFORM across the roster (convergence is process-global); "
+             f"got {_wallet_exits!r}")
+        _exit_type = next(iter(_wallet_exits)) if _wallet_exits else d.get("exit_type")
+        if _exit_type == "LEADER_FLAT":
+            # THE OTHER PATH THAT SHORTENS HOLDS (codex P1 2026-07-31). Fixing _check_exits alone is
+            # not parity: _converge_positions trims our leg downward when the leader reduces, deriving
+            # a smaller target from their remaining-size ratio. m07 under sizing_mode=fixed_position
+            # holds sign(position_after) * FIXED size through every partial -- it never trims. So under
+            # LEADER_FLAT downward convergence must be OFF, and this refuses the config rather than
+            # silently forcing it, because a silently-forced knob is how the last three of these hid.
+            _req(not bool(g.get("copy_trims_enabled", True)),
+                 "LEADER_FLAT requires copy_trims_enabled=false: m07 fixed_position holds a CONSTANT "
+                 "size through leader partials, so downward convergence would re-introduce exactly the "
+                 "short-hold behaviour LEADER_FLAT exists to remove")
         # Alberto 2026-07-24: the old "<=1, no stacking at $12" guard was a small-size min-order concern, NOT
         # data-proven. Leaders' MEASURED scale-in is ~2.0x median, so mirroring adds up to 2x is data-justified.
         # Keep ONLY the real protection: adds must stay above exchange min-order -> require order_size >= $50 when
@@ -4937,12 +5144,32 @@ class V16CopyTrader(CopyTrader):
         # and a huge exit_twap_min_notional, the engine's FIRST_CLOSE machinery only acts when the
         # leader has closed >= 80% of tracked notional (full exit at >= 90%) -- the validated
         # full-close exit, not a 5%-reverse-flow trim.
-        _req(float(g.get("exit_min_trim_pct", 0)) >= 0.80,
-             "exit_min_trim_pct must be >= 0.80 (full-close exit semantics, codex finding #2)")
-        _req(float(d.get("exit_twap_min_notional", 0)) >= 1e8,
-             "exit_twap_min_notional must be huge (disable $-threshold trims, codex finding #2)")
-        _req(abs(float(g.get("full_exit_trim_pct", 0.90)) - float(g["exit_min_trim_pct"])) < 1e-9,
-             "full_exit_trim_pct must equal exit_min_trim_pct (no partial-trim band; codex r2 #2)")
+        # These three constrain the FIRST_CLOSE ratio machinery ONLY. Under LEADER_FLAT that machinery
+        # is never reached, so asserting them there would be a VACUOUS gate that reads as protection
+        # (2026-07-31). LEADER_FLAT gets the guard that is actually load-bearing for it instead: a flat
+        # threshold that cannot be set so wide it closes live positions.
+        if _exit_type == "FIRST_CLOSE":
+            _req(float(g.get("exit_min_trim_pct", 0)) >= 0.80,
+                 "exit_min_trim_pct must be >= 0.80 (full-close exit semantics, codex finding #2)")
+            _req(float(d.get("exit_twap_min_notional", 0)) >= 1e8,
+                 "exit_twap_min_notional must be huge (disable $-threshold trims, codex finding #2)")
+            _req(abs(float(g.get("full_exit_trim_pct", 0.90)) - float(g["exit_min_trim_pct"])) < 1e-9,
+                 "full_exit_trim_pct must equal exit_min_trim_pct (no partial-trim band; codex r2 #2)")
+        else:
+            # Tightened to $10 (codex P2): at $25 we would declare a genuine $10-24 leader position
+            # "flat" and close against a leader who is still in. The floor exists only to ignore a
+            # residue too small for us to have mirrored at all -- min order is $10, so $10 is the cap.
+            _flat_usd = float(g.get("leader_flat_notional_usd", g.get("min_entry_notional", 10.0)))
+            _req(0.0 < _flat_usd <= 10.0,
+                 "leader_flat_notional_usd must be in (0, 10] -- above that we would call a live "
+                 "leader position 'flat' and exit early, which is the bug LEADER_FLAT exists to fix")
+            _req(float(g.get("leader_flat_poll_s", 10.0)) <= 60.0,
+                 "leader_flat_poll_s must be <= 60s (staler than that and we hold past the leader's exit)")
+            _req(int(g.get("leader_flat_confirms", 2)) >= 2,
+                 "leader_flat_confirms must be >= 2 (one lagging REST snapshot must not close a leg)")
+            _req(float(g.get("leader_flat_min_age_s", 90.0)) >= 60.0,
+                 "leader_flat_min_age_s must be >= 60s: our fill can complete BEFORE the leader's "
+                 "position appears in REST, and a fresh leg would otherwise self-close instantly")
         n_wallets = len(self.wallet_configs)
         # ── wallet floor: config-gated, default 30 (the validated-cohort floor). Lowering it below
         # 30 declares "this is no longer the validated V16/V17 cohort" -- so it is allowed ONLY in
