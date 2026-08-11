@@ -15,6 +15,19 @@ cd "$REPO"
 set -a; [ -f "$REPO/.env" ] && source "$REPO/.env"; set +a
 
 TS=$(date +%Y%m%dT%H%M%S)
+
+# SINGLE-WRITER GUARD (2026-08-11). This script had NO lock, so the 06:45 cron would happily start a
+# SECOND m02_journeys_daily against the same store while a long catch-up was still running. Two writers
+# share the closed/ store, the actions store and one checkpoint.json -- the loser silently corrupts the
+# winner. Caught today: a 16h catch-up was due to finish at 07:38, 53 minutes AFTER the cron fires.
+# Refuse rather than race. Fail-closed and idempotent: a skipped daily is recovered by the next run,
+# a corrupted store is not.
+if pgrep -f "m02_journeys_daily\.py" >/dev/null 2>&1; then
+  echo "REFUSING to start: an m02_journeys_daily process is already running (pids: $(pgrep -f 'm02_journeys_daily\.py' | tr '\n' ' '))." >&2
+  echo "Two writers on the same journeys store + checkpoint corrupt each other. Skipping this run." >&2
+  exit 0
+fi
+
 echo "=== [$TS] M2 daily pipeline start ==="
 
 echo "--- step 1/2: funding+ledger hot refresh (incremental) ---"
