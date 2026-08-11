@@ -84,8 +84,13 @@ bash scripts/run_backtest.sh e1_bulk_backtest   # isolated backtest
 
 ## Process Supervision
 
-LaunchDaemons (`/Library/LaunchDaemons/com.quantslab.{pipeline,api}.plist`) auto-restart on crash.
-Logs: `/tmp/ql-pipeline-launchd.log`, `/tmp/ql-api-launchd.log`
+User-domain LaunchAgents in `~/Library/LaunchAgents/` (no sudo): `com.quantslab.hl-s3-fills-daily`,
+`.hl-mark-collector`, `.m02-journeys-daily`. Check with `launchctl list | grep quantslab`.
+Logs: `/tmp/ql-<job>.launchd.log`.
+
+**`com.quantslab.{pipeline,api}` are RETIRED (removed 2026-08-11)** — their entrypoint `cli.py` was
+archived with the HB fork on 2026-07-10 and the orphaned plists then crash-looped for 32 days.
+Never reinstate. Never put a secret in a plist; use the vault.
 
 ## Strategy Lifecycle (HB-native)
 

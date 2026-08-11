@@ -2,6 +2,11 @@
 
 Last updated: 2026-04-25
 
+> **HISTORICAL — describes the retired HB-fork stack.** `cli.py`, `config/hermes_pipeline.yml` and the
+> TaskOrchestrator it documents were archived to `archive/` by `2da394c` (2026-07-10) in the HL-only
+> pivot; the `com.quantslab.{pipeline,api}` daemons that ran them were removed 2026-08-11. Every
+> `python cli.py ...` command below is non-executable. Kept for design reference only.
+
 ## Architecture
 
 ```
@@ -253,7 +258,7 @@ Most common cause: NaN in a merged column. `BacktestingEngineBase.prepare_market
 
 Check `python cli.py feature-catalog` for stale sources. Common causes:
 - Collector task failed (check `task_executions` collection)
-- External API changed (check collector logs in `tail -f /tmp/ql-pipeline-launchd.log`)
+- External API changed (check the collector's own launchd log in `/tmp/ql-<job>.launchd.log`)
 - Collection dropped accidentally
 
 ### Walk-forward lookahead

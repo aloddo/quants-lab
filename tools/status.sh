@@ -8,27 +8,25 @@ echo "════════════════════════�
 echo "  QuantsLab System Status"
 echo "═══════════════════════════════════════════"
 
-# LaunchDaemon services
+# Launchd jobs (user domain -- the HL-only keep-set after the 2026-07-10 HB retirement).
+# com.quantslab.{pipeline,api} are GONE: their entrypoint cli.py was archived by 2da394c and the
+# plists were removed 2026-08-11. Do not re-add them here.
 echo ""
-echo "🔧 LaunchDaemon services:"
-for svc in com.quantslab.pipeline com.quantslab.api; do
-    pid=$(sudo launchctl list 2>/dev/null | grep "$svc" | awk '{print $1}')
-    if [ -n "$pid" ] && [ "$pid" != "-" ]; then
-        echo "  $svc: running (PID $pid)"
-    elif [ -n "$pid" ]; then
-        echo "  $svc: loaded (not running)"
+echo "🔧 Launchd jobs:"
+for svc in com.quantslab.hl-s3-fills-daily com.quantslab.hl-mark-collector com.quantslab.m02-journeys-daily; do
+    line=$(launchctl list 2>/dev/null | grep "$svc")
+    if [ -z "$line" ]; then
+        echo "  $svc: NOT LOADED"
     else
-        echo "  $svc: not loaded"
+        pid=$(echo "$line" | awk '{print $1}')
+        rc=$(echo "$line" | awk '{print $2}')
+        if [ "$pid" != "-" ]; then
+            echo "  $svc: running (PID $pid)"
+        else
+            echo "  $svc: idle (last exit $rc)"
+        fi
     fi
 done
-
-# Pipeline process check (fallback if launchctl needs sudo)
-echo ""
-echo "📦 Processes:"
-PIPE_PID=$(pgrep -f "run-tasks.*hermes_pipeline|orchestrator.*hermes_pipeline" 2>/dev/null | head -1)
-API_PID=$(pgrep -f "serve.*8001" 2>/dev/null | head -1)
-[ -n "$PIPE_PID" ] && echo "  Pipeline: running (PID $PIPE_PID)" || echo "  Pipeline: NOT RUNNING"
-[ -n "$API_PID" ] && echo "  QL API:   running (PID $API_PID)" || echo "  QL API:   NOT RUNNING"
 
 # MongoDB via Python (mongosh not always available)
 echo ""

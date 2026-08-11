@@ -35,31 +35,36 @@ Backtests (all disabled, run via scripts/run_backtest.sh):
   {e1,e2,e3,e4,h2,m1,s6,s7,s9}_{bulk_backtest,walk_forward}
 ```
 
-## Process Supervision (LaunchDaemon)
+## Process Supervision (launchd)
 
-Primary supervision via launchd (since 2026-04-10):
+**RETIRED 2026-08-11: `com.quantslab.pipeline` and `com.quantslab.api` no longer exist.** Their
+entrypoint `cli.py` + `config/hermes_pipeline.yml` were archived by `2da394c` (2026-07-10) with the
+rest of the HB fork, but the installed plists were left behind and crash-looped on `KeepAlive` every
+10s for 32 days, writing 26 MB of `cli.py: No such file` to `/tmp` and carrying plaintext Bybit +
+Telegram credentials in a world-readable root file. Do not reinstate them.
+
+Current keep-set (all user-domain LaunchAgents, no sudo needed):
 
 ```bash
 # Check status
-sudo launchctl list | grep quantslab
+launchctl list | grep quantslab
+#   com.quantslab.hl-s3-fills-daily     -- daily HL S3 fills refresh
+#   com.quantslab.hl-mark-collector     -- 60s live mark collector
+#   com.quantslab.m02-journeys-daily    -- daily M2 journeys
 
-# Restart (launchd auto-restarts within 10s)
-sudo launchctl stop com.quantslab.pipeline
-sudo launchctl stop com.quantslab.api
+# Restart one
+launchctl kickstart -k gui/$UID/com.quantslab.hl-mark-collector
 
-# Permanent stop/start
-sudo launchctl unload /Library/LaunchDaemons/com.quantslab.pipeline.plist
-sudo launchctl load /Library/LaunchDaemons/com.quantslab.pipeline.plist
+# Stop / start permanently
+launchctl bootout  gui/$UID/com.quantslab.hl-mark-collector
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.quantslab.hl-mark-collector.plist
 
 # Logs
-tail -f /tmp/ql-pipeline-launchd.log
-tail -f /tmp/ql-api-launchd.log
-
-# Quick restart (kill, launchd restarts automatically)
-ps aux | grep "cli.py" | grep -v grep | awk '{print $2}' | xargs kill -9
+tail -f /tmp/ql-hl-mark-collector.launchd.log
+tail -f /tmp/ql-m02-journeys-daily.launchd.log
 ```
 
-Plist sources: `scripts/launchd/com.quantslab.{pipeline,api}.plist`
+Secrets never belong in a plist. Env comes from the vault (`secret get`) or a rendered `.env`.
 
 ## Quick Commands
 
