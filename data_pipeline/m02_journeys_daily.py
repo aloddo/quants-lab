@@ -91,7 +91,13 @@ _DEFAULT_PARENT_GB = 1.5           # target PARENT RSS per grouped-load chunk (k
                                    # roughly DOUBLES grouped-load passes. That penalty lands on the ONE-TIME
                                    # genesis replay only -- a daily incremental has a ~1-day window, hits the
                                    # chunk `hi` clamp, and is unaffected. Keep the DEFAULT for daily runs.
-_WRITER_GB = 1.0                   # ShardedParquetWriter buffers + main-process overhead
+# 2026-08-10 (Alberto TG 12286 "you CAN make it more RAM efficient even if slower"): these two
+# planner terms are PADDED ESTIMATES sized for the DEFAULT flush_rows=100k; they do not shrink when
+# --flush-rows does, so on a tight box the plan refuses runs the runtime guards (mem_safe_run 15s
+# poll + install_memory_guard) would have protected anyway. Env-overridable for a slower/smaller
+# run: M02_WRITER_GB / M02_TRACE_GB. Pair a lower writer term with a proportionally lower
+# --flush-rows; the runtime guards remain the hard safety either way.
+_WRITER_GB = float(os.environ.get("M02_WRITER_GB", "1.0"))   # ShardedParquetWriter buffers + main-process overhead
 
 
 def _bounded_chunk(window_ms: int, target_parent_gb: float = _DEFAULT_PARENT_GB, lo: int = 15, hi: int = 2000) -> int:
@@ -143,7 +149,7 @@ def _worker_pool(b, mem_soft_gb, maxtasks):
 
 _SERIAL_FREE_MARGIN_GB = 1.5   # light free-RAM margin for the serial path (the mem_safe_run backstop is the
                                # HARD box guarantee via its ceiling + immediate kernel-critical kill)
-_TRACE_WORKING_GB = 1.0        # one wallet's fills/events/journeys held in-main during a serial trace
+_TRACE_WORKING_GB = float(os.environ.get("M02_TRACE_GB", "1.0"))  # one wallet's fills/events/journeys held in-main during a serial trace (env-overridable, see _WRITER_GB note)
 
 
 def _job_ceiling_gb() -> float | None:
@@ -289,9 +295,55 @@ def assert_shard_covers(shard_dir, t0: int, t1: int) -> None:
             f"or pass --fills-shard-dir '' to fall back to the (much slower) full-store scan.")
 
 
+_SHARD_COVERAGE_VERIFIED: tuple | None = None    # (shard_dir, t0, t1) proven covered this process
+
+
+def preflight_shard_coverage(t0: int, t1: int) -> None:
+    """ONE-SHOT shard coverage preflight for the whole run. Call ONCE, before any tracing, with the
+    run's WIDEST read window (oldest replay_start .. target_end).
+
+    2026-08-11: `assert_shard_covers` was written 2026-07-27 after a stale shard was caught corrupting
+    the store, its docstring documents the exact failure mode -- and it was NEVER CALLED. On
+    2026-08-10 precisely that happened: the shard sat frozen at 20260727 while the hot store ran to
+    20260809, so a 14.8h run faithfully reproduced journeys capped at July 26 and reported success.
+    Every downstream stage inherited the cap. Wiring it is the whole fix.
+
+    Deliberately NOT called per chunk: `shard_coverage_ms` scans the shard's `time` column, so a
+    per-chunk call would re-scan it hundreds of times. One preflight over the widest window is
+    strictly stronger than a per-chunk check anyway -- every chunk window is a subrange of it."""
+    global _SHARD_COVERAGE_VERIFIED
+    if not _FILLS_SHARD_DIR:
+        return                                   # legacy full-store scan: nothing to verify
+    key = (str(_FILLS_SHARD_DIR), int(t0), int(t1))
+    if _SHARD_COVERAGE_VERIFIED == key:
+        return
+    assert_shard_covers(_FILLS_SHARD_DIR, int(t0), int(t1))
+    _SHARD_COVERAGE_VERIFIED = key
+    logger.info(f"shard coverage preflight OK: {_FILLS_SHARD_DIR} covers the run window")
+
+
 def _load_fills_funding(wallets: set, t0: int, t1: int):
-    """Grouped fills+funding for `wallets` over [t0, t1]. Uses the wallet shard when configured."""
+    """Grouped fills+funding for `wallets` over [t0, t1]. Uses the wallet shard when configured.
+
+    FAIL CLOSED if the run never ran `preflight_shard_coverage`: a silently-short shard is exactly the
+    2026-08-10 corruption, and "the caller probably checked" is what made that possible."""
     if _FILLS_SHARD_DIR:
+        if _SHARD_COVERAGE_VERIFIED is None:
+            raise SystemExit(
+                "REFUSING to read the fills shard: preflight_shard_coverage() was never called for "
+                "this run. A stale/short shard yields FEWER fills with NO error and silently writes "
+                "WRONG journeys (this is the 2026-08-10 July-26 cap). Call the preflight with the "
+                "run's widest window before tracing.")
+        # CONTAINMENT, not just presence. Every caller today reads a SUBRANGE of what it preflighted,
+        # but that is a by-hand invariant -- and a by-hand invariant is exactly what rotted when
+        # assert_shard_covers was written and never called. Enforce it structurally so a future edit
+        # that widens a read past its preflight fails loudly instead of silently short-reading.
+        _sd, _vt0, _vt1 = _SHARD_COVERAGE_VERIFIED
+        if _sd != str(_FILLS_SHARD_DIR) or int(t0) < _vt0 or int(t1) > _vt1:
+            raise SystemExit(
+                f"REFUSING to read the fills shard: requested window [{t0}..{t1}] is NOT inside the "
+                f"preflighted window [{_vt0}..{_vt1}] for {_sd}. Re-run preflight_shard_coverage() "
+                f"with the widest window this path actually reads.")
         return fio.load_grouped_fills_funding_sharded(set(wallets), t0, t1, _FILLS_SHARD_DIR)
     return fio.load_grouped_fills_funding(set(wallets), t0, t1)
 
@@ -866,7 +918,11 @@ def run_daily(
         new_day_start = day_start_ms(new_days[0]) if new_days else None
 
         # historical changes: lookback window (<= watermark) + manifest rowcount diffs (<= watermark)
-        lb_days = [d for d in window_days if d <= watermark][-max(0, lookback_days):]
+        # 2026-08-11 BUG FIX: this was `[-max(0, lookback_days):]`. In Python `x[-0:]` is `x[0:]`, i.e.
+        # THE WHOLE LIST -- so asking for zero lookback silently marked EVERY day since genesis as a
+        # historical-change day, the exact opposite of the intent. Unhit only because nobody passed 0.
+        _hist_window = [d for d in window_days if d <= watermark]
+        lb_days = _hist_window[-lookback_days:] if lookback_days > 0 else []
         diff_days = [
             d for d in window_days
             if d <= watermark and cur_manifest.get(d) != prev_manifest.get(d)
@@ -1088,6 +1144,7 @@ def run_daily(
                 # P0 memory safety: bound CHUNK by the FULL window (kills the ~34GB parent balloon) and cap
                 # procs by an aggregate budget (abort-before-start if the box can't fit it).
                 CHUNK = _bounded_chunk(target_end - start_ms, target_parent_gb=parent_gb)
+                preflight_shard_coverage(start_ms, target_end)      # widest window of this path
                 _b = _budget_or_serial(procs, parent_gb=_parent_gb_for(min(CHUNK, len(affected)), target_end - start_ms))
                 wl_sorted = sorted(affected)
                 n_chunks = (len(wl_sorted) + CHUNK - 1) // CHUNK
@@ -1153,6 +1210,7 @@ def run_daily(
                 # even old-flat holders that stretch back toward genesis stay parent-bounded; cap procs.
                 _oldest = min(replay_start.values()) if replay_start else target_end
                 CHUNK = _bounded_chunk(target_end - _oldest, target_parent_gb=parent_gb)
+                preflight_shard_coverage(_oldest, target_end)       # widest window of this path
                 _b = _budget_or_serial(procs, parent_gb=_parent_gb_for(min(CHUNK, len(affected)), target_end - _oldest))
                 wl_sorted = sorted(affected, key=lambda w: (replay_start[w], w))
                 n_chunks = (len(wl_sorted) + CHUNK - 1) // CHUNK
@@ -1511,6 +1569,7 @@ def run_daily_stateful(
         # P0 memory safety (codex P1): the 2b replay grouped-loads over the FULL [start_day..target] window,
         # so a 1500-wallet chunk is the same ~34GB balloon. Bound by window length.
         _replay_chunk = _bounded_chunk(tgt_end - day_start_ms(start_day), target_parent_gb=parent_gb)
+        preflight_shard_coverage(day_start_ms(start_day), tgt_end)   # 2b replays the FULL window
         for ci in range(0, len(wl), _replay_chunk):
             cwl = wl[ci:ci + _replay_chunk]
             gf2, gf2u = _load_fills_funding(set(cwl), day_start_ms(start_day), tgt_end)
@@ -1600,6 +1659,7 @@ def run_daily_stateful(
         # one chunk's fills over the short forward window, never the whole active universe at once. Per-wallet
         # independent (each uses its own carried init + own fills) -> chunking is output-invariant.
         _fwd_chunk = _bounded_chunk(hi - d0, target_parent_gb=parent_gb)
+        preflight_shard_coverage(d0, hi)                    # forward window for this day
         active_sorted = sorted(active)
         for _fi in range(0, len(active_sorted), _fwd_chunk):
           _cwset = active_sorted[_fi:_fi + _fwd_chunk]
@@ -1725,6 +1785,7 @@ def seed_stateful_checkpoint(
     # P0 memory safety: size the chunk for the WORST-CASE (oldest) window in the batch, so even
     # genesis-era holders stay parent-bounded. Respect a smaller explicit override.
     chunk = min(chunk, _bounded_chunk(t1 - _oldest, target_parent_gb=parent_gb))
+    preflight_shard_coverage(_oldest, t1)                  # widest window of the seed
     n_chunks = (len(wl) + chunk - 1) // chunk
     _b = _budget_or_serial(procs, parent_gb=parent_gb)
     _SEED_MAXTASKS = 40          # recycle workers periodically (MAXTASKS is a local in run_daily, not global)
@@ -1808,7 +1869,10 @@ def main() -> None:
                     help="Bypass the mem_safe_run backstop requirement (ONLY for tiny test/gate slices).")
     ap.add_argument("--lookback-days", type=int, default=3,
                     help="Treat the last N days at/before the watermark as changed (late "
-                         "publication) => their wallets are full-window replayed.")
+                         "publication) => their wallets are full-window replayed. 0 = trust the "
+                         "manifest fingerprint alone (ONLY with a preflight proving old day-files "
+                         "are unchanged -- the fingerprint is defeated by rsync -a / cp -p / restore "
+                         "/ touch -r, and covers fills only, not funding).")
     ap.add_argument("--flush-rows", type=int, default=100_000,
                     help="Rule-8 streaming: flush a parquet part every N buffered rows.")
     ap.add_argument("--mem-soft-gb", type=float, default=12.0,
@@ -1844,7 +1908,11 @@ def main() -> None:
     # run_000001.parquet with a 5-wallet subset. Verifying that ONE path was redirected and concluding
     # ALL were is exactly the partial-verification failure that cost the data.
     # Refuse the half-isolated combination outright: if out-dir is non-default, actions-dir must be too.
-    if str(Path(args.out_dir)) != str(DEFAULT_OUT_DIR) and str(Path(args.actions_dir)) == str(DEFAULT_ACTIONS_DIR):
+    # codex 2026-08-10 #4: EXCLUDE stateful mode. The stateful driver writes NO actions, and its own
+    # branch refuses a redirected --actions-dir; applying this guard there made redirected stateful
+    # output impossible (each guard demanding what the other forbids).
+    if (not args.stateful) and str(Path(args.out_dir)) != str(DEFAULT_OUT_DIR) \
+            and str(Path(args.actions_dir)) == str(DEFAULT_ACTIONS_DIR):
         sys.stderr.write(
             "REFUSING half-isolated run: --out-dir is redirected but --actions-dir is still the SHARED "
             f"default ({DEFAULT_ACTIONS_DIR}). "
@@ -1889,14 +1957,48 @@ def main() -> None:
     state_dir = Path(args.state_dir)
     if (args.stateful or args.seed) and args.state_dir == str(DEFAULT_STATE_DIR):
         state_dir = DEFAULT_STATEFUL_STATE_DIR
+    # codex 2026-08-10 #3: excluding stateful from the actions half-isolation guard re-opened a
+    # DIFFERENT shared write: a redirected --out-dir with the default --state-dir maps to the SHARED
+    # stateful checkpoint, which run_daily_stateful then saves over. An isolated stateful run must
+    # isolate its state dir too.
+    # codex 2026-08-10 round 3 #2: compare the RESOLVED EFFECTIVE state dir against BOTH shared
+    # state dirs. A raw string compare was bypassable by an equivalent spelling
+    # (".../m02_daily_state/../m02_daily_state") or by naming the shared stateful dir explicitly.
+    _shared_states = {DEFAULT_STATE_DIR.resolve(), DEFAULT_STATEFUL_STATE_DIR.resolve()}
+    # codex round 4 #2: cover --seed too. The shared-state REMAP above applies to (stateful OR seed),
+    # so a redirected seed run could write seed state derived from isolated output into the shared
+    # stateful checkpoint. The refusal must have the same scope as the remap.
+    if (args.stateful or args.seed) and Path(args.out_dir).resolve() != DEFAULT_OUT_DIR.resolve() \
+            and state_dir.resolve() in _shared_states:
+        sys.stderr.write(
+            "REFUSING half-isolated STATEFUL/SEED run: --out-dir is redirected but the effective "
+            f"--state-dir resolves to a SHARED checkpoint ({state_dir.resolve()}), which "
+            "run_daily_stateful would overwrite with this run's state. Pass an isolated "
+            "--state-dir (a sibling of --out-dir is the usual intent), or drop --out-dir to run "
+            "against the shared stores deliberately.\n")
+        sys.exit(2)
+
+    # 2026-08-11: a negative lookback is meaningless and its slice silently selects a suffix of the
+    # WRONG length (`x[-(-2):]` == `x[2:]`). Reject rather than guess.
+    if args.lookback_days < 0:
+        sys.stderr.write(f"--lookback-days must be >= 0 (got {args.lookback_days})\n")
+        sys.exit(2)
 
     t0 = time.time()
     if args.seed:
         seed_stateful_checkpoint(args.seed, state_dir=state_dir, out_dir=Path(args.out_dir), procs=args.procs,
                                  parent_gb=args.parent_gb)
     elif args.stateful:
+        # 2026-08-08 fix: run_daily_stateful takes NO actions_dir — the stateful driver DELIBERATELY
+        # excludes actions persistence (see its docstring: canonical actions come ONLY from run_daily).
+        # The kwarg was caller drift that made --stateful raise TypeError on EVERY run since rollout
+        # (the daily pipeline died silently each morning). Refuse a redirected --actions-dir here
+        # rather than silently ignoring it (same philosophy as the half-isolation refusal above).
+        if Path(args.actions_dir) != DEFAULT_ACTIONS_DIR:
+            raise SystemExit("--stateful ignores --actions-dir (no actions persistence in the "
+                             "stateful driver); refusing a redirected --actions-dir to avoid a "
+                             "silently half-isolated run.")
         run_daily_stateful(target_day=args.target_day, state_dir=state_dir, out_dir=Path(args.out_dir),
-                           actions_dir=Path(args.actions_dir),
                            flush_rows=args.flush_rows, mem_soft_gb=args.mem_soft_gb, parent_gb=args.parent_gb)
     else:
         run_daily(
