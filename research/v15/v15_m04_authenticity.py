@@ -25,6 +25,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import sys
@@ -162,7 +163,34 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
         _hp_orig = (m01.load_wallet_fills, m01.load_wallet_funding, m01.load_wallet_ledger,
                     fio.load_wallet_fills)
         log.info(f"PREFETCH ledger (global, [lo,hi]) for {len(wallets)} wallets")
+        _t_pre = time.time()
         _ledger_full = fio.load_grouped_ledger(set(wallets), lo_ms, hi_ms)
+
+        # GC FREEZE (2026-08-12) -- this is what made M4 look "hung".
+        # _ledger_full is a dict of ~11.6k wallets -> lists of entry dicts: MILLIONS of long-lived
+        # container objects, every one of them GC-tracked. STAGE A then allocates continuously (the
+        # _cache_ledger comprehension below builds a fresh list per wallet), and CPython triggers a
+        # gen-2 collection on allocation COUNT, not on how much is actually garbage. So every gen-2
+        # pass re-traversed the entire prefetch cache to prove it was still reachable.
+        #
+        # Measured live on 2026-08-12: two independent 3s samples of the running process put
+        # 2180/2180 and 2136/2180 stack samples inside gc_collect_main -> list_traverse ->
+        # visit_decref. The process was at 16% CPU and had emitted ZERO of its per-500-wallet
+        # progress lines in 89 minutes. It was not hung and it had not crashed -- it was spending
+        # essentially all of its time garbage-collecting a cache that is immutable by construction.
+        # This is also the most likely explanation for the 2026-08-10 run that announced STAGE A and
+        # was never heard from again.
+        #
+        # gc.freeze() moves everything currently tracked into a permanent generation the collector
+        # never examines again. The cache is read-only for the rest of the run, so nothing here can
+        # become garbage; new allocations are still collected normally. Cheap, and it removes the
+        # cache from every future traversal.
+        _n_before = len(gc.get_objects())
+        gc.collect()
+        gc.freeze()
+        log.info(f"PREFETCH done in {time.time()-_t_pre:.1f}s; gc.freeze() applied to "
+                 f"~{_n_before:,} tracked objects (the prefetch cache is immutable for the rest of "
+                 f"the run; without this, every gen-2 pass re-walks it -- measured 98%+ of wall time)")
 
         def _cache_ledger(w, t0, t1, _c=_ledger_full):
             return [e for e in _c.get(str(w).lower(), []) if t0 <= int(e["time"]) <= t1]
