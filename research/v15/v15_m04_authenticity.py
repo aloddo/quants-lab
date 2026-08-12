@@ -210,6 +210,20 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
     if hot_prefetch:
         # bounded-memory chunks: hold ONE chunk's fills+funding at a time, free before the next.
         CHUNK = int(os.environ.get("QL_M04_STAGEA_CHUNK", "5000"))
+        # GC OFF FOR THE HOT LOOP (2026-08-12, second and correct half of the fix).
+        # Freezing the ledger cache alone was NOT enough: _grouped_ff below builds a FRESH
+        # fills+funding cache per chunk -- 5,000 wallets over a window widened by 365 days -- which is
+        # far larger than the ledger cache and is rebuilt every chunk, so it was never frozen. Sampled
+        # 9.6h into the "fixed" run: 2921/2921 stack samples STILL inside gc_collect_main.
+        # The automatic collector is scheduled on allocation COUNT, so a loop that allocates millions
+        # of long-lived container objects triggers gen-2 passes that re-walk everything alive. Turn it
+        # off for the loop and collect ONCE per chunk, right after the chunk's cache is dropped --
+        # that is the only moment there is real garbage to reclaim. Cycle accumulation is bounded to
+        # one chunk. Restored in the same finally that restores the loaders.
+        _gc_was_on = gc.isenabled()
+        gc.disable()
+        log.info(f"STAGE A: gc DISABLED for the chunk loop (collect once per chunk of {CHUNK}); "
+                 f"automatic gen-2 passes were measured at 100% of wall time on the per-chunk caches")
         try:
             for ci in range(0, len(recompute), CHUNK):
                 chunk = recompute[ci:ci + CHUNK]
@@ -219,14 +233,28 @@ def run(wallets, lo_ms, hi_ms, as_of_ms, procs: int = 1, worker_soft_gb: float =
                 fio.load_wallet_fills = m01.load_wallet_fills
                 m01.load_wallet_funding = (lambda w, a, b, _c=cfu:
                                            [x for x in _c.get(str(w).lower(), []) if a <= int(x["time"]) <= b])
-                for w in chunk:
+                _t_chunk = time.time()
+                for wi, w in enumerate(chunk, 1):
                     scores[w] = g.stage_a(w, lo_ms, hi_ms)
+                    # Per-chunk progress. The old logging fired ONCE PER CHUNK of 5,000, so an
+                    # 11,648-wallet run had exactly 3 log points and 9.6 hours of silence looked
+                    # identical to a hang. Silence must never be the only evidence.
+                    if wi % 250 == 0:
+                        log.info(f"  A [{ci+wi}/{len(recompute)}] ({(time.time()-t0)/60:.1f}min, "
+                                 f"{(time.time()-_t_chunk)/wi:.2f}s/wallet)")
+                m01.load_wallet_fills = _hp_orig[0]; m01.load_wallet_funding = _hp_orig[1]
+                fio.load_wallet_fills = _hp_orig[3]
                 del cf, cfu
-                log.info(f"  A [{min(ci+CHUNK,len(wallets))}/{len(wallets)}] ({(time.time()-t0)/60:.1f}min)")
+                gc.collect()      # the ONE moment in the loop with real garbage to reclaim
+                log.info(f"  A chunk done [{min(ci+CHUNK,len(recompute))}/{len(recompute)}] "
+                         f"({(time.time()-t0)/60:.1f}min)")
         finally:
             # restore fills+funding loaders (ledger stays redirected through STAGE B)
             m01.load_wallet_fills, m01.load_wallet_funding = _hp_orig[0], _hp_orig[1]
             fio.load_wallet_fills = _hp_orig[3]
+            if _gc_was_on:
+                gc.enable()
+                log.info("STAGE A: gc re-enabled")
     elif procs > 1:
         tasks = [(w, lo_ms, hi_ms) for w in recompute]
         with Pool(procs, initializer=_worker_init, initargs=("m04-stageA", worker_soft_gb)) as pool:
