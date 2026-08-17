@@ -27,10 +27,20 @@ DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 # (name, class, threshold_hours or None, note)
 CHECKS = [
+    # --- RAW S3 DAY-STORES: the inputs everything else is derived from. Added 2026-08-17 after the
+    # fills feed died on 08-14 and went unnoticed for FOUR DAYS because nothing checked it. HL's S3
+    # archive publishes with ~1-2 day lag, so ~48h is normal and 72h means the feed has stopped.
+    ("hl_s3_fills_v2_hot",  "daystore", None,     "ARCHIVE",    72.0,  "HL S3 fills day-store -- THE root input; feed death here silently freezes m02-m05"),
+    ("hl_s3_funding_hot",   "daystore", None,     "ARCHIVE",    72.0,  "HL S3 funding day-store (funding_net is part of journey identity)"),
+    ("hl_s3_ledger_hot",    "daystore", None,     "ARCHIVE",    72.0,  "HL S3 ledger day-store (M4 authenticity input)"),
+    ("m02_watermark",       "watermark", None,    "ARCHIVE",    96.0,  "m02 checkpoint watermark_day -- how current the journeys store ACTUALLY is, vs how current its inputs are"),
     ("v17_target_fills",    "mongo", "ts_epoch",  "LIVE",       2.0,   "leader fills WS stream"),
     ("v17_exchange_fills",  "mongo", "time",      "LIVE_OURS",  36.0,  "our own fills (only on trade)"),
     ("assetctx_marks",      "marks", None,        "ARCHIVE",    13.5*24,"HL S3 asset_ctxs, ~10d publish lag"),
-    ("hyperliquid_candles", "mongo", "timestamp", "ARCHIVE",    16.0*24,"S3-reconstructed 1m candles, ~13d lag"),
+    # 2026-08-08: field was the LEGACY "timestamp" (frozen at 06-24 — none of the current writers
+    # set it), threshold assumed the dead ~13d archive lag. Now the daily Mongo sync feeds this
+    # collection from the 1-day-lag hot store: key on timestamp_utc, alarm at 3 days.
+    ("hyperliquid_candles", "mongo", "timestamp_utc", "ARCHIVE", 3.0*24, "hot-store 1m candles via daily hl_candles_mongo_sync"),
     ("hl_copy_target_fills","mongo", "ts_epoch",  "DEPRECATED", None,  "SUPERSEDED by v17_target_fills; do not use post-Jun"),
     ("unified_copy_trades", "mongo", "timestamp", "DEPRECATED", None,  "frozen analysis coll (Jun 2)"),
     ("/tmp/measured_halfspread.json","file",None, "FILE",       None,  "per-coin half-spread (env MEASURED_SLIP, consumed by build_skill_cohort); MISSING => selection COST=flat; NO committed builder = real gap"),
@@ -72,6 +82,39 @@ def _marks_last():
     return len(ps), pd.Timestamp(int(np.median(sorted(ends)[-20:])), unit="ms", tz="UTC")
 
 
+def _daystore_last(rel_dir: str):
+    """Newest YYYYMMDD.parquet in a day-partitioned hot store, as (n_days, day_end_utc).
+
+    2026-08-17: added because this script -- whose entire premise is "silent-stale data is the worst
+    failure mode" -- did not check the HL S3 day-stores AT ALL. On 2026-08-14 the fills feed stopped
+    (launchd calendar jobs wedged: loaded, reported exit 0, never fired) and nothing noticed for four
+    days. The pipeline was fine; its input had simply stopped arriving. These are the raw inputs
+    everything downstream is derived from, so they belong at the TOP of this table, not missing from it.
+    """
+    d = os.path.join(os.path.dirname(DATA), *rel_dir.split("/"))
+    if not os.path.isdir(d):
+        return 0, None
+    days = sorted(f[:8] for f in os.listdir(d) if f.endswith(".parquet") and f[:8].isdigit())
+    if not days:
+        return 0, None
+    # the day-file covers a whole UTC day; freshness is measured from its END
+    return len(days), pd.Timestamp(days[-1], tz="UTC") + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+
+def _checkpoint_watermark():
+    """M2's own watermark_day -- the single number saying how current the journeys store actually is."""
+    p = os.path.join(DATA, "m02_daily_state", "checkpoint.json")
+    if not os.path.exists(p):
+        return 0, None
+    try:
+        wm = json.load(open(p)).get("watermark_day")
+        if not wm or len(str(wm)) != 8:
+            return 0, None
+        return 1, pd.Timestamp(str(wm), tz="UTC") + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    except Exception:
+        return 0, None
+
+
 def _journeys_last():
     p = os.path.join(DATA, "m02_journeys.parquet")
     if not os.path.exists(p):
@@ -111,6 +154,10 @@ def main():
                     n, last = _mongo_last(db, name, field)
                 except Exception as e:
                     status = f"ERR:{e}"
+        elif kind == "daystore":
+            n, last = _daystore_last(name)
+        elif kind == "watermark":
+            n, last = _checkpoint_watermark()
         elif kind == "marks":
             n, last = _marks_last()
         elif kind == "journeys":

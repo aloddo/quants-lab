@@ -425,13 +425,79 @@ def day_fingerprint(day: str) -> str:
     day left the lookback window -> the affected wallets were never replayed. The fingerprint combines
     file size + mtime_ns + num_rows: any rewrite updates mtime_ns (and almost always size), so a
     same-rowcount value change is detected and its day's wallets are replayed. Stable across runs when
-    the file is untouched (no over-replay). Returns "missing" if the file is absent."""
+    the file is untouched (no over-replay). Returns "missing" if the file is absent.
+
+    2026-08-17 FIX -- mtime_ns REMOVED. The claim above that it is "stable across runs when the file is
+    untouched" was FALSE in production. The HL S3 daily refresh RE-DOWNLOADS the last few day-files
+    every morning and rewrites them with byte-identical content, which moves mtime_ns and nothing else.
+    Measured on three separate occasions:
+
+        day        size THEN     size NOW     rows THEN    rows NOW    mtime
+        20260808  20,657,000   20,657,000      230,895     230,895    MOVED
+        20260809  23,673,590   23,673,590      275,075     275,075    MOVED
+        20260810  32,860,063   32,860,063      374,949     374,949    MOVED
+
+    Every one of those registered as a "content change", so every wallet active in those days that was
+    not provably flat at the boundary replayed from GENESIS -- ~1.2M wallet-days, ~15 hours, nightly,
+    for files that had not changed a single byte. This was the engine of the 14-hour "daily" runs; a
+    blanket lookback was flagging the same days on top of it and hid the cause completely.
+
+    Now a CONTENT DIGEST of the file bytes: ``v2:<size>:<rowcount>:<blake2b-128>``.
+
+    My first attempt was size+rowcount, and codex refuted it: correcting one existing price from
+    "123.4" to "123.5" preserves the rowcount and can preserve the Snappy-compressed length exactly,
+    because a compressed length is not a content digest. Upstream corrections are not theoretical.
+    A digest is the only thing that satisfies BOTH requirements at once -- it is identical for a
+    byte-identical re-download (no false alarm) and different for any real edit (no miss). It is what
+    the original mtime component was reaching for and failing to be."""
     p = _fills_dir() / f"{day}.parquet"
     try:
         stt = p.stat()
-        return f"{stt.st_size}:{stt.st_mtime_ns}:{day_rowcount(day)}"
+        h = hashlib.blake2b(digest_size=16)
+        with open(p, "rb") as fh:
+            for block in iter(lambda: fh.read(4 << 20), b""):
+                h.update(block)
+        return f"v2:{stt.st_size}:{day_rowcount(day)}:{h.hexdigest()}"
     except FileNotFoundError:
         return "missing"
+
+
+def fingerprints_differ(stored: Optional[str], current: Optional[str]) -> bool:
+    """True when a stored manifest fingerprint denotes DIFFERENT content from the current one.
+
+    Two formats coexist during migration:
+      legacy  ``<size>:<mtime_ns>:<rowcount>``   (3 numeric parts, no prefix)
+      current ``v2:<size>:<rowcount>:<digest>``
+
+    When BOTH sides are v2 the digests are compared -- full strength. When either side is legacy the
+    digest simply does not exist for it, so the comparison degrades to size+rowcount for that pair.
+    That is deliberate: the alternative is declaring every historical day changed on the first run
+    after this ships, which triggers the full-universe replay this whole change exists to avoid.
+    The weaker comparison applies ONLY to days still carrying a pre-migration entry; every day
+    re-fingerprinted after this ships gets a digest and is compared at full strength thereafter.
+    Codex flagged this window (P2) and it is accepted knowingly, not overlooked."""
+    def norm(v):
+        if v is None:
+            return None
+        s = str(v)
+        parts = s.split(":")
+        if s.startswith("v2:") and len(parts) == 4:
+            return ("v2", parts[1], parts[2], parts[3])          # size, rows, digest
+        if len(parts) == 3 and all(x.isdigit() for x in parts):
+            return ("legacy", parts[0], parts[2])                # size, rowcount (drop mtime)
+        return ("raw", s)                                        # "missing" / unrecognised
+
+    a, b = norm(stored), norm(current)
+    if a is None or b is None:
+        return a is not b
+    if a[0] == "v2" and b[0] == "v2":
+        return a != b                                            # digests compared
+    if a[0] in ("v2", "legacy") and b[0] in ("v2", "legacy"):
+        # mixed or both-legacy: compare on what they have in common (size, rowcount)
+        sa = (a[1], a[2]) if a[0] == "v2" else (a[1], a[2])
+        sb = (b[1], b[2]) if b[0] == "v2" else (b[1], b[2])
+        return sa != sb
+    return a != b
 
 
 def wallets_in_days(days: list[str], universe: Optional[set[str]]) -> set[str]:
@@ -925,7 +991,7 @@ def run_daily(
         lb_days = _hist_window[-lookback_days:] if lookback_days > 0 else []
         diff_days = [
             d for d in window_days
-            if d <= watermark and cur_manifest.get(d) != prev_manifest.get(d)
+            if d <= watermark and fingerprints_differ(prev_manifest.get(d), cur_manifest.get(d))
         ]
         hist_days = sorted(set(lb_days) | set(diff_days))
         hist_wallets = wallets_in_days(hist_days, universe)
@@ -1514,7 +1580,7 @@ def run_daily_stateful(
     # detection AND the manifest write, so a mid-replay file change can never record a version the replay
     # did not actually use (TOCTOU silent-miss).
     _cur_fp = {d: day_fingerprint(d) for d in hot_days if d <= watermark}
-    diff_days = sorted(d for d in _cur_fp if _cur_fp[d] != fills_manifest.get(d))
+    diff_days = sorted(d for d in _cur_fp if fingerprints_differ(fills_manifest.get(d), _cur_fp[d]))
     late_wallets = wallets_in_days(diff_days, universe) if diff_days else set()
     if universe is not None:
         late_wallets &= universe

@@ -49,12 +49,15 @@ say "VERIFIED: watermark advanced to $WM"
 $PY - "$FP_SNAP" <<'PY' 2>&1 | tee -a "$LOG"
 import sys, json, pathlib
 sys.path.insert(0,"data_pipeline"); sys.path.insert(0,"research/v15")
-from m02_journeys_daily import day_fingerprint, hot_available_days
+from m02_journeys_daily import day_fingerprint, hot_available_days, fingerprints_differ
 p = pathlib.Path(sys.argv[1])
 if not p.exists():
     print("WARN: no pre-refresh fingerprint snapshot; cannot check for mid-run source drift"); raise SystemExit(0)
 snap = json.loads(p.read_text()); hot = set(hot_available_days())
-moved = sorted(d for d in snap if d in hot and day_fingerprint(d) != snap[d])
+# codex P2 2026-08-17: this compared fingerprints with != . A legacy 3-part snapshot against a new
+# v2 digest differs textually while denoting IDENTICAL content -> it would have cried source drift
+# on every run after the migration. Route through the same comparator the pipeline uses.
+moved = sorted(d for d in snap if d in hot and fingerprints_differ(snap[d], day_fingerprint(d)))
 new   = sorted(d for d in hot if d not in snap)
 print(f"SOURCE DRIFT during the run: {len(moved)} changed {moved or '-> NONE'} | {len(new)} new {new or '-> NONE'}")
 if moved:
