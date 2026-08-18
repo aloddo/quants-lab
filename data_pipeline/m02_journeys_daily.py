@@ -1839,8 +1839,25 @@ def seed_stateful_checkpoint(
     holders = set(pd.read_parquet(snap, columns=["wallet"])["wallet"].astype(str).str.lower())
     if universe is not None:
         holders &= universe
-    _cp0 = load_checkpoint(state_dir) or {}
-    start_day = _cp0.get("start_day") or hot_available_days()[0]   # match the store's genesis (1c-1f)
+    # THE SEED MUST READ THE PRODUCTION CHECKPOINT, NOT ITS OWN (2026-08-18).
+    # `main()` remaps state_dir to DEFAULT_STATEFUL_STATE_DIR for --seed, and that directory is EMPTY on
+    # a first seed. So `load_checkpoint(state_dir)` returned {}, `last_flat_ts` was {}, and _rs() below
+    # fell back to genesis for EVERY holder -- turning a bounded ~1.3M wallet-day seed into a ~3.7M one.
+    # Caught 2026-08-12 by codex and confirmed from this run's own log: it planned "10,153 holders in 261
+    # chunks of 39", and 39/chunk is exactly the chunk size the memory model yields for a 365-day window.
+    # An ETA of ~5h was quoted to Alberto; the real figure was ~48h.
+    #
+    # The per-wallet flat points, the store's genesis day and the committed run id all live in the
+    # PRODUCTION checkpoint, because run_daily is what computed them. Read from there and fail loudly if
+    # it is absent -- seeding against an empty state is the failure this comment exists to prevent.
+    _prod = load_checkpoint(DEFAULT_STATE_DIR) or {}
+    if not _prod:
+        raise SystemExit(
+            f"seed: no production checkpoint at {DEFAULT_STATE_DIR}. The seed derives last_flat_ts, "
+            f"start_day and the committed run id from it; without it every holder would replay from "
+            f"genesis (~3x the work) and the run_id would collide with existing run parts.")
+    _cp0 = load_checkpoint(state_dir) or {}          # the stateful checkpoint (empty on a first seed)
+    start_day = _prod.get("start_day") or _cp0.get("start_day") or hot_available_days()[0]
     t0, t1 = day_start_ms(start_day), day_end_ms(watermark_day)
     wallet_state: dict = {}
 
@@ -1851,7 +1868,12 @@ def seed_stateful_checkpoint(
     # DAILY path already relies on (PHASE 1c/1d/1e/1f). The seed simply never used it.
     # MEASURED over these 10,077 holders: median window 45.6d, mean 127.3d vs the 362d global start
     # => 64.8% less work. Fail SAFE: any wallet without a usable last_flat replays from genesis.
-    _lf = (_cp0.get("last_flat_ts") or {})
+    # from the PRODUCTION checkpoint (see the comment above); _cp0 is empty on a first seed.
+    _lf = (_prod.get("last_flat_ts") or _cp0.get("last_flat_ts") or {})
+    _n_bounded = sum(1 for w in holders if isinstance(_lf.get(w), (int, float)) and t0 < int(_lf[w]) <= t1)
+    logger.info(f"seed: last_flat_ts source = production checkpoint ({len(_lf):,} entries); "
+                f"{_n_bounded:,}/{len(holders):,} holders bounded, "
+                f"{len(holders)-_n_bounded:,} fall back to genesis")
     def _rs(w: str) -> int:
         v = _lf.get(w)
         return int(v) if isinstance(v, (int, float)) and t0 < int(v) <= t1 else t0
@@ -1905,7 +1927,12 @@ def seed_stateful_checkpoint(
         "start_day": start_day,
         "wallet_state": wallet_state,
         "fills_manifest": {d: day_fingerprint(d) for d in hot_available_days() if d <= watermark_day},
-        "run_id": int(cp.get("run_id", 1)),
+        # RUN_ID MUST NOT COLLIDE WITH EXISTING RUN PARTS (2026-08-18, codex P1 2026-08-12).
+        # This defaulted to 1 when the stateful checkpoint was empty -- i.e. on every first seed. The
+        # stateful and legacy drivers SHARE the out-dir, so the next stateful run would have written
+        # run_000002.parquet straight over a run part the legacy driver had already published, silently
+        # replacing real journeys. Start strictly above whatever the production checkpoint has committed.
+        "run_id": max(int(cp.get("run_id", 0)), committed_run_id(DEFAULT_STATE_DIR)),
         "mode": "stateful",
         # seed writes the LAST-written run_id (matches run_daily_stateful) -> committed = run_id (codex P2)
         "run_id_is_next": False,
