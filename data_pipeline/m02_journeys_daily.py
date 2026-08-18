@@ -1382,7 +1382,18 @@ def run_daily(
         "universe_file": wallets_file,
         "updated_utc": pd.Timestamp.utcnow().isoformat(),
     }
-    save_checkpoint(state_dir, new_cp)
+    # TOUCHED SIDECAR (2026-08-18). _write_touched was added on 2026-07-16 at codex's P1 request as the
+    # authoritative per-run delta signal, and wired into run_daily_stateful ONLY -- never into run_daily,
+    # which is the driver production actually uses. Consequence, found today: M3's contiguous-prefix walk
+    # treats a NEWEST run that has a closed parquet but no sidecar as possibly mid-write and STOPS, so
+    # under run_daily the newest run was never consumable. M3 was permanently one M2 run behind, every
+    # single day, and said "incremental(0 changed)" while doing it. Today that meant M3 reflected data
+    # through 20260810 while M2 had just landed 20260816.
+    #
+    # Written AFTER save_checkpoint, deliberately: the checkpoint is the commit, and the sidecar is the
+    # marker saying that commit is finalized. Writing it earlier would advertise a run that had not
+    # committed yet -- the exact ordering hazard the walk's comment warns about.
+    _write_touched(out_dir, run_id, affected)
     # Introspection for the equivalence gate (prod cost nil).
     _LAST_REPLAY_START.clear()
     _LAST_REPLAY_START.update(replay_start)
