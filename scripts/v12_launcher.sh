@@ -76,7 +76,7 @@ SCRIPT="strategies/live/hl_copy_trader_v17.py"
 # Any disagreement means the gate certifies one roster and the engine trades another, which is the whole
 # bug. Now there is exactly one assignment, everyone reads THAT, and argv is built as an array.
 CONFIG="config/copy_trader_v15recent9_20260731.json"
-ARGS=(--config "$CONFIG")
+ARGS=(--config "$CONFIG" --live)
 # PRIOR (2026-07-26, quant): TOTAL-RETURN 5 roster. No alpha/benchmark -- return from leaders own fills. Screen: hold<2d + positive total return net of our fee + not-martingale + p95 MAE<=300 + p99 MAE<=600 => 285; then recency<=14d (143/285 were DEAD) + operator-correlation (4 earlier picks were ONE operator, dead since May) => 96; final 5 on distinct coin sets. Alberto GO TG 11861. Revert prior: config/copy_trader_printalpha3_20260726.json
 
 cd "$WORKDIR"
@@ -134,12 +134,16 @@ _refuse() { echo "[$(date '+%F %T %Z')] v12_launcher: REFUSING -- $*"; sleep 5; 
 _ARMED_CONFIG=$(sed -n 's/^config=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
 _ARMED_SHA=$(sed -n 's/^config_sha256=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
 _ARMED_RC=$(sed -n 's/^gate_rc=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
+_ARMED_LINEAGE_RC=$(sed -n 's/^lineage_rc=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
+_ARMED_LINEAGE_DIGEST=$(sed -n 's/^lineage_digest=//p' "$WORKDIR/.ARM_COPY" | tail -1 || true)
 
 # Schema check: a hand-made .ARM_COPY containing only a matching `config=` line used to be accepted,
 # so "armed" could mean "someone wrote a file" rather than "the gate ran" (codex r2 P1).
 [ -n "$_ARMED_CONFIG" ] || _refuse ".ARM_COPY carries no config= line. Re-arm via scripts/arm_copy.sh"
 [ -n "$_ARMED_RC" ]     || _refuse ".ARM_COPY carries no gate_rc= line -- it was not written by arm_copy.sh"
 [ -n "$_ARMED_SHA" ]    || _refuse ".ARM_COPY carries no config_sha256= line -- re-arm via scripts/arm_copy.sh"
+[ "$_ARMED_LINEAGE_RC" = "0" ] || _refuse ".ARM_COPY has no passing research-lineage result -- re-arm"
+[ -n "$_ARMED_LINEAGE_DIGEST" ] || _refuse ".ARM_COPY carries no lineage_digest= line -- re-arm"
 
 [ "$_ARMED_CONFIG" = "$CONFIG" ] || {
   echo "    gated/armed : $_ARMED_CONFIG"
@@ -160,6 +164,16 @@ _NOW_SHA=$(shasum -a 256 "$WORKDIR/$CONFIG" | awk '{print $1}' || true)
   _refuse "roster CONTENT changed since it was gated -- re-arm to re-gate it (fail-closed)"
 }
 
+# Re-verify the complete artifact graph at every supervised start. The config
+# hash alone cannot detect a provenance/result file being replaced in place
+# after arming; the lineage digest binds all of those bytes too.
+LINEAGE_JSON="/tmp/research_lineage_launch_$$.json"
+if ! "$PYTHON" tools/research_lineage_gate.py --config "$CONFIG" \
+     --expect-digest "$_ARMED_LINEAGE_DIGEST" --json-out "$LINEAGE_JSON" >/dev/null; then
+  sed 's/^/    /' "$LINEAGE_JSON" 2>/dev/null || true
+  _refuse "research lineage no longer verifies (fail-closed; re-run the experiment or re-arm)"
+fi
+
 # Source .env safely (auto-export, then disable)
 if [ -f .env ]; then
   set -a
@@ -168,5 +182,5 @@ if [ -f .env ]; then
   set +a
 fi
 
-echo "[$(date '+%F %T %Z')] v12_launcher: starting $SCRIPT ${ARGS[*]} (gate_rc=$_ARMED_RC)"
+echo "[$(date '+%F %T %Z')] v12_launcher: starting $SCRIPT ${ARGS[*]} (gate_rc=$_ARMED_RC lineage_rc=$_ARMED_LINEAGE_RC)"
 exec "$PYTHON" "$SCRIPT" "${ARGS[@]}"

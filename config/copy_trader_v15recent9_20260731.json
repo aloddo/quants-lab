@@ -40,6 +40,10 @@
     "coin_side_cap_x": 2.0,
     "seed_min_wallets": 1,
     "v17_authorization": "V15 cohort_recent12 (12 folds, chained OOS 2026-01-26..2026-07-13); m06b FDR q=0.10 confirmed 18; filtered to 9 by account_gate liveness (fill<=7d) on exchange truth 2026-07-31. Alberto GO TG 12110.",
+    "research_lineage": {
+      "deployment_manifest": "app/data/v15/experiments/cohort_recent12/deployment_manifest.json",
+      "deployment_manifest_sha256": "a322f0bee968f3114eb7e45732860bd8ab6bea92e8f820200746261ebb6b8c2f"
+    },
     "min_cohort_wallets": 1,
     "expansion": {
       "coins": [

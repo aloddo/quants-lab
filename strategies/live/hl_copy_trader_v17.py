@@ -333,6 +333,7 @@ class CopyTrader:
 
         # MongoDB
         self.db = MongoClient("mongodb://localhost:27017").quants_lab
+        self._ensure_db_indexes()
 
         # Exchange state cache (source of truth for margin, equity, positions)
         self._equity_cache = None
@@ -639,6 +640,27 @@ class CopyTrader:
                                   self.order_size)
 
     # ── Persistent position state ─────────────────────────────────────────────
+
+    def _ensure_db_indexes(self) -> None:
+        """Install the idempotency keys assumed by every upsert/recovery path.
+
+        Application-level upsert is not a uniqueness guarantee under concurrent
+        callbacks or two accidental processes. Refuse a real start if Mongo
+        cannot enforce these keys; continuing would make restart state and PnL
+        attribution ambiguous.
+        """
+        try:
+            self.db[DB_OPEN_POSITIONS].create_index(
+                [("wallet", 1), ("coin", 1)], unique=True, name="uniq_wallet_coin")
+            self.db[DB_ORDER_IDS].create_index(
+                [("oid", 1)], unique=True, name="uniq_oid")
+            self.db[DB_EXCHANGE_FILLS].create_index(
+                [("tid", 1)], unique=True, sparse=True, name="uniq_tid")
+        except Exception as exc:
+            if self.shadow_mode:
+                logger.warning("Mongo idempotency-index setup failed in shadow mode: %s", exc)
+                return
+            raise RuntimeError(f"Mongo idempotency indexes unavailable: {exc}") from exc
 
     def _persist_position(self, pos: dict) -> bool:
         """Save/update an open position to MongoDB. Keyed by (wallet, coin). Returns success."""
@@ -1205,6 +1227,19 @@ class CopyTrader:
                 self._leader_flat_outage_alerted.pop((w, dx), None)
                 for c, szi in res.items():          # ground truth -> shared tracker
                     self._target_positions.setdefault(w, {})[c] = szi
+                # L-F4 (2026-08-06, OPEN DEFECT — do NOT hot-fix here): a leader-flat coin is
+                # simply ABSENT from the snapshot body, so a closing fill missed on WS leaves BOTH
+                # leader maps stale (_target_positions here AND _v16_leader_pos, which is what V17
+                # verb classification actually reads at :7390/:5493) and the leader's next
+                # OPPOSITE-side open is suppressed as REDUCE_NOT_HELD. A first flag-gated fix that
+                # zeroed only _target_positions was codex-REJECTED 2026-08-06: (a) ineffective —
+                # the classifier never consults this map; (b) unsafe — without a request-start
+                # generation guard, a WS fill landing between REST observation and application is
+                # overwritten by the OLDER snapshot, and zeroing can flip _adopt_orphan into
+                # _force_exit (a close path). The real fix lives in the target-vs-actual
+                # reconciliation build: generation-guarded, updates BOTH maps, proven on the
+                # production _on_hl_trade path. See docs/research/backtest_live_parity_map_20260806.md
+                # (STAGE-1 FIXTURE FINDINGS, L-F4) and tests/v15/test_live_fix_batch1.py defect pins.
 
     def _leader_flat_or_flipped(self, wallet: str, coin: str, our_side: str,
                                 mark: float, entry_ts: float = 0.0) -> Optional[bool]:
@@ -2524,6 +2559,13 @@ class CopyTrader:
                 _tg(f"GLOBAL STOP -{self.global_stop_pct:.0%} (fast): net ${net_pnl:.2f} -- FLATTENING all")
                 self._kill_reasons["global_stop"] = True
                 self._flatten_requested = True
+                # L-F5 FIX (2026-08-06, fixture-pinned race): _kill_switch_active was synced from
+                # _kill_reasons only by the 60s stats loop, so for up to 60s after this latch a WS
+                # entry still passed the base _enter_position kill gate (L2096) — open-then-flatten
+                # churn during a stop event. Flag-gated per plan v2 finding 4: OFF (default) is
+                # byte-identical legacy behavior; arming the flag ON requires Alberto's GO.
+                if bool(self.global_config.get("fast_stop_kill_sync", False)):
+                    self._kill_switch_active = True
         except Exception as e:
             logger.warning(f"fast global-stop eval failed: {e}")
 
@@ -7648,7 +7690,9 @@ def main():
     ap = argparse.ArgumentParser(description="HL Copy Trader V17 -- gated herd copy")
     ap.add_argument("--config", default="config/copy_trader_wallets_v17.json")
     ap.add_argument("--size", type=float, default=None)
-    ap.add_argument("--shadow", action="store_true")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--live", action="store_true", help="real orders; requires arm + lineage authorization")
+    mode.add_argument("--shadow", action="store_true", help="simulate decisions without placing orders")
     args = ap.parse_args()
 
     config_path = args.config
@@ -7657,6 +7701,17 @@ def main():
     if not Path(config_path).exists():
         logger.error(f"V17 config not found: {config_path}")
         sys.exit(1)
+
+    if args.live:
+        # Defense in depth: direct Python invocation must not bypass the launcher's
+        # arm/config/hash/research-lineage boundary. Keep this import local so the
+        # shadow path has no dependency on operational authorization files.
+        sys.path.insert(0, str(_REPO / "tools"))
+        from live_authorization import verify_live_authorization
+        authorization = verify_live_authorization(Path(config_path), _REPO)
+        if not authorization["ok"]:
+            logger.error("REFUSING LIVE START: %s", "; ".join(authorization["errors"]))
+            sys.exit(2)
 
     trader = V17CopyTrader(config_path, order_size_override=args.size, shadow=args.shadow)
     asyncio.run(trader.run())

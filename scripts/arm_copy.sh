@@ -5,7 +5,9 @@
 # $WORKDIR/.ARM_COPY (findings/quant/2026-07-29-kill-switch-fails-open). This script is what creates
 # that file, and it will not create it unless the configured roster passes the exchange-truth account
 # gate. The gate is therefore structurally unavoidable: you cannot arm around it, you can only
-# deliberately bypass it, loudly, with --force.
+# deliberately bypass the account-health part, loudly, with --force. Research
+# lineage is non-bypassable: an incomplete/non-investable experiment can never
+# be converted into permission to trade by an operational override.
 #
 # The gate exists because two independently-built cohorts were both about to be traded while holding
 # lifetime-negative accounts of $969-$2,658 and, in the funnel's case, ten of eleven wallets at ~$0.
@@ -63,6 +65,24 @@ if [ -f /tmp/v12_pause ] || [ -f "$WORKDIR/.HALT_COPY" ]; then
   exit 2
 fi
 
+# The research decision must be complete, investable, hash-pinned, and tied to
+# exactly the wallets in this config. Run this BEFORE the API account gate: it
+# is deterministic/local, and --force intentionally cannot bypass it.
+LINEAGE_JSON="/tmp/research_lineage_gate_$(date +%Y%m%d_%H%M%S).json"
+$PY tools/research_lineage_gate.py --config "$CONFIG" --json-out "$LINEAGE_JSON"
+lineage_rc=$?
+if [ $lineage_rc -ne 0 ]; then
+  echo ""
+  echo "NOT ARMED. Research lineage is missing, mutated, incomplete, or non-investable."
+  echo "This gate is non-bypassable; --force applies only to the exchange account-health gate."
+  exit 1
+fi
+LINEAGE_DIGEST=$($PY - "$LINEAGE_JSON" <<'PYEOF'
+import json, sys
+print(json.load(open(sys.argv[1]))["lineage_digest"])
+PYEOF
+)
+
 # 2026-07-31 (quant): THRESHOLDS COME FROM THE ROSTER, WHEN IT DECLARES THEM.
 # The gate's strict defaults (equity>=$10k, lifetime PnL>0, lev<=10x) encode a DIFFERENT thesis from
 # the entries-only copy strategy: they failed 9/9 of a cohort that had passed its own selection, purely
@@ -107,6 +127,9 @@ fi
   echo "config_sha256=$(shasum -a 256 "$CONFIG" | awk '{print $1}')"
   echo "gate_rc=$rc"
   echo "gate_result=$GATE_JSON"
+  echo "lineage_rc=$lineage_rc"
+  echo "lineage_result=$LINEAGE_JSON"
+  echo "lineage_digest=$LINEAGE_DIGEST"
   echo "forced=$FORCE"
   echo "git_head=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } > "$WORKDIR/.ARM_COPY"
