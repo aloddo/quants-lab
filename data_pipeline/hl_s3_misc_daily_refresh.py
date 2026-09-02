@@ -150,9 +150,19 @@ def refresh_day(s3, d: date, wallets_lc: set[str], args: argparse.Namespace) -> 
                 hours_missing += 1
             else:
                 real_errors.append(err or "unknown")
-    # Codex P1: a real outage/permission error must NOT be silently written as an empty/missing day.
-    if real_errors and hours_ok == 0:
-        raise RuntimeError(f"{ds}: {len(real_errors)} hour(s) failed with non-404 errors, 0 ok: {real_errors[:3]}")
+    # A real outage/permission/read error must NEVER produce or overwrite a daily partition, even
+    # when the other 23 hours succeeded. Likewise, a partly published day is incomplete. Preserve a
+    # prior complete rewrite-lookback file and retry the whole day on the next run.
+    if real_errors:
+        raise RuntimeError(
+            f"{ds}: {len(real_errors)} hour(s) failed with non-404 errors "
+            f"({hours_ok}/24 ok): {real_errors[:3]}"
+        )
+    if 0 < hours_ok < 24:
+        raise RuntimeError(
+            f"{ds}: incomplete S3 misc day ({hours_ok}/24 hourly objects, "
+            f"{hours_missing} missing); refusing to write partial funding/ledger partitions"
+        )
     funding_rows = _dedup(funding_rows, ["wallet", "time", "hash", "coin", "usdc", "szi", "fundingRate"])
     ledger_rows = _dedup(ledger_rows, ["wallet", "time", "hash", "delta_json"])
     fw = _write_day(Path(args.funding_out_dir), ds, funding_rows, FUNDING_COLUMNS, hours_ok, args.dry_run)
@@ -228,6 +238,9 @@ def main() -> int:
             LOG.info("%s status=%s funding=%s ledger=%s hours_ok=%s missing=%s err=%s elapsed=%.1fs",
                      row["day"], row["status"], row["funding_rows"], row["ledger_rows"],
                      row["hours_ok"], row["hours_missing"], row["hours_error"], row["elapsed_s"])
+            if row["status"] not in {"ok", "dry_run"}:
+                failed += 1
+                LOG.error("planned day incomplete: %s status=%s", row["day"], row["status"])
         except Exception as exc:
             failed += 1
             ds = day_id(d)

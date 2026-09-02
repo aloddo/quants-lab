@@ -305,6 +305,9 @@ def upsert_candles_mongo(db, collection: str, pair: str, coin: str, interval: st
                         "close": _to_float(r["close"]),
                         "volume": _to_float(r["volume"]),
                         "n_trades": int(r.get("n_trades", 0)),
+                        # B1 (hl_candles_mongo_sync contract): exact API candles are stamped so the
+                        # sync's amend op (source-filtered) can never touch them — API wins forever.
+                        "source": "hl_api",
                         "recorded_at": now_ms,
                     }
                 },

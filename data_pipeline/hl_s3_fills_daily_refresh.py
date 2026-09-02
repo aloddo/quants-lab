@@ -417,6 +417,16 @@ def refresh_day(s3, d: date, wallets_lc: set[str], args: argparse.Namespace) -> 
             bytes_downloaded += n_bytes
             hours_found += int(found)
 
+    # A partially published/read day is not a valid daily partition. In particular, do not
+    # atomically replace an already-complete rewrite-lookback file with a 23-hour retry. A wholly
+    # absent day remains distinguishable as `missing` below, but the caller treats that planned day
+    # as an incomplete run and exits non-zero.
+    if 0 < hours_found < 24:
+        raise RuntimeError(
+            f"{ds}: incomplete S3 fills day ({hours_found}/24 hourly objects); "
+            "refusing to write a partial fills/candles partition"
+        )
+
     write = write_day(Path(args.out_dir), ds, rows, hours_found, args.dry_run)
     candles = (
         {"status": "disabled", "rows": 0, "path": None, "written": False}
@@ -537,6 +547,9 @@ def main() -> int:
                 row["bytes_downloaded"] / 1e6,
                 row["elapsed_s"],
             )
+            if row["status"] not in {"ok", "dry_run"}:
+                failed += 1
+                LOG.error("planned day incomplete: %s status=%s", row["day"], row["status"])
         except Exception as exc:
             failed += 1
             ds = day_id(d)
