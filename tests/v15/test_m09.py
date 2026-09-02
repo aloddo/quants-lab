@@ -3,6 +3,7 @@
 Run: /Users/hermes/miniforge3/envs/quants-lab/bin/python -m pytest tests/v15/test_m09.py -q
 """
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1045,16 +1046,25 @@ def test_fixed_notional_carried_over_budget_flagged_not_trimmed(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# codex P1-A: HEAD-comparison contamination test. The fixed_position path must produce results
-# identical to the git-HEAD implementation run on the same scenario.
+# codex P1-A: baseline-comparison contamination test. The fixed_position path must produce results
+# identical to the PRE-CHANGE implementation run on the same scenario.
+#
+# BASELINE IS A PINNED COMMIT, NOT `HEAD` (2026-09-02). Comparing against a moving
+# `HEAD` meant this test silently changed meaning at every commit, and it failed the
+# moment the branch was committed because HEAD then carried the very change under
+# test. Pinning to the last commit before this work keeps the contamination check
+# honest. Override with M09_BASELINE_REV when intentionally re-baselining.
 # --------------------------------------------------------------------------- #
+_BASELINE_REV = os.environ.get("M09_BASELINE_REV", "2e99b265277a803ed14767fb863bee578bfb01b4")
+
+
 def _load_head_m09(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     try:
-        src = subprocess.run(["git", "show", "HEAD:research/v15/v15_m09_sim.py"],
+        src = subprocess.run(["git", "show", f"{_BASELINE_REV}:research/v15/v15_m09_sim.py"],
                              cwd=repo, capture_output=True, text=True, check=True).stdout
     except Exception:
-        pytest.skip("git HEAD version of v15_m09_sim.py unavailable")
+        pytest.skip(f"baseline {_BASELINE_REV[:12]} version of v15_m09_sim.py unavailable")
     head_path = tmp_path / "m09_head.py"
     head_path.write_text(src)
     spec = importlib.util.spec_from_file_location("v15_m09_sim_head", head_path)

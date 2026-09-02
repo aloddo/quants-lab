@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1045,15 +1046,28 @@ def test_gate_report_empty_schema_when_no_candidates(tmp_path):
 
 # --------------------------------------------------------------------------- #
 # (codex #6) golden depth: gates-off through the REAL pipeline surface must be
-# identical to the git-HEAD implementation run on the same fixture files.
+# identical to the PRE-CHANGE implementation run on the same fixture files.
+#
+# BASELINE IS A PINNED COMMIT, NOT `HEAD` (2026-09-02). This compared against
+# `git show HEAD:...` while the work was uncommitted, which the original docstring
+# flagged would "degrade to a tautology" once committed. It did worse than that: on
+# commit it FAILED, because the pinned return_basis delta it asserts and strips
+# stopped existing when HEAD started carrying the change itself. A moving baseline
+# makes this test mean something different every commit. Pinning to the last commit
+# before the native-gates work preserves exactly the guarantee it was written to
+# give: gates-off output is byte-identical to the implementation that predates them.
+# Override with M06B_BASELINE_REV when intentionally re-baselining.
 # --------------------------------------------------------------------------- #
+_BASELINE_REV = os.environ.get("M06B_BASELINE_REV", "2e99b265277a803ed14767fb863bee578bfb01b4")
+
+
 def _load_head_m06b(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     try:
-        src = subprocess.run(["git", "show", "HEAD:research/v15/v15_m06b_ranking.py"],
+        src = subprocess.run(["git", "show", f"{_BASELINE_REV}:research/v15/v15_m06b_ranking.py"],
                              cwd=repo, capture_output=True, text=True, check=True).stdout
     except Exception:
-        pytest.skip("git HEAD version of v15_m06b_ranking.py unavailable")
+        pytest.skip(f"baseline {_BASELINE_REV[:12]} version of v15_m06b_ranking.py unavailable")
     head_path = tmp_path / "m06b_head.py"
     head_path.write_text(src)
     spec = importlib.util.spec_from_file_location("v15_m06b_ranking_head", head_path)
