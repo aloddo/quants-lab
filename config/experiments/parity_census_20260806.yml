@@ -1,0 +1,111 @@
+# DRAFT — DO NOT RUN until every <<PIN>> below is resolved. Created 2026-08-06 after the lever lock
+# (projects/quant/decisions/2026-08-06-selection-principles-and-dials-locked, Alberto delegation TG
+# 12219/12222). This is the PARITY-CONFIGURED full-census selection manifest: m07 runs the exact
+# semantics the live engine trades (fixed $100 legs, flatten-only reversal, slow leader-flat exits,
+# live stop layers), so the selection statistic is measured on the replica we will actually deploy.
+#
+# HARD PRECONDITIONS before un-drafting:
+#   1. Funding legacy re-fetch complete + verified 175/175 (running 2026-08-06).
+#   2. Fresh full M02 rebuild through 2026-08-05 -> pin the new actions/journeys paths.
+#   3. M03 folds regenerated on the extended calendar -> pin path + expected_n_folds.
+#   4. M04 entity views regenerated fold-pure on the new corpus -> pin wallet_only dir.
+#   5. Task 7 (M9 fixed_notional threading) landed + codex-gated, else the m09 section is invalid.
+#   6. m06b gate GAPs landed (two-sidedness, bag components, latency-ratio as blocking knobs) —
+#      until then those locked HARD gates run as a post-m06b filter script, named in provenance.
+#   7. Register in the experiment registry BEFORE first read (append-only, hash-pinned).
+#
+# STATISTICAL DIALS are the LOCKED permissive tier; each carries a pre-registered one-dimensional
+# sweep (curves into the run report; value at the robustness plateau by fixed rule, never the peak).
+
+name: parity_census_20260806
+description: >-
+  Full-census copyability selection under LIVE-PARITY m07 semantics and the 2026-08-06 locked
+  dials. Wallet-only fold-pure M04 primary; high-confidence co-primary; broad temporal graph as
+  sensitivity only. Marked-open economics throughout. Stops ON both sides (primary); stops-off is
+  the named sensitivity variant.
+
+inputs:
+  actions: <<PIN_AFTER_M02_REBUILD>>/m02_actions.parquet
+  journeys: <<PIN_AFTER_M02_REBUILD>>/m02_journeys.parquet
+  folds: <<PIN_AFTER_M03_REBUILD>>/m03_folds.parquet
+  m04_dir: <<PIN_AFTER_M04_REBUILD>>/wallet_only
+  m03_activity: <<PIN_AFTER_M03_REBUILD>>/m03_wallet_activity_summary.parquet
+  slip_calib: <<PIN_FRESH_SLIP_CALIB>>/slippage_calib.json
+  action_shards: <<PIN_AFTER_SHARD_CACHE_BUILD>>
+
+output:
+  dir: app/data/v15/experiments/parity_census_20260806
+
+m05:
+  mode: copyability
+  # LOCKED HARD gates implemented in m05 today: hold floor/ceiling, latency share, accessibility.
+  # GAP (precondition 6): latency-ratio <=2%, two-sidedness 25-75 — post-m06b filter until landed.
+
+m06a:
+  manifest: config/experiments/m06a_manifest_full_census.json   # 25,000 seats/fold: census, no cut
+
+m07:
+  windows: [pretest, test]
+  workers: 1
+  # LIVE-PARITY configuration (Fable-approved plan v2; codex-approved implementation 2026-08-06):
+  sizing_mode: fixed_notional
+  fixed_notional_usd: 100.0
+  reversal_mode: flatten_only
+  exit_latency_ms: 30000
+  exit_entry_grace_ms: 90000
+  leader_dust_floor_usd: 10.0
+  sl_bps: -2500.0
+  global_stop_pct: 0.15
+  copy_policy: full_mirror
+  copy_latency_ms: 4000            # measured median 3.21s live; 4.0s conservative
+  start_equity: 452.96             # HL-deployable at lock time (Bybit consolidation = Alberto option)
+
+m06b:
+  # weights unchanged from census run pending the LCB-ordering capability review; ranking floor
+  # (+25bps) and LCB seat-order applied at the confirm/report layer, named in provenance.
+  w_pp_mean_r: 0.45
+  w_pp_t: 0.15
+  w_pp_std: 0.05
+  w_pp_mtm_dd: 0.20
+  w_pp_quick: 0.15
+  pp_min_positions: 25             # sweep: 15..40
+  fdr_q: 0.20                      # LOCKED permissive (sweep 0.05..0.30, curve reported)
+  oos_min_folds: 3                 # relaxed from 4 (locked decision)
+  oos_min_journeys_pooled: 50      # sweep: 30..80
+  oos_min_frac_folds_pos: 0.50     # relaxed from 0.60 (locked decision)
+  # +10bps HARD arithmetic kill (oos_margin knob) — <<VERIFY_KNOB_UNITS before setting>>
+  fee_schedule_version: hl_fee_schedule_2026-06-01
+  slippage_calibration_version: <<PIN_FRESH_SLIP_CALIB_VERSION>>
+
+m09:
+  # REQUIRES task 7 (fixed_notional M9 threading + parity knobs) — INVALID until landed.
+  b0: 452.96
+  target_count: 20                 # locked K target; K=10/40 variants run for concordance
+  rho_max: 0.70                    # GAP: correlation dict currently empty — wire real overlaps
+  gross_cap: 5.0                   # Alberto TG 12209
+  global_dd_derisk: 0.15           # parity variant: live's -15%, via manifest only (M9 defaults untouched)
+  g4_intrafold_kill: 0.15
+  per_entity_cap: 0.15             # locked (tightened from 0.40)
+  suspicious_cohort_cap: 0.10
+  min_order_notional: 10.0
+  min_accessible_frac: 0.80        # locked accessibility floor
+  sizing_mode: fixed_notional      # <<REQUIRES_TASK_7>>
+  fixed_notional_usd: 100.0
+
+m10:
+  n_null_dev: 1000
+  workers: 2
+  gate_percentile: 95
+  expected_n_folds: <<PIN_AFTER_M03_REBUILD>>
+  min_positive_folds: <<PIN_AFTER_M03_REBUILD>>
+  g1_chained_roe: <<RECOMPUTE_ON_ACTUAL_HORIZON>>
+
+oos:
+  tool: forward_oos_hot
+  mark_source: candles
+  allow_unverified_marks: false
+  min_trades: 5
+  windows: <<PIN_AFTER_M03_REBUILD>>
+
+resources:
+  mem_safe_floor_gb: 2

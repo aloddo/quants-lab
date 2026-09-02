@@ -19,7 +19,6 @@ description: >-
 
 # --- inputs (read-only; never written to) -------------------------------------------------------- #
 inputs:
-  run_dir: app/data/v15/census20k_20260728     # existing artifacts are REUSED, not rebuilt
   actions: app/data/v15/census20k_20260728/m02_actions.parquet
   journeys: app/data/v15/census20k_20260728/m02_journeys.parquet
   folds: app/data/v15/folds12_20260730/m03_folds.parquet
@@ -80,6 +79,7 @@ m06b:
   oos_min_folds: 4
   oos_min_journeys_pooled: 50
   fee_schedule_version: hl_fee_schedule_2026-06-01
+  slippage_calibration_version: v11-fills-v2
 
 # --- out-of-sample validation (LOCAL data only; no API) ------------------------------------------ #
 # two_regime_test's live-API path lost 97% of the population to rate limits and is unnecessary:

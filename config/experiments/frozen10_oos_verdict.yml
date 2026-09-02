@@ -1,0 +1,63 @@
+# THE ONE-TOUCH VERDICT PASS — decision projects/quant/decisions/2026-08-07-roster-freeze-10 (AMENDED).
+# Replays the FROZEN 10 (two pre-declared nested books: STRICT-5 and L4-10) through the parity
+# engine over 14 chained folds; folds 13-14 (test 2026-07-13..08-06) are the UNTOUCHED fresh-window
+# judgment; folds 1-12 reproduce corpus-period behavior for continuity. Inputs are the frozen-10
+# batch trace (canonical v15_m02_journey_trace, 2026-08-07 21:00, wall 9.78min).
+# NO oos/forward stage: the validation budget rule (corrections/.../2026-08-07-touched-validation-
+# window-with-scorer) — every window this run consumes is argued HERE. This manifest consumes
+# folds 13-14 test windows ONCE, for exactly the two pre-declared books.
+# Stages run: m05 -> m06a -> m07 only (judgment pass, not selection: no m06b/m08/m09/m10).
+
+# STATUS 2026-08-08: verdict EXECUTED + roster RETIRED (Alberto TG 12263: reselect). Kept for
+# provenance only — do not rerun.
+name: frozen10_oos_verdict
+description: >-
+  One-touch fresh-window judgment of the frozen 10 (STRICT-5 + L4-10 readings) via parity m07
+  over folds 13-14; corpus folds 1-12 as continuity reference.
+
+inputs:
+  actions: app/data/v15/experiments/parity_census_asof0713/frozen10_fresh/m02_actions.parquet
+  journeys: app/data/v15/experiments/parity_census_asof0713/frozen10_fresh/m02_journeys.parquet
+  folds: app/data/v15/experiments/parity_census_asof0713/frozen10_fresh/m03/m03_folds.parquet
+  # f1-12 symlinked from entity_resolution_views_20260803/wallet_only; f13-14 generated 2026-08-07
+  # 21:05 (as-of fold test_starts, standard fold-pure causal design) for the judgment folds.
+  m04_dir: app/data/v15/experiments/parity_census_asof0713/frozen10_fresh/m04_views
+  m03_activity: app/data/v15/experiments/parity_census_asof0713/frozen10_fresh/m03/m03_wallet_activity_summary.parquet
+  slip_calib: app/data/v15/census20k_20260728/slippage_calib.json
+
+output:
+  dir: app/data/v15/experiments/frozen10_oos_verdict
+
+m05:
+  mode: copyability
+
+m06a:
+  manifest: config/experiments/m06a_manifest_full_census.json
+
+m07:
+  # PINNED SHORTLIST (2026-08-07 pass 2): pass 1 exposed selection-machinery leakage into the
+  # judgment — m05/m06a re-applied per-fold eligibility (hold_too_long_censored, pretest net_pnl<=0,
+  # dropped_stale) and unseated 7 of 20 frozen judgment seats despite active leaders (0xba0c: 671
+  # in-window actions). The frozen contract (decisions/2026-08-07-roster-freeze-10 AMENDED) judges
+  # ALL 10 in both folds — live copying never re-vetoes per fold. This pin flips in_shortlist=True
+  # for exactly the 20 frozen (wallet, fold in 13/14) rows; folds 1-12 seating untouched. Pass-1
+  # partial results were seen before this pin (disclosed on the card + to Alberto); completion adds
+  # unseen seats only — pass-1 seats reproduce byte-identically (deterministic engine, same marks).
+  shortlist: app/data/v15/experiments/frozen10_oos_verdict/m06a_shortlist_pinned20.parquet
+  windows: [test]
+  workers: 1
+  sizing_mode: fixed_notional
+  fixed_notional_usd: 100.0
+  reversal_mode: flatten_only
+  exit_latency_ms: 30000
+  exit_entry_grace_ms: 90000
+  leader_dust_floor_usd: 10.0
+  sl_bps: -2500.0
+  global_stop_pct: 0.15
+  copy_policy: full_mirror
+  copy_latency_ms: 4000
+  start_equity: 452.96
+  fixed_target_exposure: 0.10
+
+resources:
+  mem_safe_floor_gb: 2

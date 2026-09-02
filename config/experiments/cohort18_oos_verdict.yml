@@ -1,0 +1,62 @@
+# COHORT-18 ONE-TOUCH VERDICT PASS — Alberto-directed judgment of the 18 screened preliminary-cohort
+# wallets (criterion_scorecard preliminary_cohort_screened.csv PASS rows; codex-approved scorecard +
+# behavior screen, 2026-08-09/10). MIRRORS config/experiments/frozen10_oos_verdict.yml (the frozen-10
+# verdict playbook): parity engine over 14 chained folds; folds 13-14 (test 2026-07-13..08-06) are
+# the UNTOUCHED fresh-window judgment; folds 1-12 reproduce corpus-period behavior for continuity.
+# Two PRE-DECLARED nested books, ONE parity pass, both books are readings:
+#   BOOK-12 = the first 12 PASS wallets in combined-rank order (absolute-floor cut)
+#   BOOK-18 = all 18 PASS wallets
+# NONE of the 18 overlap the retired frozen-10 (verified 2026-08-10; their window is unburned).
+# Inputs are the cohort-18 batch trace (canonical v15_m02_journey_trace, --start 2025-12-01
+# --end 2026-08-05 inclusive = window edge 2026-08-06 exclusive, matching the declared window).
+# This manifest consumes folds 13-14 test windows ONCE, for exactly the two pre-declared books.
+# Stages run: m05 -> m06a -> m07 only (judgment pass, not selection: no m06b/m08/m09/m10).
+
+name: cohort18_oos_verdict
+description: >-
+  One-touch fresh-window judgment of the 18 screened cohort wallets (BOOK-12 + BOOK-18 readings)
+  via parity m07 over folds 13-14; corpus folds 1-12 as continuity reference.
+
+inputs:
+  actions: app/data/v15/experiments/cohort18_oos_verdict/fresh/m02_actions.parquet
+  journeys: app/data/v15/experiments/cohort18_oos_verdict/fresh/m02_journeys.parquet
+  folds: app/data/v15/experiments/cohort18_oos_verdict/fresh/m03/m03_folds.parquet
+  # f1-12 symlinked from entity_resolution_views_20260803/wallet_only; f13-14 generated as-of the
+  # fold test_starts (standard fold-pure causal design) for the judgment folds — the
+  # frozen10_fresh/m04_views recipe.
+  m04_dir: app/data/v15/experiments/cohort18_oos_verdict/fresh/m04_views
+  m03_activity: app/data/v15/experiments/cohort18_oos_verdict/fresh/m03/m03_wallet_activity_summary.parquet
+  slip_calib: app/data/v15/census20k_20260728/slippage_calib.json
+
+output:
+  dir: app/data/v15/experiments/cohort18_oos_verdict
+
+m05:
+  mode: copyability
+
+m06a:
+  manifest: config/experiments/m06a_manifest_full_census.json
+
+m07:
+  # PINNED SHORTLIST (the frozen10 m06a_shortlist_pinned20 pattern): selection eligibility must NOT
+  # unseat judgment wallets — live copying never re-vetoes per fold. The pin flips in_shortlist=True
+  # for exactly the 36 (wallet, fold in 13/14) rows of the 18 judgment wallets; folds 1-12 seating
+  # untouched. Built AFTER the m06a stage, BEFORE the m07 stage.
+  shortlist: app/data/v15/experiments/cohort18_oos_verdict/m06a_shortlist_pinned36.parquet
+  windows: [test]
+  workers: 1
+  sizing_mode: fixed_notional
+  fixed_notional_usd: 100.0
+  reversal_mode: flatten_only
+  exit_latency_ms: 30000
+  exit_entry_grace_ms: 90000
+  leader_dust_floor_usd: 10.0
+  sl_bps: -2500.0
+  global_stop_pct: 0.15
+  copy_policy: full_mirror
+  copy_latency_ms: 4000
+  start_equity: 452.96
+  fixed_target_exposure: 0.10
+
+resources:
+  mem_safe_floor_gb: 2

@@ -1,0 +1,9 @@
+{
+  "manifest_version": "v1-full-census-20260803",
+  "mode": "shortlist",
+  "shortlist_n_per_fold": 25000,
+  "recency_gate": true,
+  "contamination_status": "clean_oos",
+  "persistence_horizon_days": 168,
+  "score_basis": "activity_only"
+}

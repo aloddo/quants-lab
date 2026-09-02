@@ -69,7 +69,7 @@ if [ "$M4_AGE_DAYS" -gt 9 ]; then
 fi
 echo "--- M4 source-watermark age: ${M4_AGE_DAYS}d (OK) ---"
 
-# --- M2: stateful incremental journeys (only after the one-time seed exists) ---
+# --- M2: stateful incremental journeys after migration; proven 1c-1f incremental before it ---
 # Detection is fail-closed (codex P2): a checkpoint file that EXISTS but is malformed (bad JSON) must NOT be
 # silently treated as "not seeded" -- exit codes distinguish absent(2)/malformed(3)/unseeded(1)/seeded(0).
 M2_CKPT="$REPO/app/data/v15/m02_stateful_state/checkpoint.json"
@@ -95,7 +95,13 @@ if [ "$M2_RC" -eq 0 ]; then
 elif [ "$M2_RC" -eq 3 ]; then
   echo "FATAL: M2 stateful checkpoint exists but is unreadable/malformed ($M2_CKPT). Refusing to guess." >&2; exit 1
 else
-  echo "--- M2 stateful checkpoint not seeded yet (rc=$M2_RC); M3-M5 run off the current M2 store ---"
+  # Migration must not freeze the canonical store. The previous fallback skipped
+  # M2 entirely, so every pre-seed daily run advanced M3/M5 over stale journeys.
+  # Keep using the already-proven 1c-1f incremental driver until the separate
+  # stateful checkpoint is genuinely seeded; both drivers share the output store.
+  echo "--- M2 stateful checkpoint not seeded yet (rc=$M2_RC); running canonical incremental fallback ---"
+  "$REPO/scripts/mem_safe_run.sh" --floor-gb 4 --label m02-incremental -- \
+    $PY data_pipeline/m02_journeys_daily.py
 fi
 
 echo "--- M3 folds (incremental) ---"; $PY data_pipeline/m03_folds_daily.py --run

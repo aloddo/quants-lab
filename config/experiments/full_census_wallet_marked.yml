@@ -1,0 +1,87 @@
+name: full_census_wallet_marked
+description: >-
+  Canonical full-census copyability search. No top-N truncation can bind because the declared
+  25,000-seat per-fold ceiling exceeds the 20,378-wallet source universe. Wallet-only fold-pure M04
+  is the primary view; high-confidence is identical on the observed graph and broader temporal links
+  are a sensitivity run. M07 includes conservative cutoff marking for every open follower position.
+
+inputs:
+  actions: app/data/v15/census20k_20260728/m02_actions.parquet
+  journeys: app/data/v15/census20k_20260728/m02_journeys.parquet
+  folds: app/data/v15/folds12_20260730/m03_folds.parquet
+  m04_dir: app/data/v15/entity_resolution_views_20260803/wallet_only
+  m03_activity: app/data/v15/folds12_20260730/m03_wallet_activity_summary.parquet
+  slip_calib: app/data/v15/census20k_20260728/slippage_calib.json
+  # Canonical M07 content-addressed wallet partition cache for this exact census/action artifact.
+  action_shards: research/app/data/v15/m07_shard_cache/7e2f7c71be389d0e2928a83590ed2bdcd8d4840d704c8944d33bf74bb116e184
+
+output:
+  dir: app/data/v15/experiments/full_census_wallet_marked
+
+m05:
+  mode: copyability
+
+m06a:
+  manifest: config/experiments/m06a_manifest_full_census.json
+
+m07:
+  windows: [pretest, test]
+  workers: 1
+  sizing_mode: fixed_position
+  fixed_target_exposure: 0.10
+  copy_policy: full_mirror
+  copy_latency_ms: 4000
+  start_equity: 937.47
+
+m06b:
+  w_pp_mean_r: 0.45
+  w_pp_t: 0.15
+  w_pp_std: 0.05
+  w_pp_mtm_dd: 0.20
+  w_pp_quick: 0.15
+  pp_min_positions: 25
+  fdr_q: 0.10
+  oos_min_folds: 4
+  oos_min_journeys_pooled: 50
+  oos_min_frac_folds_pos: 0.60
+  fee_schedule_version: hl_fee_schedule_2026-06-01
+  slippage_calibration_version: v11-fills-v2
+
+m09:
+  b0: 937.47
+  target_count: 9
+  rho_max: 0.70
+  gross_cap: 3.0
+  global_dd_derisk: 0.35
+  g4_intrafold_kill: 0.50
+  per_entity_cap: 0.40
+  suspicious_cohort_cap: 0.10
+  min_order_notional: 10.0
+  min_accessible_frac: 0.50
+  sizing_mode: fixed_position
+  # M09 allocates one subaccount sleeve per wallet. A 1.0 sleeve target makes nine ~$104 sleeves
+  # reproduce the live engine's ~$100 fixed order, whereas reusing M07's account-level 0.10 here
+  # would apply the 10% multiplier twice and simulate ~$10 orders.
+  fixed_target_exposure: 1.0
+
+m10:
+  n_null_dev: 1000
+  workers: 2
+  gate_percentile: 95
+  expected_n_folds: 12
+  min_positive_folds: 8
+  # Twelve 14-day folds = 168 days; preserve the frozen 2x-per-6-month pace on the actual horizon.
+  g1_chained_roe: 0.8928340679571876
+
+oos:
+  tool: forward_oos_hot
+  mark_source: candles
+  allow_unverified_marks: false
+  min_trades: 5
+  windows:
+    - 2026-07-13
+    - 2026-07-20
+    - 2026-07-27
+
+resources:
+  mem_safe_floor_gb: 2

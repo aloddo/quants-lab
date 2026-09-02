@@ -28,7 +28,6 @@ description: >-
   weight vector: variance penalty 0.05 -> 0.35, edge magnitude 0.45 -> 0.20. No code changed.
 
 inputs:
-  run_dir: app/data/v15/census20k_20260728
   actions: app/data/v15/census20k_20260728/m02_actions.parquet
   journeys: app/data/v15/census20k_20260728/m02_journeys.parquet
   folds: app/data/v15/census20k_20260728/m03_folds.parquet
@@ -65,6 +64,7 @@ m06b:
   oos_min_folds: 4
   oos_min_journeys_pooled: 50
   fee_schedule_version: hl_fee_schedule_2026-06-01
+  slippage_calibration_version: v11-fills-v2
 
 oos:
   tool: forward_oos_hot
