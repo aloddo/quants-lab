@@ -78,3 +78,10 @@ repos = [
     { repo = "https://github.com/psf/black", rev = "21.6b0", hooks = [{ id = "black" }] },
     { repo = "https://github.com/pre-commit/mirrors-isort", rev = "v5.9.3", hooks = [{ id = "isort" }] }
 ]
+
+[tool.pytest.ini_options]
+# `archive/` and `strategies/_archive/` retain historical test-shaped scripts
+# whose production modules and fixtures were intentionally removed. Keep the
+# default regression command pointed at the maintained suite; archived code can
+# still be invoked explicitly when reconstructing an old environment.
+testpaths = ["tests"]
