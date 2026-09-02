@@ -1,8 +1,8 @@
 """V15 M10 -- Gates G1-G7 + quality-matched null + percentile ladder. M10-CORE = the gate-evaluation +
 significance statistics (pure functions on the M9 chained path + the matched-null distributions). The
-NULL GENERATION (driving M9 with pool_provider=matched_null over N_NULL seeds) is the integration step
-wired once M9-v2's chained sim + the re-run data are available; this module computes the verdict GIVEN
-the strategy result + null distributions.
+The executable integration drives the exact M9 chained simulator with pool_provider=matched_null over
+N_NULL deterministic seeds. Each draw uses the same causal top-quality pool, survival tiers, sizing,
+caps, costs, and execution; only the peer ordering at the target-count selection is randomized.
 
 Design: brain projects/quant/v15/modules/m10 (codex DESIGN-SHIP r2) + decisions/2026-06-01-m9-m10-
 manifest-freeze. dev_verdict gates LIVE-SMALL ONLY (one-regime caveat); LP claims need the §4 forward
@@ -10,8 +10,12 @@ holdout (p99). Reports the FULL percentile ladder p75/p90/p95/p99 (Alberto #5), 
 """
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -188,3 +192,151 @@ def evaluate_gates(strat: dict, null_roe, null_calmar, m: M10Manifest, holdout: 
                        ("lp_confirmatory" if (all_pass and holdout) else "no")),
         "required_n": required_n,
     }
+
+
+def main():
+    """Canonical M10 integration: exact M09 replays with randomized peers from the same causal pool."""
+    # codex 2026-08-10 #3 (CLAUDE.md Rule 8): guard at PROCESS start — the OHLC-cache preamble below
+    # scans the census action dataset before any per-run guard would install, and an unguarded
+    # overrun there is a silent OS SIGKILL instead of a loud abort.
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _streaming_io import install_memory_guard
+    install_memory_guard(label="m10_main")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--m09-result", required=True)
+    ap.add_argument("--m06b-pool", required=True)
+    ap.add_argument("--m08-survival", required=True)
+    ap.add_argument("--m04-dir", required=True)
+    ap.add_argument("--folds", required=True)
+    ap.add_argument("--actions", required=True)
+    ap.add_argument("--action-shards", default=None)
+    ap.add_argument("--slip-calib", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--n-null-dev", type=int, default=1000)
+    ap.add_argument("--gate-percentile", type=float, default=95.0)
+    ap.add_argument("--expected-n-folds", type=int, required=True)
+    ap.add_argument("--min-positive-folds", type=int, required=True)
+    ap.add_argument("--g1-chained-roe", type=float, default=0.5302)
+    ap.add_argument("--worker-index", type=int, default=0)
+    ap.add_argument("--worker-count", type=int, default=1)
+    ap.add_argument("--merge-workers", type=int, default=0)
+    args = ap.parse_args()
+    if args.n_null_dev < 1:
+        raise ValueError("n_null_dev must be positive")
+    if args.worker_count < 1 or not (0 <= args.worker_index < args.worker_count):
+        raise ValueError(f"invalid worker shard {args.worker_index}/{args.worker_count}")
+
+    import pyarrow.dataset as ds
+    import v15_m07_engine as eng
+    import v15_m09_sim as m09
+
+    strat = json.loads(Path(args.m09_result).read_text())
+    folds = pd.read_parquet(args.folds)
+    if len(folds) != args.expected_n_folds:
+        raise ValueError(
+            f"M10 expected {args.expected_n_folds} folds but input contains {len(folds)}"
+        )
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    m10_manifest = M10Manifest(
+        g1_chained_roe=args.g1_chained_roe,
+        g2_min_positive_folds=args.min_positive_folds,
+        expected_n_folds=args.expected_n_folds,
+        g6_gate_pct=args.gate_percentile,
+        n_null_dev=args.n_null_dev,
+    )
+
+    def publish(nulls: pd.DataFrame) -> None:
+        expected = set(range(args.n_null_dev))
+        actual = set(pd.to_numeric(nulls["seed"], errors="raise").astype(int))
+        if len(nulls) != args.n_null_dev or actual != expected:
+            raise ValueError(
+                f"M10 null seed coverage invalid: rows={len(nulls)}, "
+                f"missing={sorted(expected-actual)[:10]}, extra={sorted(actual-expected)[:10]}"
+            )
+        nulls = nulls.sort_values("seed").reset_index(drop=True)
+        nulls.to_parquet(out_dir / "m10_matched_null.parquet", index=False)
+        verdict = evaluate_gates(
+            strat, nulls["chained_roe"], nulls["chained_calmar"], m10_manifest
+        )
+        verdict["manifest"] = m10_manifest.__dict__
+        verdict["null_method"] = "exact_m09_randomized_peers_same_causal_top100_pool_v1"
+        verdict["strategy_result"] = str(Path(args.m09_result))
+        (out_dir / "m10_result.json").write_text(
+            json.dumps(verdict, indent=2, default=str, allow_nan=False) + "\n"
+        )
+        logger.info("M10 verdict -> %s", out_dir / "m10_result.json")
+
+    if args.merge_workers:
+        parts = []
+        for idx in range(args.merge_workers):
+            path = out_dir / f"m10_null_worker_{idx}.parquet"
+            if not path.exists():
+                raise FileNotFoundError(f"missing M10 worker artifact: {path}")
+            parts.append(pd.read_parquet(path))
+        publish(pd.concat(parts, ignore_index=True))
+        return
+    pool = pd.read_parquet(args.m06b_pool)
+    tiers = pd.read_parquet(args.m08_survival)
+    entities = m09._load_fold_pure_m04(Path(args.m04_dir), folds)
+    manifest_fields = set(m09.M9Manifest.__dataclass_fields__)
+    m9_manifest = m09.M9Manifest(**{
+        k: v for k, v in (strat.get("manifest") or {}).items() if k in manifest_fields
+    })
+
+    dataset = ds.dataset(
+        args.action_shards, format="parquet", partitioning="hive"
+    ) if args.action_shards else ds.dataset(args.actions, format="parquet")
+
+    @lru_cache(maxsize=512)
+    def wallet_actions(wallet: str) -> pd.DataFrame:
+        cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size",
+                "position_after", "target_exposure_pct", "is_liquidation", "carry_in_status",
+                "lifecycle_valid", "stream_replay_valid"]
+        return dataset.to_table(filter=ds.field("wallet") == wallet, columns=cols).to_pandas()
+
+    def loader(wallet, t0, t1):
+        if wallet is None:
+            return None
+        frame = wallet_actions(str(wallet))
+        return frame[(frame["ts"] >= int(t0)) & (frame["ts"] < int(t1))].copy()
+
+    calibration = json.loads(Path(args.slip_calib).read_text())
+    per_fold = {int(k): v for k, v in calibration.get("per_fold_asof", {}).items()}
+    version = calibration.get("version")
+    # Fable B4 (2026-08-08): require_cache raises on missing .npy (daily sync invalidates lazily)
+    # -> m06b-style preamble, batch-streamed for bounded memory.
+    _coins: set = set()
+    for _b in dataset.to_batches(columns=["coin"]):
+        _coins.update(_b.column("coin").unique().to_pylist())
+    eng.build_ohlc_cache(sorted(c for c in _coins if c and not eng.coin_is_spot(c)))
+    md = eng.MarketData(require_cache=True)
+    rows = []
+    worker_seeds = range(args.worker_index, args.n_null_dev, args.worker_count)
+    for completed, seed in enumerate(worker_seeds, start=1):
+        result = m09.run_m09_chained(
+            pool, tiers, entities, folds, eng, md, loader, m9_manifest, m9_manifest.b0,
+            pool_provider="matched_null", seed=seed, out_dir=None,
+            slip_calib_per_fold=per_fold, slip_calib_version=version,
+        )
+        rows.append({"seed": seed, "chained_roe": result["chained_roe"],
+                     "chained_calmar": result["chained_calmar"],
+                     "max_chained_dd": result["max_chained_dd"]})
+        if completed % 25 == 0:
+            logger.info("M10 worker %d/%d exact matched null %d/%d",
+                        args.worker_index, args.worker_count, completed,
+                        len(range(args.worker_index, args.n_null_dev, args.worker_count)))
+
+    nulls = pd.DataFrame(rows)
+    if args.worker_count > 1:
+        path = out_dir / f"m10_null_worker_{args.worker_index}.parquet"
+        nulls.to_parquet(path, index=False)
+        logger.info("M10 worker %d/%d wrote %d rows -> %s", args.worker_index,
+                    args.worker_count, len(nulls), path)
+        return
+    publish(nulls)
+
+
+if __name__ == "__main__":
+    main()

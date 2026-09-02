@@ -260,6 +260,9 @@ def _current_rss_gb() -> float:
         return peak / (1024 ** 3) if sys.platform == "darwin" else peak / (1024 ** 2)
 
 
+_GUARD_STATE: "dict | None" = None   # process-wide: one watchdog thread, mutable soft cap (codex #2)
+
+
 def install_memory_guard(soft_gb: float = 12.0, label: str = "proc", poll_s: int = 15) -> None:
     """Backstop watchdog: abort LOUDLY (logged, exit 137) if RSS exceeds `soft_gb`, instead of a
     silent OS SIGKILL. Prevention is ShardedParquetWriter; this turns any residual runaway into a
@@ -272,12 +275,25 @@ def install_memory_guard(soft_gb: float = 12.0, label: str = "proc", poll_s: int
                 g = _current_rss_gb()
             except Exception:
                 continue
-            if g > soft_gb:
+            cap = _GUARD_STATE["soft_gb"] if _GUARD_STATE else soft_gb   # honours later tightening
+            if g > cap:
                 logger.error(
-                    f"[memory_guard:{label}] RSS {g:.1f}GB exceeded soft cap {soft_gb}GB. "
+                    f"[memory_guard:{label}] RSS {g:.1f}GB exceeded soft cap {cap}GB. "
                     f"Aborting LOUDLY (exit 137) instead of a silent OOM SIGKILL. Use "
                     f"ShardedParquetWriter / smaller flush_rows. Flushed parts are safe on disk.")
                 os._exit(137)
+    # codex 2026-08-10 #2: PROCESS-IDEMPOTENT. m10 calls run_m09_chained() once per null seed
+    # (~1,000 at defaults), and each call used to spawn another permanent watchdog thread. One guard
+    # per process is all the guarantee requires; a later call with a TIGHTER cap still wins by
+    # replacing the effective cap on the running guard.
+    global _GUARD_STATE
+    if _GUARD_STATE is not None:
+        if soft_gb < _GUARD_STATE["soft_gb"]:
+            _GUARD_STATE["soft_gb"] = float(soft_gb)
+            logger.info(f"[memory_guard:{_GUARD_STATE['label']}] soft cap tightened to {soft_gb}GB "
+                        f"by nested install ({label})")
+        return
+    _GUARD_STATE = {"soft_gb": float(soft_gb), "label": label}
     threading.Thread(target=_watch, daemon=True, name=f"memguard-{label}").start()
     logger.info(f"[memory_guard:{label}] installed (soft cap {soft_gb}GB, poll {poll_s}s)")
 

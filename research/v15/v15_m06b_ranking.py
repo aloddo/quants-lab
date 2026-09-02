@@ -15,6 +15,15 @@ fee_unversioned True on its M7 input) is stamped investable=False (pipeline dry-
 investable pool reruns AFTER cost calibration, recording fee_schedule_version +
 slippage_calibration_version in the manifest.
 
+NATIVE BEHAVIOR GATES (2026-08-07, Alberto TG-12245: selection logic lives in the CANONICAL module,
+not side scripts): the post-FDR confirmed set can be filtered through pre-registered behavior vetoes
+(--gate-* knobs, ALL off by default -> byte-identical output when unset), absorbing the transition
+scripts research/v15/post_m06b_hard_gates.py + build_roster_freeze.py. Leader-tier attributes come
+from --leader-panel (LEADER-space profile panel; three-tier law -- see apply_behavior_gates);
+replica-tier attributes from the m07 outputs m06b already consumes. EXCHANGE-TRUTH (lifetime PnL /
+equity / recency via the live HL API) deliberately does NOT belong in m06b: a live API read breaks
+deterministic, hash-pinned research runs -- it stays at the ARM stage (scripts/arm_copy.sh).
+
 Run:
   /Users/hermes/miniforge3/envs/quants-lab/bin/python research/v15/v15_m06b_ranking.py \
       --m07-dir app/data/v15/m07_pretest --out app/data/v15
@@ -22,6 +31,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field, asdict
@@ -101,6 +111,27 @@ class M6bManifest:
     oos_min_frac_folds_pos: float = 0.5 # net-positive in a MAJORITY of OOS folds (regime stability)
     oos_margin: float = 0.0             # H0 margin on pooled mean NET per-journey return (0 = break-even; raise for slippage/model-risk buffer)
     fdr_q: float = 0.10                 # Benjamini-Hochberg false-discovery rate across all eligible wallets
+    # === MARK-COVERAGE GATE (2026-08-07, Fable-approved; findings/quant/2026-08-07-mongo-candle-
+    # freeze-*): a claimed OOS fold whose actions were silently unpriced must not quietly vanish
+    # from the fold count (fold 12 of the selection run replayed with ZERO fills and the artifact
+    # said "11 OOS folds available"). Claimed set = fold_ids in the TEST m07_summary (every seat
+    # emits a row regardless of fills) — NEVER derived from positions/fills. HARD refuse iff a fold
+    # has seats>0 AND sum(n_actions)>0 AND sum(n_fills)==0. Partial starvation gates on
+    # sum(n_actions_unpriced)/sum(n_actions) (legacy artifacts without the counter: R2 check only).
+    unpriced_warn_pct: float = 0.10     # per-fold unpriced-action share that logs a WARN
+    unpriced_refuse_pct: float = 0.50   # per-fold unpriced-action share that REFUSES the run
+    allow_unpriced_folds: bool = False  # diagnostics escape: demote refusals to warnings + STAMP the artifact
+    # === NATIVE BEHAVIOR GATES (2026-08-07, absorbing post_m06b_hard_gates.py + build_roster_freeze.py;
+    # Alberto TG-12245). Applied to the CONFIRMED set AFTER BH-FDR, before m06b_confirmed is written.
+    # ALL default None = OFF (byte-identical output when unset). Leader-tier values come from the
+    # --leader-panel profile panel (three-tier law); NaN on a gated attribute FAILS CLOSED.
+    gate_uw_add_max: Optional[float] = None        # LEADER tier: max n_pos-weighted mean_underwater_add (martingale veto)
+    gate_leader_liq_max: Optional[float] = None    # LEADER tier: max n_pos-weighted liq_rate
+    gate_leader_mae_p90_max: Optional[float] = None  # LEADER tier: max n_pos-weighted mae_p90 (bag-risk veto)
+    gate_two_sided_lo: Optional[float] = None      # min long_share (leader frac_long, replica fallback)
+    gate_two_sided_hi: Optional[float] = None      # max long_share
+    gate_latency_ratio_max: Optional[float] = None  # REPLICA tier: max copy_latency_s / median_hold
+    copy_latency_s: float = 4.0                    # our copy latency (s) for the latency-ratio gate
     # calmar / winsor / fidelity
     dd_floor: float = 0.05            # calmar = realized_roe / max(max_dd, dd_floor)
     winsor_lo_pct: float = 1.0        # winsorize calmar + realized_roe at fold [p1, p99]
@@ -247,6 +278,14 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
         mfe = pd.to_numeric(g.get("mfe"), errors="coerce")
         gb = pd.to_numeric(g.get("mfe_giveback"), errors="coerce")
         amae = mae.abs()
+        # two-sided balance of OUR replica book (native behavior-gate two-sided FALLBACK; the leader
+        # panel frac_long is the PRIMARY source per the three-tier law). side: +1 long / -1 short,
+        # same (>0) convention as copy_wallet_profile. Absent side column (older emit) -> NaN.
+        if "side" in g.columns:
+            _sd = pd.to_numeric(g["side"], errors="coerce")
+            frac_long = float((_sd > 0).mean()) if _sd.notna().any() else np.nan
+        else:
+            frac_long = np.nan
         # === m6_redesign_v2 §5 additional metrics ===
         realized_usd = pd.to_numeric(g.get("realized_pnl_after_cost"), errors="coerce")
         tuw = (pd.to_numeric(g["time_underwater"], errors="coerce")      # gate 5 (emitted 2026-07-24)
@@ -272,6 +311,7 @@ def _per_position_metrics(m07_dir: Path) -> pd.DataFrame | None:
             "pp_n": n, "pp_mean_r": mean_r, "pp_std_r": std_r, "pp_t": t, "pp_lcb_mean_r": lcb,
             "pp_med_hold_h": g["hold_h"].median(), "pp_p90_hold_h": g["hold_h"].quantile(0.9),
             "pp_frac_quick": (g["hold_h"] <= 48).mean(),
+            "pp_frac_long": frac_long,   # replica two-sided fallback (NOT in OUT_COLS; pool parquet unchanged)
             "pp_realized": realized_usd.sum() if realized_usd.notna().any() else np.nan,
             "pp_uw_add": (uw.mean() if uw.notna().any() else np.nan),
             # position-drawdown (MAE) block
@@ -713,21 +753,36 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
     # uncalibrated-cost flags -> drives provisional/FINAL
     uncalibrated = bool(summ["slippage_uncalibrated"].any() or summ["fee_unversioned"].any())
 
-    # --- RETURN BASIS (v2): rank on M7 REALIZED round-trip ROE, NOT full-window MTM roe_engine.
-    #     The M7 engine emits realized_roe over CLEAN round-trips (realized_pnl_total / start_equity).
-    #     Fall back to roe_engine ONLY when realized_roe is absent, flagged per-run + per-row so a
-    #     fallback never silently masquerades as the realized basis. ---
+    # --- RETURN BASIS (v3): closed realized PnL PLUS a loss-only debit for every marked open position.
+    #     Open winners receive no credit; open losers reduce the score. This prevents selective realization
+    #     (close winners, retain losers) from inflating the rank. Older M7 output may fall back to realized_roe
+    #     for diagnostics, but such a run can never be investable because censoring_final below is false. ---
+    has_conservative = "conservative_roe" in summ.columns
     has_realized = "realized_roe" in summ.columns
-    if has_realized:
-        realized = pd.to_numeric(summ["realized_roe"], errors="coerce")
-        summ["roe_adj"] = realized
-        # rows where realized_roe is NaN but roe_engine exists fall back per-row (flagged)
+    if has_conservative:
+        conservative = pd.to_numeric(summ["conservative_roe"], errors="coerce")
+        summ["roe_adj"] = conservative
         if "roe_engine" in summ.columns:
             fb_mask = summ["roe_adj"].isna() & summ["roe_engine"].notna()
             summ.loc[fb_mask, "roe_adj"] = pd.to_numeric(
                 summ.loc[fb_mask, "roe_engine"], errors="coerce")
-        summ["return_basis"] = np.where(realized.notna(), "realized_roe", "roe_engine_fallback")
+        summ["return_basis"] = np.where(conservative.notna(), "conservative_roe", "roe_engine_fallback")
+        # A cutoff mark can be unavailable (market-data gap or an unreconstructable carry-in basis).
+        # The account engine floors equity at zero, so -100% is a valid worst-case bound on that
+        # entity-fold's return. Apply that bound instead of either dropping the open exposure or
+        # blocking the entire census. This is deliberately punitive: an incompletely marked row can
+        # never benefit from its closed PnL and will normally fall out of the ranked pool.
+        if "censoring_coverage" in summ.columns:
+            coverage = pd.to_numeric(summ["censoring_coverage"], errors="coerce")
+            incomplete = coverage.notna() & coverage.lt(1.0)
+            summ.loc[incomplete, "roe_adj"] = -1.0
+            summ.loc[incomplete, "return_basis"] = "conservative_roe_worst_case_bound"
         return_basis_fallback = bool((summ["return_basis"] == "roe_engine_fallback").any())
+    elif has_realized:
+        realized = pd.to_numeric(summ["realized_roe"], errors="coerce")
+        summ["roe_adj"] = realized
+        summ["return_basis"] = np.where(realized.notna(), "realized_roe_uncensored", "roe_engine_fallback")
+        return_basis_fallback = True
     else:
         summ["roe_adj"] = pd.to_numeric(summ.get("roe_engine"), errors="coerce")
         summ["return_basis"] = "roe_engine_fallback"
@@ -759,7 +814,15 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         cons = _consistency_provisional(m06a)
 
     # --- eligibility (M5 pass as-of k) ---
-    elig = m05[["entity_id", "fold_id", "eligible"]].rename(columns={"eligible": "m5_eligible"})
+    # Carry M5's causal executability measurements through to M09. Dropping these columns here made
+    # the portfolio simulator label minimum-notional accessibility "unchecked" even though M5 had
+    # already measured it for the same entity-fold.
+    elig_keep = ["entity_id", "fold_id", "eligible"]
+    elig_keep += [c for c in (
+        "accessible_frac_notional", "accessible_frac_count", "accessibility_unknown",
+        "accessible_set_as_of_ms",
+    ) if c in m05.columns]
+    elig = m05[elig_keep].rename(columns={"eligible": "m5_eligible"})
 
     # --- M6a provenance/copyability + n_journeys + tier + alloc + G5 fields.
     #     active_pretest_folds = # active 14d pretest sub-splits (m06a active_blocks), NOT
@@ -1059,13 +1122,27 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
     fidelity_source = _src_rows["fidelity_source"].mode().iat[0] if len(_src_rows) else "unknown"
     fidelity_final = bool(rk_mask.any() and out.loc[rk_mask, "fidelity_source"].eq("m07_tracking_error").all())
     consistency_final = bool(rk_mask.any() and out.loc[rk_mask, "consistency_source"].eq("m07_equity_block_roe").all())
-    # v2: FINAL additionally requires the REALIZED round-trip metrics to be present on every rankable
-    #     row -- a realized_roe (no roe_engine fallback) AND a finite round_trip_win_rate AND a
-    #     non-null n_round_trips. The rank now depends on realized round-trips; a fallback/missing
-    #     basis means the pool was not locked on the after-cost realized return.
+    # Prefer observed cutoff marks. Where a mark/basis is unavailable, the explicit -100% account-loss
+    # bound above is also a complete conservative treatment; missing coverage metadata remains a hard fail.
+    censoring_observed_final = bool(
+        rk_mask.any()
+        and "censoring_coverage" in out.columns
+        and pd.to_numeric(out.loc[rk_mask, "censoring_coverage"], errors="coerce").eq(1.0).all()
+    )
+    censoring_bound_final = bool(
+        rk_mask.any()
+        and "censoring_coverage" in out.columns
+        and pd.to_numeric(out.loc[rk_mask, "censoring_coverage"], errors="coerce").notna().all()
+        and out.loc[rk_mask & pd.to_numeric(out["censoring_coverage"], errors="coerce").lt(1.0),
+                    "return_basis"].eq("conservative_roe_worst_case_bound").all()
+    )
+    censoring_final = censoring_observed_final or censoring_bound_final
+    # FINAL additionally requires conservative (closed + open-loss debit) round-trip economics.
     if rk_mask.any():
         realized_final = bool(
-            out.loc[rk_mask, "return_basis"].eq("realized_roe").all()
+            out.loc[rk_mask, "return_basis"].isin(
+                ["conservative_roe", "conservative_roe_worst_case_bound"]
+            ).all()
             and pd.to_numeric(out.loc[rk_mask, "round_trip_win_rate"], errors="coerce").notna().all()
             and pd.to_numeric(out.loc[rk_mask, "n_round_trips"], errors="coerce").notna().all()
         )
@@ -1091,6 +1168,7 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
         and fidelity_final
         and consistency_final
         and realized_final
+        and censoring_final
         and m04_fold_pure
         and slippage_version_final
     )
@@ -1106,6 +1184,8 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
     manifest["fidelity_source"] = fidelity_source
     manifest["return_basis"] = return_basis
     manifest["return_basis_fallback"] = bool(return_basis_fallback)
+    manifest["open_position_censoring_complete"] = bool(censoring_observed_final)
+    manifest["missing_mark_worst_case_bound_complete"] = bool(censoring_bound_final)
     if not investable:
         reasons = []
         if uncalibrated:
@@ -1120,6 +1200,8 @@ def build_ranking(inputs: dict, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
             reasons.append(f"consistency_provisional({consistency_source})")
         if not realized_final:
             reasons.append(f"realized_metrics_missing({return_basis})")
+        if not censoring_final:
+            reasons.append("open_position_censoring_incomplete")
         if not m04_fold_pure:
             reasons.append("m04_not_fold_pure(look_ahead_global_m04)")
         if not slippage_version_final:
@@ -1139,6 +1221,8 @@ OUT_COLS = [
     "n_backstop_transfer", "account_ruin", "m4_tier", "entity_alloc_weight",
     "m5_eligible", "entity_copyable", "m6b_rankable", "rank_in_fold", "bucket", "in_pool",
     "quality_weight", "excluded_reason", "slippage_uncalibrated", "investable",
+    "accessible_frac_notional", "accessible_frac_count", "accessibility_unknown",
+    "accessible_set_as_of_ms",
     # V2.2 per-position basis (ranking unit = round-trip journey) + position drawdown/run-up (MAE/MFE)
     "pp_n", "pp_mean_r", "pp_std_r", "pp_t", "pp_lcb_mean_r", "pp_med_hold_h", "pp_p90_hold_h",
     "pp_frac_quick", "pp_uw_add", "pp_mae_med", "pp_mae_p90", "pp_frac_underwater",
@@ -1196,7 +1280,227 @@ def _boot_p_mean_gt(x: np.ndarray, margin: float, n_boot: int = 4000, seed: int 
     return float((boot_means >= obs).mean())
 
 
-def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifest) -> tuple[pd.DataFrame, dict]:
+# --------------------------------------------------------------------------- #
+# NATIVE BEHAVIOR GATES (2026-08-07). Absorbs the transition scripts
+# research/v15/post_m06b_hard_gates.py + build_roster_freeze.py into the canonical
+# module (Alberto TG-12245: selection logic lives HERE, not in side scripts), so a
+# roster run needs ZERO side scripts. Thresholds are yml/CLI knobs, off by default.
+# --------------------------------------------------------------------------- #
+_LEADER_TIER_GATES = ("uw_add", "leader_liq", "leader_mae_p90")
+_LEADER_GATE_COLS = {"uw_add": "mean_underwater_add", "leader_liq": "liq_rate",
+                     "leader_mae_p90": "mae_p90"}
+# wallet-level attribute columns of the gate report. FIXED SCHEMA even when the report is EMPTY
+# (codex 2026-08-07 #5): an empty report must still prove which attributes the gates evaluated --
+# absence of the artifact means "gates off", never "no candidates".
+_REPORT_ATTR_COLS = (
+    "primary_wallet", "n_panel_cells", "n_panel_pos", "uw_add", "leader_mae_p90", "leader_liq",
+    "leader_frac_long", "leader_median_hold_h", "replica_hold_h", "replica_frac_long",
+    "n_pretest_cells_used", "n_pp_positions_used", "hold_h", "hold_source", "latency_ratio",
+    "long_share", "long_share_source")
+_THREE_TIER_LAW = (
+    "THREE-TIER LAW (findings/quant/2026-08-07-replica-space-attributes-neuter-behavior-vetoes): "
+    "behavior/martingale attributes MUST be read from LEADER-space data (the full-mirror profile "
+    "panel, copy_wallet_profile.py output). The parity REPLICA suppresses adds and caps MAE, so "
+    "replica-space values silently NEUTER these vetoes."
+)
+
+
+def _active_behavior_gates(m: M6bManifest) -> dict:
+    """The behavior-gate knobs that are SET (None = off). Empty dict = gates disabled entirely,
+    guaranteeing byte-identical confirmed output vs the pre-gate module."""
+    g: dict = {}
+    if m.gate_uw_add_max is not None:
+        g["uw_add"] = m.gate_uw_add_max
+    if m.gate_leader_liq_max is not None:
+        g["leader_liq"] = m.gate_leader_liq_max
+    if m.gate_leader_mae_p90_max is not None:
+        g["leader_mae_p90"] = m.gate_leader_mae_p90_max
+    if m.gate_two_sided_lo is not None or m.gate_two_sided_hi is not None:
+        g["two_sided"] = (m.gate_two_sided_lo, m.gate_two_sided_hi)
+    if m.gate_latency_ratio_max is not None:
+        g["latency_ratio"] = m.gate_latency_ratio_max
+    return g
+
+
+def _require_leader_panel(m: M6bManifest, leader_panel) -> None:
+    """A leader-tier gate set WITHOUT a leader panel is a HARD ERROR, never a replica fallback."""
+    active = _active_behavior_gates(m)
+    need = [g for g in _LEADER_TIER_GATES if g in active]
+    if need and leader_panel is None:
+        raise ValueError(
+            f"leader-tier behavior gate(s) {need} set WITHOUT --leader-panel. {_THREE_TIER_LAW} "
+            f"Pass --leader-panel <profile_panel.parquet> or unset the leader-tier gates.")
+
+
+def _wmean(d: pd.DataFrame, col: str, wcol: str) -> float:
+    """n_pos-weighted mean of `col` across a wallet's fold cells -- build_roster_freeze.wmean
+    semantics (weights clipped to >=1, NaN values masked; NaN weights additionally masked here so a
+    corrupt weight cannot poison the mean). Missing column / no measurable cell -> NaN."""
+    if col not in d.columns or not len(d):
+        return float("nan")
+    v = pd.to_numeric(d[col], errors="coerce")
+    w = pd.to_numeric(d[wcol], errors="coerce").clip(lower=1).astype(float)
+    mk = v.notna() & w.notna()
+    return float(np.average(v[mk], weights=w[mk])) if mk.any() else float("nan")
+
+
+def apply_behavior_gates(confirmed: pd.DataFrame, m: M6bManifest,
+                         leader_panel: pd.DataFrame | None = None,
+                         replica_cells: pd.DataFrame | None = None,
+                         ) -> tuple[pd.DataFrame, pd.DataFrame | None, dict]:
+    """Filter the POST-FDR confirmed set through the native behavior gates. Returns
+    (survivors, gate_report, gate_summary); with every gate unset returns (confirmed, None, {})
+    untouched -- byte-identical legacy behavior.
+
+    THREE-TIER LAW (findings/quant/2026-08-07-replica-space-attributes-neuter-behavior-vetoes):
+      LEADER tier  -- martingale/behavior vetoes (uw_add / leader_liq / leader_mae_p90; two-sided
+                      long_share primarily) read from LEADER-space data: `leader_panel`, the
+                      full-mirror profile panel (copy_wallet_profile.py output) with per
+                      (entity, fold) cells keyed by primary_wallet. The parity REPLICA suppresses
+                      adds and caps MAE, so replica-space values silently neuter these vetoes --
+                      a leader-tier gate without a leader panel raises, never falls back.
+      REPLICA tier -- what OUR book experiences: median hold -> latency_ratio, from the m07 PRETEST
+                      per-position outputs m06b already consumes (pp_med_hold_h weighted by pp_n via
+                      `replica_cells`). When that emit is absent (legacy m07 run) the leader panel's
+                      median_hold_h is the per-wallet fallback (source recorded per wallet).
+                      two-sidedness: leader frac_long where measurable, replica pp_frac_long
+                      otherwise (build_roster_freeze parity).
+      EXCHANGE tier -- lifetime PnL / equity / recency via the live HL API does NOT belong in m06b:
+                      a live API read breaks deterministic, hash-pinned research runs. It stays at
+                      the ARM stage (scripts/arm_copy.sh liveness criteria), by design.
+
+    Aggregation per wallet = n_pos-weighted mean across its fold cells (build_roster_freeze.wmean).
+    NaN on a gated attribute FAILS CLOSED (killed; counted separately as unmeasurable). Kills are
+    counted per gate and logged -- never silent.
+    """
+    gates = _active_behavior_gates(m)
+    if not gates:
+        return confirmed, None, {}
+    _require_leader_panel(m, leader_panel)
+    # schema check: an active leader gate whose source column is MISSING from the panel would kill
+    # every wallet as "unmeasurable" -- that is a schema error, not a data gap. Fail loud instead.
+    if leader_panel is not None:
+        need_cols = [_LEADER_GATE_COLS[g] for g in _LEADER_TIER_GATES if g in gates] + \
+                    (["n_pos", "primary_wallet"] if any(g in gates for g in _LEADER_TIER_GATES) else [])
+        missing = [c for c in need_cols if c not in leader_panel.columns]
+        if missing:
+            raise ValueError(f"leader panel lacks required column(s) {missing} for active gate(s) "
+                             f"{sorted(gates)} -- wrong panel file? (expect copy_wallet_profile.py output)")
+    lp = None
+    if leader_panel is not None and len(leader_panel):
+        lp = leader_panel.copy()
+        lp["_w"] = lp["primary_wallet"].astype(str).str.lower()
+    rc = None
+    if replica_cells is not None and len(replica_cells):
+        rc = replica_cells.copy()
+        rc["_w"] = rc["primary_wallet"].astype(str).str.lower()
+
+    rows = []
+    for w_orig in confirmed["primary_wallet"].astype(str):
+        w = w_orig.lower()
+        rec: dict = {"primary_wallet": w_orig}
+        d = lp[lp["_w"] == w] if lp is not None else pd.DataFrame()
+        rec["n_panel_cells"] = int(len(d))
+        rec["n_panel_pos"] = int(pd.to_numeric(d["n_pos"], errors="coerce").fillna(0).sum()) \
+            if len(d) and "n_pos" in d.columns else 0
+        rec["uw_add"] = _wmean(d, "mean_underwater_add", "n_pos")
+        rec["leader_mae_p90"] = _wmean(d, "mae_p90", "n_pos")
+        rec["leader_liq"] = _wmean(d, "liq_rate", "n_pos")
+        rec["leader_frac_long"] = _wmean(d, "frac_long", "n_pos")
+        rec["leader_median_hold_h"] = _wmean(d, "median_hold_h", "n_pos")
+        dr = rc[rc["_w"] == w] if rc is not None else pd.DataFrame()
+        rec["replica_hold_h"] = _wmean(dr, "pp_med_hold_h", "pp_n")
+        rec["replica_frac_long"] = _wmean(dr, "pp_frac_long", "pp_n")
+        # latency-coverage disclosure (codex 2026-08-07 #3): replica hold is computed from the
+        # wallet's RANKABLE pretest cells only -- expose how much support that read has so a
+        # thin-coverage latency verdict is visible, never implicit.
+        rec["n_pretest_cells_used"] = int(len(dr))
+        rec["n_pp_positions_used"] = int(pd.to_numeric(dr["pp_n"], errors="coerce").fillna(0).sum()) \
+            if len(dr) and "pp_n" in dr.columns else 0
+        # hold source for latency (REPLICA tier): prefer the m07 pretest per-position hold (what OUR
+        # book experiences); leader-panel median_hold_h only as the per-wallet fallback.
+        if rec["replica_hold_h"] == rec["replica_hold_h"]:
+            hold, hold_src = rec["replica_hold_h"], "m07_pretest_positions"
+        elif rec["leader_median_hold_h"] == rec["leader_median_hold_h"]:
+            hold, hold_src = rec["leader_median_hold_h"], "leader_panel_median_hold_h"
+        else:
+            hold, hold_src = float("nan"), "unavailable"
+        rec["hold_h"], rec["hold_source"] = hold, hold_src
+        rec["latency_ratio"] = float(m.copy_latency_s / max(hold * 3600.0, 1e-9)) \
+            if hold == hold else float("nan")
+        # two-sided basis: leader long-share where measurable, replica otherwise (build_roster_freeze)
+        if rec["leader_frac_long"] == rec["leader_frac_long"]:
+            rec["long_share"], rec["long_share_source"] = rec["leader_frac_long"], "leader_panel"
+        elif rec["replica_frac_long"] == rec["replica_frac_long"]:
+            rec["long_share"], rec["long_share_source"] = rec["replica_frac_long"], "replica_m07"
+        else:
+            rec["long_share"], rec["long_share_source"] = float("nan"), "unavailable"
+        rows.append(rec)
+    report = pd.DataFrame(rows) if rows else pd.DataFrame(columns=list(_REPORT_ATTR_COLS))
+
+    killed: dict = {}
+    unmeasurable: dict = {}
+    all_pass = pd.Series(True, index=report.index, dtype=bool)
+    _value_col = {"uw_add": "uw_add", "leader_liq": "leader_liq", "leader_mae_p90": "leader_mae_p90",
+                  "two_sided": "long_share", "latency_ratio": "latency_ratio"}
+    for gname in gates:
+        v = pd.to_numeric(report.get(_value_col[gname], pd.Series(dtype=float)), errors="coerce")
+        if gname == "two_sided":
+            lo = m.gate_two_sided_lo if m.gate_two_sided_lo is not None else -np.inf
+            hi = m.gate_two_sided_hi if m.gate_two_sided_hi is not None else np.inf
+            ok = v.between(lo, hi)              # inclusive bounds, matching post_m06b_hard_gates
+        else:
+            ok = v <= gates[gname]
+        unm = v.isna()                          # unmeasurable = NaN attribute -> FAILS CLOSED
+        ok = ok & ~unm
+        report[f"pass_{gname}"] = ok.to_numpy(dtype=bool)
+        report[f"unmeasurable_{gname}"] = unm.to_numpy(dtype=bool)
+        killed[gname] = int(((~ok) & (~unm)).sum())
+        unmeasurable[gname] = int(unm.sum())
+        all_pass &= ok
+    report["all_pass"] = all_pass.to_numpy(dtype=bool)
+    # report rows are built in confirmed row order -> positional boolean mask (index-agnostic).
+    _mask = report["all_pass"].to_numpy(dtype=bool) if len(report) else np.zeros(0, dtype=bool)
+    survivors = confirmed.loc[_mask] if len(confirmed) else confirmed
+    gate_summary = {"behavior_gates": {
+        "gates": {k: (list(v) if isinstance(v, tuple) else v) for k, v in gates.items()},
+        "copy_latency_s": m.copy_latency_s,
+        "aggregation": "n_pos-weighted mean across fold cells (build_roster_freeze.wmean)",
+        "nan_policy": "gated attribute NaN FAILS CLOSED (counted separately as unmeasurable)",
+        "exchange_tier": ("lifetime-PnL/equity/recency NOT gated here (live HL API breaks "
+                          "deterministic hash-pinned runs); enforced at the ARM stage"),
+        "leader_panel_provided": leader_panel is not None,
+        "n_confirmed_pre_gate": int(len(confirmed)),
+        "n_confirmed_post_gate": int(len(survivors)),
+        "killed": killed,
+        "unmeasurable": unmeasurable,
+        "hold_source_counts": (report["hold_source"].value_counts().to_dict()
+                               if "hold_source" in report.columns and len(report) else {}),
+        # codex 2026-08-07 #3: latency reads rest on RANKABLE pretest cells only -- disclose the
+        # coverage so a thin-support latency verdict is visible at the summary level too.
+        "latency_coverage": {
+            "note": ("replica hold_h is measured on RANKABLE pretest cells only (m07 per-position "
+                     "emit); per-wallet support is in the gate report (n_pretest_cells_used / "
+                     "n_pp_positions_used); hold_source_counts shows leader-panel fallbacks"),
+            "wallets_replica_hold": int((report["hold_source"] == "m07_pretest_positions").sum())
+            if len(report) else 0,
+            "wallets_leader_panel_fallback": int(
+                (report["hold_source"] == "leader_panel_median_hold_h").sum()) if len(report) else 0,
+            "wallets_hold_unavailable": int((report["hold_source"] == "unavailable").sum())
+            if len(report) else 0,
+            "min_pp_positions_used": (int(report["n_pp_positions_used"].min()) if len(report) else 0),
+            "median_pp_positions_used": (float(report["n_pp_positions_used"].median())
+                                         if len(report) else 0.0),
+        },
+    }}
+    logger.info("BEHAVIOR GATES (native, post-FDR): %d -> %d confirmed; killed=%s unmeasurable=%s",
+                len(confirmed), len(survivors), killed, unmeasurable)
+    return survivors, report, gate_summary
+
+
+def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifest,
+                         leader_panel: pd.DataFrame | None = None,
+                         ) -> tuple[pd.DataFrame, dict, pd.DataFrame | None]:
     """OUT-OF-SAMPLE CONFIRMATION (2026-07-23, Fable+Codex UNANIMOUS after Alberto's push). The pretest ranking
     is IN-SAMPLE (rho~0 forward). A single-window OOS gate is either too strict (lower-bound, ~3 wallets) or
     ~72% false-discoveries (mean>0, ~15). The SOUND gate = POOL a wallet's OOS journeys across its NON-OVERLAPPING
@@ -1204,7 +1508,12 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
     FDR at q across all eligible wallets. NO forcing a target count. Requires >= oos_min_folds folds and
     >= oos_min_journeys_pooled pooled OOS journeys per wallet (Codex: 4 folds / 50 journeys is the standard;
     fewer available until the FULL 12-fold action bootstrap exists). Also require net-positive in a majority of
-    the wallet's OOS folds (stability). Ranking still comes from build_ranking (the module)."""
+    the wallet's OOS folds (stability). Ranking still comes from build_ranking (the module).
+
+    NATIVE BEHAVIOR GATES (2026-08-07): when any gate_* knob is set, the confirmed set is filtered
+    through apply_behavior_gates AFTER BH-FDR, before it is returned/written. Returns
+    (confirmed, summary, gate_report); gate_report is None when every gate is unset."""
+    _require_leader_panel(m, leader_panel)   # fail FAST (before build_ranking) on a three-tier violation
     pool, mani = build_ranking(inputs_pretest, m)
     pre = pool[pool["m6b_rankable"] & pool["m6b_score"].notna()].copy()
     # ── IDENTITY (2026-07-29, P0). This function pools ACROSS FOLDS, so it MUST key on the wallet
@@ -1218,6 +1527,11 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
         raise ValueError("walk_forward_confirm: pool lacks primary_wallet; cannot pool across folds "
                          "on entity_id (positional index, collides). Re-run M6a to emit it.")
     pre = pre[pre["primary_wallet"].notna()].copy()
+    # REPLICA-tier cells for the behavior gates: per (entity, fold) m07 PRETEST per-position hold /
+    # long-share, keyed by wallet, weighted by pp_n (the m07 outputs m06b already consumes). Absent
+    # on a legacy run without the per-position emit -> gates fall back to the leader panel per wallet.
+    _rep_cols = [c for c in ("pp_n", "pp_med_hold_h", "pp_frac_long") if c in pre.columns]
+    replica_cells = pre[["primary_wallet"] + _rep_cols].copy() if "pp_n" in _rep_cols else None
     pre_entity = pre.sort_values("m6b_score", ascending=False).drop_duplicates("primary_wallet")
     cand = set(pre_entity["primary_wallet"].astype(str))
     # RAW per-journey OOS returns from the held-out test window(s)
@@ -1242,6 +1556,113 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
                     "EXCLUDED (an unnamed row cannot be attributed to a trader)", _unnamed * 100)
     tpos = tpos.dropna(subset=["primary_wallet", "r_i"])
     tpos = tpos[tpos["primary_wallet"].astype(str).isin(cand)]
+    # OOS inference may only use fully observed position outcomes. Pretest ranking can safely apply
+    # the -100% account bound above, but converting a missing account-level cutoff mark into an
+    # invented per-journey return would distort the bootstrap. Exclude any wallet with an incomplete
+    # candidate test fold instead.
+    tsumm = _read_parquet_maybe_parts(Path(m07_test_dir) / "m07_summary.parquet")
+    n_oos_censor_excluded = 0
+    if tsumm is None or "censoring_coverage" not in tsumm.columns:
+        raise ValueError("walk_forward_confirm: test summary lacks censoring_coverage")
+    # ── MARK-COVERAGE GATE (R1-R4, Fable-approved 2026-08-07). Claimed fold set from the SUMMARY
+    # (every seat emits a row even at 0 fills), cross-checked vs the m03 fold universe; never from
+    # positions/fills — deriving it there is the original bug (a dead fold vanishes from the count).
+    _has_cov_cols = {"n_actions", "n_fills"}.issubset(tsumm.columns)
+    if not _has_cov_cols:
+        logger.warning("MARK-COVERAGE: test summary lacks n_actions/n_fills (pre-2026 artifact) — "
+                       "coverage gate SKIPPED entirely; fold starvation is NOT checked")
+    # codex 2026-08-07 #1 (mark-coverage): FAIL CLOSED on invalid telemetry. NaN counters must never
+    # sum to 0 and read as "quiet fold" (fail-open), and an unparseable fold_id must refuse loudly,
+    # not crash at astype(int). Corrupt-artifact refusals are NOT demotable by allow_unpriced_folds.
+    _fid_num = pd.to_numeric(tsumm["fold_id"], errors="coerce")
+    _fid_bad = _fid_num.isna() | ~np.isfinite(_fid_num) | (_fid_num != _fid_num.round())
+    if _fid_bad.any():
+        # codex round-2: inf passes isna() and crashes astype(int); fractional IDs silently
+        # truncate. Reject anything not a finite integer BEFORE casting — named, fail-closed.
+        raise ValueError(f"MARK-COVERAGE: {int(_fid_bad.sum())} test-summary rows have "
+                         "unparseable fold_id (NaN/inf/fractional) — fold coverage cannot be "
+                         "audited (corrupt artifact)")
+    _t = tsumm.copy()
+    if _has_cov_cols:
+        for _c in ("n_actions", "n_fills") + (("n_actions_unpriced",)
+                                              if "n_actions_unpriced" in tsumm.columns else ()):
+            _num = pd.to_numeric(_t[_c], errors="coerce")
+            if _num.isna().any() or not np.isfinite(_num).all():
+                raise ValueError(f"MARK-COVERAGE: {int((~np.isfinite(_num.fillna(np.nan))).sum())} "
+                                 f"test-summary rows have non-finite {_c} — coverage telemetry is "
+                                 "corrupt; refusing to audit fold coverage on it")
+            _t[_c] = _num
+    _agg = {"seats": ("entity_id", "size")}
+    if _has_cov_cols:
+        _agg.update(actions=("n_actions", "sum"), fills=("n_fills", "sum"))
+    _cov = _t.groupby(_fid_num.astype(int)).agg(**_agg)
+    if not _has_cov_cols:
+        _cov["actions"] = 0
+        _cov["fills"] = 0
+    _m03_folds = set(pd.to_numeric(folds_ref["fold_id"], errors="coerce").astype(int)) \
+        if (folds_ref := inputs_pretest.get("folds")) is not None else set()
+    for _fid in sorted(_m03_folds - set(_cov.index)):
+        logger.warning("MARK-COVERAGE: m03 fold %d has ZERO seats in the test m07_summary "
+                       "(empty fold roster — observable via folds_in_summary vs the fold universe)", _fid)
+    _refuse, _quiet = [], []
+    if _has_cov_cols:
+        for _fid, _r in _cov.iterrows():
+            if _r.seats > 0 and _r.actions > 0 and _r.fills == 0:      # R2 conjunct
+                _refuse.append((int(_fid), "zero_fills_with_actions",
+                                f"fold {_fid}: {int(_r.seats)} seats, {int(_r.actions)} actions, 0 fills"))
+            elif _r.seats > 0 and _r.actions == 0:
+                _quiet.append(int(_fid))
+    if _quiet:
+        logger.warning("MARK-COVERAGE: fold(s) %s have seats but ZERO leader actions (legitimately "
+                       "quiet — counted, not refused)", _quiet)
+    _unpriced_telemetry = _has_cov_cols and "n_actions_unpriced" in tsumm.columns
+    _fold_unpriced_pct: dict[int, float] = {}
+    if _unpriced_telemetry:
+        _unp = _t.groupby(_fid_num.astype(int))["n_actions_unpriced"].sum()
+        for _fid, _r in _cov.iterrows():
+            _pct = float(_unp.get(_fid, 0) / _r.actions) if _r.actions > 0 else 0.0
+            _fold_unpriced_pct[int(_fid)] = _pct
+            if _pct > m.unpriced_refuse_pct:                        # R3 hard guard
+                _refuse.append((int(_fid), "unpriced_over_refuse_pct",
+                                f"fold {_fid}: {_pct:.1%} of actions unpriced (> {m.unpriced_refuse_pct:.0%})"))
+            elif _pct > m.unpriced_warn_pct:
+                logger.warning("MARK-COVERAGE: fold %d has %.1f%% unpriced actions "
+                               "(> warn %.0f%%) — check the candle store", _fid, _pct * 100,
+                               m.unpriced_warn_pct * 100)
+    elif _has_cov_cols:
+        logger.warning("MARK-COVERAGE: unpriced telemetry unavailable (legacy m07 artifact without "
+                       "n_actions_unpriced) — running the zero-fill refusal only")
+    _demoted_folds = []
+    if _refuse:
+        _msg = "MARK-COVERAGE REFUSAL: " + "; ".join(r[2] for r in _refuse) + \
+               " — the claimed OOS evidence is mark-starved (see findings/quant/2026-08-07-mongo-" \
+               "candle-freeze-*). Heal the marks or pass allow_unpriced_folds for diagnostics."
+        if m.allow_unpriced_folds:
+            _demoted_folds = sorted({r[0] for r in _refuse})
+            logger.warning("%s [DEMOTED to warning by allow_unpriced_folds — artifact STAMPED]", _msg)
+        else:
+            raise ValueError(_msg)
+    # codex 2026-08-07 #2 (mark-coverage): the stamps must reach EVERY summary this function can
+    # write — including the empty-statistics early return below — or an overridden mark-starved run
+    # can produce an unstamped artifact.
+    _cov_stamps = {
+        "folds_in_summary": int(len(_cov)),
+        "unpriced_telemetry_available": bool(_unpriced_telemetry),
+        "unpriced_warn_pct": m.unpriced_warn_pct,
+        "unpriced_refuse_pct": m.unpriced_refuse_pct,
+        "unpriced_fold_override": bool(_demoted_folds),
+        "unpriced_demoted_folds": ",".join(str(f) for f in _demoted_folds),
+    }
+    tcov = tsumm[["entity_id", "fold_id", "censoring_coverage"]].merge(
+        _map, on=["entity_id", "fold_id"], how="left", validate="one_to_one"
+    )
+    tcov = tcov[tcov["primary_wallet"].astype(str).isin(cand)]
+    bad_oos_wallets = set(tcov.loc[
+        pd.to_numeric(tcov["censoring_coverage"], errors="coerce").ne(1.0), "primary_wallet"
+    ].dropna().astype(str))
+    n_oos_censor_excluded = len(bad_oos_wallets)
+    if bad_oos_wallets:
+        tpos = tpos[~tpos["primary_wallet"].astype(str).isin(bad_oos_wallets)]
     rows = []
     for wal, g in tpos.groupby("primary_wallet"):
         r = g["r_i"].to_numpy("float64")
@@ -1253,7 +1674,17 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
                      "p_boot": _boot_p_mean_gt(r, m.oos_margin)})
     stats = pd.DataFrame(rows)
     if stats.empty:
-        return stats, {"pretest_rankable_entities": len(cand), "eligible": 0, "confirmed": 0}
+        summ0 = {"pretest_rankable_entities": len(cand), "eligible": 0, "confirmed": 0,
+                 "confirmed_written": 0, "folds_with_positions": 0, **_cov_stamps}
+        gate_report0 = None
+        if _active_behavior_gates(m):
+            # codex 2026-08-07 #5: gates ON with ZERO candidates surviving to FDR must still emit
+            # the schema'd EMPTY gate report -- absence must mean "gates off", never "no candidates".
+            _empty = pd.DataFrame({"primary_wallet": pd.Series(dtype=str)})
+            _, gate_report0, gsumm0 = apply_behavior_gates(
+                _empty, m, leader_panel=leader_panel, replica_cells=replica_cells)
+            summ0.update(gsumm0)
+        return stats, summ0, gate_report0
     eligible = stats[(stats["oos_folds"] >= m.oos_min_folds)
                      & (stats["oos_n"] >= m.oos_min_journeys_pooled)
                      & (stats["oos_frac_folds_pos"] >= m.oos_min_frac_folds_pos)].copy()
@@ -1266,6 +1697,11 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
     _wcol = [c for c in ("entity_id", "m6b_score") if c in pre_entity.columns]
     confirmed = confirmed.merge(pre_entity[["primary_wallet"] + _wcol], on="primary_wallet",
                                 how="left")
+    # === NATIVE BEHAVIOR GATES: post-FDR, pre-output. No-op (gate_report None) when every knob is
+    # unset -> confirmed is byte-identical to the pre-gate module. Kills counted + logged inside.
+    n_fdr = int(len(confirmed))   # BH-FDR discovery count, BEFORE any behavior gate (codex #4)
+    confirmed, gate_report, gate_summ = apply_behavior_gates(
+        confirmed, m, leader_panel=leader_panel, replica_cells=replica_cells)
     # The note was a HARDCODED "only 3 OOS folds available ... needs the FULL 12-fold action
     # bootstrap" string. Once that bootstrap exists the artifact would assert the opposite of its own
     # provenance. Data-derive it so a stamped artifact can never lie about the gate it ran at.
@@ -1274,19 +1710,33 @@ def walk_forward_confirm(inputs_pretest: dict, m07_test_dir: Path, m: M6bManifes
     summ = {
         "pretest_rankable_wallets": len(cand),
         "eligible_for_fdr": int(len(eligible)),
-        "confirmed": int(len(confirmed)),
+        # codex 2026-08-07 #4: `confirmed` is the BH-FDR DISCOVERY count (pre-gate, consistent with
+        # the FDR statistics beside it); `confirmed_written` is what survives the behavior gates and
+        # is actually written to m06b_confirmed.parquet. Equal when gates are off.
+        "confirmed": n_fdr,
+        "confirmed_written": int(len(confirmed)),
         "fdr_q": m.fdr_q, "oos_min_folds": m.oos_min_folds,
         "oos_min_journeys_pooled": m.oos_min_journeys_pooled,
         "oos_folds_available": _folds_avail,
+        # MARK-COVERAGE stamps (R1/R3/R4): the artifact itself answers "why N of M folds" —
+        # folds_in_summary is the CLAIMED set (summary-derived); folds_with_positions is what the
+        # bootstrap actually consumed. A gap between them is mark starvation, named above.
+        # (single source: _cov_stamps, shared with the empty-statistics early return — codex #2)
+        **_cov_stamps,
+        "folds_with_positions": _folds_avail,
+        "wallets_excluded_incomplete_oos_censoring": n_oos_censor_excluded,
         "gate_level": "codex_standard" if _at_standard else "floor_below_standard",
         "note": (f"{_folds_avail} OOS test folds present in the M7 test run; gate ran at "
                  f"{m.oos_min_folds} folds / {m.oos_min_journeys_pooled} pooled journeys "
                  f"({'CODEX STANDARD' if _at_standard else 'BELOW the codex standard of 4/50'}). "
                  "FREEZE this gate + validate on an untouched future window before capital."),
     }
-    logger.info("WALK-FORWARD CONFIRM (pooled+BH-FDR q=%.2f): cand_entities=%d eligible=%d CONFIRMED=%d",
-                m.fdr_q, len(cand), summ["eligible_for_fdr"], summ["confirmed"])
-    return confirmed, summ
+    summ.update(gate_summ)   # per-gate kill counts into the walk-forward summary (never silent)
+    logger.info("WALK-FORWARD CONFIRM (pooled+BH-FDR q=%.2f): cand_entities=%d eligible=%d "
+                "CONFIRMED(FDR)=%d written(post-gate)=%d",
+                m.fdr_q, len(cand), summ["eligible_for_fdr"], summ["confirmed"],
+                summ["confirmed_written"])
+    return confirmed, summ, gate_report
 
 
 def main():
@@ -1337,6 +1787,39 @@ def main():
     ap.add_argument("--pp-min-lcb-mean-r", type=float, default=None, help="gate: 95%% LCB on net per-position return")
     ap.add_argument("--pp-max-med-hold-h", type=float, default=None, help="gate: max median hold (h)")
     ap.add_argument("--pp-max-mtm-dd", type=float, default=None, help="gate: max MTM drawdown")
+    # === NATIVE BEHAVIOR GATES (2026-08-07, Alberto TG-12245: the roster-freeze transition scripts
+    # post_m06b_hard_gates.py / build_roster_freeze.py become yml-settable m06b knobs; the next run
+    # needs ZERO side scripts). ALL default None/off -> byte-identical output when unset. Applied to
+    # the CONFIRMED set AFTER BH-FDR, before m06b_confirmed.parquet is written. EXCHANGE-TRUTH
+    # (lifetime PnL / equity / recency via live HL API) is deliberately NOT here -- it breaks
+    # deterministic hash-pinned runs and stays at the ARM stage (scripts/arm_copy.sh).
+    ap.add_argument("--leader-panel", default=None,
+                    help="LEADER-space profile panel parquet (copy_wallet_profile.py output; per "
+                         "(entity,fold) cells keyed by primary_wallet). REQUIRED iff any leader-tier "
+                         "gate is set -- three-tier law: behavior attributes must be read from "
+                         "LEADER-space data, the parity replica neuters the vetoes.")
+    ap.add_argument("--gate-uw-add-max", type=float, default=None,
+                    help="LEADER tier: KILL if n_pos-weighted mean_underwater_add > this (martingale veto)")
+    ap.add_argument("--gate-leader-liq-max", type=float, default=None,
+                    help="LEADER tier: KILL if n_pos-weighted liq_rate > this")
+    ap.add_argument("--gate-leader-mae-p90-max", type=float, default=None,
+                    help="LEADER tier: KILL if n_pos-weighted mae_p90 > this (bag-risk veto)")
+    ap.add_argument("--gate-two-sided-lo", type=float, default=None,
+                    help="KILL if long_share < this (leader frac_long, replica fallback)")
+    ap.add_argument("--gate-two-sided-hi", type=float, default=None,
+                    help="KILL if long_share > this")
+    ap.add_argument("--gate-latency-ratio-max", type=float, default=None,
+                    help="REPLICA tier: KILL if copy_latency_s / median_hold > this")
+    ap.add_argument("--copy-latency-s", type=float, default=None,
+                    help="our copy latency in seconds for the latency-ratio gate (manifest default 4.0)")
+    # MARK-COVERAGE gate knobs (2026-08-07, Fable-approved). Defaults None -> dataclass unchanged.
+    ap.add_argument("--unpriced-warn-pct", type=float, default=None,
+                    help="per-fold unpriced-action share that WARNs (manifest default 0.10)")
+    ap.add_argument("--unpriced-refuse-pct", type=float, default=None,
+                    help="per-fold unpriced-action share that REFUSES the run (manifest default 0.50)")
+    ap.add_argument("--allow-unpriced-folds", action="store_true", default=False,
+                    help="DIAGNOSTICS ONLY: demote mark-coverage refusals to warnings; the artifact "
+                         "is stamped unpriced_fold_override=true with the demoted fold ids")
     args = ap.parse_args()
     _over = {k: v for k, v in (
         ("oos_min_folds", args.oos_min_folds),
@@ -1353,24 +1836,68 @@ def main():
         ("pp_min_lcb_mean_r", args.pp_min_lcb_mean_r),
         ("pp_max_med_hold_h", args.pp_max_med_hold_h),
         ("pp_max_mtm_dd", args.pp_max_mtm_dd),
+        ("gate_uw_add_max", args.gate_uw_add_max),
+        ("gate_leader_liq_max", args.gate_leader_liq_max),
+        ("gate_leader_mae_p90_max", args.gate_leader_mae_p90_max),
+        ("gate_two_sided_lo", args.gate_two_sided_lo),
+        ("gate_two_sided_hi", args.gate_two_sided_hi),
+        ("gate_latency_ratio_max", args.gate_latency_ratio_max),
+        ("copy_latency_s", args.copy_latency_s),
+        ("unpriced_warn_pct", args.unpriced_warn_pct),
+        ("unpriced_refuse_pct", args.unpriced_refuse_pct),
+        ("allow_unpriced_folds", args.allow_unpriced_folds or None),
     ) if v is not None}
     m = M6bManifest(fee_schedule_version=args.fee_schedule_version,
                     slippage_calibration_version=args.slippage_calibration_version, **_over)
     if _over:
         logger.info("M6b OOS-gate overrides: %s", _over)
+    # behavior-gate wiring validation BEFORE any expensive load (fail fast, fail loud).
+    _gates = _active_behavior_gates(m)
+    if _gates and not args.m07_test_dir:
+        raise SystemExit(
+            f"behavior gate(s) {sorted(_gates)} set but no --m07-test-dir: the gates apply to the "
+            f"post-FDR CONFIRMED set (walk_forward_confirm), which only exists on a walk-forward "
+            f"run. Pass --m07-test-dir or unset the gate knobs.")
+    if any(g in _gates for g in _LEADER_TIER_GATES) and not args.leader_panel:
+        raise SystemExit(
+            f"leader-tier behavior gate(s) {[g for g in _LEADER_TIER_GATES if g in _gates]} set "
+            f"WITHOUT --leader-panel. {_THREE_TIER_LAW} Pass --leader-panel "
+            f"<profile_panel.parquet> or unset the leader-tier gates.")
+    leader_panel = None
+    leader_panel_sha256 = None
+    if args.leader_panel:
+        leader_panel = pd.read_parquet(args.leader_panel)
+        # codex 2026-08-07 #2: the panel is a REAL stage input -- pin its CONTENT hash in provenance
+        # (experiment.sh stage_fp hashes it too, so a changed panel re-runs the stage).
+        leader_panel_sha256 = hashlib.sha256(Path(args.leader_panel).read_bytes()).hexdigest()
     inputs = load_inputs(
         Path(args.m07_dir), data_dir=Path(args.data_dir), m02_journeys=args.m02_journeys,
         m04_dir=Path(args.m04_dir) if args.m04_dir else None,
     )
     out, manifest = build_ranking(inputs, m)
+    # codex 2026-08-07 #2: record the leader-panel input (path + content sha256) in the m06b
+    # manifest itself; None when no panel was supplied (explicit provenance either way).
+    manifest["leader_panel_path"] = args.leader_panel
+    manifest["leader_panel_sha256"] = leader_panel_sha256
     res = write_outputs(out, manifest, Path(args.out))
     logger.info("M6b done: %s", res)
     # OOS CONFIRMATION (pooled multi-fold + BH-FDR). Only meaningful with the full 12-fold action bootstrap;
     # writes the confirmed set + its summary alongside the pool so the roster rests on OOS, not in-sample rank.
     if args.m07_test_dir:
-        confirmed, wf_summ = walk_forward_confirm(inputs, Path(args.m07_test_dir), m)
+        confirmed, wf_summ, gate_report = walk_forward_confirm(
+            inputs, Path(args.m07_test_dir), m, leader_panel=leader_panel)
         out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
         confirmed.to_parquet(out_dir / "m06b_confirmed.parquet", index=False)
+        if gate_report is not None:
+            # per-wallet attribute values + pass booleans for every active gate (audit trail).
+            gate_report.to_parquet(out_dir / "m06b_gate_report.parquet", index=False)
+            bg = wf_summ.setdefault("behavior_gates", {})
+            bg["leader_panel_path"] = args.leader_panel
+            bg["leader_panel_sha256"] = leader_panel_sha256
+        else:
+            # codex 2026-08-07 #5: gates OFF must not leave a previous gated run's report lying
+            # around in --out -- absence of the artifact must MEAN "gates off".
+            (out_dir / "m06b_gate_report.parquet").unlink(missing_ok=True)
         (out_dir / "m06b_walkforward_summary.json").write_text(json.dumps(wf_summ, indent=2, default=str))
         logger.info("M6b walk-forward: %s -> m06b_confirmed.parquet", wf_summ)
 

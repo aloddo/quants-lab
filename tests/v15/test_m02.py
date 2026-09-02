@@ -2,7 +2,7 @@
 """V15 M02 unit tests — NON-LOOK-AHEAD invariants + state machine correctness.
 
 Synthetic fixtures only; no network, no Mongo, no parquet. We monkeypatch
-m01.get_mark so equity reconstruction is deterministic, then drive
+the optional enrichment module's get_mark so equity reconstruction is deterministic, then drive
 trace_wallet / compute_event_equity directly.
 
 Run:
@@ -38,7 +38,6 @@ def _patch_marks(monkeypatch):
             return None
         return FIXED_MARK
     monkeypatch.setattr(m01, "get_mark", fake_mark)
-    monkeypatch.setattr(m02.m01, "get_mark", fake_mark)
 
 
 def _fill(ts, coin, side, size, price, start_pos, tid, closed=0.0, dir_="", liq=False):
@@ -86,13 +85,14 @@ def test_core_m02_does_not_reconstruct_equity(monkeypatch):
     for i, fill in enumerate(fills):
         fill["fill_seq"] = i
         fill["causal_order_ok"] = True
-    monkeypatch.setattr(m02.m01, "load_wallet_fills", lambda *_: fills)
-    monkeypatch.setattr(m02.m01, "load_wallet_funding", lambda *_: [])
+    # The core lane is deliberately backed by the standalone hot-store I/O module, not M01.
+    monkeypatch.setattr(m02.fio, "load_wallet_fills", lambda *_: fills)
+    monkeypatch.setattr(m02.fio, "load_wallet_funding", lambda *_: [])
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("core M02 consulted M01 equity reconstruction")
 
-    monkeypatch.setattr(m02.m01, "reconstruct_wallet_event_equity", forbidden)
+    monkeypatch.setattr(m01, "reconstruct_wallet_event_equity", forbidden)
     result = m02.process_wallet(("0xtest", 0, 10_000, False))
 
     assert "error" not in result
@@ -315,7 +315,6 @@ def test_future_coin_does_not_affect_earlier_equity(monkeypatch):
     def per_coin_mark(coin, ts_ms, causal=False):
         return 50.0 if coin == "ALT" else 100.0
     monkeypatch.setattr(m01, "get_mark", per_coin_mark)
-    monkeypatch.setattr(m02.m01, "get_mark", per_coin_mark)
 
     fills = [
         _fill(2000, "BTC", "B", 1, 100, 0, tid=1),       # t1: BTC entry, ALT untraded
@@ -598,7 +597,6 @@ def test_snapshot_seed_independent_of_future_fills(monkeypatch):
             return 100.0 if ts_ms <= 1000 else 120.0
         return 100.0  # BTC flat
     monkeypatch.setattr(m01, "get_mark", mark)
-    monkeypatch.setattr(m02.m01, "get_mark", mark)
 
     class _NearFetchAnchor(_Anchor):
         positions = {"ETH": 5.0}   # 5 ETH held pre-window, in the fetch snapshot

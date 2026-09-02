@@ -59,8 +59,17 @@ class M8Manifest:
     # eviction (>10d inactive). A leader that went dark before the decision is not copyable.
     staleness_max_days: int = 14
     inferential_layer_active: bool = False
-    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
+    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position | fixed_notional
     fixed_target_exposure: float = 0.10
+    # PARITY knobs (2026-08-07, mirrors the m07/m09 threading — codex-approved pattern): the stress
+    # verdict must judge the SAME replica semantics the selection measured. Defaults inert.
+    fixed_notional_usd: float = 100.0
+    reversal_mode: str = "flip"
+    exit_latency_ms: int | None = None
+    exit_entry_grace_ms: int = 90_000
+    leader_dust_floor_usd: float = 0.0
+    sl_bps: float | None = None
+    global_stop_pct: float | None = None
     # outcome -> tier
     indeterminate_heavy_frac: float = 0.25     # >this share of indeterminate minutes -> cap at UNCERTAIN
 
@@ -77,6 +86,13 @@ def _run_stress(actions: pd.DataFrame, md: E.MarketData, start_equity: float, t0
         slippage_band=m.stress_slippage_band, adl_stress=m.stress_adl,
         start_policy="causal_carry_in", sizing_mode=m.sizing_mode,
         fixed_target_exposure=m.fixed_target_exposure,
+        fixed_notional_usd=m.fixed_notional_usd,
+        reversal_mode=m.reversal_mode,
+        exit_latency_ms=m.exit_latency_ms,
+        exit_entry_grace_ms=m.exit_entry_grace_ms,
+        leader_dust_floor_usd=m.leader_dust_floor_usd,
+        sl_bps=m.sl_bps,
+        global_stop_pct=m.global_stop_pct,
     )
     res = E.step_subaccount(actions, md, start_equity, params, end_ts_ms=t1, start_ts_ms=t0)
     s = res["summary"]
@@ -430,15 +446,32 @@ def main():
     ap.add_argument("--nominal-capital", type=float, default=10_000.0,
                     help="bankroll scale for absolute survival stress slices (default: 10000.0)")
     ap.add_argument(
-        "--sizing-mode", choices=("leader_equity", "fixed_position"),
+        "--sizing-mode", choices=("leader_equity", "fixed_position", "fixed_notional"),
         default="leader_equity",
     )
     ap.add_argument("--fixed-target-exposure", type=float, default=0.10)
+    # PARITY knobs (2026-08-07): the stress replica must match the selection replica's semantics.
+    ap.add_argument("--fixed-notional-usd", type=float, default=100.0)
+    ap.add_argument("--reversal-mode", choices=("flip", "flatten_only"), default="flip")
+    ap.add_argument("--exit-latency-ms", type=int, default=None)
+    ap.add_argument("--exit-entry-grace-ms", type=int, default=90_000)
+    ap.add_argument("--leader-dust-floor-usd", type=float, default=0.0)
+    ap.add_argument("--sl-bps", type=float, default=None)
+    ap.add_argument("--global-stop-pct", type=float, default=None)
     args = ap.parse_args()
+    if args.sl_bps is not None and args.reversal_mode != "flatten_only":
+        ap.error("--sl-bps requires --reversal-mode flatten_only (mirrors the m07 engine validation)")
     man = replace(
         M8Manifest(), nominal_capital=args.nominal_capital,
         sizing_mode=args.sizing_mode,
         fixed_target_exposure=args.fixed_target_exposure,
+        fixed_notional_usd=args.fixed_notional_usd,
+        reversal_mode=args.reversal_mode,
+        exit_latency_ms=args.exit_latency_ms,
+        exit_entry_grace_ms=args.exit_entry_grace_ms,
+        leader_dust_floor_usd=args.leader_dust_floor_usd,
+        sl_bps=args.sl_bps,
+        global_stop_pct=args.global_stop_pct,
     )
     run_m08(Path(args.m07_dir), Path(args.out), man, slip_calib_path=args.slip_calib,
             actions_path=Path(args.actions) if args.actions else None,

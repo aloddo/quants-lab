@@ -301,7 +301,15 @@ class MarketData:
                 return tuple(np.asarray(arr[i], dtype=("int64" if i == 0 else "float64")) for i in range(5))
             except Exception:
                 pass
-        if self._require_cache or not self._allow_mongo:
+        if self._require_cache:
+            # Fable B4 (2026-08-08): under require_cache a MISSING .npy must raise, not return
+            # empty arrays — build_ohlc_cache writes an empty (6,0) file for candle-less coins, so
+            # file-missing is never legitimate, only "never built / invalidated by the daily sync".
+            # Empty-return here silently skipped every trade on the coin (the freeze class).
+            raise FileNotFoundError(
+                f"ohlc cache missing for {coin!r} under require_cache=True — run build_ohlc_cache "
+                f"first (m09/m10 preambles do this); expected {self._ohlc_path(coin)}")
+        if not self._allow_mongo:
             return (np.empty(0, "int64"),) + tuple(np.empty(0, "float64") for _ in range(4))
         cur = self._mongo().hyperliquid_candles.find(
             {"coin": coin, "interval": "1m"},
@@ -491,8 +499,50 @@ class EngineParams:
     follower_trail: Optional[float] = None     # FOLLOWER trailing exit ("exit before them"): if our copy
     # 2026-07-30: default was "leader_equity", which is BOTH an M1 remnant and a silent-zero-orders
     # trap (see _action_target_pct). Default is now the mode every real sim has actually used.
-    sizing_mode: str = "fixed_position"        # fixed_position | leader_equity(DEPRECATED, refuses)
+    sizing_mode: str = "fixed_position"        # fixed_position | fixed_notional | leader_equity(DEPRECATED, refuses)
     fixed_target_exposure: float = 0.10         # signed direction gets this absolute follower exposure
+    # PARITY 2026-08-06 (Fable-approved plan v2, finding 5: opt-in, defaults byte-identical):
+    # sizing_mode="fixed_notional" replicates the LIVE engine's `sizing_mode:"fixed"` +
+    # `order_size_usd` semantics (hl_copy_trader_v17.py:2247, config copy_trader_v15recent9): a flat
+    # $ notional per (wallet,coin) leg, sized ONCE at entry, NO equity compounding and NO
+    # drift-rebalance orders on the leader's ADDON/TRIM rows (live tracks-but-never-copies those;
+    # fixed_position emitted fictitious re-size fills — parity map divergence #1). Inert unless
+    # sizing_mode == "fixed_notional".
+    fixed_notional_usd: float = 100.0
+    # PARITY divergence #3 (plan v2): live defaults to FLATTEN-ONLY on a leader sign flip
+    # (copy_reverse_enabled absent/False -> hl_copy_trader_v17.py:6231-6234) while this replay FLIPS
+    # to the far side (_book_fill flip branch). "flatten_only" reproduces live: on a flip we go FLAT
+    # and stay out until the leader passes through flat and opens again (live only re-enters on the
+    # OPEN verb; their far-side ADDs are tracked, never copied). Default "flip" = byte-identical
+    # legacy behavior. Leader-came-from-flat is detected as position_after - signed_size == 0.
+    reversal_mode: str = "flip"                # flip (legacy default) | flatten_only (live parity)
+    # PARITY divergence #5 (plan v2): live LEADER_FLAT exit detection is a 10s REST poll x 2 fresh
+    # confirms + 90s entry grace + $10 leader-dust floor (hl_copy_trader_v17.py:1193-1326) — effective
+    # exit latency ~20-110s, while this replay exited at copy_latency_ms (4s). Opt-in model:
+    #   exit_latency_ms      — latency for leader-flat/dust EXIT rows (None = legacy copy_latency_ms).
+    #                          Flip-flattens stay at copy_latency_ms: live detects REVERSE on the WS
+    #                          feed (fast), only leader-FLAT comes from the slow REST poll.
+    #   exit_entry_grace_ms  — a leg younger than this cannot confirm-exit (live 90s entry grace).
+    #   leader_dust_floor_usd — leader |position_after|*mark below this counts as flat (live $10).
+    # An exit pushed past fold end stays OPEN and is priced by the fold-end force-mark (conservative,
+    # matches the marked-open accounting); counted in summary n_exit_pushed_past_end.
+    exit_latency_ms: Optional[int] = None
+    exit_entry_grace_ms: int = 90_000
+    leader_dust_floor_usd: float = 0.0
+    # PARITY divergence #4 (plan v2): live-only risk stops, opt-in for the parity variant.
+    #   sl_bps          — per-leg hard stop: close the leg when its uPnL in bps of entry price
+    #                     <= sl_bps (live sl_bps=-2500 = the -25% disaster stop). After an SL close
+    #                     the coin joins rev_latch, so under reversal_mode="flatten_only" we stay out
+    #                     until the leader passes flat + reopens (live: our unilateral exit never
+    #                     re-enters on their ADDs). Designed for use WITH flatten_only.
+    #   global_stop_pct — latched account stop vs START equity (live 0.15 latched flatten-all):
+    #                     flatten everything + halt copying for the rest of the window.
+    # GRANULARITY (documented approximation, parity-report item per Fable finding 7): checked at
+    # every action cursor (pre-copy + post-fill) and at fold end — the follower_trail house pattern —
+    # NOT continuously like live. Intra-gap breaches on quiet wallets land in the Stage-3
+    # reconciliation residual budget.
+    sl_bps: Optional[float] = None
+    global_stop_pct: Optional[float] = None
     # COPY POLICY (2026-07-23, Alberto HOW: test each wallet BOTH ways):
     #   "full_mirror"  = copy every ENTRY/ADDON/TRIM/EXIT verbatim (default; byte-identical to prior engine).
     #   "entry_trail"  = mirror the ENTRY only (open one fixed-size leg), IGNORE their adds/trims/exits, and
@@ -522,6 +572,16 @@ def _action_target_pct(action: dict, params: EngineParams) -> float:
         if abs(pa) <= 1e-12:
             return 0.0
         return float(np.sign(pa) * abs(params.fixed_target_exposure))
+    if params.sizing_mode == "fixed_notional":
+        # SIGN CARRIER only (±1.0 / 0.0 / NaN). The $ magnitude is applied in the order block —
+        # deliberately NOT an exposure fraction here, so nothing downstream can silently multiply
+        # it by equity and reintroduce compounding.
+        pa = _f(action.get("position_after"))
+        if pa != pa:
+            return float("nan")
+        if abs(pa) <= 1e-12:
+            return 0.0
+        return float(np.sign(pa))
     raise ValueError(f"unknown sizing_mode {params.sizing_mode!r}")
 
 
@@ -542,6 +602,16 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         actions = actions[actions["stream_replay_valid"].fillna(False).astype(bool)].copy()
     if not actions.empty and "lifecycle_valid" in actions.columns:
         actions = actions[actions["lifecycle_valid"].fillna(False).astype(bool)].copy()
+
+    # PARITY param-combo validation (codex R1 P1#5/P1#7): refuse silently-wrong combinations rather
+    # than documenting them. sl_bps without flatten_only would stop out and instantly re-enter on the
+    # leader's next row; fixed_notional under entry_trail silently sizes by equity fraction.
+    if params.sl_bps is not None and params.reversal_mode != "flatten_only":
+        raise ValueError("sl_bps requires reversal_mode='flatten_only' (a stopped-out leg must not "
+                         "re-enter on the leader's next ADD; live parity)")
+    if params.sizing_mode == "fixed_notional" and params.copy_policy != "full_mirror":
+        raise ValueError("sizing_mode='fixed_notional' requires copy_policy='full_mirror' "
+                         "(entry_trail sizes by equity fraction and would silently ignore it)")
 
     st = copy.deepcopy(start_state) if start_state is not None else AccountState(cross_collateral={"main": float(start_equity)})
     if not st.cross_collateral:
@@ -609,6 +679,60 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             _ruin(st, md, summary, events, ts)
         return post_eq
 
+    def _sl_fire(ts):
+        """PARITY stop layer (divergence #4): per-leg hard SL. Closes any open leg whose uPnL in bps
+        of entry price <= params.sl_bps (force_close: no min-notional/capacity skip — a disaster stop
+        must not be skippable). Latches the coin in rev_latch so flatten_only stays out until the
+        leader passes flat. Returns True if any leg was closed. No-op when sl_bps is None ->
+        byte-identical default path."""
+        if params.sl_bps is None:
+            return False
+        closed_any = False
+        for c in list(st.positions.keys()):
+            p = st.positions.get(c)
+            if p is None or p.szi == 0.0 or p.entry_px <= 0:
+                continue
+            m = md.mark(c, ts, causal=True)
+            if m is None or m != m or m <= 0:
+                continue
+            upnl_bps = ((m - p.entry_px) / p.entry_px) * (1.0 if p.szi > 0 else -1.0) * 10_000.0
+            if upnl_bps <= params.sl_bps:
+                _apply_order(st, md, c, -p.szi, m, ts, {"action_type": "SL_EXIT", "ts": ts},
+                             params, band, fills, events, summary, force_close=True)
+                rev_latch.add(c)
+                leg_open_ts.pop(c, None)
+                events.append({"ts": ts, "event_type": "sl_exit", "entity_id": entity_id,
+                               "fold_id": fold_id, "coin": c, "sl_bps": float(params.sl_bps),
+                               "upnl_bps": float(upnl_bps)})
+                closed_any = True
+        return closed_any
+
+    def _global_stop_fire(cur_eq, ts):
+        """PARITY stop layer (divergence #4): latched account stop vs START equity (live 15% latched
+        flatten-all). Flatten everything, halt copying for the rest of the window (reuses the
+        follower_halted latch). No-op when global_stop_pct is None -> byte-identical default path."""
+        if params.global_stop_pct is None or follower_halted[0]:
+            return cur_eq
+        if cur_eq > float(start_equity) * (1.0 - float(params.global_stop_pct)):
+            return cur_eq
+        _flatten_all(ts)
+        follower_halted[0] = True
+        post_eq = st.equity(_marks(st, md, ts))
+        events.append({"ts": ts, "event_type": "global_stop_exit", "entity_id": entity_id,
+                       "fold_id": fold_id, "global_stop_pct": float(params.global_stop_pct),
+                       "start_equity": float(start_equity), "trigger_equity": float(cur_eq)})
+        if post_eq <= 0 and not summary["ruin"]:
+            _ruin(st, md, summary, events, ts)
+        return post_eq
+
+    def _stops_fire(cur_eq, ts):
+        """Run both opt-in stop layers at an observation point; returns refreshed equity."""
+        if params.sl_bps is None and params.global_stop_pct is None:
+            return cur_eq
+        if _sl_fire(ts):
+            cur_eq = st.equity(_marks(st, md, ts))
+        return _global_stop_fire(cur_eq, ts)
+
     # CHANGE 1: block-boundary anchors b_k = start_ts + k*14d in [start_ts, end_ts) (fold_start = b_0;
     # interior = block_boundary; the fold_end sample is the final anchor). `_emit` is a PURE-READ
     # observer threaded into _advance_between: it appends boundary equity samples ONLY (never touches
@@ -650,8 +774,21 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
     summary["window_end_ms"] = int(end_ts_ms)
     # count of COPYABLE (perp, non-spot) actions whose latency-pushed our_ts lands at/after the fold end
     # (codex P0#1 minor; spot rows are skipped by the loop so they must not inflate this reject count).
-    summary["n_late_copy_skipped"] = sum(
-        1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
+    if params.exit_latency_ms is None:
+        summary["n_late_copy_skipped"] = sum(
+            1 for r in rows if not coin_is_spot(r["coin"]) and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
+    else:
+        # codex R2 P2: with the exit-latency model ON, exit rows execute on exit_latency_ms and are
+        # counted at skip time in n_exit_pushed_past_end — the upfront late count covers NON-exit
+        # rows only. Dust-exits are mark-dependent and classified here as non-exit (diagnostic may
+        # overcount by those; documented, diagnostic-only field).
+        def _is_exit_row_cheap(r):
+            _at = str(r.get("action_type", "")).upper()
+            _pa = _f(r.get("position_after"))
+            return _at in ("EXIT", "CLOSE") or _pa == 0.0
+        summary["n_late_copy_skipped"] = sum(
+            1 for r in rows if not coin_is_spot(r["coin"]) and not _is_exit_row_cheap(r)
+            and int(r["ts"]) + params.copy_latency_ms >= int(end_ts_ms))
     # AUDIT 2026-07-10 (codex P0#7): adl_stress is accepted but NOT applied (n_adl_stress stays 0). A caller
     # (e.g. m08 stress_adl=True) that thinks it is getting ADL de-leverage stress is getting an unstressed run
     # -> ruin/max_dd/roe too favorable. Surface the gap LOUDLY on the summary instead of silently zeroing it,
@@ -709,6 +846,17 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
 
     # entry_trail (policy b): per-position peak favorable mark, for OUR trailing-TP exit.
     trail_peak: dict = {}
+    # reversal_mode="flatten_only" (plan v2 divergence #3): coins where a leader flip flattened us and
+    # we must STAY OUT until the leader passes through flat and opens again (live OPEN-verb parity).
+    # In-memory per-window, matching live's in-memory pending-reverse scope.
+    rev_latch: set = set()
+    # exit-latency model (divergence #5): OUR fill ts that opened the current leg per coin, for the
+    # live 90s entry-grace. Maintained unconditionally (cheap, output-neutral when the model is off).
+    # codex R1 P1#4 + R2: positions that PRE-EXIST the loop (carry-in seeds, M9 chained start_state)
+    # are anchored at the WINDOW start (_win_lo — the same value provenance-stamped as
+    # window_start_ms), NOT at prev_ts, which is copy-latency-late when start_ts_ms is omitted.
+    # Conservative: a leg opened <90s before the fold boundary keeps (at most) a full fresh grace.
+    leg_open_ts: dict = {c: int(_win_lo) for c, p in st.positions.items() if p.szi != 0.0}
 
     def _trail_step_all(ts):
         """Policy (b) entry_trail: update each open position's peak favorable (causal) mark and exit the
@@ -737,12 +885,45 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         coin = a["coin"]
         if coin_is_spot(coin):
             continue
-        our_ts = int(a["ts"]) + params.copy_latency_ms
-        # AUDIT 2026-07-10 (codex P0#1): a latency-pushed fill at our_ts >= end_ts_ms would execute on
-        # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
-        # + funds + liquidates risk to end_ts_ms. rows are ts-sorted so no later action can be in-window.
-        if our_ts >= int(end_ts_ms):
-            break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
+        # PARITY divergence #5: EXIT rows may carry their own (slower) latency when the opt-in
+        # exit-latency model is on. Classified BEFORE the latency stamp; flip rows are NOT exits here
+        # (live detects REVERSE fast on WS; only leader-FLAT rides the slow REST poll).
+        _row_is_exit = False
+        if params.exit_latency_ms is not None:
+            _at_up = str(a.get("action_type", "")).upper()
+            _pa_row = _f(a.get("position_after"))
+            _row_is_exit = _at_up in ("EXIT", "CLOSE") or _pa_row == 0.0
+            if (not _row_is_exit) and params.leader_dust_floor_usd > 0 and _pa_row == _pa_row:
+                _mk0 = md.mark(coin, int(a["ts"]), causal=True)
+                if _mk0 is not None and _mk0 == _mk0 and abs(_pa_row) * _mk0 < params.leader_dust_floor_usd:
+                    _row_is_exit = True
+                    a = dict(a)
+                    a["_dust_exit"] = True      # keeps the downstream exit_cond consistent
+        if _row_is_exit:
+            our_ts = int(a["ts"]) + int(params.exit_latency_ms)
+            _lo = leg_open_ts.get(coin)
+            _held = coin in st.positions and st.positions[coin].szi != 0.0
+            if _lo is not None and _held:
+                our_ts = max(our_ts, int(_lo) + int(params.exit_entry_grace_ms))   # live entry grace
+            our_ts = max(our_ts, prev_ts)       # keep the sim cursor monotone
+            if our_ts >= int(end_ts_ms):
+                # Exit would land beyond the fold boundary: live would still be holding at the
+                # boundary too. Leg stays OPEN; fold-end force-mark prices it (marked-open accounting).
+                summary["n_exit_pushed_past_end"] += 1
+                continue
+        else:
+            our_ts = int(a["ts"]) + params.copy_latency_ms
+            # codex R1 P1#2: a DELAYED exit can push prev_ts past this row's naive our_ts, sending
+            # simulated time backwards (duplicate risk scans, regressed TE cursor, out-of-order fills).
+            # Clamp EVERY row monotone. Output-neutral for defaults: with uniform copy latency and
+            # ts-sorted rows the clamp is a no-op.
+            our_ts = max(our_ts, prev_ts)
+            # AUDIT 2026-07-10 (codex P0#1): a latency-pushed fill at our_ts >= end_ts_ms would execute on
+            # post-window (test) marks/liquidity -> look-ahead. Skip the fill; the post-loop advance still marks
+            # + funds + liquidates risk to end_ts_ms. Break is safe under the monotone clamp: prev_ts never
+            # decreases, so every later row's clamped our_ts is also >= end_ts_ms.
+            if our_ts >= int(end_ts_ms):
+                break   # n_late_copy_skipped already counted upfront (rows are ts-sorted -> nothing later is in-window)
 
         _advance_between(st, md, prev_ts, our_ts, params, events, summary, _emit=_emit, fold_end_ms=end_ts_ms)
         if summary["ruin"]:
@@ -757,6 +938,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         # FOLLOWER trailing exit: check on the freshly-advanced equity BEFORE copying this action. If we
         # breach, flatten + latch; once halted we stop copying source entries for the rest of the fold.
         cur_eq = _trail_fire(cur_eq, our_ts)
+        cur_eq = _stops_fire(cur_eq, our_ts)   # PARITY stop layers (no-op unless opted in)
         if summary["ruin"]:
             break
         if follower_halted[0]:
@@ -767,13 +949,22 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
 
         mark = marks.get(coin)
         if mark is None or mark != mark or mark <= 0:
+            # DEPRECATED flag, kept for reader compat: metadata_uncertain actually means "at least
+            # one action had NO VALID MARK and was silently skipped" (per-seat ANY granularity).
+            # The counters below are the honest measure; m06b gates on their fold aggregation.
+            # (2026-08-07 incident: a fold with EVERY action unpriced exited rc=0 and vanished from
+            # the OOS fold count — findings/quant/2026-08-07-mongo-candle-freeze-*.)
             summary["metadata_uncertain"] = True
+            summary["n_actions_unpriced"] += 1
+            summary["_unpriced_coins"].add(coin)
             prev_ts = our_ts
             continue
 
         # tgt_pct + exit_cond computed for BOTH policies (post-order tracking-error uses them).
         tgt_pct = _action_target_pct(a, params)
-        exit_cond = str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE") or _f(a.get("position_after")) == 0.0
+        exit_cond = (str(a.get("action_type", "")).upper() in ("EXIT", "CLOSE")
+                     or _f(a.get("position_after")) == 0.0
+                     or bool(a.get("_dust_exit")))
         if params.copy_policy == "entry_trail":
             # POLICY (b): first run OUR trailing-TP on every open position at this cursor; then MIRROR THE
             # ENTRY ONLY (open one fixed-size leg when the leader opens from flat and we're flat). ADDON/
@@ -791,14 +982,58 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             if tgt_pct != tgt_pct:
                 prev_ts = our_ts
                 continue
-            target_notional = tgt_pct * cur_eq
-            target_szi = target_notional / mark
             cur_szi = st.positions[coin].szi if coin in st.positions else 0.0
-            if exit_cond:
-                target_szi = 0.0
+            if params.reversal_mode == "flatten_only":
+                # LIVE-PARITY REVERSAL (divergence #3): on a leader sign flip we FLATTEN and never
+                # open the far side; we re-enter only when the leader passes through flat and opens
+                # again (their far-side ADDs are tracked-not-copied live). Leader-from-flat is
+                # position_after - signed_size == 0.
+                _pa_r = _f(a.get("position_after"))
+                _ss_r = _f(a.get("signed_size"))
+                _from_flat = (_pa_r == _pa_r and _ss_r == _ss_r and abs(_pa_r - _ss_r) <= 1e-12)
+                if exit_cond or tgt_pct == 0.0:
+                    rev_latch.discard(coin)          # leader is flat: journey over, latch clears
+                elif cur_szi != 0.0 and (cur_szi > 0) != (tgt_pct > 0):
+                    rev_latch.add(coin)              # flip while held -> flatten only
+                    tgt_pct = 0.0
+                    exit_cond = True
+                elif cur_szi == 0.0 and coin in rev_latch:
+                    if _from_flat:
+                        rev_latch.discard(coin)      # leader re-opened from flat -> copyable OPEN
+                    else:
+                        prev_ts = our_ts             # suppressed mid-journey row: track, don't trade
+                        continue
+            if params.sizing_mode == "fixed_notional":
+                # LIVE-PARITY SIZING (plan v2): flat $ per leg, sized once at entry.
+                #   flat + leader open  -> open sign * fixed_notional_usd / mark
+                #   held, same sign     -> HOLD (no drift-rebalance: live never re-sizes on ADDON/TRIM)
+                #   held, sign flipped  -> flip through zero to a fresh $-sized far leg
+                #   exit_cond           -> full close
+                if exit_cond or tgt_pct == 0.0:
+                    target_szi = 0.0
+                elif cur_szi != 0.0 and (cur_szi > 0) == (tgt_pct > 0):
+                    target_szi = cur_szi
+                else:
+                    target_szi = tgt_pct * params.fixed_notional_usd / mark
+                # TE tracking stores exposure FRACTIONS: convert the $ target for src_target below.
+                tgt_pct = (0.0 if cur_eq <= 0 else
+                           float(np.sign(target_szi)) * params.fixed_notional_usd / cur_eq
+                           if target_szi != 0.0 else 0.0)
+            else:
+                target_notional = tgt_pct * cur_eq
+                target_szi = target_notional / mark
+                if exit_cond:
+                    target_szi = 0.0
             delta_szi = target_szi - cur_szi
 
             _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, events, summary)
+            # exit-latency model bookkeeping (output-neutral when the model is off): remember OUR
+            # fill ts that opened / re-opened the leg, for the live 90s entry-grace on exits.
+            _new_szi = st.positions[coin].szi if coin in st.positions else 0.0
+            if _new_szi == 0.0:
+                leg_open_ts.pop(coin, None)
+            elif cur_szi == 0.0 or (cur_szi > 0) != (_new_szi > 0):
+                leg_open_ts[coin] = our_ts
 
         marks = _marks(st, md, our_ts, extra=coin)
         eq = st.equity(marks)
@@ -809,6 +1044,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         # fill's fee/slippage/marking can itself breach the trail -> check again immediately so we never
         # stay exposed past the threshold until the NEXT action.
         eq = _trail_fire(eq, our_ts)
+        eq = _stops_fire(eq, our_ts)           # PARITY stop layers (no-op unless opted in)
         if peak_equity > 0:
             summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
         equity_samples.append(_eq_sample(entity_id, fold_id, our_ts, eq, "action", st, summary["max_dd"]))
@@ -840,6 +1076,7 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
         # fold, a single-action fold, or a post-last-action drawdown via funding/MTM/liquidation that the
         # per-action checks cannot see. Flattens so the carried state into the next chained fold is flat.
         eq = _trail_fire(eq, end_ts_ms)
+        eq = _stops_fire(eq, end_ts_ms)        # PARITY stop layers (no-op unless opted in)
         if peak_equity > 0:
             summary["max_dd"] = max(summary["max_dd"], (peak_equity - eq) / peak_equity)
         equity_samples.append(_eq_sample(entity_id, fold_id, end_ts_ms, eq, "fold_end", st, summary["max_dd"]))
@@ -882,6 +1119,14 @@ def step_subaccount(actions: pd.DataFrame, md: MarketData, start_equity: float, 
             summary["_te_weighted_sum"] += (end_ts_ms - cur) * pen
             summary["tracking_error_active_ms"] += (end_ts_ms - cur)
 
+    # OPEN-POSITION CENSORING FIX: positions still alive at the ranking cutoff
+    # are economic exposure, not missing observations. Emit one marked snapshot
+    # per tracked round trip and debit open LOSSES (without crediting open wins)
+    # into conservative_pnl_total. A carried-in position without an _rt record
+    # remains observable through censoring_coverage < 1 and makes M6b
+    # non-investable until its entry basis can be reconstructed.
+    _snapshot_open_round_trips(st, md, summary, end_ts_ms)
+
     return _finalize(st, fills, events, equity_samples, summary, md, start_equity)
 
 
@@ -892,13 +1137,26 @@ def _new_summary(entity_id, fold_id, start_equity, n_actions, params, md):
         "n_market_liq_orders": 0, "n_backstop_transfer": 0, "n_adl_stress": 0,
         "total_fees": 0.0, "total_funding": 0.0, "slip_bps_notional_sum": 0.0, "notional_traded": 0.0,
         "outcome_states": set(), "n_indeterminate_minutes": 0, "max_dd": 0.0, "time_to_ruin_ms": None,
+        "n_exit_pushed_past_end": 0,
+        "exit_latency_ms": (int(params.exit_latency_ms) if params.exit_latency_ms is not None else None),
+        "leader_dust_floor_usd": (float(params.leader_dust_floor_usd) if params.leader_dust_floor_usd else None),
+        "sl_bps": (float(params.sl_bps) if params.sl_bps is not None else None),
+        "global_stop_pct": (float(params.global_stop_pct) if params.global_stop_pct is not None else None),
         "slippage_band": params.slippage_band, "start_policy": params.start_policy,
         "sizing_mode": params.sizing_mode,
         "fixed_target_exposure": (
             float(params.fixed_target_exposure) if params.sizing_mode == "fixed_position" else None
         ),
+        "fixed_notional_usd": (
+            float(params.fixed_notional_usd) if params.sizing_mode == "fixed_notional" else None
+        ),
+        "reversal_mode": params.reversal_mode,
         "slippage_uncalibrated": False, "metadata_uncertain": False, "mode_uncertain": False,
         "adv_unavailable": False,
+        # LOUD MARK COVERAGE (2026-08-07, Fable-approved after the 06-24 candle-freeze incident):
+        # count every leader action skipped for lack of a valid mark, and record which coins.
+        # Invariant (tested): metadata_uncertain == (n_actions_unpriced > 0).
+        "n_actions_unpriced": 0, "_unpriced_coins": set(),
         "fee_unversioned": (not md.fees.versioned), "ruin": False,
         "slippage_calibration_version": None,
         # CHANGE 2 tracking_error accumulators (finalized in _finalize): time-weighted L1 signed
@@ -1006,6 +1264,9 @@ def _seed_carry_in(st, md, first_row, params, summary, seed_ts=None):
         pre_pos = pa - ss
         if params.sizing_mode == "fixed_position":
             pre_pct = float(np.sign(pre_pos) * abs(params.fixed_target_exposure))
+        elif params.sizing_mode == "fixed_notional":
+            # Seed the carried leg at the same flat $ the live engine would hold.
+            pre_pct = (float(np.sign(pre_pos)) * params.fixed_notional_usd / eq) if eq > 0 else 0.0
         else:
             # source exposure% BEFORE the first observed action = post% scaled by the pre/post size ratio.
             # target_exposure_pct is already SIGNED, so do NOT multiply by sign(pa) (that double-flips
@@ -1093,7 +1354,16 @@ def _apply_order(st, md, coin, delta_szi, mark, our_ts, a, params, band, fills, 
     # is preserved while the look-ahead is removed. Conservative CAUSAL VOL-PROXY APPROXIMATION pending
     # real sub-minute (HL trades / L2 book) data. Determinism: derived from the frozen OHLC cache + the
     # fixed copy_latency_ms only.
-    lat_frac = min(1.0, params.copy_latency_ms / 60_000.0)   # fraction of a 1m bar our latency spans
+    # codex R1 P1#3: when the exit-latency model is ON (or for OUR synthetic SL exits), the drift
+    # haircut must use the row's EFFECTIVE latency (our_ts - leader_ts: includes exit delay, grace,
+    # monotone clamp), not the entry copy latency — otherwise a 30s-delayed exit gets the delayed
+    # mark but a 4s haircut. Default path (model off) keeps params.copy_latency_ms exactly:
+    # byte-identical (legacy synthetic actions like FOLLOWER_TRAIL_* keep their historical charge).
+    if params.exit_latency_ms is not None or str(a.get("action_type", "")) == "SL_EXIT":
+        _eff_lat_ms = max(0, int(our_ts) - int(a.get("ts", our_ts)))
+    else:
+        _eff_lat_ms = params.copy_latency_ms
+    lat_frac = min(1.0, _eff_lat_ms / 60_000.0)   # fraction of a 1m bar our latency spans
     vol_proxy = _bar_vol_proxy(md, coin, our_ts)             # UNSIGNED |return| of the PRIOR closed bar
     latency_drift_bps = 0.0
     if lat_frac > 0.0 and vol_proxy == vol_proxy:
@@ -1283,6 +1553,9 @@ def _rt_close(summary: dict, coin: str, our_ts=None, close_reason: str = "normal
         "side": int(acc.get("side", 0)), "entry_ts": acc.get("entry_ts"),
         "exit_ts": (int(our_ts) if our_ts is not None else None),
         "peak_notional": peak, "realized_pnl_after_cost": float(pnl),
+        "realized_component_after_cost": float(pnl),
+        "unrealized_pnl_at_cutoff": 0.0,
+        "marked_pnl_after_cost": float(pnl),
         "r_i": (pnl / peak if peak > 0 else None),
         "n_addon": int(acc.get("n_addon", 0)), "n_trim": int(acc.get("n_trim", 0)),
         "addon_notional": addon_notional,
@@ -1304,6 +1577,66 @@ def _rt_close(summary: dict, coin: str, our_ts=None, close_reason: str = "normal
             float(acc.get("n_uw", 0)) / float(acc.get("n_samp", 0)) if acc.get("n_samp", 0) else 0.0),
         "close_reason": close_reason, "closed": True,
     })
+
+
+def _snapshot_open_round_trips(st: "AccountState", md: "MarketData", summary: dict,
+                               cutoff_ts: int) -> None:
+    """Emit non-mutating, marked-at-cutoff records for every tracked open RT.
+
+    Open winners do not improve the conservative ranking return; open losses do
+    reduce it. This prevents a leader from manufacturing a high closed-trip win
+    rate by retaining losing inventory indefinitely.
+    """
+    marks = _marks(st, md, cutoff_ts)
+    open_coins = [coin for coin, p in st.positions.items() if abs(p.szi) > 0]
+    tracked = 0
+    marked_total = 0.0
+    loss_debit = 0.0
+    for coin in open_coins:
+        acc = summary["_rt"].get(coin)
+        p = st.positions.get(coin)
+        mark = marks.get(coin)
+        if acc is None or p is None or mark is None or not np.isfinite(mark) or mark <= 0:
+            continue
+        tracked += 1
+        _rt_update_excursions(acc, float(mark), float(acc.get("entry_px", p.entry_px)),
+                              int(acc.get("side", 1 if p.szi > 0 else -1)))
+        realized_component = float(acc["realized"] - acc["fee"] + acc["funding"])
+        unrealized = float(p.szi * (float(mark) - float(p.entry_px)))
+        marked = realized_component + unrealized
+        marked_total += marked
+        loss_debit += min(0.0, marked)
+        peak = max(float(acc.get("peak_notional", 0.0) or 0.0), abs(float(p.szi) * float(mark)))
+        addon_notional = float(acc.get("addon_notional", 0.0) or 0.0)
+        entry_ts = acc.get("entry_ts")
+        summary["_positions"].append({
+            "entity_id": summary["entity_id"], "fold_id": summary["fold_id"], "coin": coin,
+            "side": int(acc.get("side", 0)), "entry_ts": entry_ts, "exit_ts": int(cutoff_ts),
+            "peak_notional": peak, "realized_pnl_after_cost": marked,
+            "realized_component_after_cost": realized_component,
+            "unrealized_pnl_at_cutoff": unrealized, "marked_pnl_after_cost": marked,
+            "r_i": (marked / peak if peak > 0 else None),
+            "n_addon": int(acc.get("n_addon", 0)), "n_trim": int(acc.get("n_trim", 0)),
+            "addon_notional": addon_notional,
+            "underwater_add_notional": float(acc.get("underwater_add_notional", 0.0) or 0.0),
+            "underwater_add_ratio": (
+                float(acc.get("underwater_add_notional", 0.0) or 0.0) / addon_notional
+                if addon_notional > 0 else 0.0),
+            "mae": float(acc.get("mae", 0.0) or 0.0),
+            "mfe": float(acc.get("mfe", 0.0) or 0.0),
+            "mfe_giveback": (float(acc.get("mfe", 0.0) or 0.0) - marked / peak
+                              if peak > 0 else None),
+            "time_underwater": (float(acc.get("n_uw", 0)) / float(acc.get("n_samp", 0))
+                                  if acc.get("n_samp", 0) else 0.0),
+            "open_age_h": ((int(cutoff_ts) - int(entry_ts)) / MS_HOUR if entry_ts is not None else None),
+            "close_reason": "cutoff_mark", "closed": False,
+        })
+    total = len(open_coins)
+    summary["n_open_positions_at_cutoff"] = total
+    summary["n_open_positions_marked_at_cutoff"] = tracked
+    summary["censoring_coverage"] = (tracked / total) if total else 1.0
+    summary["marked_open_pnl_total"] = marked_total
+    summary["open_loss_debit"] = loss_debit
 
 
 def _book_fill(st: AccountState, md: MarketData, coin: str, delta_szi: float, fill_px: float,
@@ -1850,11 +2183,20 @@ def _finalize(st, fills, events, equity_samples, summary, md, start_equity):
     nrt = summary["n_round_trips"]
     summary["round_trip_win_rate"] = (summary["n_round_trip_wins"] / nrt) if nrt > 0 else 0.0
     summary["realized_roe"] = (summary["realized_pnl_total"] / start_equity) if start_equity > 0 else 0.0
+    summary["conservative_pnl_total"] = summary["realized_pnl_total"] + summary.get("open_loss_debit", 0.0)
+    summary["conservative_roe"] = (
+        summary["conservative_pnl_total"] / start_equity if start_equity > 0 else 0.0)
     # CHANGE B: declare the latency-cost model used to price every fill (see _apply_order).
     summary["latency_model"] = "bar_drift_v1"
     if not summary["outcome_states"]:
         summary["outcome_states"].add("survived")
     summary["outcome_states"] = sorted(summary["outcome_states"])
+    # LOUD MARK COVERAGE: deterministic (sorted BEFORE the 20-cap) coin list + true distinct count,
+    # so the cap can never hide cardinality. List here (structured for in-process consumers like
+    # m09); joined to a str at the run_shortlist writer site next to outcome_states.
+    _upc = sorted(summary.pop("_unpriced_coins", set()))
+    summary["n_unpriced_coins"] = len(_upc)
+    summary["unpriced_coins"] = _upc[:20]
     ending_state = {"cross_collateral": dict(st.cross_collateral),
                     "positions": {c: vars(p) for c, p in st.positions.items()},
                     "cooldown_until_ms": st.cooldown_until_ms}
@@ -2015,7 +2357,15 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
                   copy_latency_ms: int = 4_000, sizing_mode: str = "fixed_position",  # latency measured 2026-07-27;
                   # sizing default flipped off leader_equity 2026-07-30 (silent-zero-orders trap + M1 remnant)
                   fixed_target_exposure: float = 0.10,
-                  copy_policy: str = "full_mirror", trail_pct: float = 0.15):
+                  fixed_notional_usd: float = 100.0,
+                  reversal_mode: str = "flip",
+                  exit_latency_ms: Optional[int] = None,
+                  exit_entry_grace_ms: int = 90_000,
+                  leader_dust_floor_usd: float = 0.0,
+                  sl_bps: Optional[float] = None,
+                  global_stop_pct: Optional[float] = None,
+                  copy_policy: str = "full_mirror", trail_pct: float = 0.15,
+                  shard_index: int = 0, shard_count: int = 1):
     import shutil
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -2040,6 +2390,17 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
 
     sl = pd.read_parquet(shortlist_path, columns=["entity_id", "primary_wallet", "fold_id", "in_shortlist"])
     sl = sl[sl.in_shortlist].copy()
+    if shard_count < 1 or not (0 <= shard_index < shard_count):
+        raise ValueError(f"invalid M07 shard {shard_index}/{shard_count}")
+    if shard_count > 1:
+        # Keep every fold-seat for a wallet in one worker. Python's hash() is process-randomized, so
+        # use SHA256 for stable assignment across reruns and hosts.
+        import hashlib as _hashlib
+        wallet_shard = sl["primary_wallet"].astype(str).map(
+            lambda w: int.from_bytes(_hashlib.sha256(w.encode()).digest()[:8], "big") % shard_count
+        )
+        sl = sl[wallet_shard == shard_index].copy()
+        logger.info("M7 deterministic worker shard %d/%d: %d seats", shard_index, shard_count, len(sl))
     if limit_entities:
         keep = sl.entity_id.drop_duplicates().head(limit_entities)
         sl = sl[sl.entity_id.isin(keep)]
@@ -2123,9 +2484,21 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
         slippage_band=band, follower_trail=follower_trail,
         copy_latency_ms=copy_latency_ms, sizing_mode=sizing_mode,
         fixed_target_exposure=fixed_target_exposure,
+        fixed_notional_usd=fixed_notional_usd,
+        reversal_mode=reversal_mode,
+        exit_latency_ms=exit_latency_ms,
+        exit_entry_grace_ms=exit_entry_grace_ms,
+        leader_dust_floor_usd=leader_dust_floor_usd,
+        sl_bps=sl_bps,
+        global_stop_pct=global_stop_pct,
         copy_policy=copy_policy, trail_pct=trail_pct,
     )
 
+    # LOUD MARK COVERAGE (2026-08-07): bounded in-loop per-fold accumulator (<= n_folds entries;
+    # never re-reads the sharded summary parquet). SHARD-LOCAL: this table sees only this worker's
+    # wallet-hash shard — a fold can be 0-fill here yet healthy globally. The merged-level hard gate
+    # lives in m06b.walk_forward_confirm; this table is the operator's early signal.
+    fold_cov: dict[int, dict[str, int]] = {}
     for w in wallets:
         try:
             wdf = shard_ds.to_table(filter=ds.field("wallet") == w).to_pandas()
@@ -2142,11 +2515,83 @@ def run_shortlist(actions_path: Path, shortlist_path: Path, folds_path: Path, ou
             fw.add_many(res["fills"]); ew.add_many(res["events"]); qw.add_many(res["equity"])
             pw.add_many(res["positions"])   # INCREMENT 1: per-position records (streamed, bounded)
             sm = res["summary"]; sm["outcome_states"] = ",".join(sm["outcome_states"])
+            # unpriced_coins: str always (possibly ""), never None — a shard must not infer a
+            # null-typed column (breaks the permissive merge unify).
+            sm["unpriced_coins"] = ",".join(sm.get("unpriced_coins") or [])
+            fc = fold_cov.setdefault(int(fold_id), {"seats": 0, "fills": 0, "actions": 0, "unpriced": 0})
+            fc["seats"] += 1
+            fc["fills"] += int(sm.get("n_fills", 0))
+            fc["actions"] += int(sm.get("n_actions", 0))
+            fc["unpriced"] += int(sm.get("n_actions_unpriced", 0))
             sw.add(sm)
     nf, ne, ns, nq, npos = fw.close(), ew.close(), sw.close(), qw.close(), pw.close()
+    _shard_tag = f"shard {shard_index}/{shard_count}"
+    logger.info("M7 MARK COVERAGE (%s, shard-local): fold_id seats fills actions unpriced pct", _shard_tag)
+    for fid in sorted(fold_cov):
+        fc = fold_cov[fid]
+        pct = (fc["unpriced"] / fc["actions"]) if fc["actions"] > 0 else 0.0
+        logger.info("M7 MARK COVERAGE (%s): %4d %6d %8d %9d %9d %6.1f%%",
+                    _shard_tag, fid, fc["seats"], fc["fills"], fc["actions"], fc["unpriced"], pct * 100)
+        if fc["actions"] > 0 and pct > 0.10:
+            logger.warning("M7 MARK COVERAGE (%s): fold %d has %.1f%% UNPRICED actions "
+                           "(mark starvation — check the candle store)", _shard_tag, fid, pct * 100)
+        if fc["seats"] > 0 and fc["actions"] > 0 and fc["fills"] == 0:
+            logger.error("M7 MARK COVERAGE (%s): fold %d produced ZERO fills from %d actions within "
+                         "THIS SHARD — if this holds across shards, the m06b gate will refuse it",
+                         _shard_tag, fid, fc["actions"])
     logger.info("M7 runner done: %d fills, %d events, %d summaries, %d equity, %d positions",
                 nf, ne, ns, nq, npos)
     return {"fills": nf, "events": ne, "summaries": ns, "equity": nq, "positions": npos}
+
+
+_M07_OUTPUT_NAMES = ("m07_fills.parquet", "m07_events.parquet", "m07_summary.parquet",
+                     "m07_equity.parquet", "m07_positions.parquet")
+
+
+def merge_m07_worker_outputs(worker_dirs: list[Path], out_dir: Path) -> None:
+    """Deterministically stream worker artifacts into the canonical five M07 Parquet files.
+
+    Each worker owns a disjoint stable set of wallets. The merge reads bounded record batches and
+    atomically replaces each destination, so parallel execution changes wall time only and a failed
+    merge cannot publish a partial canonical artifact.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if not worker_dirs:
+        raise ValueError("M07 merge needs at least one worker directory")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name in _M07_OUTPUT_NAMES:
+        sources = [d / name for d in worker_dirs]
+        missing = [str(p) for p in sources if not p.is_file()]
+        if missing:
+            raise FileNotFoundError(f"M07 merge missing worker outputs for {name}: {missing}")
+        schemas = [pq.read_schema(p) for p in sources]
+        try:
+            unified = pa.unify_schemas(schemas, promote_options="permissive")
+        except TypeError:
+            unified = pa.unify_schemas(schemas)
+        dest = out_dir / name
+        tmp = dest.with_suffix(dest.suffix + ".merge_tmp")
+        writer = pq.ParquetWriter(tmp, unified, compression="snappy")
+        rows = 0
+        try:
+            for source in sources:  # worker-index order is deterministic
+                pf = pq.ParquetFile(source)
+                for batch in pf.iter_batches(batch_size=200_000):
+                    table = pa.Table.from_batches([batch])
+                    if table.schema != unified:
+                        if table.schema.names != unified.names:
+                            for col in (n for n in unified.names if n not in table.schema.names):
+                                table = table.append_column(col, pa.nulls(table.num_rows, unified.field(col).type))
+                            table = table.select(unified.names)
+                        table = table.cast(unified, safe=False)
+                    writer.write_table(table)
+                    rows += table.num_rows
+        finally:
+            writer.close()
+        tmp.replace(dest)
+        logger.info("M7 merged %s: %d rows from %d workers", name, rows, len(worker_dirs))
 
 
 def main():
@@ -2167,9 +2612,12 @@ def main():
     ap.add_argument("--copy-latency-ms", type=int, default=2_000,
                     help="copy entry lag in ms (2000=typical, 15000=P95 tail stress)")
     ap.add_argument(
-        "--sizing-mode", choices=("leader_equity", "fixed_position"),
+        "--sizing-mode", choices=("leader_equity", "fixed_position", "fixed_notional"),
         default="fixed_position",
-        help="fixed_position (default) = signed direction x --fixed-target-exposure. "
+        help="fixed_position (default) = signed direction x --fixed-target-exposure (compounds with "
+             "sleeve equity + emits drift-rebalance orders). fixed_notional = LIVE-PARITY flat $ per "
+             "leg (--fixed-notional-usd), sized once at entry, no compounding, no drift-rebalance "
+             "(matches hl_copy_trader_v17 sizing_mode 'fixed' + order_size_usd; plan v2 2026-08-06). "
              "leader_equity is DEPRECATED and refuses to run (M1 remnant; the column it reads is "
              "100%% NULL in every store, so it silently emitted zero orders).",
     )
@@ -2177,17 +2625,64 @@ def main():
         "--fixed-target-exposure", type=float, default=0.10,
         help="Absolute follower exposure per open leader position in fixed_position mode.",
     )
+    ap.add_argument(
+        "--fixed-notional-usd", type=float, default=100.0,
+        help="fixed_notional mode: flat $ notional per (wallet,coin) leg, matching live order_size_usd.",
+    )
+    ap.add_argument(
+        "--reversal-mode", choices=("flip", "flatten_only"), default="flip",
+        help="flip (default, legacy) = open the far side on a leader sign flip. flatten_only = "
+             "LIVE-PARITY (copy_reverse_enabled=False): flatten on flip, stay out until the leader "
+             "passes through flat and opens again (plan v2 divergence #3).",
+    )
+    ap.add_argument(
+        "--exit-latency-ms", type=int, default=None,
+        help="LIVE-PARITY exit model (plan v2 divergence #5): latency for leader-flat/dust exits "
+             "(live REST-poll detection ~25-30s). Default None = legacy (exits at --copy-latency-ms).",
+    )
+    ap.add_argument(
+        "--exit-entry-grace-ms", type=int, default=90_000,
+        help="exit model: a held leg younger than this cannot confirm-exit (live 90s entry grace).",
+    )
+    ap.add_argument(
+        "--leader-dust-floor-usd", type=float, default=0.0,
+        help="exit model: leader |position|*mark below this counts as flat (live $10). 0 = off.",
+    )
+    ap.add_argument(
+        "--sl-bps", type=float, default=None,
+        help="LIVE-PARITY per-leg hard stop in bps of entry price (live -2500 = -25%%). None = off.",
+    )
+    ap.add_argument(
+        "--global-stop-pct", type=float, default=None,
+        help="LIVE-PARITY latched account stop vs START equity (live 0.15). None = off. "
+             "Checked at action cursors + fold end (documented granularity approximation).",
+    )
     ap.add_argument("--copy-policy", choices=("full_mirror", "entry_trail"), default="full_mirror",
                     help="(a) full_mirror = copy every add/trim; (b) entry_trail = mirror ENTRY only, exit on OUR trailing-TP.")
     ap.add_argument("--trail-pct", type=float, default=0.15, help="entry_trail: trailing-TP retrace-from-peak threshold.")
+    ap.add_argument("--shard-index", type=int, default=0)
+    ap.add_argument("--shard-count", type=int, default=1)
+    ap.add_argument("--merge-shard-dir", action="append", default=[],
+                    help="Merge mode: repeat once per completed worker directory.")
     args = ap.parse_args()
+    if args.merge_shard_dir:
+        merge_m07_worker_outputs([Path(p) for p in args.merge_shard_dir], Path(args.out))
+        return
     run_shortlist(Path(args.actions), Path(args.shortlist), Path(args.folds), Path(args.out),
                   band=args.band, limit_entities=args.limit, start_equity=args.start_equity,
                   require_cache=args.require_cache, window=args.window, slip_calib_path=args.slip_calib,
                   follower_trail=args.follower_trail, copy_latency_ms=args.copy_latency_ms,
                   sizing_mode=args.sizing_mode,
                   fixed_target_exposure=args.fixed_target_exposure,
-                  copy_policy=args.copy_policy, trail_pct=args.trail_pct)
+                  fixed_notional_usd=args.fixed_notional_usd,
+                  reversal_mode=args.reversal_mode,
+                  exit_latency_ms=args.exit_latency_ms,
+                  exit_entry_grace_ms=args.exit_entry_grace_ms,
+                  leader_dust_floor_usd=args.leader_dust_floor_usd,
+                  sl_bps=args.sl_bps,
+                  global_stop_pct=args.global_stop_pct,
+                  copy_policy=args.copy_policy, trail_pct=args.trail_pct,
+                  shard_index=args.shard_index, shard_count=args.shard_count)
 
 
 if __name__ == "__main__":

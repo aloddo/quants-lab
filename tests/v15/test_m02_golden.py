@@ -13,6 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "research" / "v15"))
 import v15_m02_journey_trace as m02  # noqa: E402
+import v15_m01_equity_reconstruct as m01  # noqa: E402
 from v15_m02_journey_trace import LifecycleFillEvent  # noqa: E402
 from test_m02 import _fill  # noqa: E402
 
@@ -142,7 +143,7 @@ class _EE:
 def test_p1_nonfinite_mark_is_unsizeable(monkeypatch):
     f = _fill(120_000, "BTC", "B", 1, 100, 0, tid=1)
     for bad in (float("nan"), float("inf")):
-        monkeypatch.setattr(m02.m01, "get_mark", lambda *a, **k: bad)
+        monkeypatch.setattr(m01, "get_mark", lambda *a, **k: bad)
         actions, _j = m02.trace_wallet("0x", [_EE(f)], [f], [], equity_enriched=True)
         assert actions[0]["target_exposure_pct"] is None   # NaN/inf mark never becomes a target
         assert actions[0]["mark"] is None
@@ -157,7 +158,7 @@ def test_p1_nonfinite_source_equity_nulled(monkeypatch):
     # codex r5: a non-finite source_equity_post from M01 must be nulled in the action row (never a trusted
     # non-finite equity), and the action is unsizeable.
     f = _fill(120_000, "BTC", "B", 1, 100, 0, tid=1)
-    monkeypatch.setattr(m02.m01, "get_mark", lambda *a, **k: 100.0)
+    monkeypatch.setattr(m01, "get_mark", lambda *a, **k: 100.0)
     actions, _j = m02.trace_wallet("0x", [_EE_bad_equity(f)], [f], [], equity_enriched=True)
     assert actions[0]["source_equity_post"] is None
     assert actions[0]["target_exposure_pct"] is None
@@ -165,7 +166,7 @@ def test_p1_nonfinite_source_equity_nulled(monkeypatch):
 
 def test_p1_finite_mark_still_sizes(monkeypatch):
     f = _fill(120_000, "BTC", "B", 1, 100, 0, tid=1)
-    monkeypatch.setattr(m02.m01, "get_mark", lambda *a, **k: 100.0)
+    monkeypatch.setattr(m01, "get_mark", lambda *a, **k: 100.0)
     actions, _j = m02.trace_wallet("0x", [_EE(f)], [f], [], equity_enriched=True)
     # position_after=1, mark=100, equity=1000 -> target 0.1
     assert actions[0]["target_exposure_pct"] is not None

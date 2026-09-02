@@ -546,6 +546,36 @@ def test_ending_account_state_returned():
     assert "BTC" in eas["positions"]      # the open long carries into ending state for M9 chaining
 
 
+def test_open_position_is_marked_and_loss_debited_at_cutoff():
+    prices = np.linspace(100.0, 80.0, 200)
+    md = FakeMarketData(ohlc=_ohlc_path("BTC", prices))
+    acts = pd.DataFrame([_action("BTC", T0 + 5 * E.MS_MIN, 0.5, "ENTRY", position_after=1.0)])
+    end = T0 + 150 * E.MS_MIN
+    res = _run(acts, md, end=end)
+    open_rows = [p for p in res["positions"] if p["closed"] is False]
+    assert len(open_rows) == 1
+    row = open_rows[0]
+    assert row["close_reason"] == "cutoff_mark"
+    assert row["unrealized_pnl_at_cutoff"] < 0
+    assert row["marked_pnl_after_cost"] < 0
+    summary = res["summary"]
+    assert summary["censoring_coverage"] == 1.0
+    assert summary["open_loss_debit"] < 0
+    assert summary["conservative_pnl_total"] < summary["realized_pnl_total"]
+
+
+def test_untracked_carry_in_is_visible_as_incomplete_censoring():
+    md = FakeMarketData(ohlc=_flat_ohlc("BTC", T0, 200, 100.0))
+    start = E.AccountState(cross_collateral={"main": 5000.0})
+    start.positions["BTC"] = E.Position("BTC", szi=50.0, entry_px=100.0, mode="cross", leverage=1.0)
+    res = E.step_subaccount(pd.DataFrame([]), md, 10_000.0,
+                            E.EngineParams(copy_latency_ms=0, sizing_mode="leader_equity"),
+                            end_ts_ms=T0 + 100 * E.MS_MIN, start_ts_ms=T0, start_state=start)
+    assert res["summary"]["n_open_positions_at_cutoff"] == 1
+    assert res["summary"]["n_open_positions_marked_at_cutoff"] == 0
+    assert res["summary"]["censoring_coverage"] == 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Streaming
 # --------------------------------------------------------------------------- #
@@ -1016,3 +1046,24 @@ def test_follower_trail_records_ruin_if_flatten_nonpositive():
                             end_ts_ms=T0 + 8 * E.MS_MIN, start_ts_ms=T0, start_state=start)
     assert res["ending_account_state"]["positions"] == {}
     assert res["summary"]["ruin"], "non-positive post-flatten equity must record ruin"
+
+
+def test_merge_m07_worker_outputs_streams_all_rows(tmp_path):
+    """Parallel workers publish every disjoint row in deterministic worker order."""
+    names = (
+        "m07_fills.parquet", "m07_events.parquet", "m07_summary.parquet",
+        "m07_equity.parquet", "m07_positions.parquet",
+    )
+    workers = [tmp_path / "w0", tmp_path / "w1"]
+    for wi, worker in enumerate(workers):
+        worker.mkdir()
+        for name in names:
+            pd.DataFrame({"worker": [wi], "value": [wi + 0.5]}).to_parquet(worker / name, index=False)
+
+    out = tmp_path / "merged"
+    E.merge_m07_worker_outputs(workers, out)
+
+    for name in names:
+        got = pd.read_parquet(out / name)
+        assert got["worker"].tolist() == [0, 1]
+        assert got["value"].tolist() == [0.5, 1.5]

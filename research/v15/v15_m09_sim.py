@@ -14,10 +14,13 @@ tolerated+flagged, NOT force-trimmed (winners compound untouched; strategy §7).
 """
 from __future__ import annotations
 
+import argparse
 import copy
+import json
 import logging
 import tempfile
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -46,8 +49,24 @@ class M9Manifest:
     # action clears min-notional. viable_slice = min_order_notional / min_action_exposure_frac, with a
     # floor so a tiny exposure_frac doesn't demand an absurd slice. accessible_frac (M5) refines it.
     min_accessible_frac: float = 0.50      # need >=50% of actions to clear min-notional to be feasible
-    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position
+    sizing_mode: str = "leader_equity"      # leader_equity | fixed_position | fixed_notional
     fixed_target_exposure: float = 0.10
+    # PARITY 2026-08-06 (settled design; threads the m07 live-parity knobs through the portfolio sim).
+    # Defaults preserve prior behavior EXACTLY (they equal the m07 EngineParams defaults, all inert):
+    #   fixed_notional_usd     -- flat $ per (wallet,coin) leg; used only when sizing_mode=="fixed_notional".
+    #   reversal_mode          -- "flip" (legacy) | "flatten_only" (live parity on leader sign flips).
+    #   exit_latency_ms        -- leader-flat/dust EXIT latency (None = legacy copy_latency_ms).
+    #   exit_entry_grace_ms    -- a leg younger than this cannot confirm-exit (live 90s entry grace).
+    #   leader_dust_floor_usd  -- leader |position|*mark below this counts as flat (live $10).
+    #   sl_bps                 -- per-leg hard stop in bps of entry (requires reversal_mode="flatten_only").
+    #   global_stop_pct        -- latched account stop vs sleeve start equity (fold-scoped; see threading site).
+    fixed_notional_usd: float = 100.0
+    reversal_mode: str = "flip"
+    exit_latency_ms: Optional[int] = None
+    exit_entry_grace_ms: int = 90_000
+    leader_dust_floor_usd: float = 0.0
+    sl_bps: Optional[float] = None
+    global_stop_pct: Optional[float] = None
 
 
 def sizing_chain_weight(quality_weight: float, m4_confidence: float, survival_mult: float) -> float:
@@ -244,6 +263,109 @@ def expected_leverage(
     return float(max(1.0, te.quantile(0.75)))
 
 
+# PARITY fixed_notional margin divisor fallback. LOUD: used ONLY when engine metadata (md.meta
+# .max_leverage) or the wallet's pretest coins are unavailable (e.g. fake-engine tests with md=None).
+# 5.0 is DELIBERATELY far below HL majors' 20-50x default max leverage, so the water-fill RESERVES
+# MORE margin per sleeve than the engine will actually need -- over-reserve (conservative), never
+# under-reserve. If this constant ever binds on a real run, wire the real metadata instead.
+FIXED_NOTIONAL_ASSUMED_LEVERAGE = 5.0
+
+# codex P1-C: a sleeve funded at EXACTLY fixed_notional/leverage has ZERO headroom, so the very leg
+# it was sized for fails m07's IM+fee admission (IM consumes the whole slice; the taker fee -- ~4.5bps
+# one-way on HL, plus slippage and lot/IM rounding -- has nothing left to draw on) and the order
+# rejects or downsizes. 1.05 is LOUD, deliberate over-reserve: ~5% margin headroom >> fee+slip+rounding
+# at any realistic leverage. Conservative: it can only make a sleeve ask for slightly MORE margin.
+FIXED_NOTIONAL_MARGIN_HEADROOM = 1.05
+
+
+def p90_concurrent_legs(adf: Optional[pd.DataFrame], window_end_ms: Optional[int] = None) -> float:
+    """PARITY fixed_notional sizing input: CAUSAL, OCCUPANCY-weighted estimate of how many fixed-$
+    legs a sleeve holds at once (codex P1-D: time-weighted, NOT event-weighted -- a burst of quick
+    flips must not out-vote a week-long holding). Reconstructs per-coin open state from the PRETEST
+    action stream (a coin is OPEN while position_after != 0) in (ts, event_order) order, then:
+      - SAME-TS BURSTS collapse to their FINAL state (all rows of one ts applied, sampled once);
+      - a NaN position_after KEEPS the coin's previous open/closed state (unknown != closed);
+      - each concurrency level is weighted by the TIME it persists (until the next distinct action
+        ts; the TERMINAL open state is weighted to `window_end_ms`, which production callers MUST
+        pass = the pretest window end pt1);
+      - p90 = time-weighted quantile: the smallest level covering >= 90% of the observed time.
+    FLOORED at 1.0 (a funded sleeve holds at least one leg). Fallback 1.0 when the stream is
+    missing/empty or lacks coin/position_after/ts; a stream with no measurable dwell (single instant,
+    no window end) falls back to its terminal holding. Callers MUST pass pretest actions only (never
+    the test fold -- that would be look-ahead)."""
+    if adf is None or len(adf) == 0:
+        return 1.0
+    if "stream_replay_valid" in adf.columns:
+        adf = adf[adf["stream_replay_valid"].fillna(False).astype(bool)]
+    if len(adf) == 0 or not {"coin", "position_after", "ts"}.issubset(adf.columns):
+        return 1.0
+    order = [c for c in ("ts", "event_order") if c in adf.columns]
+    adf = adf.sort_values(order)
+    ts_arr = pd.to_numeric(adf["ts"], errors="coerce").to_numpy(dtype="float64")
+    coins = adf["coin"].astype(str).to_numpy()
+    pas = pd.to_numeric(adf["position_after"], errors="coerce").to_numpy(dtype="float64")
+    open_coins: set = set()
+    samples: list[list] = []                    # [ts, level AFTER all rows at this ts]
+    for i in range(len(adf)):
+        t = ts_arr[i]
+        if not np.isfinite(t):
+            continue
+        pa = pas[i]
+        if pa != pa:
+            pass                                # NaN: unknown -> keep the coin's previous state
+        elif abs(float(pa)) > 1e-12:
+            open_coins.add(coins[i])
+        else:
+            open_coins.discard(coins[i])
+        t = int(t)
+        if samples and samples[-1][0] == t:
+            samples[-1][1] = len(open_coins)    # same-ts burst: only the FINAL state counts
+        else:
+            samples.append([t, len(open_coins)])
+    if not samples:
+        return 1.0
+    levels: list[float] = []
+    weights: list[float] = []
+    for i, (t, lv) in enumerate(samples):
+        if i + 1 < len(samples):
+            w = samples[i + 1][0] - t
+        else:
+            w = (int(window_end_ms) - t) if (window_end_ms is not None and int(window_end_ms) > t) else 0
+        if w > 0:
+            levels.append(float(lv))
+            weights.append(float(w))
+    if not weights:
+        # degenerate: no measurable dwell (single-instant stream / missing window end). The only
+        # defensible estimate is the terminal holding.
+        return float(max(1.0, samples[-1][1]))
+    order_ix = np.argsort(levels, kind="stable")
+    lv_sorted = np.asarray(levels, dtype="float64")[order_ix]
+    w_sorted = np.asarray(weights, dtype="float64")[order_ix]
+    cum = np.cumsum(w_sorted)
+    k = int(np.searchsorted(cum, 0.90 * cum[-1], side="left"))
+    return float(max(1.0, lv_sorted[min(k, len(lv_sorted) - 1)]))
+
+
+def _assumed_sleeve_leverage(md, pre_adf: Optional[pd.DataFrame]) -> float:
+    """Margin divisor for a fixed_notional sleeve's desired water-fill margin: the MINIMUM HL default
+    max leverage across the coins the wallet actually traded in the PRETEST window (the most
+    margin-hungry leg bounds the sleeve's margin need -- conservative). The engine opens copied
+    positions at md.meta.max_leverage(coin) (v15_m07_engine), so this is the same metadata the run
+    will use. Falls back to FIXED_NOTIONAL_ASSUMED_LEVERAGE when metadata/coins are unavailable."""
+    meta = getattr(md, "meta", None) if md is not None else None
+    if meta is None or pre_adf is None or len(pre_adf) == 0 or "coin" not in pre_adf.columns:
+        return FIXED_NOTIONAL_ASSUMED_LEVERAGE
+    levs = []
+    for c in pd.unique(pre_adf["coin"].dropna()):
+        try:
+            lv = float(meta.max_leverage(str(c)))
+        except Exception:
+            continue
+        if np.isfinite(lv) and lv > 0:
+            levs.append(lv)
+    return float(min(levs)) if levs else FIXED_NOTIONAL_ASSUMED_LEVERAGE
+
+
 def apply_gross_budget(funded: dict, carried_exposure: dict, lev: dict, gross_budget_notional: float,
                        eps: float = 1e-9) -> tuple:
     """ENFORCE the AGGREGATE levered-margin budget (manifest gross_cap): the total resulting NOTIONAL
@@ -420,7 +542,10 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                     pool_provider: str = "ranked", seed: Optional[int] = None,
                     corr: Optional[dict] = None, out_dir: Optional[str] = None,
                     flush_rows: int = 250_000, mem_soft_gb: float = 12.0,
-                    allow_global_m04: bool = False) -> dict:
+                    allow_global_m04: bool = False,
+                    slip_calib_per_fold: Optional[dict] = None,
+                    slip_calib_version: Optional[str] = None,
+                    pinned_wallets: Optional[set] = None) -> dict:
     """M9-v2 fixed-bankroll CHAINED portfolio sim over the 8 contiguous test folds. Per fold: select
     (M6b in_pool, drop M8 KILL), size via the sizing chain, run M7 per subaccount on that fold's TEST
     actions (carried state for continuing entities = winners compound untouched; new entities cold-start
@@ -438,12 +563,22 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
     AGGREGATE levered-margin / gross cap (total resulting notional <= bankroll x gross_cap; per-leader
     leverage copied untouched). Cash from selected-but-unrunnable entities (no wallet / funded<=0) is
     RETURNED to cash (no leak). Fixed bankroll, no-hindsight rebalance, causal, G4-DD-kill intact."""
-    # Matched-null pool construction is not wired yet. Previously the argument
-    # was ignored, so a caller could request ``matched_null`` and receive the
-    # ranked strategy path mislabeled as a null sample. Fail closed until M10's
-    # quality-matched provider is implemented and tested.
-    if pool_provider != "ranked":
+    if pool_provider not in {"ranked", "matched_null", "pinned"}:
         raise NotImplementedError(f"unsupported M9 pool_provider: {pool_provider!r}")
+    if pool_provider == "matched_null" and seed is None:
+        raise ValueError("matched_null requires an explicit seed")
+    # HOLD-THE-COHORT provider (2026-08-07, task 9): the m10 development verdict buried per-fold
+    # score rotation (-17.2% chained, worse than 98.9% of matched nulls). "pinned" holds a FIXED
+    # wallet list through the chain: per fold, the candidate pool is restricted to the pinned
+    # wallets BEFORE anti-corr/caps/water-fill; everything else (sizing chain, kills, carried
+    # compounding, boundary flattens) is unchanged. SEMANTICS = pinned-if-rankable: a fold where a
+    # pinned wallet has no in_pool row holds NO sleeve for it that fold (its carried sleeve is
+    # flattened at the boundary by the standard drop mechanics; no un-rankable resurrection).
+    if pool_provider == "pinned":
+        if not pinned_wallets:
+            raise ValueError("pool_provider='pinned' requires a non-empty pinned_wallets set")
+        pinned_wallets = {str(w).lower() for w in pinned_wallets}
+    rng = np.random.default_rng(seed) if pool_provider == "matched_null" else None
     install_memory_guard(soft_gb=mem_soft_gb, label="m09_chained")
     conf_map = {"CLEAN": 1.0, "UNCERTAIN": 0.25, "SUSPICIOUS": 0.10, "KILL": 0.0}
     corr = corr or {}
@@ -481,7 +616,9 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
     eq_writer = ShardedParquetWriter(base / "m09_chained_equity.parquet", flush_rows=flush_rows)
     fold_writer = ShardedParquetWriter(base / "m09_per_fold.parquet", flush_rows=max(1, flush_rows))
 
-    carried: dict = {}            # entity_id -> {"state": AccountState, "equity": float, "wallet": str}
+    # Cross-fold identity MUST be the stable wallet address. entity_id is a fold-local positional seat
+    # and can refer to a different wallet in the next fold.
+    carried: dict = {}            # wallet -> {"state", "equity", "wallet", "entity_id"}
     cash = float(b0)
     per_fold = []                 # bounded (<= n_folds rows) summary kept in RAM for the M10-input return
     entity_pnl = {}               # entity_id -> cumulative realized+unrealized PnL contribution
@@ -509,9 +646,22 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         params.copy_latency_ms = 0
         params.sizing_mode = m.sizing_mode
         params.fixed_target_exposure = m.fixed_target_exposure
+        # PARITY: thread the sizing knobs so a fixed_notional book closes under its own sizing
+        # contract; reversal_mode is a no-op on a pure close-to-flat stream but kept consistent.
+        # The stops/exit-latency knobs are deliberately NOT threaded here: the boundary flatten is
+        # a mechanical zero-latency close-all (drop/rebalance), not leader-driven copying -- an SL
+        # or exit-latency model applied to synthetic EXIT rows would change close pricing paths.
+        params.fixed_notional_usd = m.fixed_notional_usd
+        params.reversal_mode = m.reversal_mode
+        # codex P1-E (defect PRE-EXISTING at HEAD, fixed here): m07 filters actions to the half-open
+        # window [start_ts_ms, end_ts_ms) (v15_m07_engine.py:762), so end_ts_ms == ts_ms DROPPED the
+        # synthetic EXIT rows and the boundary close booked NO fill -- the dropped sleeve became cash
+        # at pure mark, paying zero fees/slippage. end_ts_ms = ts_ms + 1 makes the window contain the
+        # close; copy_latency_ms = 0 keeps the fill AT ts_ms, so the close now prices through the
+        # full m07 fee+slippage path (asserted by test_boundary_flatten_close_pays_fee_and_slip).
         res = eng.step_subaccount(
             pd.DataFrame(rows), md, float(record["equity"]), params,
-            end_ts_ms=int(ts_ms), start_ts_ms=int(ts_ms),
+            end_ts_ms=int(ts_ms) + 1, start_ts_ms=int(ts_ms),
             start_state=state, entity_id=eid, fold_id=fid,
         )
         # codex m09 r3: finite-gate the flatten proceeds before they re-enter cash (a non-finite exit equity
@@ -521,6 +671,11 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
 
     for fr in fold_rows.itertuples():
         fid = int(fr.fold_id)
+        # M07's standalone runner installs the causal, per-fold calibration before every seat. M09
+        # must do the same before it replays the selected subaccounts; otherwise the portfolio stage
+        # silently uses whichever calibration happened to be installed last on the shared MarketData.
+        if slip_calib_per_fold is not None:
+            md.set_slip_calib(slip_calib_per_fold.get(fid), slip_calib_version)
         t0 = pd.Timestamp(fr.test_start).value // 1_000_000
         t1 = pd.Timestamp(fr.test_end_excl).value // 1_000_000
         # PRETEST (causal) window [train_start_k, test_start_k) -- the SAME look-ahead-safe window M5/M6
@@ -533,6 +688,7 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         eweight = {}
         tier_of = {}
         prio_rows = []
+        prio_of = {}
         accessible_frac_of = {}   # codex m09 P1: M5 accessibility per entity for min-notional feasibility
         for r in fold_pool.itertuples():
             eid = int(r.entity_id)
@@ -547,9 +703,23 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                 desired[eid] = w
                 eweight[eid] = {"max_surv": tk.get("max_survivable_slice", np.inf)}
                 tier_of[eid] = etier
-                prio_rows.append({"entity_id": eid, "select_priority": float(r.quality_weight) * surv})
+                # The M10 null draws from the exact same causal top-100 quality/survival pool and
+                # retains the same sizing/caps/execution. It randomizes only which eligible peers win
+                # the target-count selection, isolating the incremental value of M6b's ordering.
+                priority = float(rng.random()) if rng is not None else float(r.quality_weight) * surv
+                prio_rows.append({"entity_id": eid, "select_priority": priority})
+                prio_of[eid] = priority   # rank map for the fixed_notional sleeve-count gross budget
                 _af = getattr(r, "accessible_frac_notional", getattr(r, "accessible_frac", None))
                 accessible_frac_of[eid] = (float(_af) if _af is not None and _af == _af else None)
+
+        # PINNED provider: restrict the fold's candidates to the held cohort BEFORE anti-corr/caps.
+        if pool_provider == "pinned":
+            for eid in list(desired):
+                w = str(_entity(eid, fid).get("primary_wallet") or "").lower()
+                if w not in pinned_wallets:
+                    desired.pop(eid, None); eweight.pop(eid, None); tier_of.pop(eid, None)
+                    prio_of.pop(eid, None)
+            prio_rows = [r for r in prio_rows if r["entity_id"] in desired]
 
         # ANTI-CORR prune + target_count ceiling (design §4): drop lower-ranked of a >rho_max pair.
         if prio_rows:
@@ -559,35 +729,67 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                 if eid not in keep_ids:
                     desired.pop(eid, None); eweight.pop(eid, None); tier_of.pop(eid, None)
         selected = set(desired)
+        selected_wallet_of = {
+            eid: str(_entity(eid, fid).get("primary_wallet"))
+            for eid in selected if _entity(eid, fid).get("primary_wallet") is not None
+        }
+        selected_wallets = set(selected_wallet_of.values())
 
         # DROP: carried entities not reselected (incl. anti-corr-pruned) -> flatten to cash at carried eq.
-        for eid in list(carried):
-            if eid not in selected:
-                before = float(carried[eid]["equity"])
-                after = _flatten_at_boundary(eid, carried[eid], t0, fid)
+        for wallet in list(carried):
+            if wallet not in selected_wallets:
+                record = carried[wallet]
+                before = float(record["equity"])
+                after = _flatten_at_boundary(int(record["entity_id"]), record, t0, fid)
                 cash += after
-                entity_pnl[eid] = entity_pnl.get(eid, 0.0) + (after - before)
-                del carried[eid]
+                entity_pnl[wallet] = entity_pnl.get(wallet, 0.0) + (after - before)
+                del carried[wallet]
 
         # SIZE new/top-up via cap-aware water-filling against the running portfolio equity.
         kept_equity = sum(c["equity"] for c in carried.values())
         portfolio_equity = kept_equity + cash
         cap_df = pd.DataFrame([{"entity_id": e, "max_survivable_slice": eweight[e]["max_surv"]} for e in selected])
         caps = effective_caps(cap_df, m, portfolio_equity) if len(cap_df) else {}
+        # PARITY fixed_notional SLEEVE MARGIN NEED (settled design B + codex P1-C/P1-D): under
+        # fixed_notional a sleeve's implied gross is FIXED by construction (fixed_notional_usd x
+        # expected concurrent legs), so its useful margin is bounded -- desired sleeve margin =
+        # fixed_notional_usd x p90_concurrent_legs / assumed_leverage x MARGIN_HEADROOM
+        # (>= fixed_notional_usd/assumed_leverage via the p90 floor: at least one leg; the 1.05
+        # headroom keeps the top-leverage leg clear of m07's IM+fee admission). Enforced by
+        # TIGHTENING the per-sleeve cap before the water-fill (extra margin past the need is wasted
+        # cash, never deployed). p90 legs come CAUSALLY from the PRETEST window only, occupancy-
+        # weighted with the terminal holding weighted to the pretest window end pt1.
+        p90_legs: dict = {}
+        if m.sizing_mode == "fixed_notional":
+            for eid in selected:
+                _w = _entity(eid, fid).get("primary_wallet")
+                _pre = acts_loader(_w, pt0, pt1) if _w is not None else None
+                p90_legs[eid] = p90_concurrent_legs(_pre, window_end_ms=pt1)
+                margin_need = ((m.fixed_notional_usd * p90_legs[eid])
+                               / _assumed_sleeve_leverage(md, _pre)) * FIXED_NOTIONAL_MARGIN_HEADROOM
+                caps[eid] = min(caps.get(eid, 0.0), margin_need)
         # SUSPICIOUS-cohort cap: the SUSPICIOUS tier's combined NEW margin <= suspicious_cohort_cap x
         # equity. Enforced as a per-entity ceiling tightened so the cohort's residual sums to the cap.
         susp = [e for e in selected if tier_of.get(e) == "SUSPICIOUS"]
         if susp:
             cohort_budget = m.suspicious_cohort_cap * portfolio_equity
-            susp_carried = sum(carried[e]["equity"] for e in susp if e in carried)
+            susp_carried = sum(
+                carried[selected_wallet_of[e]]["equity"]
+                for e in susp if selected_wallet_of.get(e) in carried
+            )
             cohort_new_room = max(0.0, cohort_budget - susp_carried)
-            cohort_resid = sum(max(0.0, caps.get(e, 0.0) - carried.get(e, {}).get("equity", 0.0)) for e in susp)
+            cohort_resid = sum(max(
+                0.0, caps.get(e, 0.0) - carried.get(selected_wallet_of.get(e), {}).get("equity", 0.0)
+            ) for e in susp)
             if cohort_resid > cohort_new_room + 1e-9 and cohort_resid > 0:
                 shrink = cohort_new_room / cohort_resid          # scale each SUSPICIOUS cap's residual
                 for e in susp:
-                    ce = carried.get(e, {}).get("equity", 0.0)
+                    ce = carried.get(selected_wallet_of.get(e), {}).get("equity", 0.0)
                     caps[e] = ce + max(0.0, caps.get(e, 0.0) - ce) * shrink
-        carried_exposure = {e: carried[e]["equity"] for e in selected if e in carried}
+        carried_exposure = {
+            e: carried[selected_wallet_of[e]]["equity"]
+            for e in selected if selected_wallet_of.get(e) in carried
+        }
         wf = cap_aware_waterfill(desired, carried_exposure, caps, m, cash, portfolio_equity)
         funded = {e: wf["per_entity"].get(e, {}).get("cash_funded", 0.0) for e in selected}
 
@@ -603,6 +805,12 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
             wallet = _entity(eid, fid).get("primary_wallet")
             test_adf = acts_loader(wallet, t0, t1) if wallet is not None else None
             adf_cache[eid] = (wallet, test_adf)
+            if m.sizing_mode == "fixed_notional":
+                # PARITY fixed_notional (codex P1-A: strictly self-contained -- writes NO shared
+                # sizing state). lev/min_frac are NOT used in this mode: the gross budget is
+                # enforced by SLEEVE COUNT below (codex P1-B, never margin scaling), and the
+                # feasibility loop sizes the $-order directly against the funded slice.
+                continue
             pre_adf = acts_loader(wallet, pt0, pt1) if wallet is not None else None
             lev[eid] = expected_leverage(
                 pre_adf, m.sizing_mode, m.fixed_target_exposure
@@ -610,7 +818,12 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
             # A low percentile of |target_exposure_pct| over the PRETEST window = a representative SMALL
             # action; its notional must clear HL $10 for the entity to be tradeably copyable at this slice.
             mf = None
-            if pre_adf is not None and len(pre_adf) and "target_exposure_pct" in pre_adf.columns:
+            if m.sizing_mode == "fixed_position" and pre_adf is not None and len(pre_adf):
+                # In the supported no-M1 lane target_exposure_pct is intentionally null. A fixed
+                # position's smallest intended open is instead exactly fixed_target_exposure of its
+                # sleeve. Using the deprecated column here dropped every new sleeve as "unprovable".
+                mf = abs(float(m.fixed_target_exposure))
+            elif pre_adf is not None and len(pre_adf) and "target_exposure_pct" in pre_adf.columns:
                 _te = pd.to_numeric(pre_adf["target_exposure_pct"], errors="coerce").abs()
                 _te = _te[np.isfinite(_te) & (_te > 0)]
                 if len(_te):
@@ -619,7 +832,52 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         # FIXED-BANKROLL thesis: the gross budget keys off the FIXED bankroll b0, NOT live portfolio
         # equity -- winners must NOT expand portfolio capacity fold-to-fold (no equity-following leverage).
         gross_budget = m.gross_cap * float(b0)
-        funded, gross_returned, implied_gross = apply_gross_budget(funded, carried_exposure, lev, gross_budget)
+        n_gross_dropped = 0
+        if m.sizing_mode == "fixed_notional":
+            # AMENDED (codex P1-B, r2 TWO-PASS): a fixed-$ book CANNOT be gross-capped by scaling
+            # margin -- m07 still orders fixed_notional_usd per leg regardless of sleeve margin, so
+            # margin scaling leaves the book over-gross (or the engine rejects the orders). Enforce
+            # by SLEEVE COUNT in TWO passes -- a single rank-interleaved walk could admit a higher-
+            # ranked NEW sleeve before counting a lower-ranked CARRIED one, and since carried is
+            # untrimmable the book would exceed the budget:
+            #   PASS 1: reserve the implied gross of ALL carried sleeves first, REGARDLESS of rank.
+            #     They are already live and untrimmable -- caps bind at ALLOCATION; force-flattening
+            #     a live sleeve is the demotion machinery's decision, NOT the allocation budget's.
+            #     Their top-up margin adds no gross (fixed-$ book). If carried ALONE exceeds the
+            #     budget, flag LOUDLY (carried_gross_over_budget on the fold record) and fund no new
+            #     sleeves, but do NOT trim.
+            #   PASS 2: admit NEW sleeves in selection-rank order (select_priority DESC, entity_id
+            #     ASC -- the same deterministic order anti_corr_select uses) into the REMAINING
+            #     budget; a new sleeve is funded FULLY or DROPPED to cash entirely (n_gross_dropped,
+            #     no silent cap). The margin-scaling path (apply_gross_budget) is NOT called here.
+            gross_returned = 0.0
+            carried_gross = sum(
+                m.fixed_notional_usd * p90_legs.get(eid, 1.0)
+                for eid in selected if selected_wallet_of.get(eid) in carried
+            )
+            carried_gross_over_budget = carried_gross > gross_budget + 1e-9
+            if carried_gross_over_budget:
+                logger.warning(
+                    "m09 fold %s: carried fixed_notional gross %.2f ALONE exceeds gross budget %.2f; "
+                    "NOT force-trimmed (allocation never trims live sleeves -- demotion machinery's "
+                    "call); no new sleeves funded this fold", fid, carried_gross, gross_budget,
+                )
+            cum_gross = carried_gross
+            for eid in sorted(selected, key=lambda e: (-prio_of.get(e, 0.0), e)):
+                if selected_wallet_of.get(eid) in carried:
+                    continue                               # reserved in pass 1
+                if funded.get(eid, 0.0) <= 0:
+                    continue
+                implied = m.fixed_notional_usd * p90_legs.get(eid, 1.0)
+                if cum_gross + implied <= gross_budget + 1e-9:
+                    cum_gross += implied
+                else:
+                    gross_returned += funded[eid]
+                    funded[eid] = 0.0
+                    n_gross_dropped += 1
+            implied_gross = cum_gross
+        else:
+            funded, gross_returned, implied_gross = apply_gross_budget(funded, carried_exposure, lev, gross_budget)
         # MIN-NOTIONAL FEASIBILITY (codex m09 P1: wire the defined+tested helper into allocation). A NEW
         # entity whose funded slice cannot clear HL $10 for a representative small pretest action is
         # UNTRADEABLE at this capital -> zero its funding (the freed margin stays cash; the debit below is on
@@ -634,7 +892,24 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         n_min_notional_dropped = 0
         n_accessible_unchecked = 0
         for eid in list(selected):
-            if eid in carried or funded.get(eid, 0.0) <= 0:
+            wallet = selected_wallet_of.get(eid)
+            if wallet in carried or funded.get(eid, 0.0) <= 0:
+                continue
+            if m.sizing_mode == "fixed_notional":
+                # SELF-CONTAINED fixed_notional leg (codex P1-A: gated strictly on this mode; the
+                # shared fixed_position/leader_equity path below is untouched). Every follower order
+                # is exactly fixed_notional_usd, independent of the sleeve slice: expressed as a
+                # fraction of THIS funded slice the smallest intended order is fixed_notional_usd /
+                # slice, so min_notional_feasible passes iff fixed_notional_usd >= HL $10 -- feasible
+                # BY CONSTRUCTION for any slice (a sub-$10 fixed notional correctly drops every
+                # sleeve). Accessibility is 1.0 by the same sizing-contract argument as the
+                # fixed_position branch below: the follower order is a known $ size regardless of
+                # source size. funded[eid] > 0 is guaranteed by the skip at the top of this loop.
+                mf_fn = m.fixed_notional_usd / funded[eid]
+                feasible, _viable, _reason = min_notional_feasible(mf_fn, 1.0, funded[eid], m)
+                if not feasible:
+                    funded[eid] = 0.0                   # untradeable order size -> stays cash
+                    n_min_notional_dropped += 1
                 continue
             mf = min_frac.get(eid)
             if mf is None:
@@ -643,7 +918,14 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                 n_min_notional_dropped += 1
                 continue
             af = accessible_frac_of.get(eid)
-            if af is None:
+            if m.sizing_mode == "fixed_position":
+                # Under fixed-position sizing every non-flat target is exactly
+                # fixed_target_exposure * sleeve equity. Once the sleeve clears the slice leg above,
+                # its follower order is accessible by construction. M5's source-size accessibility
+                # can legitimately be unknown in the no-M1 lane and is not the sizing contract used
+                # here; treating that NaN as a failure incorrectly forced the entire book to cash.
+                af_for_check = 1.0
+            elif af is None:
                 if pool_has_accessible:
                     # column exists but this entity has no finite in-range value -> fail closed.
                     funded[eid] = 0.0
@@ -658,16 +940,36 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                 funded[eid] = 0.0                       # untradeable slice -> freed margin stays cash
                 n_min_notional_dropped += 1
         cash -= sum(funded.values())                       # only the gross/cap-trimmed margin leaves cash
-        fold_caps_applied.append({"fold_id": fid, "gross_budget": gross_budget,
-                                  "implied_gross_notional": implied_gross,
-                                  "gross_trimmed_cash": gross_returned, "n_suspicious": len(susp),
-                                  "n_min_notional_dropped": n_min_notional_dropped,
-                                  "n_accessible_unchecked": n_accessible_unchecked})
+        fc_row = {"fold_id": fid, "gross_budget": gross_budget,
+                  "implied_gross_notional": implied_gross,
+                  "gross_trimmed_cash": gross_returned, "n_suspicious": len(susp),
+                  "n_min_notional_dropped": n_min_notional_dropped,
+                  "n_accessible_unchecked": n_accessible_unchecked}
+        if m.sizing_mode == "fixed_notional":
+            # keyed ONLY in this mode so the default-mode output contract stays byte-identical
+            # (the HEAD-comparison contamination test in tests/v15/test_m09.py relies on this).
+            fc_row["n_gross_dropped"] = n_gross_dropped
+            fc_row["carried_gross_over_budget"] = bool(carried_gross_over_budget)
+        fold_caps_applied.append(fc_row)
 
         # RUN M7 per selected subaccount on this fold's TEST actions (carried or new).
         params = eng.EngineParams(slippage_band="base", start_policy="causal_carry_in")
         params.sizing_mode = m.sizing_mode
         params.fixed_target_exposure = m.fixed_target_exposure
+        # PARITY knobs (settled design 2026-08-06): threaded VERBATIM into every per-fold engine run;
+        # defaults equal the m07 EngineParams defaults, so the no-knob path is byte-identical.
+        params.fixed_notional_usd = m.fixed_notional_usd
+        params.reversal_mode = m.reversal_mode
+        params.exit_latency_ms = m.exit_latency_ms
+        params.exit_entry_grace_ms = m.exit_entry_grace_ms
+        params.leader_dust_floor_usd = m.leader_dust_floor_usd
+        params.sl_bps = m.sl_bps
+        # global_stop_pct baseline is FOLD-SCOPED (each fold's sleeve start equity) -- exactly what
+        # m07's global_stop_pct already does per step_subaccount call, so the knob threads verbatim.
+        # Fold-scoped baseline approximates live's engine-restart-per-rebalance; live latches
+        # boot-time equity (hl_copy_trader_v17.py:4602); documented as an approximation in the
+        # parity report.
+        params.global_stop_pct = m.global_stop_pct
         sub_eq = {}
         new_carried = {}
         deployed_new = 0.0                                 # NEW margin that actually reached the engine
@@ -676,8 +978,9 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
             if wallet is None:                             # unrunnable: RETURN any funded cash (no leak)
                 cash += funded.get(eid, 0.0)
                 continue
-            if eid in carried:                         # continuing winner: carried state + any top-up
-                start_state = copy.deepcopy(carried[eid]["state"])
+            wallet_key = str(wallet)
+            if wallet_key in carried:                  # continuing wallet: carried state + any top-up
+                start_state = copy.deepcopy(carried[wallet_key]["state"])
                 # CASH CONSERVATION: a carried entity can receive a water-fill TOP-UP (funded[eid]); that
                 # margin was already debited from cash, so it MUST enter the carried subaccount's starting
                 # equity. Dropping it (start from old equity only) silently vanishes that cash.
@@ -685,7 +988,7 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
                 start_state.cross_collateral["main"] = (
                     start_state.cross_collateral.get("main", 0.0) + topup
                 )
-                start_eq = carried[eid]["equity"] + topup
+                start_eq = carried[wallet_key]["equity"] + topup
                 deployed_new += topup
             else:                                       # new entity: cold-start from the funded slice
                 if funded.get(eid, 0.0) <= 0:
@@ -704,9 +1007,11 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
             end_eq = float(res["summary"]["final_equity"])
             if not np.isfinite(end_eq):
                 end_eq = 0.0
-            new_carried[eid] = {"state": _reconstruct_account_state(eng, res["ending_account_state"]),
-                                "equity": end_eq, "wallet": wallet}
-            entity_pnl[eid] = entity_pnl.get(eid, 0.0) + (end_eq - start_eq)
+            new_carried[wallet_key] = {
+                "state": _reconstruct_account_state(eng, res["ending_account_state"]),
+                "equity": end_eq, "wallet": wallet_key, "entity_id": eid,
+            }
+            entity_pnl[wallet_key] = entity_pnl.get(wallet_key, 0.0) + (end_eq - start_eq)
 
         # AGGREGATE this fold on the event clock + add cash -> chained portfolio equity.
         fold_port = portfolio_path(sub_eq) if sub_eq else pd.DataFrame(columns=["ts", "portfolio_equity"])
@@ -778,9 +1083,12 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         else:
             fold_end_equity = g4["fold_end_equity"]
 
+        selected_wallets_out = sorted(str(adf_cache[e][0]) for e in selected if adf_cache[e][0] is not None)
         per_fold.append({"fold_id": fid, "fold_initial": fold_initial, "fold_end_equity": fold_end_equity,
                          "fold_pnl": fold_end_equity - fold_initial, "g4_killed": g4_killed_causal,
                          "g4_pass": g4["g4_pass"], "n_selected": len(selected),
+                         "selected_entity_ids": sorted(int(e) for e in selected),
+                         "selected_wallets": selected_wallets_out,
                          "intervention": intervention_kind, "intervention_ts": intervention_ts})
         fold_writer.add({"fold_id": fid, "fold_initial": float(fold_initial),
                          "fold_end_equity": float(fold_end_equity),
@@ -808,13 +1116,16 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
     n_pos = sum(1 for f in per_fold if f["fold_pnl"] > 0)
     total_pnl = sum(entity_pnl.values())
     if total_pnl > 0:
-        top_share = max((max(v, 0.0) / total_pnl for v in entity_pnl.values()), default=0.0)
+        top_wallet, top_pnl = max(entity_pnl.items(), key=lambda item: max(item[1], 0.0),
+                                  default=(None, 0.0))
+        top_share = max(float(top_pnl), 0.0) / total_pnl
     else:
         # A losing/flat strategy cannot satisfy a positive-PnL concentration gate. codex m09 r4: emit a
         # FINITE, in-[0,1] MAX-concentration sentinel (1.0), NOT inf -- inf failed m10's finite/[0,1] input
         # validation as "malformed" instead of failing G7 as "too concentrated". 1.0 > g7 cap -> G7 fails
         # (conservative) AND every run_m09_chained output stays finite.
         top_share = 1.0 if entity_pnl else 0.0
+        top_wallet = None
     # codex m09 r4: guard the calmar ratio finite (chained_roe is finite by the sanitizers above; max_dd is a
     # streamed finite accumulator, but keep the output contract explicit).
     max_chained_calmar = chained_roe / max(max_dd, 1e-9)
@@ -835,7 +1146,9 @@ def run_m09_chained(m06b_pool: pd.DataFrame, m08_tiers: pd.DataFrame, m04_entiti
         "n_g4_kills": sum(1 for f in per_fold if f.get("intervention") == "g4_kill"),
         "n_global_dd_derisks": sum(1 for f in per_fold if f.get("intervention") == "global_dd_derisk"),
         "any_intervention": any(f.get("intervention") for f in per_fold),
-        "top_entity_pnl_share": top_share, "per_fold": per_fold, "fold_caps_applied": fold_caps_applied,
+        "top_entity_pnl_share": top_share, "top_entity_wallet": top_wallet,
+        "entity_pnl": dict(sorted(entity_pnl.items())),
+        "per_fold": per_fold, "fold_caps_applied": fold_caps_applied,
         "equity_path": equity_path,
         "_simplifications": "dropped entities exit through M7 at fold boundary; "
                             "G4/global-DD breach uses marked breach equity because historical "
@@ -863,3 +1176,192 @@ def effective_caps(entities: pd.DataFrame, m: M9Manifest, portfolio_equity: floa
             m8 = max(0.0, float(m8))
         caps[int(r.entity_id)] = float(min(g7, m8))
     return caps
+
+
+def _jsonable(value):
+    """Convert numpy/pandas scalars in the bounded M09 result to strict JSON values."""
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def _load_fold_pure_m04(m04_dir: Path, folds: pd.DataFrame) -> pd.DataFrame:
+    """Load and verify the fold-pure entity map used for M09 allocation decisions."""
+    parts = []
+    for fr in folds.itertuples():
+        fid = int(fr.fold_id)
+        path = m04_dir / f"m04_entities_f{fid}.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"M09 missing fold-pure M04 file: {path}")
+        frame = pd.read_parquet(path)
+        required = {"entity_id", "primary_wallet", "entity_tier", "as_of_ms"}
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise ValueError(f"M09 {path} missing columns {missing}")
+        expected = int(pd.Timestamp(fr.test_start).value // 1_000_000)
+        bad = frame["as_of_ms"].isna() | (frame["as_of_ms"].astype("int64") != expected)
+        if bool(bad.any()):
+            raise ValueError(f"M09 {path} has {int(bad.sum())} rows not as-of fold test_start")
+        frame = frame[["entity_id", "primary_wallet", "entity_tier"]].copy()
+        frame["fold_id"] = fid
+        parts.append(frame)
+    return pd.concat(parts, ignore_index=True)
+
+
+def main():
+    """Canonical executable M09 interface used by scripts/experiment.sh."""
+    # codex 2026-08-10 #3 (CLAUDE.md Rule 8): guard at PROCESS start, not at run_m09_chained() —
+    # the cache preamble below scans the census action dataset and builds OHLC arrays before that
+    # point, and an unguarded overrun there is a silent OS SIGKILL instead of a loud abort.
+    install_memory_guard(label="m09_main")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--m06b-pool", required=True)
+    ap.add_argument("--m08-survival", required=True)
+    ap.add_argument("--m04-dir", required=True)
+    ap.add_argument("--folds", required=True)
+    ap.add_argument("--actions", required=True)
+    ap.add_argument("--action-shards", default=None)
+    ap.add_argument("--slip-calib", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--b0", type=float, default=500.0)
+    ap.add_argument("--target-count", type=int, default=40)
+    ap.add_argument("--rho-max", type=float, default=0.70)
+    ap.add_argument("--gross-cap", type=float, default=3.0)
+    ap.add_argument("--global-dd-derisk", type=float, default=0.35)
+    ap.add_argument("--g4-intrafold-kill", type=float, default=0.50)
+    ap.add_argument("--per-entity-cap", type=float, default=0.40)
+    ap.add_argument("--suspicious-cohort-cap", type=float, default=0.10)
+    ap.add_argument("--min-order-notional", type=float, default=10.0)
+    ap.add_argument("--min-accessible-frac", type=float, default=0.50)
+    ap.add_argument("--sizing-mode", choices=("leader_equity", "fixed_position", "fixed_notional"),
+                    default="fixed_position")
+    ap.add_argument("--fixed-target-exposure", type=float, default=0.10)
+    # PARITY knobs (settled design 2026-08-06). Defaults preserve prior behavior EXACTLY (all inert).
+    ap.add_argument("--fixed-notional-usd", type=float, default=100.0)
+    ap.add_argument("--reversal-mode", choices=("flip", "flatten_only"), default="flip")
+    ap.add_argument("--exit-latency-ms", type=int, default=None)
+    ap.add_argument("--exit-entry-grace-ms", type=int, default=90_000)
+    ap.add_argument("--leader-dust-floor-usd", type=float, default=0.0)
+    ap.add_argument("--sl-bps", type=float, default=None)
+    ap.add_argument("--global-stop-pct", type=float, default=None)
+    ap.add_argument("--pool-provider", choices=("ranked", "pinned"), default="ranked",
+                    help="ranked (default) = per-fold score selection. pinned = HOLD the wallet list "
+                         "in --pinned-wallets through the chain (pinned-if-rankable semantics; the "
+                         "2026-08-07 m10 verdict buried per-fold rotation).")
+    ap.add_argument("--pinned-wallets", default=None,
+                    help="text file, one wallet address per line (required for --pool-provider pinned)")
+    args = ap.parse_args()
+    if args.pool_provider == "pinned" and not args.pinned_wallets:
+        ap.error("--pool-provider pinned requires --pinned-wallets <file>")
+
+    # PARITY FAIL-FAST (settled design E): mirror m07 step_subaccount's param-combo validation HERE,
+    # at parse time, so a bad manifest dies immediately with a clear message instead of mid-fold.
+    if args.sl_bps is not None and args.reversal_mode != "flatten_only":
+        raise ValueError("M09 --sl-bps requires --reversal-mode flatten_only (m07 parity validation: "
+                         "a stopped-out leg must not re-enter on the leader's next ADD)")
+    # m07's second combo check (fixed_notional requires copy_policy='full_mirror') cannot fail from
+    # here: M09 exposes no copy_policy knob and always runs the engine default 'full_mirror'.
+
+    if args.b0 <= 0 or args.target_count <= 0:
+        raise ValueError("M09 b0 and target_count must be positive")
+    # At fixed exposure, every new sleeve needs at least min_notional/exposure capital. Refuse a
+    # manifest whose target count guarantees sub-minimum equal sleeves; the caller must make the
+    # intended concentration explicit rather than allowing a post-allocation all-cash accident.
+    if args.sizing_mode == "fixed_position":
+        viable_slice = args.min_order_notional / abs(args.fixed_target_exposure)
+        max_equal_sleeves = int(args.b0 // viable_slice)
+        if max_equal_sleeves < 1 or args.target_count > max_equal_sleeves:
+            raise ValueError(
+                f"M09 target_count={args.target_count} is infeasible at b0={args.b0}: fixed exposure "
+                f"requires >=${viable_slice:.2f}/sleeve, so target_count must be <= {max_equal_sleeves}"
+            )
+    elif args.sizing_mode == "fixed_notional":
+        # The fixed_position sleeve-viability check does NOT apply here: sleeve margin is
+        # fixed_notional/leverage (margined), not an exposure fraction of the slice. The binding
+        # constraint is GROSS: target_count one-leg sleeves at $fixed_notional_usd each must fit
+        # inside the aggregate gross budget (gross_cap x b0). Refuse a manifest that cannot.
+        gross_budget = args.gross_cap * args.b0
+        if args.target_count * args.fixed_notional_usd > gross_budget:
+            raise ValueError(
+                f"M09 fixed_notional gross-infeasible: target_count={args.target_count} x "
+                f"fixed_notional_usd={args.fixed_notional_usd:.2f} = "
+                f"{args.target_count * args.fixed_notional_usd:.2f} notional exceeds the gross budget "
+                f"gross_cap x b0 = {gross_budget:.2f}; lower target_count/fixed_notional_usd or raise "
+                f"gross_cap/b0"
+            )
+
+    folds = pd.read_parquet(args.folds)
+    pool = pd.read_parquet(args.m06b_pool)
+    tiers = pd.read_parquet(args.m08_survival)
+    entities = _load_fold_pure_m04(Path(args.m04_dir), folds)
+
+    import pyarrow.dataset as ds
+    import v15_m07_engine as eng
+    dataset = ds.dataset(
+        args.action_shards, format="parquet", partitioning="hive"
+    ) if args.action_shards else ds.dataset(args.actions, format="parquet")
+
+    @lru_cache(maxsize=512)
+    def wallet_actions(wallet: str) -> pd.DataFrame:
+        cols = ["wallet", "coin", "ts", "event_order", "action_type", "signed_size",
+                "position_after", "target_exposure_pct", "is_liquidation", "carry_in_status",
+                "lifecycle_valid", "stream_replay_valid"]
+        return dataset.to_table(filter=ds.field("wallet") == wallet, columns=cols).to_pandas()
+
+    def loader(wallet, t0, t1):
+        if wallet is None:
+            return None
+        frame = wallet_actions(str(wallet))
+        return frame[(frame["ts"] >= int(t0)) & (frame["ts"] < int(t1))].copy()
+
+    calibration = json.loads(Path(args.slip_calib).read_text())
+    per_fold = {int(k): v for k, v in calibration.get("per_fold_asof", {}).items()}
+    version = calibration.get("version")
+    # Fable B4 (2026-08-08): require_cache now RAISES on a missing .npy (the daily Mongo sync
+    # invalidates caches lazily), so every require_cache consumer must run the m06b-style preamble.
+    # Batch-streamed coin scan: bounded memory on census-size action artifacts.
+    _coins: set = set()
+    for _b in dataset.to_batches(columns=["coin"]):
+        _coins.update(_b.column("coin").unique().to_pylist())
+    eng.build_ohlc_cache(sorted(c for c in _coins if c and not eng.coin_is_spot(c)))
+    md = eng.MarketData(require_cache=True)
+    manifest = M9Manifest(
+        b0=args.b0, target_count=args.target_count, rho_max=args.rho_max,
+        gross_cap=args.gross_cap, global_dd_derisk=args.global_dd_derisk,
+        g4_intrafold_kill=args.g4_intrafold_kill, per_entity_cap=args.per_entity_cap,
+        suspicious_cohort_cap=args.suspicious_cohort_cap,
+        min_order_notional=args.min_order_notional, min_accessible_frac=args.min_accessible_frac,
+        sizing_mode=args.sizing_mode, fixed_target_exposure=args.fixed_target_exposure,
+        fixed_notional_usd=args.fixed_notional_usd, reversal_mode=args.reversal_mode,
+        exit_latency_ms=args.exit_latency_ms, exit_entry_grace_ms=args.exit_entry_grace_ms,
+        leader_dust_floor_usd=args.leader_dust_floor_usd, sl_bps=args.sl_bps,
+        global_stop_pct=args.global_stop_pct,
+    )
+    pinned = None
+    if args.pool_provider == "pinned":
+        pinned = {l.strip().lower() for l in open(args.pinned_wallets)
+                  if l.strip() and not l.startswith("#")}
+        logger.info("M09 pinned cohort: %d wallets from %s", len(pinned), args.pinned_wallets)
+    result = run_m09_chained(
+        pool, tiers, entities, folds, eng, md, loader, manifest, args.b0,
+        pool_provider=args.pool_provider, pinned_wallets=pinned,
+        out_dir=args.out, slip_calib_per_fold=per_fold, slip_calib_version=version,
+    )
+    result["n_folds"] = int(len(folds))
+    result["g5_pool_ok"] = bool(len(pool[pool["in_pool"]]) > 0)
+    result["manifest"] = _jsonable(manifest.__dict__)
+    out = Path(args.out) / "m09_result.json"
+    out.write_text(json.dumps(_jsonable(result), indent=2, allow_nan=False) + "\n")
+    logger.info("M09 result -> %s", out)
+
+
+if __name__ == "__main__":
+    main()
